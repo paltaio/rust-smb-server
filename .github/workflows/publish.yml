@@ -31,7 +31,5 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           cargo publish -p paltaio-smb-proto
-          sleep 30
           cargo publish -p paltaio-smb-server
-          sleep 30
           cargo publish -p paltaio-smb-fs

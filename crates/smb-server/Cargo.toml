@@ -31,4 +31,4 @@ getrandom = "0.4"
 tokio = { workspace = true }
 tracing-subscriber = "0.3"
 tempfile = "3"
-smb-fs.workspace = true
+smb-fs = { path = "../smb-fs", package = "paltaio-smb-fs" }
