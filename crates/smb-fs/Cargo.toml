@@ -1,11 +1,14 @@
 [package]
-name = "smb-fs"
+name = "paltaio-smb-fs"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Local-filesystem ShareBackend for smb-server, sandboxed via cap-std."
+description = "Local-filesystem ShareBackend for paltaio-smb-server, sandboxed via cap-std."
+
+[lib]
+name = "smb_fs"
 
 [dependencies]
 smb-server.workspace = true

@@ -1,11 +1,14 @@
 [package]
-name = "smb-server"
+name = "paltaio-smb-server"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "SMB2/3 file-sharing server library with pluggable storage backends."
+
+[lib]
+name = "smb_server"
 
 [dependencies]
 smb-proto.workspace = true

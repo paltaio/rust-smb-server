@@ -8,16 +8,16 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.95"
 license = "MIT"
 repository = "https://github.com/paltaio/rust-smb-server"
 
 [workspace.dependencies]
-smb-proto = { path = "crates/smb-proto", version = "0.1.0" }
-smb-server = { path = "crates/smb-server", version = "0.1.0" }
-smb-fs    = { path = "crates/smb-fs",    version = "0.1.0" }
+smb-proto  = { path = "crates/smb-proto",  version = "0.1.1", package = "paltaio-smb-proto" }
+smb-server = { path = "crates/smb-server", version = "0.1.1", package = "paltaio-smb-server" }
+smb-fs     = { path = "crates/smb-fs",     version = "0.1.1", package = "paltaio-smb-fs" }
 
 tokio = { version = "1.40", features = ["full"] }
 binrw = "0.15"
