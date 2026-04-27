@@ -1,0 +1,26 @@
+[package]
+name = "smb-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "SMB2/3 wire-format types, framing, signing, and authentication primitives."
+
+[dependencies]
+binrw.workspace = true
+bytes.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+hmac.workspace = true
+sha2.workspace = true
+md-5.workspace = true
+md4.workspace = true
+aes.workspace = true
+cmac.workspace = true
+rc4.workspace = true
+
+[dev-dependencies]
+hex = "0.4"

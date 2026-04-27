@@ -1,0 +1,31 @@
+[package]
+name = "smb-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "SMB2/3 file-sharing server library with pluggable storage backends."
+
+[dependencies]
+smb-proto.workspace = true
+
+tokio = { workspace = true }
+bytes.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+# Used as the wire codec inside negotiate-context payload encoders. Justified:
+# `smb-proto` already exposes binrw-derived structs (`PreauthIntegrityCapabilities`
+# etc) and we need `BinWrite::write` to serialize them into a context body.
+binrw = { workspace = true }
+# Cryptographically-strong randomness for the NTLM server challenge and the
+# 3.1.1 negotiate-context salt.
+getrandom = "0.4"
+
+[dev-dependencies]
+tokio = { workspace = true }
+tracing-subscriber = "0.3"
+tempfile = "3"
+smb-fs.workspace = true

@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/smb-proto",
+    "crates/smb-server",
+    "crates/smb-fs",
+    "examples/minimal",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/paltaio/rust-smb-server"
+
+[workspace.dependencies]
+smb-proto = { path = "crates/smb-proto", version = "0.1.0" }
+smb-server = { path = "crates/smb-server", version = "0.1.0" }
+smb-fs    = { path = "crates/smb-fs",    version = "0.1.0" }
+
+tokio = { version = "1.40", features = ["full"] }
+binrw = "0.15"
+bytes = "1.7"
+async-trait = "0.1"
+tracing = "0.1"
+thiserror = "1"
+uuid = { version = "1.10", features = ["v4"] }
+cap-std = "3"
+
+# RustCrypto family
+hmac  = "0.12"
+sha2  = "0.10"
+md-5  = "0.10"
+md4   = "0.10"
+aes   = "0.8"
+cmac  = "0.7"
+rc4   = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
