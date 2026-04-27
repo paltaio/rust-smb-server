@@ -5,8 +5,8 @@ use std::sync::Arc;
 use smb_proto::auth::ntlm::Identity;
 use smb_proto::crypto::sign;
 use smb_proto::header::{
-    Command, HeaderTail, Smb2Header, SMB2_FLAGS_ASYNC_COMMAND, SMB2_FLAGS_SERVER_TO_REDIR,
-    SMB2_FLAGS_SIGNED, SMB2_HEADER_LEN,
+    Command, HeaderTail, Smb2Header, SMB2_FLAGS_ASYNC_COMMAND, SMB2_FLAGS_RELATED_OPERATIONS,
+    SMB2_FLAGS_SERVER_TO_REDIR, SMB2_FLAGS_SIGNED, SMB2_HEADER_LEN,
 };
 use smb_proto::messages::ErrorResponse;
 use tracing::{debug, debug_span, error, warn, Instrument};
@@ -86,6 +86,212 @@ pub async fn dispatch_frame(
         warn!(len = frame.len(), "frame too short for SMB2 header");
         return None;
     }
+
+    let mut sub_offset = 0;
+    let mut responses = Vec::new();
+    let mut prev_session_id = 0;
+    let mut prev_tree_id = 0;
+    let mut prev_create_file_id = None;
+
+    while sub_offset < frame.len() {
+        let available = &frame[sub_offset..];
+        if available.len() < SMB2_HEADER_LEN {
+            warn!(remaining = available.len(), "compound tail too short");
+            return None;
+        }
+
+        let (mut req_hdr, _) = match Smb2Header::parse(available) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(error = %e, "failed to parse compound sub-header");
+                return None;
+            }
+        };
+
+        let next = req_hdr.next_command as usize;
+        let sub_len = if next == 0 {
+            available.len()
+        } else if next < SMB2_HEADER_LEN || next > available.len() {
+            warn!(
+                next,
+                remaining = available.len(),
+                "invalid compound NextCommand"
+            );
+            return None;
+        } else {
+            next
+        };
+
+        let mut sub_frame = available[..sub_len].to_vec();
+        if req_hdr.flags & SMB2_FLAGS_RELATED_OPERATIONS != 0 {
+            inherit_related_context(
+                &mut sub_frame,
+                &mut req_hdr,
+                prev_session_id,
+                prev_tree_id,
+                prev_create_file_id,
+            );
+        }
+
+        prev_session_id = req_hdr.session_id;
+        prev_tree_id = req_hdr.tree_id().unwrap_or(0);
+
+        if let Some(response) = dispatch_one(server, conn, &sub_frame).await {
+            if req_hdr.command == Command::Create {
+                prev_create_file_id = capture_create_file_id(&response);
+            }
+            responses.push(response);
+        }
+
+        if next == 0 {
+            break;
+        }
+        sub_offset += next;
+    }
+
+    if responses.is_empty() {
+        return None;
+    }
+
+    Some(stitch_responses(conn, responses).await)
+}
+
+fn inherit_related_context(
+    sub_frame: &mut [u8],
+    req_hdr: &mut Smb2Header,
+    prev_session_id: u64,
+    prev_tree_id: u32,
+    prev_create_file_id: Option<[u8; 16]>,
+) {
+    if read_u64(sub_frame, 0x28) == u64::MAX {
+        sub_frame[0x28..0x30].copy_from_slice(&prev_session_id.to_le_bytes());
+        req_hdr.session_id = prev_session_id;
+    }
+
+    if read_u32(sub_frame, 0x24) == u32::MAX {
+        sub_frame[0x24..0x28].copy_from_slice(&prev_tree_id.to_le_bytes());
+        if let HeaderTail::Sync { reserved, .. } = req_hdr.tail {
+            req_hdr.tail = HeaderTail::Sync {
+                reserved,
+                tree_id: prev_tree_id,
+            };
+        }
+    }
+
+    let Some(file_id) = prev_create_file_id else {
+        return;
+    };
+    let Some(body_offset) = file_id_body_offset(req_hdr.command) else {
+        return;
+    };
+    let offset = SMB2_HEADER_LEN + body_offset;
+    if offset + 16 <= sub_frame.len()
+        && read_u64(sub_frame, offset) == u64::MAX
+        && read_u64(sub_frame, offset + 8) == u64::MAX
+    {
+        sub_frame[offset..offset + 16].copy_from_slice(&file_id);
+    }
+}
+
+fn file_id_body_offset(command: Command) -> Option<usize> {
+    match command {
+        Command::Close
+        | Command::Flush
+        | Command::Lock
+        | Command::Ioctl
+        | Command::QueryDirectory
+        | Command::ChangeNotify
+        | Command::OplockBreak => Some(8),
+        Command::Read | Command::Write => Some(16),
+        Command::QueryInfo => Some(24),
+        Command::SetInfo => Some(16),
+        _ => None,
+    }
+}
+
+fn capture_create_file_id(response: &[u8]) -> Option<[u8; 16]> {
+    if response.len() < SMB2_HEADER_LEN + 80 || read_u32(response, 0x08) != ntstatus::STATUS_SUCCESS
+    {
+        return None;
+    }
+
+    let mut file_id = [0u8; 16];
+    let offset = SMB2_HEADER_LEN + 64;
+    file_id.copy_from_slice(&response[offset..offset + 16]);
+    Some(file_id)
+}
+
+async fn stitch_responses(conn: &Arc<Connection>, responses: Vec<Vec<u8>>) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut ranges = Vec::with_capacity(responses.len());
+    let response_count = responses.len();
+
+    for (index, mut response) in responses.into_iter().enumerate() {
+        let start = out.len();
+        let actual_len = response.len();
+        if index + 1 < response_count {
+            let next = align_8(actual_len);
+            response[0x14..0x18].copy_from_slice(&(next as u32).to_le_bytes());
+        }
+        out.extend_from_slice(&response);
+        ranges.push((start, actual_len));
+
+        if index + 1 < response_count {
+            out.resize(start + align_8(actual_len), 0);
+        }
+    }
+
+    let algo = *conn.signing_algo.read().await;
+    for (start, len) in ranges {
+        let flags = read_u32(&out, start + 0x10);
+        if flags & SMB2_FLAGS_SIGNED == 0 {
+            continue;
+        }
+
+        let session_id = read_u64(&out, start + 0x28);
+        let key = {
+            let sessions = conn.sessions.read().await;
+            sessions.get(&session_id).cloned()
+        };
+        let Some(session) = key else {
+            continue;
+        };
+        let session = session.read().await;
+        if matches!(session.identity, Identity::Anonymous) {
+            continue;
+        }
+        let signing_key = session.signing_key;
+        drop(session);
+
+        if let Err(e) = sign(&mut out[start..start + len], &signing_key, algo) {
+            error!(error = %e, "failed to sign compound response");
+        }
+    }
+
+    out
+}
+
+const fn align_8(n: usize) -> usize {
+    (n + 7) & !7
+}
+
+fn read_u32(buf: &[u8], offset: usize) -> u32 {
+    let mut bytes = [0u8; 4];
+    bytes.copy_from_slice(&buf[offset..offset + 4]);
+    u32::from_le_bytes(bytes)
+}
+
+fn read_u64(buf: &[u8], offset: usize) -> u64 {
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&buf[offset..offset + 8]);
+    u64::from_le_bytes(bytes)
+}
+
+async fn dispatch_one(
+    server: &Arc<ServerState>,
+    conn: &Arc<Connection>,
+    frame: &[u8],
+) -> Option<Vec<u8>> {
     let (req_hdr, body_bytes) = match Smb2Header::parse(frame) {
         Ok(p) => p,
         Err(e) => {
@@ -116,7 +322,10 @@ pub async fn dispatch_frame(
 
         // Pre-auth integrity (3.1.1): hash the request before processing.
         if matches!(cmd, Command::Negotiate | Command::SessionSetup) {
-            let mut p = conn.preauth.lock().await;
+            let mut p = conn
+                .preauth
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             p.update(frame);
         }
 
@@ -124,7 +333,11 @@ pub async fn dispatch_frame(
 
         // If the handler asked for a preauth snapshot (3.1.1), take it now.
         if let Some(sid) = resp.take_preauth_snapshot_for_session {
-            let snap = conn.preauth.lock().await.snapshot();
+            let snap = conn
+                .preauth
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .snapshot();
             // Stash on the session — the handler already created it.
             let sessions = conn.sessions.read().await;
             if let Some(sess_arc) = sessions.get(&sid) {
@@ -143,7 +356,10 @@ pub async fn dispatch_frame(
 
         // 3.1.1 preauth: hash response too (after signing).
         if matches!(cmd, Command::Negotiate | Command::SessionSetup) {
-            let mut p = conn.preauth.lock().await;
+            let mut p = conn
+                .preauth
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             p.update(&bytes);
         }
 
@@ -180,6 +396,9 @@ async fn verify_request_signature(
 
     if hdr.flags & SMB2_FLAGS_SIGNED != 0 {
         let sess = sess_arc.read().await;
+        if matches!(sess.identity, Identity::Anonymous) {
+            return Ok(());
+        }
         let key = sess.signing_key;
         drop(sess);
         let algo = *conn.signing_algo.read().await;
@@ -221,17 +440,15 @@ async fn build_response_bytes(
     }
     hdr.signature = [0u8; 16];
 
-    // Decide signing.
+    let request_was_signed = req_hdr.flags & SMB2_FLAGS_SIGNED != 0;
     let mut should_sign = false;
     let mut key = [0u8; 16];
     let algo = *conn.signing_algo.read().await;
-    if !handler_resp.skip_signing && hdr.session_id != 0 {
+    if !handler_resp.skip_signing && hdr.session_id != 0 && request_was_signed {
         let sessions = conn.sessions.read().await;
         if let Some(sess_arc) = sessions.get(&hdr.session_id) {
             let sess = sess_arc.read().await;
             let is_anon = matches!(sess.identity, Identity::Anonymous);
-            // Sign whenever the session has an identity (i.e. not anonymous).
-            // SESSION_SETUP success responses *are* signed once a key is set.
             if !is_anon {
                 key = sess.signing_key;
                 should_sign = true;
@@ -315,7 +532,7 @@ async fn handle_smb1_multi_protocol(
     };
 
     debug!(
-        chosen = format!("0x{chosen:04X}"),
+        chosen = %format_args!("0x{chosen:04X}"),
         "SMB1 multi-protocol negotiate"
     );
 

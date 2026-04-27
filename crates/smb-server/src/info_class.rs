@@ -143,6 +143,12 @@ pub fn encode_file_all_information(info: &FileInfo, file_index: u64, access_mask
     out.extend_from_slice(&encode_file_mode_information(0));
     out.extend_from_slice(&encode_file_alignment_information());
     out.extend_from_slice(&encode_file_name_information(&info.name));
+    // Linux cifs checks FileAllInformation against its struct with
+    // FileName[1], so the empty-name root case must still be at least 101
+    // bytes.
+    if out.len() < 101 {
+        out.push(0);
+    }
     out
 }
 
@@ -477,6 +483,14 @@ mod tests {
     fn network_open_information_is_56_bytes() {
         let bytes = encode_file_network_open_information(&fake_info());
         assert_eq!(bytes.len(), 56);
+    }
+
+    #[test]
+    fn file_all_information_empty_name_keeps_linux_minimum_size() {
+        let mut info = fake_info();
+        info.name.clear();
+        let bytes = encode_file_all_information(&info, 1, 0x001F_01FF);
+        assert_eq!(bytes.len(), 101);
     }
 
     #[test]

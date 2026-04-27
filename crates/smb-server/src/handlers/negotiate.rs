@@ -18,11 +18,15 @@ use crate::ntstatus;
 use crate::server::ServerState;
 use crate::utils::{fill_random, now_filetime};
 
-const SECURITY_MODE_SIGNING_REQUIRED: u16 = 0x0002;
+// MS-SMB2 §2.2.4 SecurityMode bits. Keep SIGNING_REQUIRED clear: anonymous
+// Linux cifs mounts do not send enough NTLM material for the server to derive
+// matching SMB3 signing keys.
+pub(crate) const NEGOTIATE_SECURITY_MODE: u16 = 0x0001;
 
 const CAP_DFS: u32 = 0x0000_0001;
 const CAP_LEASING: u32 = 0x0000_0002;
 const CAP_LARGE_MTU: u32 = 0x0000_0004;
+pub(crate) const NEGOTIATE_CAPABILITIES: u32 = CAP_DFS | CAP_LEASING | CAP_LARGE_MTU;
 
 pub async fn handle(
     server: &Arc<ServerState>,
@@ -51,7 +55,10 @@ pub async fn handle(
         Some(d) => d,
         None => return HandlerResponse::err(ntstatus::STATUS_NOT_SUPPORTED),
     };
-    let dialect = Dialect::from_u16(chosen).unwrap();
+    let dialect = match Dialect::from_u16(chosen) {
+        Some(dialect) => dialect,
+        None => return HandlerResponse::err(ntstatus::STATUS_NOT_SUPPORTED),
+    };
     *conn.dialect.write().await = Some(dialect);
     *conn.client_guid.write().await = Uuid::from_bytes(req.client_guid);
     *conn.signing_algo.write().await = match dialect {
@@ -82,7 +89,7 @@ pub async fn handle(
         let preauth_data = {
             use binrw::BinWrite;
             let mut c = std::io::Cursor::new(Vec::new());
-            BinWrite::write(&preauth_caps, &mut c).expect("encode preauth caps");
+            BinWrite::write(&preauth_caps, &mut c).expect("preauth negotiate context encodes");
             c.into_inner()
         };
         let preauth_ctx = NegotiateContext {
@@ -100,7 +107,7 @@ pub async fn handle(
         let signing_data = {
             use binrw::BinWrite;
             let mut c = std::io::Cursor::new(Vec::new());
-            BinWrite::write(&signing_caps, &mut c).expect("encode signing caps");
+            BinWrite::write(&signing_caps, &mut c).expect("signing negotiate context encodes");
             c.into_inner()
         };
         let signing_ctx = NegotiateContext {
@@ -129,11 +136,11 @@ pub async fn handle(
 
     let resp = NegotiateResponse {
         structure_size: 65,
-        security_mode: SECURITY_MODE_SIGNING_REQUIRED,
+        security_mode: NEGOTIATE_SECURITY_MODE,
         dialect_revision: chosen,
         negotiate_context_count_or_reserved: context_count,
         server_guid: *server.config.server_guid.as_bytes(),
-        capabilities: CAP_DFS | CAP_LEASING | CAP_LARGE_MTU,
+        capabilities: NEGOTIATE_CAPABILITIES,
         max_transact_size,
         max_read_size,
         max_write_size,
@@ -185,7 +192,7 @@ pub async fn multi_protocol_response(
 
     let resp = NegotiateResponse {
         structure_size: 65,
-        security_mode: SECURITY_MODE_SIGNING_REQUIRED,
+        security_mode: NEGOTIATE_SECURITY_MODE,
         dialect_revision: chosen,
         negotiate_context_count_or_reserved: 0,
         server_guid: *server.config.server_guid.as_bytes(),
@@ -207,7 +214,7 @@ pub async fn multi_protocol_response(
         return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
     }
     info!(
-        chosen = format!("0x{chosen:04X}"),
+        chosen = %format_args!("0x{chosen:04X}"),
         "SMB1 multi-protocol -> SMB2"
     );
     let mut hr = HandlerResponse::ok(body_out);

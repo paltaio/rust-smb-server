@@ -8,6 +8,7 @@ use smb_proto::messages::{Fsctl, IoctlRequest, IoctlResponse};
 
 use crate::conn::state::Connection;
 use crate::dispatch::HandlerResponse;
+use crate::handlers::negotiate::{NEGOTIATE_CAPABILITIES, NEGOTIATE_SECURITY_MODE};
 use crate::ntstatus;
 use crate::server::ServerState;
 
@@ -28,9 +29,9 @@ pub async fn handle(
             // Capabilities (4) | Guid (16) | SecurityMode (2) | Dialect (2) = 24 bytes.
             let dialect = conn.dialect.read().await.map(|d| d.as_u16()).unwrap_or(0);
             let mut out = Vec::with_capacity(24);
-            out.extend_from_slice(&0x0000_0007u32.to_le_bytes()); // capabilities (DFS|LEASING|LARGE_MTU)
+            out.extend_from_slice(&NEGOTIATE_CAPABILITIES.to_le_bytes());
             out.extend_from_slice(server.config.server_guid.as_bytes());
-            out.extend_from_slice(&0x0003u16.to_le_bytes()); // signing required+enabled
+            out.extend_from_slice(&NEGOTIATE_SECURITY_MODE.to_le_bytes());
             out.extend_from_slice(&dialect.to_le_bytes());
 
             let resp = IoctlResponse {
@@ -47,7 +48,7 @@ pub async fn handle(
                 output: out,
             };
             let mut buf = Vec::new();
-            resp.write_to(&mut buf).expect("encode");
+            resp.write_to(&mut buf).expect("IOCTL response encodes");
             HandlerResponse::ok(buf)
         }
         Fsctl::DfsGetReferrals | Fsctl::DfsGetReferralsEx => {

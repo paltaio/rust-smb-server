@@ -32,12 +32,19 @@ pub async fn handle(
     if blob.is_empty() {
         return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
     }
-    tracing::debug!(
-        first8 = %blob.iter().take(8).map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(""),
-        len = blob.len(),
-        sid = hdr.session_id,
-        "session setup blob"
-    );
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        let mut first8 = String::with_capacity(16);
+        for b in blob.iter().take(8) {
+            use std::fmt::Write as _;
+            write!(&mut first8, "{b:02x}").expect("writing to String cannot fail");
+        }
+        tracing::debug!(
+            first8 = %first8,
+            len = blob.len(),
+            sid = hdr.session_id,
+            "session setup blob"
+        );
+    }
 
     // Decide which form the security blob takes:
     //   * GSS-API NegTokenInit       — starts with 0x60.
@@ -126,7 +133,7 @@ pub async fn handle(
             let mut pa = conn.pending_auths.write().await;
             pa.insert(
                 new_sid,
-                Arc::new(tokio::sync::Mutex::new((acceptor, is_raw_ntlmssp))),
+                Arc::new(std::sync::Mutex::new((acceptor, is_raw_ntlmssp))),
             );
         }
 
@@ -155,18 +162,22 @@ pub async fn handle(
         Some(a) => a,
         None => return HandlerResponse::err(ntstatus::STATUS_USER_SESSION_DELETED),
     };
-    let pair = acceptor_arc.lock().await;
-    let (acceptor, raw_form) = (&pair.0, pair.1);
-    let users = &server.users.table;
-    let lookup = |u: &str, _d: &str| -> Option<UserCreds> { users.get(u).cloned() };
-    let outcome = match acceptor.authenticate(&inner_token, lookup) {
-        Ok(o) => o,
-        Err(e) => {
-            info!(error = %e, "NTLM authenticate failed");
-            return HandlerResponse::err(ntstatus::STATUS_LOGON_FAILURE);
-        }
+    let (outcome, raw_form) = {
+        let pair = acceptor_arc
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (acceptor, raw_form) = (&pair.0, pair.1);
+        let users = &server.users.table;
+        let lookup = |u: &str, _d: &str| -> Option<UserCreds> { users.get(u).cloned() };
+        let outcome = match acceptor.authenticate(&inner_token, lookup) {
+            Ok(o) => o,
+            Err(e) => {
+                info!(error = %e, "NTLM authenticate failed");
+                return HandlerResponse::err(ntstatus::STATUS_LOGON_FAILURE);
+            }
+        };
+        (outcome, raw_form)
     };
-    drop(pair);
 
     // Anonymous gating.
     if matches!(outcome.identity, Identity::Anonymous) && !server.anonymous_allowed() {
@@ -182,11 +193,11 @@ pub async fn handle(
     };
 
     let session_flags = if matches!(outcome.identity, Identity::Anonymous) {
-        SessionSetupResponse::FLAG_IS_NULL
+        SessionSetupResponse::FLAG_IS_GUEST
     } else {
         0
     };
-    let signing_required = !matches!(outcome.identity, Identity::Anonymous);
+    let signing_required = false;
 
     let session = Session::new(
         sid,
@@ -240,7 +251,8 @@ fn build_session_setup_response(_status: u32, spnego_blob: &[u8], session_flags:
         security_buffer: spnego_blob.to_vec(),
     };
     let mut buf = Vec::new();
-    resp.write_to(&mut buf).expect("encode");
+    resp.write_to(&mut buf)
+        .expect("SESSION_SETUP response encodes");
     debug!(len = buf.len(), "SESSION_SETUP response built");
     buf
 }

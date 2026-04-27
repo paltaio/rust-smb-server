@@ -18,8 +18,9 @@ use smb_proto::auth::ntlm::NTLMSSP_SIGNATURE;
 use smb_proto::auth::spnego::{decode_resp_token, encode_resp_token, NegState, OID_NTLMSSP};
 use smb_proto::header::Command;
 use smb_proto::messages::{
-    CreateRequest, CreateResponse, NegotiateRequest, NegotiateResponse, ReadRequest, ReadResponse,
-    SessionSetupRequest, SessionSetupResponse, TreeConnectRequest, TreeConnectResponse,
+    CreateRequest, CreateResponse, FileId, Fsctl, IoctlRequest, IoctlResponse, NegotiateRequest,
+    NegotiateResponse, ReadRequest, ReadResponse, SessionSetupRequest, SessionSetupResponse,
+    TreeConnectRequest, TreeConnectResponse,
 };
 use smb_server::{Share, SmbServer};
 use tokio::net::TcpStream;
@@ -68,6 +69,7 @@ async fn end_to_end_anon_read() {
     assert_eq!(rh.channel_sequence_status, STATUS_SUCCESS);
     let neg_resp = NegotiateResponse::parse(rb).expect("parse neg resp");
     assert!(matches!(neg_resp.dialect_revision, 0x0202 | 0x0210));
+    assert_eq!(neg_resp.security_mode, 0x0001);
 
     // ---- SESSION_SETUP (round 1: anon NTLM NEGOTIATE blob in SPNEGO init) -
     let mut ntlm_negotiate = Vec::new();
@@ -145,10 +147,19 @@ async fn end_to_end_anon_read() {
     write_frame(&mut s, &hdr, &body).await;
 
     let resp = read_frame(&mut s).await;
-    let (rh, _rb) = parse_response_header(&resp);
+    let (rh, rb) = parse_response_header(&resp);
     assert_eq!(rh.command, Command::SessionSetup);
     assert_eq!(rh.channel_sequence_status, STATUS_SUCCESS);
     assert_eq!(rh.session_id, session_id);
+    let ss_resp = SessionSetupResponse::parse(rb).expect("parse ss success resp");
+    assert_eq!(
+        ss_resp.session_flags & SessionSetupResponse::FLAG_IS_GUEST,
+        SessionSetupResponse::FLAG_IS_GUEST
+    );
+    assert_eq!(
+        ss_resp.session_flags & SessionSetupResponse::FLAG_IS_NULL,
+        0
+    );
 
     // ---- TREE_CONNECT to \\server\downloads ------------------------------
     let path_u16 = utf16le("\\\\TESTSERVER\\downloads");
@@ -173,6 +184,36 @@ async fn end_to_end_anon_read() {
     let tc_resp = TreeConnectResponse::parse(rb).expect("parse tc resp");
     assert_eq!(tc_resp.share_type, TreeConnectResponse::SHARE_TYPE_DISK);
 
+    // ---- FSCTL_VALIDATE_NEGOTIATE_INFO mirrors NEGOTIATE ----------------
+    let ioctl_req = IoctlRequest {
+        structure_size: 57,
+        reserved: 0,
+        ctl_code: Fsctl::VALIDATE_NEGOTIATE_INFO,
+        file_id: FileId::any(),
+        input_offset: 0,
+        input_count: 0,
+        max_input_response: 0,
+        output_offset: 0,
+        output_count: 0,
+        max_output_response: 24,
+        flags: IoctlRequest::FLAG_IS_FSCTL,
+        reserved2: 0,
+        input: vec![],
+    };
+    let mut body = Vec::new();
+    ioctl_req.write_to(&mut body).expect("write");
+    let hdr = build_header(Command::Ioctl, 4, session_id, tree_id);
+    write_frame(&mut s, &hdr, &body).await;
+
+    let resp = read_frame(&mut s).await;
+    let (rh, rb) = parse_response_header(&resp);
+    assert_eq!(rh.command, Command::Ioctl);
+    assert_eq!(rh.channel_sequence_status, STATUS_SUCCESS);
+    let ioctl_resp = IoctlResponse::parse(rb).expect("parse ioctl resp");
+    assert_eq!(ioctl_resp.output.len(), 24);
+    let validate_security_mode = u16::from_le_bytes([ioctl_resp.output[20], ioctl_resp.output[21]]);
+    assert_eq!(validate_security_mode, neg_resp.security_mode);
+
     // ---- CREATE hello.txt ------------------------------------------------
     let name_u16 = utf16le("hello.txt");
     let cr_req = CreateRequest {
@@ -196,7 +237,7 @@ async fn end_to_end_anon_read() {
     };
     let mut body = Vec::new();
     cr_req.write_to(&mut body).expect("write");
-    let hdr = build_header(Command::Create, 4, session_id, tree_id);
+    let hdr = build_header(Command::Create, 5, session_id, tree_id);
     write_frame(&mut s, &hdr, &body).await;
 
     let resp = read_frame(&mut s).await;
@@ -224,7 +265,7 @@ async fn end_to_end_anon_read() {
     };
     let mut body = Vec::new();
     rd_req.write_to(&mut body).expect("write");
-    let hdr = build_header(Command::Read, 5, session_id, tree_id);
+    let hdr = build_header(Command::Read, 6, session_id, tree_id);
     write_frame(&mut s, &hdr, &body).await;
 
     let resp = read_frame(&mut s).await;

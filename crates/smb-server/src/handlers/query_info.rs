@@ -69,6 +69,9 @@ pub async fn handle(
                 ic::FILE_STANDARD_INFORMATION => ic::encode_file_standard_information(&info),
                 ic::FILE_INTERNAL_INFORMATION => ic::encode_file_internal_information(file_index),
                 ic::FILE_EA_INFORMATION => ic::encode_file_ea_information(),
+                ic::FILE_FULL_EA_INFORMATION => {
+                    return HandlerResponse::err(ntstatus::STATUS_NO_EAS_ON_FILE);
+                }
                 ic::FILE_ACCESS_INFORMATION => ic::encode_file_access_information(0x001F_01FF),
                 ic::FILE_POSITION_INFORMATION => ic::encode_file_position_information(),
                 ic::FILE_MODE_INFORMATION => ic::encode_file_mode_information(0),
@@ -135,6 +138,7 @@ pub async fn handle(
         buffer: buf,
     };
     let mut out = Vec::new();
-    resp.write_to(&mut out).expect("encode");
+    resp.write_to(&mut out)
+        .expect("QUERY_INFO response encodes");
     HandlerResponse::ok(out)
 }

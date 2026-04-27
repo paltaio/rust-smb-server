@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use smb_proto::auth::ntlm::{Identity, NtlmServer};
 use smb_proto::crypto::{PreauthIntegrity, SigningAlgo};
@@ -19,7 +19,7 @@ use crate::server::ShareBindings;
 /// In-flight NTLM acceptor + a `is_raw_ntlmssp` flag (true = raw, false =
 /// SPNEGO-wrapped). The handler hands the second-round response back in the
 /// same form the client opened with.
-pub type PendingAuth = Arc<tokio::sync::Mutex<(NtlmServer, bool)>>;
+pub type PendingAuth = Arc<Mutex<(NtlmServer, bool)>>;
 
 // ---------------------------------------------------------------------------
 // Connection
@@ -31,7 +31,7 @@ pub struct Connection {
     pub client_guid: tokio::sync::RwLock<Uuid>,
     pub dialect: tokio::sync::RwLock<Option<Dialect>>,
     pub signing_algo: tokio::sync::RwLock<SigningAlgo>,
-    pub preauth: tokio::sync::Mutex<PreauthIntegrity>,
+    pub preauth: Mutex<PreauthIntegrity>,
     /// Held only until SESSION_SETUP completes for the very first session.
     /// Subsequent sessions snapshot per-session preauth at the appropriate
     /// instant.
@@ -65,7 +65,7 @@ impl Connection {
             client_guid: tokio::sync::RwLock::new(Uuid::nil()),
             dialect: tokio::sync::RwLock::new(None),
             signing_algo: tokio::sync::RwLock::new(SigningAlgo::HmacSha256),
-            preauth: tokio::sync::Mutex::new(PreauthIntegrity::new()),
+            preauth: Mutex::new(PreauthIntegrity::new()),
             negotiate_done: tokio::sync::RwLock::new(false),
             max_read_size: tokio::sync::RwLock::new(max_read_size),
             max_write_size: tokio::sync::RwLock::new(max_write_size),
