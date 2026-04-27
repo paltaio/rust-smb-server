@@ -79,6 +79,132 @@ impl Connection {
     pub fn alloc_session_id(&self) -> u64 {
         self.next_session_id.fetch_add(1, Ordering::Relaxed)
     }
+
+    pub async fn close_session(&self, session_id: u64) -> bool {
+        let removed = {
+            let mut sessions = self.sessions.write().await;
+            sessions.remove(&session_id)
+        };
+        if let Some(sess_arc) = removed {
+            close_session_state(&sess_arc).await;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub async fn close_tree(&self, session_id: u64, tree_id: u32) -> bool {
+        let sess_arc = {
+            let sessions = self.sessions.read().await;
+            sessions.get(&session_id).cloned()
+        };
+        let Some(sess_arc) = sess_arc else {
+            return false;
+        };
+        remove_tree_from_session(&sess_arc, tree_id).await
+    }
+
+    pub async fn close_sessions_for_user(&self, user: &str) -> usize {
+        let to_remove = {
+            let sessions = self.sessions.read().await;
+            let mut ids = Vec::new();
+            for (session_id, sess_arc) in sessions.iter() {
+                let sess = sess_arc.read().await;
+                if matches!(&sess.identity, Identity::User { user: session_user, .. } if session_user == user)
+                {
+                    ids.push(*session_id);
+                }
+            }
+            ids
+        };
+
+        let mut removed = 0;
+        for session_id in to_remove {
+            if self.close_session(session_id).await {
+                removed += 1;
+            }
+        }
+        removed
+    }
+
+    pub async fn close_trees_for_share(&self, share_name: &str) -> usize {
+        self.close_matching_trees(|_, tree| tree.share.name.eq_ignore_ascii_case(share_name))
+            .await
+    }
+
+    pub async fn close_trees_for_user_share(&self, user: &str, share_name: &str) -> usize {
+        self.close_matching_trees(|sess, tree| {
+            matches!(&sess.identity, Identity::User { user: session_user, .. } if session_user == user)
+                && tree.share.name.eq_ignore_ascii_case(share_name)
+        })
+        .await
+    }
+
+    async fn close_matching_trees(
+        &self,
+        matches_tree: impl Fn(&Session, &TreeConnect) -> bool,
+    ) -> usize {
+        let sessions: Vec<_> = {
+            let sessions = self.sessions.read().await;
+            sessions.values().cloned().collect()
+        };
+
+        let mut removed = 0;
+        for sess_arc in sessions {
+            let tree_ids = {
+                let sess = sess_arc.read().await;
+                let trees = sess.trees.read().await;
+                let mut ids = Vec::new();
+                for (tree_id, tree_arc) in trees.iter() {
+                    let tree = tree_arc.read().await;
+                    if matches_tree(&sess, &tree) {
+                        ids.push(*tree_id);
+                    }
+                }
+                ids
+            };
+
+            for tree_id in tree_ids {
+                if remove_tree_from_session(&sess_arc, tree_id).await {
+                    removed += 1;
+                }
+            }
+        }
+        removed
+    }
+}
+
+async fn close_session_state(sess_arc: &Arc<RwLock<Session>>) {
+    let sess = sess_arc.write().await;
+    let trees: Vec<_> = sess.trees.write().await.drain().collect();
+    for (_tree_id, tree_arc) in trees {
+        close_tree_state(&tree_arc).await;
+    }
+}
+
+async fn remove_tree_from_session(sess_arc: &Arc<RwLock<Session>>, tree_id: u32) -> bool {
+    let removed = {
+        let sess = sess_arc.read().await;
+        let mut trees = sess.trees.write().await;
+        trees.remove(&tree_id)
+    };
+    if let Some(tree_arc) = removed {
+        close_tree_state(&tree_arc).await;
+        true
+    } else {
+        false
+    }
+}
+
+async fn close_tree_state(tree_arc: &Arc<RwLock<TreeConnect>>) {
+    let tree = tree_arc.write().await;
+    let opens: Vec<_> = tree.opens.write().await.drain().collect();
+    for (_fid, open_arc) in opens {
+        let mut open = open_arc.write().await;
+        if let Some(handle) = open.handle.take() {
+            let _ = handle.close().await;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

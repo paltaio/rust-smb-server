@@ -55,20 +55,22 @@ pub async fn handle(
     let share = if share_name.eq_ignore_ascii_case("IPC$") {
         crate::server::ShareBindings::ipc()
     } else {
-        match server.find_share(&share_name) {
+        match server.find_share(&share_name).await {
             Some(s) => s,
             None => return HandlerResponse::err(ntstatus::STATUS_BAD_NETWORK_NAME),
         }
     };
 
     // Authorize.
-    let granted = match authorize(&share.mode, &share.users, &identity) {
+    let acl = share.acl.read().await;
+    let granted = match authorize(&acl.mode, &acl.users, &identity) {
         Some(a) => a,
         None => {
             warn!(?identity, share = %share.name, "TREE_CONNECT denied");
             return HandlerResponse::err(ntstatus::STATUS_ACCESS_DENIED);
         }
     };
+    drop(acl);
     // Backend cap.
     let granted = if share.backend.capabilities().is_read_only {
         granted.clamp_to(Access::Read)

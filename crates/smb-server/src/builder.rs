@@ -227,13 +227,9 @@ impl SmbServerBuilder {
         // 5. Build ShareBindings — keep mode + users + backend together.
         let mut share_bindings: Vec<Arc<ShareBindings>> = Vec::with_capacity(self.shares.len());
         for s in self.shares {
-            share_bindings.push(Arc::new(ShareBindings {
-                name: s.name,
-                backend: s.backend,
-                mode: s.mode,
-                users: s.users,
-                is_ipc: false,
-            }));
+            share_bindings.push(ShareBindings::new(
+                s.name, s.backend, s.mode, s.users, false,
+            ));
         }
 
         // 6. Materialize the user table (precompute NT hashes to avoid retaining plaintext).
@@ -253,7 +249,9 @@ impl SmbServerBuilder {
             max_write_size: self.max_write_size,
             server_guid,
         };
-        let users = ServerUsers { table: user_table };
+        let users = ServerUsers {
+            table: tokio::sync::RwLock::new(user_table),
+        };
 
         let state = ServerState::new(cfg, users, share_bindings);
         Ok(SmbServer::from_state(state))

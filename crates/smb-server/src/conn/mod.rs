@@ -23,6 +23,7 @@ pub async fn connection_loop(stream: TcpStream, server: Arc<ServerState>) -> io:
         server.config.max_read_size,
         server.config.max_write_size,
     ));
+    let conn_id = server.active_connections.register(&conn).await;
     let (tx, rx) = mpsc::channel::<writer::FramePayload>(writer::WRITER_CHANNEL);
 
     let writer_handle = tokio::spawn(writer::writer_task(write_half, rx));
@@ -32,6 +33,7 @@ pub async fn connection_loop(stream: TcpStream, server: Arc<ServerState>) -> io:
     debug!(?reader_result, "reader exited");
     // Wait for writer to drain.
     let _ = writer_handle.await;
+    server.active_connections.unregister(conn_id).await;
     info!("connection closed");
     reader_result
 }

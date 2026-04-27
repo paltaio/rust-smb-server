@@ -162,12 +162,12 @@ pub async fn handle(
         Some(a) => a,
         None => return HandlerResponse::err(ntstatus::STATUS_USER_SESSION_DELETED),
     };
+    let users = server.users.table.read().await.clone();
     let (outcome, raw_form) = {
         let pair = acceptor_arc
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let (acceptor, raw_form) = (&pair.0, pair.1);
-        let users = &server.users.table;
         let lookup = |u: &str, _d: &str| -> Option<UserCreds> { users.get(u).cloned() };
         let outcome = match acceptor.authenticate(&inner_token, lookup) {
             Ok(o) => o,
@@ -180,7 +180,7 @@ pub async fn handle(
     };
 
     // Anonymous gating.
-    if matches!(outcome.identity, Identity::Anonymous) && !server.anonymous_allowed() {
+    if matches!(outcome.identity, Identity::Anonymous) && !server.anonymous_allowed().await {
         return HandlerResponse::err(ntstatus::STATUS_LOGON_FAILURE);
     }
 

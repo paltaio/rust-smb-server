@@ -35,4 +35,4 @@ pub use backend::{
 pub use builder::{Access, BuildError, Share, SmbServerBuilder};
 pub use error::{SmbError, SmbResult};
 pub use path::SmbPath;
-pub use server::{ServerConfig, ShutdownHandle, SmbServer};
+pub use server::{ConfigError, ConfigHandle, ServerConfig, ShareMode, ShutdownHandle, SmbServer};
