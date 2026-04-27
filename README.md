@@ -1,10 +1,26 @@
 # rust-smb-server
 
-SMB server in Rust. Workspace with three crates:
+SMB server in Rust. Three crates:
 
-- `smb-proto` — wire format, auth, crypto.
-- `smb-server` — connection handling, dispatch, share config.
-- `smb-fs` — `LocalFsBackend` over `cap-std`.
+- `paltaio-smb-proto` — wire format, auth, crypto.
+- `paltaio-smb-server` — connection handling, dispatch, share config.
+- `paltaio-smb-fs` — `LocalFsBackend` over `cap-std`.
+
+Imported as `smb_proto`, `smb_server`, `smb_fs`.
+
+## Install
+
+```sh
+cargo add paltaio-smb-server paltaio-smb-fs
+```
+
+Or in `Cargo.toml`:
+
+```toml
+[dependencies]
+paltaio-smb-server = "0.1"
+paltaio-smb-fs = "0.1"
+```
 
 ## Run the example
 
@@ -15,8 +31,6 @@ cargo run -p minimal-smb-example
 Listens on `0.0.0.0:4445`. Override with `SMB_LISTEN` and `SMB_ROOT`.
 
 Shares: `public` (anon rw), `media` (anon ro), `home` (alice rw, bob ro).
-
-See `docs/SMOKE.md` for mount commands.
 
 ## Embed
 
