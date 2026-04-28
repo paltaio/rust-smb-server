@@ -31,11 +31,9 @@ pub struct Connection {
     pub client_guid: tokio::sync::RwLock<Uuid>,
     pub dialect: tokio::sync::RwLock<Option<Dialect>>,
     pub signing_algo: tokio::sync::RwLock<SigningAlgo>,
+    /// Connection.PreauthIntegrityHashValue after NEGOTIATE. SMB 3.1.1
+    /// SESSION_SETUP exchanges fork this into `session_preauth`.
     pub preauth: Mutex<PreauthIntegrity>,
-    /// Held only until SESSION_SETUP completes for the very first session.
-    /// Subsequent sessions snapshot per-session preauth at the appropriate
-    /// instant.
-    pub negotiate_done: tokio::sync::RwLock<bool>,
     /// Granted at NEGOTIATE: large MTU support flag etc.
     pub max_read_size: tokio::sync::RwLock<u32>,
     pub max_write_size: tokio::sync::RwLock<u32>,
@@ -50,8 +48,8 @@ pub struct Connection {
     /// SPNEGO-wrapped (false) so the second-round response matches form.
     pub pending_auths: RwLock<HashMap<u64, PendingAuth>>,
 
-    /// Per-session preauth snapshots taken at SESSION_SETUP request arrival —
-    /// SMB 3.1.1 only.
+    /// In-flight SMB 3.1.1 preauth state keyed by SessionId during
+    /// multi-leg SESSION_SETUP.
     pub session_preauth: RwLock<HashMap<u64, PreauthIntegrity>>,
 
     /// Monotonic SessionId allocator.
@@ -66,7 +64,6 @@ impl Connection {
             dialect: tokio::sync::RwLock::new(None),
             signing_algo: tokio::sync::RwLock::new(SigningAlgo::HmacSha256),
             preauth: Mutex::new(PreauthIntegrity::new()),
-            negotiate_done: tokio::sync::RwLock::new(false),
             max_read_size: tokio::sync::RwLock::new(max_read_size),
             max_write_size: tokio::sync::RwLock::new(max_write_size),
             sessions: RwLock::new(HashMap::new()),

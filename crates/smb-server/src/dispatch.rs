@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use smb_proto::auth::ntlm::Identity;
-use smb_proto::crypto::sign;
+use smb_proto::crypto::{sign, PreauthIntegrity};
 use smb_proto::header::{
     Command, HeaderTail, Smb2Header, SMB2_FLAGS_ASYNC_COMMAND, SMB2_FLAGS_RELATED_OPERATIONS,
     SMB2_FLAGS_SERVER_TO_REDIR, SMB2_FLAGS_SIGNED, SMB2_HEADER_LEN,
@@ -34,10 +34,10 @@ pub struct HandlerResponse {
     /// If true, the dispatcher will not sign the response. Used for
     /// pre-session-setup messages where no key exists yet.
     pub skip_signing: bool,
-    /// If true, take the per-session 3.1.1 preauth snapshot from the
-    /// connection-level preauth hash *after* hashing the request but *before*
-    /// hashing the response. Set by SESSION_SETUP on the round that produces
-    /// STATUS_SUCCESS, so the session's KDF context can use the snapshot.
+    /// If set, take the per-session 3.1.1 preauth snapshot after hashing the
+    /// SESSION_SETUP request but before hashing the response. Set by
+    /// SESSION_SETUP on the round that produces STATUS_SUCCESS, so the
+    /// session's KDF context can use the snapshot.
     pub take_preauth_snapshot_for_session: Option<u64>,
 }
 
@@ -320,23 +320,32 @@ async fn dispatch_one(
             return None;
         }
 
-        // Pre-auth integrity (3.1.1): hash the request before processing.
-        if matches!(cmd, Command::Negotiate | Command::SessionSetup) {
+        let dialect = *conn.dialect.read().await;
+        let mut session_preauth = None;
+
+        // 3.1.1 preauth is connection-scoped for NEGOTIATE, then per
+        // SESSION_SETUP authentication exchange.
+        if cmd == Command::Negotiate {
             let mut p = conn
                 .preauth
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             p.update(frame);
+        } else if cmd == Command::SessionSetup
+            && dialect == Some(smb_proto::messages::Dialect::Smb311)
+        {
+            let mut p = take_session_preauth(conn, req_hdr.session_id).await;
+            p.update(frame);
+            session_preauth = Some(p);
         }
 
         let resp = handlers::dispatch_command(server, conn, &req_hdr, body_bytes).await;
 
         // If the handler asked for a preauth snapshot (3.1.1), take it now.
         if let Some(sid) = resp.take_preauth_snapshot_for_session {
-            let snap = conn
-                .preauth
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
+            let snap = session_preauth
+                .as_ref()
+                .expect("SMB 3.1.1 SessionSetup snapshot requires per-session preauth")
                 .snapshot();
             // Stash on the session — the handler already created it.
             let sessions = conn.sessions.read().await;
@@ -354,19 +363,46 @@ async fn dispatch_one(
 
         let bytes = build_response_bytes(conn, &req_hdr, resp).await;
 
-        // 3.1.1 preauth: hash response too (after signing).
-        if matches!(cmd, Command::Negotiate | Command::SessionSetup) {
+        if cmd == Command::Negotiate {
             let mut p = conn
                 .preauth
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             p.update(&bytes);
+        } else if cmd == Command::SessionSetup
+            && dialect == Some(smb_proto::messages::Dialect::Smb311)
+        {
+            if read_u32(&bytes, 0x08) == ntstatus::STATUS_MORE_PROCESSING_REQUIRED {
+                if let Some(mut p) = session_preauth {
+                    p.update(&bytes);
+                    let sid = read_u64(&bytes, 0x28);
+                    conn.session_preauth.write().await.insert(sid, p);
+                }
+            } else {
+                conn.session_preauth
+                    .write()
+                    .await
+                    .remove(&req_hdr.session_id);
+            }
         }
 
         Some(bytes)
     }
     .instrument(span)
     .await
+}
+
+async fn take_session_preauth(conn: &Arc<Connection>, session_id: u64) -> PreauthIntegrity {
+    if session_id != 0 {
+        if let Some(preauth) = conn.session_preauth.write().await.remove(&session_id) {
+            return preauth;
+        }
+    }
+
+    conn.preauth
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
 }
 
 async fn verify_request_signature(
@@ -441,15 +477,25 @@ async fn build_response_bytes(
     hdr.signature = [0u8; 16];
 
     let request_was_signed = req_hdr.flags & SMB2_FLAGS_SIGNED != 0;
+    // MS-SMB2 §3.3.5.5.3 step 12: SessionSetup SUCCESS must be signed for
+    // non-anon/non-guest sessions even though the request cannot be signed yet.
+    let is_session_setup_success =
+        req_hdr.command == Command::SessionSetup && handler_resp.status == ntstatus::STATUS_SUCCESS;
     let mut should_sign = false;
     let mut key = [0u8; 16];
     let algo = *conn.signing_algo.read().await;
-    if !handler_resp.skip_signing && hdr.session_id != 0 && request_was_signed {
+    if !handler_resp.skip_signing
+        && hdr.session_id != 0
+        && (request_was_signed || is_session_setup_success)
+    {
         let sessions = conn.sessions.read().await;
         if let Some(sess_arc) = sessions.get(&hdr.session_id) {
             let sess = sess_arc.read().await;
             let is_anon = matches!(sess.identity, Identity::Anonymous);
-            if !is_anon {
+            let is_guest_response = is_session_setup_success
+                && handler_resp.body.len() >= 4
+                && (handler_resp.body[2] & 0x01) != 0;
+            if !is_anon && !is_guest_response && sess.signing_key != [0u8; 16] {
                 key = sess.signing_key;
                 should_sign = true;
             }
@@ -551,4 +597,62 @@ async fn handle_smb1_multi_protocol(
     };
     let resp = handlers::negotiate::multi_protocol_response(server, conn, chosen).await;
     Some(build_response_bytes(conn, &req_hdr, resp).await)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    fn test_conn() -> Arc<Connection> {
+        Arc::new(Connection::new(Uuid::nil(), 1024 * 1024, 1024 * 1024))
+    }
+
+    fn negotiated_preauth() -> PreauthIntegrity {
+        let mut preauth = PreauthIntegrity::new();
+        preauth.update(b"negotiate request");
+        preauth.update(b"negotiate response");
+        preauth
+    }
+
+    #[tokio::test]
+    async fn new_session_setup_preauth_starts_from_negotiate_base() {
+        let conn = test_conn();
+        let base = negotiated_preauth();
+        *conn.preauth.lock().expect("preauth lock") = base.clone();
+
+        let mut first_session = take_session_preauth(&conn, 0).await;
+        first_session.update(b"session one request");
+        first_session.update(b"session one response");
+        conn.session_preauth.write().await.insert(1, first_session);
+
+        let mut second_session = take_session_preauth(&conn, 0).await;
+        second_session.update(b"session two request");
+
+        let mut expected = base.clone();
+        expected.update(b"session two request");
+
+        let mut polluted = base;
+        polluted.update(b"session one request");
+        polluted.update(b"session one response");
+        polluted.update(b"session two request");
+
+        assert_eq!(second_session.snapshot(), expected.snapshot());
+        assert_ne!(second_session.snapshot(), polluted.snapshot());
+    }
+
+    #[tokio::test]
+    async fn followup_session_setup_consumes_stored_session_preauth() {
+        let conn = test_conn();
+        let mut stored = negotiated_preauth();
+        stored.update(b"session setup request");
+        stored.update(b"session setup more-processing response");
+        let expected = stored.snapshot();
+        conn.session_preauth.write().await.insert(7, stored);
+
+        let got = take_session_preauth(&conn, 7).await;
+
+        assert_eq!(got.snapshot(), expected);
+        assert!(!conn.session_preauth.read().await.contains_key(&7));
+    }
 }

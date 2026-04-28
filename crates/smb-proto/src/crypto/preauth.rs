@@ -1,21 +1,17 @@
 //! SMB 3.1.1 pre-auth integrity (MS-SMB2 §3.1.4.4.1, §3.3.5.4).
 //!
-//! A connection-scoped running SHA-512 hash, initialized to all zeros, that
-//! absorbs the raw bytes of every NEGOTIATE and SESSION_SETUP request *and*
-//! response (transport prefix excluded). Per spec:
+//! A running SHA-512 hash, initialized to all zeros, that absorbs SMB 3.1.1
+//! preauth messages (transport prefix excluded). Connection state uses this for
+//! NEGOTIATE; each SESSION_SETUP exchange forks its own instance. Per spec:
 //!
 //! ```text
-//! ConnectionPreauthIntegrityHashValue =
-//!     SHA-512(ConnectionPreauthIntegrityHashValue || RequestOrResponse)
+//! PreauthIntegrityHashValue =
+//!     SHA-512(PreauthIntegrityHashValue || RequestOrResponse)
 //! ```
-//!
-//! The session takes a snapshot of this hash at SESSION_SETUP completion;
-//! that snapshot is then used as the KDF context when deriving the session's
-//! signing/encryption/application keys.
 
 use sha2::{Digest, Sha512};
 
-/// Running pre-auth integrity hash for a single SMB connection.
+/// Running SMB 3.1.1 preauth integrity hash.
 #[derive(Debug, Clone)]
 pub struct PreauthIntegrity {
     hash: [u8; 64],
