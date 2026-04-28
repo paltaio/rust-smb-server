@@ -18,8 +18,8 @@ Or in `Cargo.toml`:
 
 ```toml
 [dependencies]
-paltaio-smb-server = "0.1.4"
-paltaio-smb-fs = "0.1.4"
+paltaio-smb-server = "0.1.5"
+paltaio-smb-fs = "0.1.5"
 ```
 
 ## Run the example
