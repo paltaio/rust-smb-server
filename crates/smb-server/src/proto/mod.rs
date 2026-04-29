@@ -14,5 +14,3 @@ pub mod error;
 pub mod framing;
 pub mod header;
 pub mod messages;
-
-pub use error::{ProtoError, ProtoResult};

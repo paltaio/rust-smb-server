@@ -69,21 +69,6 @@ pub fn signing_key_311(session_key: &[u8], preauth_hash: &[u8; 64]) -> [u8; 16] 
     smb2_kdf(session_key, b"SMBSigningKey\x00", preauth_hash)
 }
 
-/// Application key for SMB 3.0 / 3.0.2.
-///
-/// Label = `"SMB2APP\x00"`, Context = `"SmbRpc\x00"`. Out of scope for v1
-/// signing/verification but cheap to expose for higher layers.
-pub fn application_key_30(session_key: &[u8]) -> [u8; 16] {
-    smb2_kdf(session_key, b"SMB2APP\x00", b"SmbRpc\x00")
-}
-
-/// Application key for SMB 3.1.1.
-///
-/// Label = `"SMBAppKey\x00"`, Context = pre-auth integrity hash.
-pub fn application_key_311(session_key: &[u8], preauth_hash: &[u8; 64]) -> [u8; 16] {
-    smb2_kdf(session_key, b"SMBAppKey\x00", preauth_hash)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -36,18 +36,12 @@ pub const MSG_AUTHENTICATE: u32 = 0x0000_0003;
 
 pub mod flags {
     pub const NTLMSSP_NEGOTIATE_UNICODE: u32 = 0x0000_0001;
-    pub const NTLMSSP_NEGOTIATE_OEM: u32 = 0x0000_0002;
     pub const NTLMSSP_REQUEST_TARGET: u32 = 0x0000_0004;
     pub const NTLMSSP_NEGOTIATE_SIGN: u32 = 0x0000_0010;
-    pub const NTLMSSP_NEGOTIATE_SEAL: u32 = 0x0000_0020;
-    pub const NTLMSSP_NEGOTIATE_DATAGRAM: u32 = 0x0000_0040;
-    pub const NTLMSSP_NEGOTIATE_LM_KEY: u32 = 0x0000_0080;
     pub const NTLMSSP_NEGOTIATE_NTLM: u32 = 0x0000_0200;
+    #[cfg(test)]
     pub const NTLMSSP_NEGOTIATE_ANONYMOUS: u32 = 0x0000_0800;
-    pub const NTLMSSP_NEGOTIATE_OEM_DOMAIN_SUPPLIED: u32 = 0x0000_1000;
-    pub const NTLMSSP_NEGOTIATE_OEM_WORKSTATION_SUPPLIED: u32 = 0x0000_2000;
     pub const NTLMSSP_NEGOTIATE_ALWAYS_SIGN: u32 = 0x0000_8000;
-    pub const NTLMSSP_TARGET_TYPE_DOMAIN: u32 = 0x0001_0000;
     pub const NTLMSSP_TARGET_TYPE_SERVER: u32 = 0x0002_0000;
     pub const NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY: u32 = 0x0008_0000;
     pub const NTLMSSP_NEGOTIATE_TARGET_INFO: u32 = 0x0080_0000;
@@ -59,10 +53,11 @@ pub mod flags {
 
 // --- AV_PAIR types (MS-NLMP §2.2.2.1) ---------------------------------------
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
 pub enum AvId {
-    EOL = 0x0000,
+    Eol = 0x0000,
     NbComputerName = 0x0001,
     NbDomainName = 0x0002,
     DnsComputerName = 0x0003,
@@ -101,12 +96,13 @@ pub fn encode_av_pairs(pairs: &[AvPair]) -> Vec<u8> {
         out.extend_from_slice(&p.value);
     }
     // Terminator
-    out.extend_from_slice(&(AvId::EOL as u16).to_le_bytes());
+    out.extend_from_slice(&(AvId::Eol as u16).to_le_bytes());
     out.extend_from_slice(&0u16.to_le_bytes());
     out
 }
 
 /// Decode AV_PAIRs from a byte slice; stops at (and consumes) the EOL entry.
+#[cfg(test)]
 pub fn decode_av_pairs(buf: &[u8]) -> ProtoResult<Vec<AvPair>> {
     let mut out = Vec::new();
     let mut i = 0usize;
@@ -117,7 +113,7 @@ pub fn decode_av_pairs(buf: &[u8]) -> ProtoResult<Vec<AvPair>> {
         let id = u16::from_le_bytes([buf[i], buf[i + 1]]);
         let len = u16::from_le_bytes([buf[i + 2], buf[i + 3]]) as usize;
         i += 4;
-        if id == AvId::EOL as u16 {
+        if id == AvId::Eol as u16 {
             // EOL must have len=0; tolerate stray bytes.
             break;
         }
@@ -368,10 +364,12 @@ pub fn build_challenge(p: &ChallengeParams<'_>) -> Vec<u8> {
 #[derive(Debug, Clone)]
 pub struct NtlmAuthenticate {
     pub flags: u32,
+    #[allow(dead_code)]
     pub lm_response: Vec<u8>,
     pub nt_response: Vec<u8>,
     pub domain: String,
     pub user: String,
+    #[allow(dead_code)]
     pub workstation: String,
     pub encrypted_random_session_key: Vec<u8>,
     /// Optional MIC (16 bytes, zeroed in source bytes during the MIC HMAC).

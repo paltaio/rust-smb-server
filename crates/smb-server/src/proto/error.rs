@@ -9,9 +9,6 @@ pub enum ProtoError {
     #[error("malformed wire frame: {0}")]
     Malformed(&'static str),
 
-    #[error("frame too large: {len} bytes (max {max})")]
-    FrameTooLarge { len: u32, max: u32 },
-
     #[error("unsupported dialect: 0x{0:04x}")]
     UnsupportedDialect(u16),
 

@@ -24,11 +24,9 @@ mod error;
 #[cfg(feature = "localfs")]
 mod fs;
 mod handlers;
-#[allow(dead_code)]
 pub(crate) mod info_class;
 pub mod ntstatus;
 mod path;
-#[allow(clippy::upper_case_acronyms, dead_code, unused_imports)]
 mod proto;
 mod server;
 mod utils;

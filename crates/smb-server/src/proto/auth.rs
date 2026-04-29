@@ -9,8 +9,3 @@
 
 pub mod ntlm;
 pub mod spnego;
-
-pub use ntlm::{AuthOutcome, Identity, NtlmServer, UserCreds};
-pub use spnego::{
-    decode_init_token, decode_resp_token, encode_init_response, encode_resp_token, NegState,
-};

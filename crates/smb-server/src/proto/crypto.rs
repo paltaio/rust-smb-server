@@ -15,6 +15,6 @@ pub mod kdf;
 pub mod preauth;
 pub mod sign;
 
-pub use kdf::{application_key_30, application_key_311, signing_key_30, signing_key_311, smb2_kdf};
+pub use kdf::{signing_key_30, signing_key_311};
 pub use preauth::PreauthIntegrity;
 pub use sign::{sign, verify, SigningAlgo};

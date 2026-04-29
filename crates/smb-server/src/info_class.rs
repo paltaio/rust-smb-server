@@ -28,7 +28,6 @@ pub const FILE_ALIGNMENT_INFORMATION: u8 = 0x11;
 pub const FILE_ALL_INFORMATION: u8 = 0x12;
 pub const FILE_ALLOCATION_INFORMATION: u8 = 0x13;
 pub const FILE_END_OF_FILE_INFORMATION: u8 = 0x14;
-pub const FILE_ALTERNATE_NAME_INFORMATION: u8 = 0x15;
 pub const FILE_STREAM_INFORMATION: u8 = 0x16;
 pub const FILE_DISPOSITION_INFORMATION: u8 = 0x0D;
 pub const FILE_RENAME_INFORMATION: u8 = 0x0A;
@@ -194,7 +193,6 @@ pub fn encode_file_stream_information(info: &FileInfo) -> Vec<u8> {
 // ---------------------------------------------------------------------------
 
 pub const FS_VOLUME_INFORMATION: u8 = 0x01;
-pub const FS_LABEL_INFORMATION: u8 = 0x02;
 pub const FS_SIZE_INFORMATION: u8 = 0x03;
 pub const FS_DEVICE_INFORMATION: u8 = 0x04;
 pub const FS_ATTRIBUTE_INFORMATION: u8 = 0x05;

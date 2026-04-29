@@ -32,8 +32,7 @@ pub const MAX_FRAME_PAYLOAD: u32 = 0x00FF_FFFF;
 /// Encode a single Direct-TCP frame: 4-byte header + payload.
 ///
 /// Panics in debug if the payload exceeds [`MAX_FRAME_PAYLOAD`]; release builds
-/// silently truncate the high byte (callers should validate length first via
-/// [`check_payload_len`]).
+/// silently truncate the high byte.
 pub fn encode_frame(payload: &[u8], out: &mut Vec<u8>) {
     debug_assert!(
         payload.len() as u64 <= MAX_FRAME_PAYLOAD as u64,
@@ -65,20 +64,10 @@ pub fn decode_frame_header(bytes: &[u8; FRAME_HEADER_LEN]) -> ProtoResult<u32> {
     Ok(len)
 }
 
-/// Validate a payload length against the Direct-TCP framing cap.
-pub fn check_payload_len(len: u32) -> ProtoResult<()> {
-    if len > MAX_FRAME_PAYLOAD {
-        return Err(ProtoError::FrameTooLarge {
-            len,
-            max: MAX_FRAME_PAYLOAD,
-        });
-    }
-    Ok(())
-}
-
 /// Convenience: read one full frame from a contiguous byte slice.
 ///
 /// Returns the payload slice and the remaining bytes after the frame.
+#[cfg(test)]
 pub fn decode_frame(buf: &[u8]) -> ProtoResult<(&[u8], &[u8])> {
     if buf.len() < FRAME_HEADER_LEN {
         return Err(ProtoError::Malformed("short frame header"));
