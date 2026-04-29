@@ -12,7 +12,7 @@ Or in `Cargo.toml`:
 
 ```toml
 [dependencies]
-smb-server = "0.3"
+smb-server = "0.4"
 ```
 
 ## Run the example
