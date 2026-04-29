@@ -1,6 +1,10 @@
 //! Helpers for hand-building SMB2 client requests in integration tests.
 
 use smb_server::wire::header::{Command, HeaderTail, SMB2_FLAGS_SERVER_TO_REDIR, Smb2Header};
+use smb_server::wire::messages::{
+    NegotiateRequest, NegotiateResponse, SessionSetupRequest, SessionSetupResponse,
+    TreeConnectRequest, TreeConnectResponse,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -77,26 +81,26 @@ pub fn parse_response_header(frame: &[u8]) -> (Smb2Header, &[u8]) {
     (h, rest)
 }
 
-pub fn build_spnego_init(ntlm: &[u8]) -> Vec<u8> {
-    fn write_tlv(tag: u8, content: &[u8], out: &mut Vec<u8>) {
-        out.push(tag);
-        if content.len() < 0x80 {
-            out.push(content.len() as u8);
-        } else {
-            let mut tmp = Vec::new();
-            let mut n = content.len();
-            while n > 0 {
-                tmp.push((n & 0xff) as u8);
-                n >>= 8;
-            }
-            out.push(0x80 | tmp.len() as u8);
-            for b in tmp.into_iter().rev() {
-                out.push(b);
-            }
+fn write_tlv(tag: u8, content: &[u8], out: &mut Vec<u8>) {
+    out.push(tag);
+    if content.len() < 0x80 {
+        out.push(content.len() as u8);
+    } else {
+        let mut tmp = Vec::new();
+        let mut n = content.len();
+        while n > 0 {
+            tmp.push((n & 0xff) as u8);
+            n >>= 8;
         }
-        out.extend_from_slice(content);
+        out.push(0x80 | tmp.len() as u8);
+        for b in tmp.into_iter().rev() {
+            out.push(b);
+        }
     }
+    out.extend_from_slice(content);
+}
 
+pub fn build_spnego_init(ntlm: &[u8]) -> Vec<u8> {
     let mut mts = Vec::new();
     write_tlv(0x06, OID_NTLMSSP, &mut mts);
     let mut mts_seq = Vec::new();
@@ -128,25 +132,6 @@ pub fn build_spnego_init(ntlm: &[u8]) -> Vec<u8> {
 }
 
 pub fn build_spnego_resp(ntlm: &[u8]) -> Vec<u8> {
-    fn write_tlv(tag: u8, content: &[u8], out: &mut Vec<u8>) {
-        out.push(tag);
-        if content.len() < 0x80 {
-            out.push(content.len() as u8);
-        } else {
-            let mut tmp = Vec::new();
-            let mut n = content.len();
-            while n > 0 {
-                tmp.push((n & 0xff) as u8);
-                n >>= 8;
-            }
-            out.push(0x80 | tmp.len() as u8);
-            for b in tmp.into_iter().rev() {
-                out.push(b);
-            }
-        }
-        out.extend_from_slice(content);
-    }
-
     let mut enum_state = Vec::new();
     write_tlv(0x0a, &[1], &mut enum_state);
     let mut state_ctx0 = Vec::new();
@@ -172,4 +157,135 @@ pub fn build_spnego_resp(ntlm: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     write_tlv(0xa1, &seq_outer, &mut out);
     out
+}
+
+pub async fn negotiate(s: &mut TcpStream) -> NegotiateResponse {
+    let neg_req = NegotiateRequest {
+        structure_size: 36,
+        dialect_count: 2,
+        security_mode: 0x0001,
+        reserved: 0,
+        capabilities: 0,
+        client_guid: [0xCD; 16],
+        negotiate_context_offset_or_client_start_time: 0,
+        dialects: vec![0x0202, 0x0210],
+    };
+    let mut body = Vec::new();
+    neg_req.write_to(&mut body).expect("write negotiate");
+    let hdr = build_header(Command::Negotiate, 0, 0, 0);
+    write_frame(s, &hdr, &body).await;
+
+    let resp = read_frame(s).await;
+    let (rh, rb) = parse_response_header(&resp);
+    assert_eq!(rh.command, Command::Negotiate);
+    assert_eq!(rh.channel_sequence_status, STATUS_SUCCESS);
+    let neg_resp = NegotiateResponse::parse(rb).expect("parse neg resp");
+    assert!(matches!(neg_resp.dialect_revision, 0x0202 | 0x0210));
+    assert_eq!(neg_resp.security_mode, 0x0001);
+    neg_resp
+}
+
+pub async fn anonymous_session_setup(s: &mut TcpStream) -> u64 {
+    let mut ntlm_negotiate = Vec::new();
+    ntlm_negotiate.extend_from_slice(NTLMSSP_SIGNATURE);
+    ntlm_negotiate.extend_from_slice(&1u32.to_le_bytes());
+    ntlm_negotiate.extend_from_slice(&0x6209_8215u32.to_le_bytes());
+    ntlm_negotiate.extend_from_slice(&[0u8; 16]);
+    ntlm_negotiate.extend_from_slice(&[0u8; 8]);
+
+    let spnego_init = build_spnego_init(&ntlm_negotiate);
+    let ss_req = SessionSetupRequest {
+        structure_size: 25,
+        flags: 0,
+        security_mode: 0x01,
+        capabilities: 0,
+        channel: 0,
+        security_buffer_offset: 88,
+        security_buffer_length: spnego_init.len() as u16,
+        previous_session_id: 0,
+        security_buffer: spnego_init,
+    };
+    let mut body = Vec::new();
+    ss_req.write_to(&mut body).expect("write session setup");
+    let hdr = build_header(Command::SessionSetup, 1, 0, 0);
+    write_frame(s, &hdr, &body).await;
+
+    let resp = read_frame(s).await;
+    let (rh, rb) = parse_response_header(&resp);
+    assert_eq!(rh.command, Command::SessionSetup);
+    assert_eq!(rh.channel_sequence_status, STATUS_MORE_PROCESSING_REQUIRED);
+    let session_id = rh.session_id;
+    assert_ne!(session_id, 0);
+    let ss_resp = SessionSetupResponse::parse(rb).expect("parse ss resp");
+    assert!(!ss_resp.security_buffer.is_empty());
+
+    let mut ntlm_auth = Vec::new();
+    ntlm_auth.extend_from_slice(NTLMSSP_SIGNATURE);
+    ntlm_auth.extend_from_slice(&3u32.to_le_bytes());
+    let header_len: u32 = 72;
+    for _ in 0..6 {
+        ntlm_auth.extend_from_slice(&0u16.to_le_bytes());
+        ntlm_auth.extend_from_slice(&0u16.to_le_bytes());
+        ntlm_auth.extend_from_slice(&header_len.to_le_bytes());
+    }
+    ntlm_auth.extend_from_slice(&0x0000_0800u32.to_le_bytes());
+    ntlm_auth.extend_from_slice(&[0u8; 8]);
+
+    let spnego_resp_blob = build_spnego_resp(&ntlm_auth);
+    let ss_req2 = SessionSetupRequest {
+        structure_size: 25,
+        flags: 0,
+        security_mode: 0x01,
+        capabilities: 0,
+        channel: 0,
+        security_buffer_offset: 88,
+        security_buffer_length: spnego_resp_blob.len() as u16,
+        previous_session_id: 0,
+        security_buffer: spnego_resp_blob,
+    };
+    let mut body = Vec::new();
+    ss_req2.write_to(&mut body).expect("write session setup");
+    let hdr = build_header(Command::SessionSetup, 2, session_id, 0);
+    write_frame(s, &hdr, &body).await;
+
+    let resp = read_frame(s).await;
+    let (rh, rb) = parse_response_header(&resp);
+    assert_eq!(rh.command, Command::SessionSetup);
+    assert_eq!(rh.channel_sequence_status, STATUS_SUCCESS);
+    assert_eq!(rh.session_id, session_id);
+    let ss_resp = SessionSetupResponse::parse(rb).expect("parse ss success resp");
+    assert_eq!(
+        ss_resp.session_flags & SessionSetupResponse::FLAG_IS_GUEST,
+        SessionSetupResponse::FLAG_IS_GUEST
+    );
+    assert_eq!(
+        ss_resp.session_flags & SessionSetupResponse::FLAG_IS_NULL,
+        0
+    );
+    session_id
+}
+
+pub async fn tree_connect(s: &mut TcpStream, path: &str, session_id: u64, message_id: u64) -> u32 {
+    let path_u16 = utf16le(path);
+    let tc_req = TreeConnectRequest {
+        structure_size: 9,
+        flags: 0,
+        path_offset: 64 + 8,
+        path_length: path_u16.len() as u16,
+        path: path_u16,
+    };
+    let mut body = Vec::new();
+    tc_req.write_to(&mut body).expect("write tree connect");
+    let hdr = build_header(Command::TreeConnect, message_id, session_id, 0);
+    write_frame(s, &hdr, &body).await;
+
+    let resp = read_frame(s).await;
+    let (rh, rb) = parse_response_header(&resp);
+    assert_eq!(rh.command, Command::TreeConnect);
+    assert_eq!(rh.channel_sequence_status, STATUS_SUCCESS);
+    let tree_id = rh.tree_id().expect("tree id");
+    assert_ne!(tree_id, 0);
+    let tc_resp = TreeConnectResponse::parse(rb).expect("parse tc resp");
+    assert_eq!(tc_resp.share_type, TreeConnectResponse::SHARE_TYPE_DISK);
+    tree_id
 }

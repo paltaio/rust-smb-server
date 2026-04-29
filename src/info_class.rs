@@ -342,47 +342,20 @@ pub fn encode_dir_entry(class: u8, entry: &DirEntry, file_index: u64) -> Vec<u8>
         FILE_DIRECTORY_INFORMATION => {
             // 64 bytes fixed + name
             let mut out = Vec::new();
-            out.extend_from_slice(&0u32.to_le_bytes()); // NextEntryOffset (patched later)
-            out.extend_from_slice(&(file_index as u32).to_le_bytes()); // FileIndex
-            out.extend_from_slice(&info.creation_time.to_le_bytes());
-            out.extend_from_slice(&info.last_access_time.to_le_bytes());
-            out.extend_from_slice(&info.last_write_time.to_le_bytes());
-            out.extend_from_slice(&info.change_time.to_le_bytes());
-            out.extend_from_slice(&info.end_of_file.to_le_bytes());
-            out.extend_from_slice(&info.allocation_size.to_le_bytes());
-            out.extend_from_slice(&info.attributes().to_le_bytes());
-            out.extend_from_slice(&(name_u16.len() as u32).to_le_bytes());
+            write_dir_entry_prefix(&mut out, info, file_index, name_u16.len());
             out.extend_from_slice(&name_u16);
             out
         }
         FILE_FULL_DIRECTORY_INFORMATION => {
             let mut out = Vec::new();
-            out.extend_from_slice(&0u32.to_le_bytes());
-            out.extend_from_slice(&(file_index as u32).to_le_bytes());
-            out.extend_from_slice(&info.creation_time.to_le_bytes());
-            out.extend_from_slice(&info.last_access_time.to_le_bytes());
-            out.extend_from_slice(&info.last_write_time.to_le_bytes());
-            out.extend_from_slice(&info.change_time.to_le_bytes());
-            out.extend_from_slice(&info.end_of_file.to_le_bytes());
-            out.extend_from_slice(&info.allocation_size.to_le_bytes());
-            out.extend_from_slice(&info.attributes().to_le_bytes());
-            out.extend_from_slice(&(name_u16.len() as u32).to_le_bytes());
+            write_dir_entry_prefix(&mut out, info, file_index, name_u16.len());
             out.extend_from_slice(&0u32.to_le_bytes()); // EaSize
             out.extend_from_slice(&name_u16);
             out
         }
         FILE_BOTH_DIRECTORY_INFORMATION => {
             let mut out = Vec::new();
-            out.extend_from_slice(&0u32.to_le_bytes());
-            out.extend_from_slice(&(file_index as u32).to_le_bytes());
-            out.extend_from_slice(&info.creation_time.to_le_bytes());
-            out.extend_from_slice(&info.last_access_time.to_le_bytes());
-            out.extend_from_slice(&info.last_write_time.to_le_bytes());
-            out.extend_from_slice(&info.change_time.to_le_bytes());
-            out.extend_from_slice(&info.end_of_file.to_le_bytes());
-            out.extend_from_slice(&info.allocation_size.to_le_bytes());
-            out.extend_from_slice(&info.attributes().to_le_bytes());
-            out.extend_from_slice(&(name_u16.len() as u32).to_le_bytes());
+            write_dir_entry_prefix(&mut out, info, file_index, name_u16.len());
             out.extend_from_slice(&0u32.to_le_bytes()); // EaSize
             out.push(0); // ShortNameLength
             out.push(0); // Reserved1
@@ -393,16 +366,7 @@ pub fn encode_dir_entry(class: u8, entry: &DirEntry, file_index: u64) -> Vec<u8>
         }
         FILE_ID_BOTH_DIRECTORY_INFORMATION => {
             let mut out = Vec::new();
-            out.extend_from_slice(&0u32.to_le_bytes());
-            out.extend_from_slice(&(file_index as u32).to_le_bytes());
-            out.extend_from_slice(&info.creation_time.to_le_bytes());
-            out.extend_from_slice(&info.last_access_time.to_le_bytes());
-            out.extend_from_slice(&info.last_write_time.to_le_bytes());
-            out.extend_from_slice(&info.change_time.to_le_bytes());
-            out.extend_from_slice(&info.end_of_file.to_le_bytes());
-            out.extend_from_slice(&info.allocation_size.to_le_bytes());
-            out.extend_from_slice(&info.attributes().to_le_bytes());
-            out.extend_from_slice(&(name_u16.len() as u32).to_le_bytes());
+            write_dir_entry_prefix(&mut out, info, file_index, name_u16.len());
             out.extend_from_slice(&0u32.to_le_bytes()); // EaSize
             out.push(0); // ShortNameLength
             out.push(0); // Reserved1
@@ -414,16 +378,7 @@ pub fn encode_dir_entry(class: u8, entry: &DirEntry, file_index: u64) -> Vec<u8>
         }
         FILE_ID_FULL_DIRECTORY_INFORMATION => {
             let mut out = Vec::new();
-            out.extend_from_slice(&0u32.to_le_bytes());
-            out.extend_from_slice(&(file_index as u32).to_le_bytes());
-            out.extend_from_slice(&info.creation_time.to_le_bytes());
-            out.extend_from_slice(&info.last_access_time.to_le_bytes());
-            out.extend_from_slice(&info.last_write_time.to_le_bytes());
-            out.extend_from_slice(&info.change_time.to_le_bytes());
-            out.extend_from_slice(&info.end_of_file.to_le_bytes());
-            out.extend_from_slice(&info.allocation_size.to_le_bytes());
-            out.extend_from_slice(&info.attributes().to_le_bytes());
-            out.extend_from_slice(&(name_u16.len() as u32).to_le_bytes());
+            write_dir_entry_prefix(&mut out, info, file_index, name_u16.len());
             out.extend_from_slice(&0u32.to_le_bytes()); // EaSize
             out.extend_from_slice(&0u32.to_le_bytes()); // Reserved
             out.extend_from_slice(&file_index.to_le_bytes()); // FileId
@@ -440,6 +395,19 @@ pub fn encode_dir_entry(class: u8, entry: &DirEntry, file_index: u64) -> Vec<u8>
         }
         _ => Vec::new(),
     }
+}
+
+fn write_dir_entry_prefix(out: &mut Vec<u8>, info: &FileInfo, file_index: u64, name_len: usize) {
+    out.extend_from_slice(&0u32.to_le_bytes()); // NextEntryOffset (patched later)
+    out.extend_from_slice(&(file_index as u32).to_le_bytes()); // FileIndex
+    out.extend_from_slice(&info.creation_time.to_le_bytes());
+    out.extend_from_slice(&info.last_access_time.to_le_bytes());
+    out.extend_from_slice(&info.last_write_time.to_le_bytes());
+    out.extend_from_slice(&info.change_time.to_le_bytes());
+    out.extend_from_slice(&info.end_of_file.to_le_bytes());
+    out.extend_from_slice(&info.allocation_size.to_le_bytes());
+    out.extend_from_slice(&info.attributes().to_le_bytes());
+    out.extend_from_slice(&(name_len as u32).to_le_bytes());
 }
 
 /// Round up `n` to the next multiple of 8.

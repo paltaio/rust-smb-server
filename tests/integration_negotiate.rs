@@ -7,15 +7,14 @@
 mod common;
 
 use common::{
-    NTLMSSP_SIGNATURE, STATUS_MORE_PROCESSING_REQUIRED, STATUS_SUCCESS, build_header,
-    build_spnego_init, build_spnego_resp, parse_response_header, read_frame, utf16le, write_frame,
+    STATUS_SUCCESS, anonymous_session_setup, build_header, negotiate, parse_response_header,
+    read_frame, tree_connect, utf16le, write_frame,
 };
 
 use smb_server::wire::header::Command;
 use smb_server::wire::messages::{
-    CreateRequest, CreateResponse, FileId, Fsctl, IoctlRequest, IoctlResponse, NegotiateRequest,
-    NegotiateResponse, ReadRequest, ReadResponse, SessionSetupRequest, SessionSetupResponse,
-    TreeConnectRequest, TreeConnectResponse,
+    CreateRequest, CreateResponse, FileId, Fsctl, IoctlRequest, IoctlResponse, ReadRequest,
+    ReadResponse,
 };
 use smb_server::{LocalFsBackend, Share, SmbServer};
 use tempfile::tempdir;
@@ -45,137 +44,9 @@ async fn end_to_end_anon_read() {
 
     let mut s = TcpStream::connect(addr).await.expect("connect");
 
-    // ---- NEGOTIATE -------------------------------------------------------
-    let neg_req = NegotiateRequest {
-        structure_size: 36,
-        dialect_count: 2,
-        security_mode: 0x0001, // signing enabled
-        reserved: 0,
-        capabilities: 0,
-        client_guid: [0xCD; 16],
-        negotiate_context_offset_or_client_start_time: 0,
-        dialects: vec![0x0202, 0x0210],
-    };
-    let mut body = Vec::new();
-    neg_req.write_to(&mut body).expect("write");
-    let hdr = build_header(Command::Negotiate, 0, 0, 0);
-    write_frame(&mut s, &hdr, &body).await;
-
-    let resp = read_frame(&mut s).await;
-    let (rh, rb) = parse_response_header(&resp);
-    assert_eq!(rh.command, Command::Negotiate);
-    assert_eq!(rh.channel_sequence_status, STATUS_SUCCESS);
-    let neg_resp = NegotiateResponse::parse(rb).expect("parse neg resp");
-    assert!(matches!(neg_resp.dialect_revision, 0x0202 | 0x0210));
-    assert_eq!(neg_resp.security_mode, 0x0001);
-
-    // ---- SESSION_SETUP (round 1: anon NTLM NEGOTIATE blob in SPNEGO init) -
-    let mut ntlm_negotiate = Vec::new();
-    ntlm_negotiate.extend_from_slice(NTLMSSP_SIGNATURE);
-    ntlm_negotiate.extend_from_slice(&1u32.to_le_bytes()); // MessageType
-    let flags: u32 = 0x6209_8215; // typical client-side NTLM negotiate flags
-    ntlm_negotiate.extend_from_slice(&flags.to_le_bytes());
-    // Domain + workstation: empty fields (8 bytes each).
-    ntlm_negotiate.extend_from_slice(&[0u8; 16]);
-    // Version (8 bytes).
-    ntlm_negotiate.extend_from_slice(&[0u8; 8]);
-    // Wrap in SPNEGO init.
-    let spnego_init = build_spnego_init(&ntlm_negotiate);
-    let ss_req = SessionSetupRequest {
-        structure_size: 25,
-        flags: 0,
-        security_mode: 0x01,
-        capabilities: 0,
-        channel: 0,
-        security_buffer_offset: 88,
-        security_buffer_length: spnego_init.len() as u16,
-        previous_session_id: 0,
-        security_buffer: spnego_init,
-    };
-    let mut body = Vec::new();
-    ss_req.write_to(&mut body).expect("write");
-    let hdr = build_header(Command::SessionSetup, 1, 0, 0);
-    write_frame(&mut s, &hdr, &body).await;
-
-    let resp = read_frame(&mut s).await;
-    let (rh, rb) = parse_response_header(&resp);
-    assert_eq!(rh.command, Command::SessionSetup);
-    assert_eq!(rh.channel_sequence_status, STATUS_MORE_PROCESSING_REQUIRED);
-    let session_id = rh.session_id;
-    assert_ne!(session_id, 0);
-    let ss_resp = SessionSetupResponse::parse(rb).expect("parse ss resp");
-    assert!(!ss_resp.security_buffer.is_empty());
-
-    // ---- SESSION_SETUP (round 2: anonymous NTLM AUTHENTICATE) ------------
-    let mut ntlm_auth = Vec::new();
-    ntlm_auth.extend_from_slice(NTLMSSP_SIGNATURE);
-    ntlm_auth.extend_from_slice(&3u32.to_le_bytes()); // MessageType
-    // 6 empty fields (Lm, Nt, Domain, User, Workstation, Key) — len=0, off=72.
-    let header_len: u32 = 72;
-    for _ in 0..6 {
-        ntlm_auth.extend_from_slice(&0u16.to_le_bytes());
-        ntlm_auth.extend_from_slice(&0u16.to_le_bytes());
-        ntlm_auth.extend_from_slice(&header_len.to_le_bytes());
-    }
-    // NegotiateFlags (anonymous bit set).
-    ntlm_auth.extend_from_slice(&0x0000_0800u32.to_le_bytes());
-    // Version.
-    ntlm_auth.extend_from_slice(&[0u8; 8]);
-
-    let spnego_resp_blob = build_spnego_resp(&ntlm_auth);
-    let ss_req2 = SessionSetupRequest {
-        structure_size: 25,
-        flags: 0,
-        security_mode: 0x01,
-        capabilities: 0,
-        channel: 0,
-        security_buffer_offset: 88,
-        security_buffer_length: spnego_resp_blob.len() as u16,
-        previous_session_id: 0,
-        security_buffer: spnego_resp_blob,
-    };
-    let mut body = Vec::new();
-    ss_req2.write_to(&mut body).expect("write");
-    let hdr = build_header(Command::SessionSetup, 2, session_id, 0);
-    write_frame(&mut s, &hdr, &body).await;
-
-    let resp = read_frame(&mut s).await;
-    let (rh, rb) = parse_response_header(&resp);
-    assert_eq!(rh.command, Command::SessionSetup);
-    assert_eq!(rh.channel_sequence_status, STATUS_SUCCESS);
-    assert_eq!(rh.session_id, session_id);
-    let ss_resp = SessionSetupResponse::parse(rb).expect("parse ss success resp");
-    assert_eq!(
-        ss_resp.session_flags & SessionSetupResponse::FLAG_IS_GUEST,
-        SessionSetupResponse::FLAG_IS_GUEST
-    );
-    assert_eq!(
-        ss_resp.session_flags & SessionSetupResponse::FLAG_IS_NULL,
-        0
-    );
-
-    // ---- TREE_CONNECT to \\server\downloads ------------------------------
-    let path_u16 = utf16le("\\\\TESTSERVER\\downloads");
-    let tc_req = TreeConnectRequest {
-        structure_size: 9,
-        flags: 0,
-        path_offset: 64 + 8,
-        path_length: path_u16.len() as u16,
-        path: path_u16,
-    };
-    let mut body = Vec::new();
-    tc_req.write_to(&mut body).expect("write");
-    let hdr = build_header(Command::TreeConnect, 3, session_id, 0);
-    write_frame(&mut s, &hdr, &body).await;
-
-    let resp = read_frame(&mut s).await;
-    let (rh, rb) = parse_response_header(&resp);
-    assert_eq!(rh.command, Command::TreeConnect);
-    assert_eq!(rh.channel_sequence_status, STATUS_SUCCESS);
-    let tree_id = rh.tree_id().expect("tree id");
-    assert_ne!(tree_id, 0);
-    let tc_resp = TreeConnectResponse::parse(rb).expect("parse tc resp");
-    assert_eq!(tc_resp.share_type, TreeConnectResponse::SHARE_TYPE_DISK);
+    let neg_resp = negotiate(&mut s).await;
+    let session_id = anonymous_session_setup(&mut s).await;
+    let tree_id = tree_connect(&mut s, "\\\\TESTSERVER\\downloads", session_id, 3).await;
 
     // ---- FSCTL_VALIDATE_NEGOTIATE_INFO mirrors NEGOTIATE ----------------
     let ioctl_req = IoctlRequest {
