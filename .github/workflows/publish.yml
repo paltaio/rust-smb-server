@@ -30,6 +30,6 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
-          cargo publish -p paltaio-smb-proto
-          cargo publish -p paltaio-smb-server
-          cargo publish -p paltaio-smb-fs
+          cargo publish -p smb-proto
+          cargo publish -p smb-server
+          cargo publish -p smb-fs

@@ -2,24 +2,24 @@
 
 SMB server in Rust. Three crates:
 
-- `paltaio-smb-proto` — wire format, auth, crypto.
-- `paltaio-smb-server` — connection handling, dispatch, share config, runtime updates.
-- `paltaio-smb-fs` — `LocalFsBackend` over `cap-std`.
+- `smb-proto` — wire format, auth, crypto.
+- `smb-server` — connection handling, dispatch, share config, runtime updates.
+- `smb-fs` — `LocalFsBackend` over `cap-std`.
 
 Imported as `smb_proto`, `smb_server`, `smb_fs`.
 
 ## Install
 
 ```sh
-cargo add paltaio-smb-server paltaio-smb-fs
+cargo add smb-server smb-fs
 ```
 
 Or in `Cargo.toml`:
 
 ```toml
 [dependencies]
-paltaio-smb-server = "0.1.5"
-paltaio-smb-fs = "0.1.5"
+smb-server = "0.2.0"
+smb-fs = "0.2.0"
 ```
 
 ## Run the example

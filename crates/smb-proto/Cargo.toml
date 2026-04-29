@@ -1,14 +1,11 @@
 [package]
-name = "paltaio-smb-proto"
+name = "smb-proto"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "SMB2/3 wire-format types, framing, signing, and authentication primitives."
-
-[lib]
-name = "smb_proto"
 
 [dependencies]
 binrw.workspace = true

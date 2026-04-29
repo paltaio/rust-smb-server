@@ -1,14 +1,11 @@
 [package]
-name = "paltaio-smb-server"
+name = "smb-server"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "SMB2/3 file-sharing server library with pluggable storage backends."
-
-[lib]
-name = "smb_server"
 
 [dependencies]
 smb-proto.workspace = true
@@ -31,4 +28,4 @@ getrandom = "0.4"
 tokio = { workspace = true }
 tracing-subscriber = "0.3"
 tempfile = "3"
-smb-fs = { path = "../smb-fs", package = "paltaio-smb-fs" }
+smb-fs = { path = "../smb-fs" }
