@@ -36,7 +36,7 @@ pub use builder::{Access, Share};
 #[cfg(feature = "localfs")]
 pub use fs::LocalFsBackend;
 pub use proto::auth::ntlm::Identity;
-pub use server::{ConfigHandle, ShareMode, SmbServer};
+pub use server::{ConfigHandle, ShareMode, ShutdownHandle, SmbServer};
 
 pub mod wire {
     pub use crate::proto::header;
