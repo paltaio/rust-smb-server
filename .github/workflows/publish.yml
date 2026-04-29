@@ -30,6 +30,4 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
-          cargo publish -p smb-proto
           cargo publish -p smb-server
-          cargo publish -p smb-fs
