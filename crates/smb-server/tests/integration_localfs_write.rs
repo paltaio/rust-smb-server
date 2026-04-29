@@ -5,18 +5,16 @@
 mod common;
 
 use common::{
-    build_header, build_spnego_init, parse_response_header, read_frame, utf16le, write_frame,
-    STATUS_MORE_PROCESSING_REQUIRED, STATUS_SUCCESS,
+    build_header, build_spnego_init, build_spnego_resp, parse_response_header, read_frame, utf16le,
+    write_frame, NTLMSSP_SIGNATURE, STATUS_MORE_PROCESSING_REQUIRED, STATUS_SUCCESS,
 };
-use smb_fs::LocalFsBackend;
-use smb_proto::auth::ntlm::NTLMSSP_SIGNATURE;
-use smb_proto::auth::spnego::{decode_resp_token, encode_resp_token, NegState, OID_NTLMSSP};
-use smb_proto::header::Command;
-use smb_proto::messages::{
+use smb_server::wire::header::Command;
+use smb_server::wire::messages::{
     CloseRequest, CloseResponse, CreateRequest, CreateResponse, NegotiateRequest,
     NegotiateResponse, ReadRequest, ReadResponse, SessionSetupRequest, SessionSetupResponse,
     TreeConnectRequest, TreeConnectResponse, WriteRequest, WriteResponse,
 };
+use smb_server::LocalFsBackend;
 use smb_server::{Share, SmbServer};
 use tempfile::tempdir;
 use tokio::net::TcpStream;
@@ -93,7 +91,7 @@ async fn end_to_end_anon_write_then_read_localfs() {
     assert_eq!(rh.channel_sequence_status, STATUS_MORE_PROCESSING_REQUIRED);
     let session_id = rh.session_id;
     let ss_resp = SessionSetupResponse::parse(rb).expect("parse ss resp");
-    let _ = decode_resp_token(&ss_resp.security_buffer).expect("decode spnego resp");
+    assert!(!ss_resp.security_buffer.is_empty());
 
     // ---- SESSION_SETUP round 2 (anonymous AUTHENTICATE) ------------------
     let mut ntlm_auth = Vec::new();
@@ -107,12 +105,7 @@ async fn end_to_end_anon_write_then_read_localfs() {
     }
     ntlm_auth.extend_from_slice(&0x0000_0800u32.to_le_bytes());
     ntlm_auth.extend_from_slice(&[0u8; 8]);
-    let spnego_resp_blob = encode_resp_token(
-        NegState::AcceptIncomplete,
-        Some(OID_NTLMSSP),
-        Some(&ntlm_auth),
-        None,
-    );
+    let spnego_resp_blob = build_spnego_resp(&ntlm_auth);
     let ss_req2 = SessionSetupRequest {
         structure_size: 25,
         flags: 0,

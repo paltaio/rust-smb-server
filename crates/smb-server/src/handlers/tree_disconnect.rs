@@ -2,8 +2,8 @@
 
 use std::sync::Arc;
 
-use smb_proto::header::Smb2Header;
-use smb_proto::messages::TreeDisconnectResponse;
+use crate::proto::header::Smb2Header;
+use crate::proto::messages::TreeDisconnectResponse;
 
 use crate::conn::state::Connection;
 use crate::dispatch::HandlerResponse;

@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
-use smb_proto::auth::ntlm::UserCreds;
+use crate::proto::auth::ntlm::UserCreds;
 use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, RwLock};

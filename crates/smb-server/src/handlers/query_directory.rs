@@ -2,8 +2,8 @@
 
 use std::sync::Arc;
 
-use smb_proto::header::Smb2Header;
-use smb_proto::messages::{FileInfoClass, QueryDirectoryRequest, QueryDirectoryResponse};
+use crate::proto::header::Smb2Header;
+use crate::proto::messages::{FileInfoClass, QueryDirectoryRequest, QueryDirectoryResponse};
 
 use crate::conn::state::{Connection, DirCursor};
 use crate::dispatch::HandlerResponse;

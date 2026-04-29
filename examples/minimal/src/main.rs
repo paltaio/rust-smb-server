@@ -1,4 +1,4 @@
-//! Minimal `smb-server` + `smb-fs` example.
+//! Minimal `smb-server` example.
 //!
 //! Defaults:
 //! - listen on `0.0.0.0:4445` (override with `SMB_LISTEN`),
@@ -10,15 +10,14 @@
 
 use std::path::PathBuf;
 
-use smb_fs::LocalFsBackend;
-use smb_server::{Access, Share, SmbServer};
+use smb_server::{Access, LocalFsBackend, Share, SmbServer};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,smb_server=debug,smb_proto=info".into()),
+                .unwrap_or_else(|_| "info,smb_server=debug,smb_server::proto=info".into()),
         )
         .init();
 

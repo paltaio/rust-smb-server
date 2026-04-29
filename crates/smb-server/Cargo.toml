@@ -8,8 +8,6 @@ repository.workspace = true
 description = "SMB2/3 file-sharing server library with pluggable storage backends."
 
 [dependencies]
-smb-proto.workspace = true
-
 tokio = { workspace = true }
 bytes.workspace = true
 async-trait.workspace = true
@@ -17,15 +15,27 @@ tracing.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 # Used as the wire codec inside negotiate-context payload encoders. Justified:
-# `smb-proto` already exposes binrw-derived structs (`PreauthIntegrityCapabilities`
+# the internal proto module exposes binrw-derived structs (`PreauthIntegrityCapabilities`
 # etc) and we need `BinWrite::write` to serialize them into a context body.
 binrw = { workspace = true }
 # Cryptographically-strong randomness for the NTLM server challenge and the
 # 3.1.1 negotiate-context salt.
 getrandom = "0.4"
+cap-std = { workspace = true, optional = true }
+hmac.workspace = true
+sha2.workspace = true
+md-5.workspace = true
+md4.workspace = true
+aes.workspace = true
+cmac.workspace = true
+rc4.workspace = true
+
+[features]
+default = ["localfs"]
+localfs = ["dep:cap-std"]
 
 [dev-dependencies]
 tokio = { workspace = true }
 tracing-subscriber = "0.3"
 tempfile = "3"
-smb-fs = { path = "../smb-fs" }
+hex = "0.4"

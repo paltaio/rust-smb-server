@@ -2,10 +2,10 @@
 
 use std::sync::Arc;
 
-use smb_proto::auth::spnego::encode_init_response;
-use smb_proto::crypto::SigningAlgo;
-use smb_proto::header::Smb2Header;
-use smb_proto::messages::{
+use crate::proto::auth::spnego::encode_init_response;
+use crate::proto::crypto::SigningAlgo;
+use crate::proto::header::Smb2Header;
+use crate::proto::messages::{
     Dialect, NegotiateContext, NegotiateRequest, NegotiateResponse, PreauthIntegrityCapabilities,
     SigningCapabilities,
 };

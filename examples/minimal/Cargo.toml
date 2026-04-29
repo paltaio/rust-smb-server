@@ -6,7 +6,6 @@ publish = false
 
 [dependencies]
 smb-server.workspace = true
-smb-fs.workspace = true
 tokio = { workspace = true }
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

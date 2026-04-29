@@ -236,7 +236,7 @@ impl SmbServerBuilder {
         let mut user_table = HashMap::new();
         for name in &self.user_order {
             let pw = &self.users[name];
-            let creds = smb_proto::auth::ntlm::UserCreds::from_password(pw);
+            let creds = crate::proto::auth::ntlm::UserCreds::from_password(pw);
             user_table.insert(name.clone(), creds);
         }
 

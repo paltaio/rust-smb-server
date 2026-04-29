@@ -2,8 +2,8 @@
 
 use std::sync::Arc;
 
-use smb_proto::header::Smb2Header;
-use smb_proto::messages::{InfoType, SetInfoRequest, SetInfoResponse};
+use crate::proto::header::Smb2Header;
+use crate::proto::messages::{InfoType, SetInfoRequest, SetInfoResponse};
 
 use crate::backend::FileTimes;
 use crate::conn::state::Connection;

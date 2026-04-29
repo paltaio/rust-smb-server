@@ -2,8 +2,8 @@
 
 use std::sync::Arc;
 
-use smb_proto::header::Smb2Header;
-use smb_proto::messages::FileId;
+use crate::proto::header::Smb2Header;
+use crate::proto::messages::FileId;
 use tokio::sync::RwLock;
 
 use crate::conn::state::{Connection, Open, Session, TreeConnect};

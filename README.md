@@ -1,25 +1,18 @@
 # rust-smb-server
 
-SMB server in Rust. Three crates:
-
-- `smb-proto` — wire format, auth, crypto.
-- `smb-server` — connection handling, dispatch, share config, runtime updates.
-- `smb-fs` — `LocalFsBackend` over `cap-std`.
-
-Imported as `smb_proto`, `smb_server`, `smb_fs`.
+SMB server in Rust.
 
 ## Install
 
 ```sh
-cargo add smb-server smb-fs
+cargo add smb-server
 ```
 
 Or in `Cargo.toml`:
 
 ```toml
 [dependencies]
-smb-server = "0.2.0"
-smb-fs = "0.2.0"
+smb-server = "0.3"
 ```
 
 ## Run the example
@@ -35,8 +28,7 @@ Shares: `public` (anon rw), `media` (anon ro), `home` (alice rw, bob ro).
 ## Embed
 
 ```rust
-use smb_fs::LocalFsBackend;
-use smb_server::{Access, Share, SmbServer};
+use smb_server::{Access, LocalFsBackend, Share, SmbServer};
 
 let server = SmbServer::builder()
     .listen("0.0.0.0:4445".parse()?)
@@ -56,8 +48,7 @@ server.serve().await?;
 Create a `ConfigHandle` before `serve()` and keep it in the task that owns admin/config updates:
 
 ```rust
-use smb_fs::LocalFsBackend;
-use smb_server::{Access, Share, SmbServer};
+use smb_server::{Access, LocalFsBackend, Share, SmbServer};
 
 let server = SmbServer::builder()
     .listen("0.0.0.0:4445".parse()?)

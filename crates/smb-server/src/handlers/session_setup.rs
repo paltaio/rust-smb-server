@@ -2,13 +2,13 @@
 
 use std::sync::Arc;
 
-use smb_proto::auth::ntlm::{Identity, NtlmServer, NtlmTargetInfo, UserCreds};
-use smb_proto::auth::spnego::{
+use crate::proto::auth::ntlm::{Identity, NtlmServer, NtlmTargetInfo, UserCreds};
+use crate::proto::auth::spnego::{
     decode_init_token, decode_resp_token, encode_resp_token, NegState, OID_NTLMSSP,
 };
-use smb_proto::crypto::signing_key_30;
-use smb_proto::header::Smb2Header;
-use smb_proto::messages::{Dialect, SessionSetupRequest, SessionSetupResponse};
+use crate::proto::crypto::signing_key_30;
+use crate::proto::header::Smb2Header;
+use crate::proto::messages::{Dialect, SessionSetupRequest, SessionSetupResponse};
 use tracing::{debug, info, warn};
 
 use crate::conn::state::{Connection, Session};

@@ -2,9 +2,9 @@
 
 use std::sync::Arc;
 
-use smb_proto::auth::ntlm::Identity;
-use smb_proto::header::Smb2Header;
-use smb_proto::messages::{TreeConnectRequest, TreeConnectResponse};
+use crate::proto::auth::ntlm::Identity;
+use crate::proto::header::Smb2Header;
+use crate::proto::messages::{TreeConnectRequest, TreeConnectResponse};
 use tracing::{info, warn};
 
 use crate::builder::Access;

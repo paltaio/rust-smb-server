@@ -1,23 +1,19 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/smb-proto",
     "crates/smb-server",
-    "crates/smb-fs",
     "examples/minimal",
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.95"
 license = "MIT"
 repository = "https://github.com/paltaio/rust-smb-server"
 
 [workspace.dependencies]
-smb-proto  = { path = "crates/smb-proto",  version = "0.2.0" }
-smb-server = { path = "crates/smb-server", version = "0.2.0" }
-smb-fs     = { path = "crates/smb-fs",     version = "0.2.0" }
+smb-server = { path = "crates/smb-server", version = "0.3.0" }
 
 tokio = { version = "1.40", features = ["full"] }
 binrw = "0.15"

@@ -1,7 +1,7 @@
 //! Per-connection writer task: serializes responses, applies signing, and
 //! frames the bytes onto the wire.
 
-use smb_proto::framing::encode_frame;
+use crate::proto::framing::encode_frame;
 use tokio::io::{AsyncWriteExt, WriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;

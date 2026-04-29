@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use smb_proto::header::Smb2Header;
+use crate::proto::header::Smb2Header;
 
 use crate::conn::state::Connection;
 use crate::dispatch::HandlerResponse;

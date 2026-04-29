@@ -5,9 +5,9 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use smb_proto::auth::ntlm::{Identity, NtlmServer};
-use smb_proto::crypto::{PreauthIntegrity, SigningAlgo};
-use smb_proto::messages::{Dialect, FileId};
+use crate::proto::auth::ntlm::{Identity, NtlmServer};
+use crate::proto::crypto::{PreauthIntegrity, SigningAlgo};
+use crate::proto::messages::{Dialect, FileId};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 

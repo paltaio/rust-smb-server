@@ -2,8 +2,8 @@
 
 use std::sync::Arc;
 
-use smb_proto::header::Smb2Header;
-use smb_proto::messages::{CreateRequest, CreateResponse};
+use crate::proto::header::Smb2Header;
+use crate::proto::messages::{CreateRequest, CreateResponse};
 use tracing::{debug, warn};
 
 use crate::backend::{OpenIntent, OpenOptions};

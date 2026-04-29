@@ -4,7 +4,7 @@
 use std::io;
 use std::sync::Arc;
 
-use smb_proto::framing::{decode_frame_header, FRAME_HEADER_LEN};
+use crate::proto::framing::{decode_frame_header, FRAME_HEADER_LEN};
 use tokio::io::{AsyncReadExt, ReadHalf};
 use tokio::net::TcpStream;
 use tracing::{debug, error};

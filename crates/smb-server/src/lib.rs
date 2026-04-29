@@ -16,23 +16,37 @@
 //! # Ok(()) }
 //! ```
 
-pub mod backend;
-pub mod builder;
-pub mod conn;
-pub mod dispatch;
-pub mod error;
-pub mod handlers;
-pub mod info_class;
+mod backend;
+mod builder;
+pub(crate) mod conn;
+mod dispatch;
+mod error;
+#[cfg(feature = "localfs")]
+mod fs;
+mod handlers;
+#[allow(dead_code)]
+pub(crate) mod info_class;
 pub mod ntstatus;
-pub mod path;
-pub mod server;
-pub mod utils;
+mod path;
+#[allow(clippy::upper_case_acronyms, dead_code, unused_imports)]
+mod proto;
+mod server;
+mod utils;
 
-pub use backend::{
-    BackendCapabilities, DirEntry, FileInfo, FileTimes, Handle, OpenIntent, OpenOptions,
-    ShareBackend,
-};
-pub use builder::{Access, BuildError, Share, SmbServerBuilder};
-pub use error::{SmbError, SmbResult};
-pub use path::SmbPath;
-pub use server::{ConfigError, ConfigHandle, ServerConfig, ShareMode, ShutdownHandle, SmbServer};
+pub use backend::{DirEntry, FileInfo, Handle, OpenIntent, OpenOptions, ShareBackend};
+pub use builder::{Access, Share};
+#[cfg(feature = "localfs")]
+pub use fs::LocalFsBackend;
+pub use proto::auth::ntlm::Identity;
+pub use server::{ConfigHandle, ShareMode, SmbServer};
+
+pub mod wire {
+    pub use crate::proto::header;
+    pub use crate::proto::messages;
+}
+
+#[cfg(test)]
+mod tests {
+    mod dynamic_config;
+    mod memfs;
+}

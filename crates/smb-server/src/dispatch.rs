@@ -2,13 +2,13 @@
 
 use std::sync::Arc;
 
-use smb_proto::auth::ntlm::Identity;
-use smb_proto::crypto::{sign, PreauthIntegrity};
-use smb_proto::header::{
+use crate::proto::auth::ntlm::Identity;
+use crate::proto::crypto::{sign, PreauthIntegrity};
+use crate::proto::header::{
     Command, HeaderTail, Smb2Header, SMB2_FLAGS_ASYNC_COMMAND, SMB2_FLAGS_RELATED_OPERATIONS,
     SMB2_FLAGS_SERVER_TO_REDIR, SMB2_FLAGS_SIGNED, SMB2_HEADER_LEN,
 };
-use smb_proto::messages::ErrorResponse;
+use crate::proto::messages::ErrorResponse;
 use tracing::{debug, debug_span, error, warn, Instrument};
 
 use crate::conn::state::Connection;
@@ -332,7 +332,7 @@ async fn dispatch_one(
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             p.update(frame);
         } else if cmd == Command::SessionSetup
-            && dialect == Some(smb_proto::messages::Dialect::Smb311)
+            && dialect == Some(crate::proto::messages::Dialect::Smb311)
         {
             let mut p = take_session_preauth(conn, req_hdr.session_id).await;
             p.update(frame);
@@ -354,9 +354,9 @@ async fn dispatch_one(
                 sess.preauth_snapshot = Some(snap);
                 // For 3.1.1, recompute signing key now that we have the snapshot.
                 let dialect = *conn.dialect.read().await;
-                if dialect == Some(smb_proto::messages::Dialect::Smb311) {
+                if dialect == Some(crate::proto::messages::Dialect::Smb311) {
                     sess.signing_key =
-                        smb_proto::crypto::signing_key_311(&sess.session_base_key, &snap);
+                        crate::proto::crypto::signing_key_311(&sess.session_base_key, &snap);
                 }
             }
         }
@@ -370,7 +370,7 @@ async fn dispatch_one(
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             p.update(&bytes);
         } else if cmd == Command::SessionSetup
-            && dialect == Some(smb_proto::messages::Dialect::Smb311)
+            && dialect == Some(crate::proto::messages::Dialect::Smb311)
         {
             if read_u32(&bytes, 0x08) == ntstatus::STATUS_MORE_PROCESSING_REQUIRED {
                 if let Some(mut p) = session_preauth {
@@ -438,7 +438,7 @@ async fn verify_request_signature(
         let key = sess.signing_key;
         drop(sess);
         let algo = *conn.signing_algo.read().await;
-        if let Err(e) = smb_proto::crypto::verify(frame, &key, algo) {
+        if let Err(e) = crate::proto::crypto::verify(frame, &key, algo) {
             warn!(error = %e, "request signature verification failed");
             return Err(ntstatus::STATUS_ACCESS_DENIED);
         }
@@ -570,9 +570,9 @@ async fn handle_smb1_multi_protocol(
     }
 
     let chosen = if wants_wildcard {
-        smb_proto::messages::Dialect::Smb2Wildcard.as_u16()
+        crate::proto::messages::Dialect::Smb2Wildcard.as_u16()
     } else if wants_smb202 {
-        smb_proto::messages::Dialect::Smb202.as_u16()
+        crate::proto::messages::Dialect::Smb202.as_u16()
     } else {
         return None;
     };

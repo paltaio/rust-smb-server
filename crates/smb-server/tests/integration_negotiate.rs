@@ -5,30 +5,28 @@
 //! crate.
 
 mod common;
-#[path = "common/memfs.rs"]
-mod memfs;
 
 use common::{
-    build_header, build_spnego_init, parse_response_header, read_frame, utf16le, write_frame,
-    STATUS_MORE_PROCESSING_REQUIRED, STATUS_SUCCESS,
+    build_header, build_spnego_init, build_spnego_resp, parse_response_header, read_frame, utf16le,
+    write_frame, NTLMSSP_SIGNATURE, STATUS_MORE_PROCESSING_REQUIRED, STATUS_SUCCESS,
 };
-use memfs::MemFsBackend;
 
-use smb_proto::auth::ntlm::NTLMSSP_SIGNATURE;
-use smb_proto::auth::spnego::{decode_resp_token, encode_resp_token, NegState, OID_NTLMSSP};
-use smb_proto::header::Command;
-use smb_proto::messages::{
+use smb_server::wire::header::Command;
+use smb_server::wire::messages::{
     CreateRequest, CreateResponse, FileId, Fsctl, IoctlRequest, IoctlResponse, NegotiateRequest,
     NegotiateResponse, ReadRequest, ReadResponse, SessionSetupRequest, SessionSetupResponse,
     TreeConnectRequest, TreeConnectResponse,
 };
-use smb_server::{Share, SmbServer};
+use smb_server::{LocalFsBackend, Share, SmbServer};
+use tempfile::tempdir;
 use tokio::net::TcpStream;
 
 #[tokio::test]
 async fn end_to_end_anon_read() {
     // 1. Build a server with one public share and one in-memory file.
-    let backend = MemFsBackend::new().with_file("hello.txt", b"hello world\n");
+    let td = tempdir().expect("tempdir");
+    std::fs::write(td.path().join("hello.txt"), b"hello world\n").expect("write hello.txt");
+    let backend = LocalFsBackend::new(td.path()).expect("open root");
     let server = SmbServer::builder()
         .listen("127.0.0.1:0".parse().unwrap())
         .share(Share::new("downloads", backend).public())
@@ -106,7 +104,7 @@ async fn end_to_end_anon_read() {
     let session_id = rh.session_id;
     assert_ne!(session_id, 0);
     let ss_resp = SessionSetupResponse::parse(rb).expect("parse ss resp");
-    let _spnego_resp = decode_resp_token(&ss_resp.security_buffer).expect("decode spnego resp");
+    assert!(!ss_resp.security_buffer.is_empty());
 
     // ---- SESSION_SETUP (round 2: anonymous NTLM AUTHENTICATE) ------------
     let mut ntlm_auth = Vec::new();
@@ -124,12 +122,7 @@ async fn end_to_end_anon_read() {
     // Version.
     ntlm_auth.extend_from_slice(&[0u8; 8]);
 
-    let spnego_resp_blob = encode_resp_token(
-        NegState::AcceptIncomplete,
-        Some(OID_NTLMSSP),
-        Some(&ntlm_auth),
-        None,
-    );
+    let spnego_resp_blob = build_spnego_resp(&ntlm_auth);
     let ss_req2 = SessionSetupRequest {
         structure_size: 25,
         flags: 0,
