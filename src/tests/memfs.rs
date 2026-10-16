@@ -10,9 +10,8 @@ use crate::path::SmbPath;
 use async_trait::async_trait;
 use bytes::Bytes;
 
-/// Minimal in-memory FS used by integration tests. Files are byte vectors,
-/// directories are sets of names. Not threadsafe across workers — only used
-/// within one test.
+/// In-memory backend for unit tests. Files and directories are keyed by
+/// backslash-joined path.
 pub struct MemFsBackend {
     inner: std::sync::Arc<Mutex<MemInner>>,
 }

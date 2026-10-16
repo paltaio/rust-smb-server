@@ -4,13 +4,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Number of 100-nanosecond intervals between 1601-01-01 (Windows FILETIME
 /// epoch) and 1970-01-01 (UNIX epoch). 369 years.
-const FILETIME_OFFSET: u64 = 116_444_736_000_000_000;
+pub(crate) const FILETIME_OFFSET: u64 = 116_444_736_000_000_000;
 
 /// Convert a `SystemTime` to a Windows FILETIME (100ns ticks since 1601).
 pub fn system_time_to_filetime(t: SystemTime) -> u64 {
     match t.duration_since(UNIX_EPOCH) {
         Ok(d) => FILETIME_OFFSET + (d.as_secs() * 10_000_000) + (d.subsec_nanos() as u64 / 100),
-        // Pre-1970 — clamp to the FILETIME epoch.
+        // Pre-1970: clamp to the FILETIME epoch.
         Err(_) => 0,
     }
 }
@@ -57,13 +57,7 @@ pub fn utf16le_to_units(bytes: &[u8]) -> Option<Vec<u16>> {
     )
 }
 
-/// Fill `out` with cryptographically-strong random bytes via `getrandom`.
-/// Falls back to zeros if the OS RNG fails — the caller should treat this as
-/// fatal, but we never panic.
-pub fn fill_random(out: &mut [u8]) {
-    if getrandom::fill(out).is_err() {
-        for b in out.iter_mut() {
-            *b = 0;
-        }
-    }
+/// Fill `out` from the OS RNG.
+pub fn fill_random(out: &mut [u8]) -> Result<(), getrandom::Error> {
+    getrandom::fill(out)
 }

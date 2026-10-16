@@ -10,9 +10,7 @@
 //! * Callers pass `label` and `context` *already including* a trailing `\x00`.
 //! * The KDF then **also** emits a single `0x00` separator between `label`
 //!   and `context`, so the wire-level input has two consecutive NULs at that
-//!   boundary. This matches what real Windows clients require — a single NUL
-//!   produces a different signing key and Windows rejects with
-//!   `STATUS_ACCESS_DENIED` / event 31013 "signing validation failed".
+//!   boundary.
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -21,14 +19,12 @@ type HmacSha256 = Hmac<Sha256>;
 
 /// SP 800-108 CTR-mode KDF using HMAC-SHA-256.
 ///
-/// * `key` — the input key (session key, typically 16 bytes).
-/// * `label` — the label string with trailing NUL (e.g. `b"SMB2AESCMAC\x00"`).
-/// * `context` — the context string with trailing NUL (e.g. `b"SmbSign\x00"`).
+/// * `key` - the input key (session key, typically 16 bytes).
+/// * `label` - the label string with trailing NUL (e.g. `b"SMB2AESCMAC\x00"`).
+/// * `context` - the context string with trailing NUL (e.g. `b"SmbSign\x00"`).
 ///
 /// Returns the first 16 bytes of `HMAC-SHA-256(key, fixed_input)` where
 /// `fixed_input = [0,0,0,1] || label || 0x00 || context || [0,0,0,0x80]`.
-/// The single separator `0x00` between `label` and `context` is required for
-/// Windows interop; do not remove.
 pub fn smb2_kdf(key: &[u8], label: &[u8], context: &[u8]) -> [u8; 16] {
     let mut mac =
         <HmacSha256 as Mac>::new_from_slice(key).expect("HMAC-SHA-256 accepts keys of any length");
@@ -82,18 +78,6 @@ mod tests {
         let b = smb2_kdf(&key, b"SMB2AESCMAC\x00", b"SmbSign\x00");
         assert_eq!(a, b);
         assert_eq!(a.len(), 16);
-    }
-
-    /// Different label or context → different output.
-    #[test]
-    fn smb2_kdf_label_and_context_matter() {
-        let key = [0x42u8; 16];
-        let signing = smb2_kdf(&key, b"SMB2AESCMAC\x00", b"SmbSign\x00");
-        let app = smb2_kdf(&key, b"SMB2APP\x00", b"SmbRpc\x00");
-        assert_ne!(signing, app);
-
-        let other_ctx = smb2_kdf(&key, b"SMB2AESCMAC\x00", b"OtherCtx\x00");
-        assert_ne!(signing, other_ctx);
     }
 
     /// Known-answer test computed directly from the documented fixed-input

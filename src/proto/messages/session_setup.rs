@@ -7,11 +7,9 @@ use crate::proto::error::ProtoResult;
 
 /// SMB2_SESSION_SETUP_REQUEST (MS-SMB2 §2.2.5).
 ///
-/// `security_buffer` is opaque GSS-API/SPNEGO data — the auth agent decodes it.
-/// The wire offset is from the start of the SMB2 header; we encode/decode it
-/// as length-counted data immediately following the fixed prefix, which is
-/// the canonical layout. Server crate may patch the offset if it needs an
-/// unusual layout.
+/// `security_buffer` is opaque GSS-API/SPNEGO data, decoded by the SPNEGO
+/// layer. The wire offset is from the start of the SMB2 header; the buffer is
+/// read and written immediately after the fixed prefix.
 #[binrw]
 #[brw(little)]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,7 +27,7 @@ pub struct SessionSetupRequest {
 }
 
 impl SessionSetupRequest {
-    /// Flag: SMB2_SESSION_FLAG_BINDING — bind to existing session (3.x).
+    /// Flag: SMB2_SESSION_FLAG_BINDING - bind to existing session (3.x).
     pub const FLAG_BINDING: u8 = 0x01;
 
     pub fn parse(buf: &[u8]) -> ProtoResult<Self> {

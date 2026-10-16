@@ -10,10 +10,9 @@ use std::io::Cursor;
 
 use crate::proto::error::{ProtoError, ProtoResult};
 
-/// SMB2 FileId — opaque 16 bytes (volatile + persistent).
+/// SMB2 FileId - opaque 16 bytes (volatile + persistent).
 ///
-/// MS-SMB2 §2.2.14.1. We expose both halves; the server uses identical values
-/// for both since durable handles are out of scope (spec §2 in the v1 design).
+/// MS-SMB2 §2.2.14.1. The server sets both halves to the same value.
 #[binrw]
 #[brw(little)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -30,7 +29,7 @@ impl FileId {
         }
     }
 
-    /// MS-SMB2: the "any" FileId is `0xFFFF…FFFF`.
+    /// MS-SMB2: the "any" FileId is `0xFFFF...FFFF`.
     pub const fn any() -> Self {
         Self {
             persistent: u64::MAX,
@@ -39,12 +38,12 @@ impl FileId {
     }
 }
 
-/// MS-SMB2 §2.2.13 CREATE Request — fixed prefix.
+/// MS-SMB2 §2.2.13 CREATE Request - fixed prefix.
 ///
 /// Variable-length tail: the file `name` (UTF-16LE) and `create_contexts`
 /// blob, each at absolute offsets from the start of the SMB2 header. We hold
 /// them as length-counted byte buffers immediately following the fixed
-/// portion. The server crate parses contexts with [`CreateContext::parse_chain`].
+/// portion. [`CreateContext::parse_chain`] decodes the `create_contexts` blob.
 #[binrw]
 #[brw(little)]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,17 +140,16 @@ impl CreateResponse {
 /// Generic SMB2_CREATE_CONTEXT envelope.
 ///
 /// Per MS-SMB2 §2.2.13.2 each entry has:
-/// * `Next` — offset (bytes) from the start of *this* entry to the start of
+/// * `Next` - offset (bytes) from the start of *this* entry to the start of
 ///   the next entry in the chain, or 0 for the last entry.
-/// * `NameOffset`/`NameLength` — name (typically a 4-byte ASCII tag) at an
+/// * `NameOffset`/`NameLength` - name (typically a 4-byte ASCII tag) at an
 ///   offset relative to the entry start.
-/// * `Reserved` — 2 bytes.
-/// * `DataOffset`/`DataLength` — payload at an offset relative to the entry
+/// * `Reserved` - 2 bytes.
+/// * `DataOffset`/`DataLength` - payload at an offset relative to the entry
 ///   start.
 ///
-/// We model the entry as `name` + `data` byte vectors plus the raw flags. The
-/// chain reader / writer below handles `Next` and 8-byte alignment between
-/// entries.
+/// Each entry is held as `name` and `data` byte vectors. The chain reader and
+/// writer below handle `Next` and 8-byte alignment between entries.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CreateContext {
     pub name: Vec<u8>,
@@ -235,9 +233,8 @@ impl CreateContext {
         let mut entry_starts: Vec<usize> = Vec::with_capacity(list.len());
 
         for (i, ctx) in list.iter().enumerate() {
-            // Pad to 8-byte boundary before each entry (except possibly first
-            // — but contexts must be 8-byte aligned, and the chain itself is
-            // anchored at an 8-aligned offset by the server).
+            // Each entry starts 8-byte aligned; the caller places the chain at
+            // an 8-aligned offset.
             while !scratch.len().is_multiple_of(8) {
                 scratch.push(0);
             }

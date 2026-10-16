@@ -1,4 +1,4 @@
-//! Internal helpers shared across handlers — tree/open lookup, etc.
+//! Internal helpers shared across handlers: tree/open lookup, etc.
 
 use std::sync::Arc;
 

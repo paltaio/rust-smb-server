@@ -1,9 +1,7 @@
 //! OPLOCK_BREAK Notification + Acknowledgement (MS-SMB2 §2.2.23 / §2.2.24).
 //!
-//! V1 never grants oplocks, so we never *send* a notification, but the
-//! handler exists for safety. A client may send an OPLOCK_BREAK ACK before
-//! the server has cleared its oplock state in the (rare) edge case during
-//! teardown.
+//! The server grants no oplocks and never sends a notification. An ACK gets
+//! a level-0 response.
 
 use binrw::{BinRead, BinWrite, binrw};
 use std::io::Cursor;
@@ -35,7 +33,7 @@ impl OplockBreakNotification {
     }
 }
 
-/// SMB2_OPLOCK_BREAK_ACK (MS-SMB2 §2.2.24.1) — same wire shape as the
+/// SMB2_OPLOCK_BREAK_ACK (MS-SMB2 §2.2.24.1) - same wire shape as the
 /// notification.
 pub type OplockBreakAck = OplockBreakNotification;
 

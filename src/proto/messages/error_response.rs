@@ -28,7 +28,8 @@ pub struct ErrorResponse {
 }
 
 impl ErrorResponse {
-    /// Build a minimal ERROR response body for the given NTSTATUS.
+    /// Build a minimal ERROR response body. The NTSTATUS itself goes in the
+    /// SMB2 header.
     ///
     /// Per MS-SMB2 §2.2.2 a zero-`byte_count` ERROR response still emits a
     /// single byte of `error_data` (the field is mandatory, length 1 when

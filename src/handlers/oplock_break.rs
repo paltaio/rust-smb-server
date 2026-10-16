@@ -1,4 +1,4 @@
-//! OPLOCK_BREAK handler — acknowledge breaks without granting oplocks.
+//! OPLOCK_BREAK handler: acknowledge breaks without granting oplocks.
 
 use std::sync::Arc;
 
@@ -15,7 +15,7 @@ pub async fn handle(
     _hdr: &Smb2Header,
     _body: &[u8],
 ) -> HandlerResponse {
-    // Echo back the same shape as the notification — structure_size=24, level=0.
+    // Echo back the same shape as the notification: structure_size=24, level=0.
     let mut buf = Vec::new();
     buf.extend_from_slice(&24u16.to_le_bytes()); // structure_size
     buf.push(0); // OplockLevel

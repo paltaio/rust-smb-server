@@ -1,4 +1,4 @@
-//! CREATE handler — open or create a file/directory and allocate a FileId.
+//! CREATE handler: open or create a file/directory and allocate a FileId.
 
 use std::sync::Arc;
 

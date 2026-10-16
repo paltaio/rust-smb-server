@@ -1,7 +1,4 @@
-//! NTSTATUS constants used by SMB2 handlers.
-//!
-//! Cross-referenced with MS-ERREF §2.3.1 (NTSTATUS Values). Only the codes the
-//! v1 server actually emits or recognizes live here — kept tight on purpose.
+//! NTSTATUS values (MS-ERREF §2.3.1).
 
 pub const STATUS_SUCCESS: u32 = 0x0000_0000;
 pub const STATUS_PENDING: u32 = 0x0000_0103;
@@ -32,6 +29,7 @@ pub const STATUS_FILE_IS_A_DIRECTORY: u32 = 0xC000_00BA;
 pub const STATUS_NETWORK_NAME_DELETED: u32 = 0xC000_00C9;
 pub const STATUS_BAD_NETWORK_NAME: u32 = 0xC000_00CC;
 pub const STATUS_UNEXPECTED_IO_ERROR: u32 = 0xC000_009C;
+pub const STATUS_INTERNAL_ERROR: u32 = 0xC000_00E5;
 pub const STATUS_DIRECTORY_NOT_EMPTY: u32 = 0xC000_0101;
 pub const STATUS_NOT_A_DIRECTORY: u32 = 0xC000_0103;
 pub const STATUS_USER_SESSION_DELETED: u32 = 0xC000_015C;

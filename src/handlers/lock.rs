@@ -1,4 +1,4 @@
-//! LOCK handler — v1 returns success without enforcing locks.
+//! LOCK handler. Returns success without enforcing locks.
 
 use std::sync::Arc;
 

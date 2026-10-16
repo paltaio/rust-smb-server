@@ -70,7 +70,7 @@ pub enum AvId {
     ChannelBindings = 0x000A,
 }
 
-/// One AV_PAIR (attribute–value pair) from a target-info / authenticate-target-info list.
+/// One AV_PAIR (attribute-value pair) from a target-info / authenticate-target-info list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AvPair {
     pub id: u16,
@@ -131,7 +131,7 @@ pub fn decode_av_pairs(buf: &[u8]) -> ProtoResult<Vec<AvPair>> {
 
 // --- Helpers ---------------------------------------------------------------
 
-/// UTF-8 → UTF-16LE bytes (no BOM).
+/// UTF-8 -> UTF-16LE bytes (no BOM).
 pub fn utf16le(s: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(s.len() * 2);
     for unit in s.encode_utf16() {
@@ -149,7 +149,7 @@ fn utf16le_to_string(bytes: &[u8]) -> String {
     String::from_utf16_lossy(&units)
 }
 
-/// MD4 of UTF-16LE password — the "NT hash".
+/// MD4 of UTF-16LE password - the "NT hash".
 pub fn nt_hash(password: &str) -> [u8; 16] {
     let mut h = Md4::new();
     h.update(utf16le(password));
@@ -235,7 +235,7 @@ pub struct NtlmNegotiate {
     pub flags: u32,
     pub domain: Vec<u8>,
     pub workstation: Vec<u8>,
-    /// Raw bytes of the original message — needed for MIC computation later.
+    /// Raw bytes of the original message - needed for MIC computation later.
     pub raw: Vec<u8>,
 }
 
@@ -249,7 +249,7 @@ impl NtlmNegotiate {
     /// 12 : NegotiateFlags (u32 LE)
     /// 16 : DomainNameFields (8 bytes: len, maxlen, offset)
     /// 24 : WorkstationFields (8 bytes)
-    /// 32 : Version (8 bytes, optional — only if NTLMSSP_NEGOTIATE_VERSION set)
+    /// 32 : Version (8 bytes, optional - only if NTLMSSP_NEGOTIATE_VERSION set)
     /// ```
     pub fn parse(buf: &[u8]) -> ProtoResult<Self> {
         check_signature(buf, MSG_NEGOTIATE)?;
@@ -292,8 +292,8 @@ pub struct ChallengeParams<'a> {
     pub nb_computer_name: &'a str,
     pub dns_domain_name: &'a str,
     pub dns_computer_name: &'a str,
-    /// Windows FILETIME (100-ns intervals since 1601-01-01) — caller-provided
-    /// so this module stays clock-free.
+    /// Windows FILETIME (100-ns intervals since 1601-01-01), supplied by the
+    /// caller.
     pub timestamp: u64,
     /// Negotiated flags (already AND-ed with server policy).
     pub flags: u32,
@@ -350,8 +350,8 @@ pub fn build_challenge(p: &ChallengeParams<'_>) -> Vec<u8> {
     out.extend_from_slice(&ti_len.to_le_bytes());
     out.extend_from_slice(&ti_len.to_le_bytes());
     out.extend_from_slice(&target_info_offset.to_le_bytes());
-    // 48..56: Version (we report 6.1.7600 / NTLMSSP rev 0x0F as a stable choice).
-    // Per spec, only meaningful if NTLMSSP_NEGOTIATE_VERSION is set; harmless otherwise.
+    // 48..56: Version 6.1 build 7424, NTLMSSP revision 15. MS-NLMP only reads
+    // it when NTLMSSP_NEGOTIATE_VERSION is set.
     out.extend_from_slice(&[6, 1, 0, 0x1D, 0, 0, 0, 0x0F]);
     // payload
     out.extend_from_slice(&target_name_utf16);
@@ -376,7 +376,7 @@ pub struct NtlmAuthenticate {
     pub mic: Option<[u8; 16]>,
     /// Offset of the MIC field within `raw`, if present (for re-zero during validation).
     pub mic_offset: Option<usize>,
-    /// Raw bytes of the original message — needed for MIC computation.
+    /// Raw bytes of the original message - needed for MIC computation.
     pub raw: Vec<u8>,
 }
 
@@ -395,13 +395,12 @@ impl NtlmAuthenticate {
     /// 52 : EncryptedRandomSessionKeyFields
     /// 60 : NegotiateFlags (4 bytes)
     /// 64 : Version (8 bytes)
-    /// 72 : MIC (16 bytes — present only in some versions)
+    /// 72 : MIC (16 bytes - present only in some versions)
     /// 88 : Payload...
     /// ```
     /// The MIC is present only when an `MsvAvFlags` AV_PAIR with bit 0x2 was
-    /// echoed by the client. We detect "MIC present" heuristically by checking
-    /// whether the smallest field-payload offset ≥ 88; if it is ≥ 88, bytes
-    /// 72..88 are interpreted as the MIC. Otherwise no MIC.
+    /// echoed by the client. The MIC counts as present when the smallest
+    /// field-payload offset is >= 88; bytes 72..88 are then read as the MIC.
     pub fn parse(buf: &[u8]) -> ProtoResult<Self> {
         check_signature(buf, MSG_AUTHENTICATE)?;
         if buf.len() < 64 {
@@ -471,8 +470,7 @@ impl NtlmAuthenticate {
             slice_field(buf, key_field)?.to_vec()
         };
 
-        // Per NTLMSSP_NEGOTIATE_UNICODE flag, names are UTF-16LE; otherwise OEM.
-        // We require Unicode — we only advertise it. Decode UTF-16LE.
+        // The server advertises only NTLMSSP_NEGOTIATE_UNICODE, so names are UTF-16LE.
         let domain = utf16le_to_string(&domain_bytes);
         let user = utf16le_to_string(&user_bytes);
         let workstation = utf16le_to_string(&ws_bytes);
@@ -508,9 +506,7 @@ pub struct AuthOutcome {
     pub session_key: [u8; 16],
 }
 
-/// Caller-supplied user record. We store only the precomputed NT hash —
-/// callers should derive it from the password at builder time and discard
-/// the plaintext.
+/// User record holding only the NT hash.
 #[derive(Debug, Clone)]
 pub struct UserCreds {
     pub nt_hash: [u8; 16],
@@ -561,9 +557,9 @@ impl NtlmTargetInfo {
 ///
 /// Lifecycle:
 /// 1. `NtlmServer::new(...)`
-/// 2. `step1_negotiate(blob)` — record the client's NEGOTIATE bytes (for MIC).
-/// 3. `challenge()` — produce CHALLENGE_MESSAGE bytes; record them too.
-/// 4. `authenticate(blob, lookup)` — validate AUTHENTICATE; return outcome.
+/// 2. `step1_negotiate(blob)` - record the client's NEGOTIATE bytes (for MIC).
+/// 3. `challenge()` - produce CHALLENGE_MESSAGE bytes; record them too.
+/// 4. `authenticate(blob, lookup)` - validate AUTHENTICATE; return outcome.
 pub struct NtlmServer {
     server_challenge: [u8; 8],
     target_name: String,
@@ -586,7 +582,7 @@ pub struct NtlmServer {
 impl NtlmServer {
     /// Create a new server-side acceptor.
     pub fn new(server_challenge: [u8; 8], target: NtlmTargetInfo, timestamp: u64) -> Self {
-        // Default server flag set — what we are willing to support.
+        // Flags the server offers.
         let server_flags = flags::NTLMSSP_NEGOTIATE_UNICODE
             | flags::NTLMSSP_REQUEST_TARGET
             | flags::NTLMSSP_NEGOTIATE_NTLM
@@ -691,7 +687,7 @@ impl NtlmServer {
         }
 
         // ---- SessionBaseKey = HMAC_MD5(response_key_nt, NTProofStr)
-        // (MS-NLMP §3.4 — for NTLMv2, KeyExchangeKey = SessionBaseKey.)
+        // (MS-NLMP §3.4 - for NTLMv2, KeyExchangeKey = SessionBaseKey.)
         let mut mac = HmacMd5::new_from_slice(&response_key_nt).expect("hmac key");
         mac.update(&nt_proof_computed);
         let session_base_key_bytes = mac.finalize().into_bytes();
@@ -717,10 +713,8 @@ impl NtlmServer {
         };
 
         // ---- MIC validation: HMAC_MD5(SessionKey, NEGOTIATE || CHALLENGE || AUTHENTICATE-with-MIC-zeroed).
-        // We only validate if the client supplied a MIC (i.e. presence
-        // detected during parse) AND we actually have the negotiate/challenge
-        // bytes. If absent, treat as not supplied. This v1 server does not
-        // enforce MsvAvFlags bit 0x2 from the challenge target-info.
+        // Validated only when the client sent a MIC and the NEGOTIATE bytes
+        // were recorded. MsvAvFlags bit 0x2 is not enforced.
         if let (Some(mic_off), true) = (auth.mic_offset, !self.negotiate_bytes.is_empty())
             && let Some(supplied) = auth.mic
         {
@@ -839,13 +833,10 @@ mod tests {
     ///                                    65 00 72 00 00 00 00 00
     ///                                    00 00 00 00
     /// Expected NTProofStr = 68 cd 0a b8 51 e5 1c 96 aa bc 92 7b eb ef 6a 1c
-    /// (Note: there are several editions of MS-NLMP with subtly different
-    /// vectors; this matches the §4.2.4.1.3 vector that includes the trailing
-    /// 4 zero bytes, common across recent revisions.)
     #[test]
     fn ntlmv2_known_answer() {
         let nt = nt_hash("Password");
-        // NT hash of "Password" — MS-NLMP §4.2.2.1.4: a4 f4 9c 40 65 10 bd ca b6 82 4e e7 c3 0f d8 52
+        // NT hash of "Password" - MS-NLMP §4.2.2.1.4: a4 f4 9c 40 65 10 bd ca b6 82 4e e7 c3 0f d8 52
         assert_eq!(
             nt,
             [
@@ -914,7 +905,7 @@ mod tests {
             ),
             0,
         );
-        // Skip step1_negotiate — MIC will be absent.
+        // Skip step1_negotiate - MIC will be absent.
         let _challenge = srv.challenge();
 
         // Compute NTProofStr the same way the client would.
@@ -942,7 +933,7 @@ mod tests {
         let lm_response: Vec<u8> = vec![0u8; 24];
 
         // Layout: header is 72 bytes when no MIC is present
-        // (signature 8 + msgtype 4 + 6×8-byte fields + flags 4 + version 8 = 72).
+        // (signature 8 + msgtype 4 + 6x8-byte fields + flags 4 + version 8 = 72).
         // With MIC, it would be 88.
         let header_len: u32 = 72;
         let mut payload = Vec::new();
@@ -990,7 +981,7 @@ mod tests {
         buf.extend_from_slice(&flags::NTLMSSP_NEGOTIATE_UNICODE.to_le_bytes());
         // Version (8 bytes)
         buf.extend_from_slice(&[0u8; 8]);
-        // No MIC — header is 64 bytes flat.
+        // No MIC: header is 72 bytes.
         assert_eq!(buf.len() as u32, header_len);
         buf.extend_from_slice(&payload);
 
@@ -1013,7 +1004,7 @@ mod tests {
             }
         );
 
-        // Wrong password should fail with constant-time mismatch.
+        // Wrong password fails.
         let bad = UserCreds::from_password("WrongPassword");
         let err = srv
             .authenticate(&buf, |_u, _d| Some(bad.clone()))

@@ -1,6 +1,5 @@
-//! Cross-stack write-path integration test over anonymous SESSION_SETUP:
-//! CREATE with write access, WRITE bytes, READ them back, and confirm the
-//! `LocalFsBackend` file contents on disk.
+//! Anonymous session over TCP loopback: CREATE with write access, WRITE, READ
+//! the bytes back, and check the `LocalFsBackend` file contents on disk.
 
 mod common;
 
@@ -20,15 +19,14 @@ use tokio::net::TcpStream;
 
 #[tokio::test]
 async fn end_to_end_anon_write_then_read_localfs() {
-    // 1. Empty temp dir — the test creates `out.txt` from scratch via the
-    //    SMB CREATE/WRITE dispatch path.
+    // Empty share root; CREATE makes `out.txt`.
     let td = tempdir().expect("tempdir");
     let backend = LocalFsBackend::new(td.path()).expect("open root");
 
     let server = SmbServer::builder()
         .listen("127.0.0.1:0".parse().unwrap())
         .user("alice", "password")
-        .share(Share::new("share", backend).public()) // see module-level note
+        .share(Share::new("share", backend).public())
         .netbios_name("TESTSERVER")
         .build()
         .expect("build");
@@ -57,7 +55,7 @@ async fn end_to_end_anon_write_then_read_localfs() {
         desired_access: 0x0012_0089 | 0x0012_0116,
         file_attributes: 0,
         share_access: 0x0000_0007,
-        // FILE_OVERWRITE_IF — create or overwrite.
+        // FILE_OVERWRITE_IF
         create_disposition: 5,
         create_options: 0,
         name_offset: 0x78,
@@ -151,7 +149,7 @@ async fn end_to_end_anon_write_then_read_localfs() {
     assert_eq!(rh.channel_sequence_status, STATUS_SUCCESS);
     let _ = CloseResponse::parse(rb).expect("parse close resp");
 
-    // 2. Final cross-check: the file exists on disk with the right bytes.
+    // The file on disk holds the written bytes.
     let on_disk = std::fs::read(td.path().join("out.txt")).expect("file on disk");
     assert_eq!(on_disk, payload);
 

@@ -1,7 +1,6 @@
 //! CHANGE_NOTIFY Request/Response (MS-SMB2 §2.2.35 / §2.2.36).
 //!
-//! V1 returns `STATUS_NOT_SUPPORTED`, but we still parse/encode the wire
-//! form so the dispatcher can recognize it.
+//! The server answers CHANGE_NOTIFY with `STATUS_NOT_SUPPORTED`.
 
 use binrw::{BinRead, BinWrite, binrw};
 use std::io::Cursor;

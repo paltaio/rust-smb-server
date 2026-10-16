@@ -34,13 +34,8 @@ pub async fn read_one_frame(reader: &mut ReadHalf<TcpStream>) -> io::Result<Opti
     Ok(Some(payload))
 }
 
-/// Continuously read frames; for each, await `dispatch_one`'s response and
-/// route it to the writer.
-///
-/// Sequential dispatch keeps v1 simple and matches the spec's "single writer
-/// task / per-frame dispatch" pattern. We process one frame at a time per
-/// connection in v1 — a follow-up can spawn dispatch tasks if a workload
-/// proves to need credit-window concurrency.
+/// Read frames and dispatch them one at a time, in arrival order, sending
+/// each response to the writer.
 pub async fn reader_task(
     mut reader: ReadHalf<TcpStream>,
     server: Arc<ServerState>,
@@ -67,8 +62,6 @@ pub async fn reader_task(
             debug!("server shutting down; dropping connection");
             return Ok(());
         }
-        // The dispatcher is async but we await it inline — order-preserving and
-        // good enough for v1.
         let response = crate::dispatch::dispatch_frame(&server, &conn, &frame).await;
         if let Some(bytes) = response
             && tx.send(bytes).await.is_err()

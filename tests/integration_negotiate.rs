@@ -1,8 +1,5 @@
-//! Integration test: drive a real `SmbServer` over a TCP loopback through a
-//! NEGOTIATE → SESSION_SETUP (anonymous) → TREE_CONNECT → CREATE → READ flow.
-//!
-//! We hand-craft the request bytes since we don't depend on a Rust SMB client
-//! crate.
+//! NEGOTIATE, anonymous SESSION_SETUP and TREE_CONNECT over TCP loopback, then
+//! FSCTL_VALIDATE_NEGOTIATE_INFO, CREATE and READ.
 
 mod common;
 
@@ -21,8 +18,8 @@ use tempfile::tempdir;
 use tokio::net::TcpStream;
 
 #[tokio::test]
-async fn end_to_end_anon_read() {
-    // 1. Build a server with one public share and one in-memory file.
+async fn validate_negotiate_info_then_anon_read() {
+    // One public share over a temp dir holding hello.txt.
     let td = tempdir().expect("tempdir");
     std::fs::write(td.path().join("hello.txt"), b"hello world\n").expect("write hello.txt");
     let backend = LocalFsBackend::new(td.path()).expect("open root");
@@ -35,11 +32,7 @@ async fn end_to_end_anon_read() {
 
     server.bind().await.expect("bind");
     let addr = server.local_addr().await.expect("addr");
-
-    // Spawn the server.
     let handle = tokio::spawn(async move { server.serve().await });
-
-    // Tiny grace period.
     tokio::task::yield_now().await;
 
     let mut s = TcpStream::connect(addr).await.expect("connect");

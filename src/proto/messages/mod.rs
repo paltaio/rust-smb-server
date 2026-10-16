@@ -1,11 +1,8 @@
 //! Per-command request/response wire structs.
 //!
-//! Each SMB2 command (MS-SMB2 §2.2.3 — §2.2.18, §2.2.31, §2.2.37, §2.2.39)
-//! gets its own submodule with a `…Request` and `…Response` struct, both
-//! `binrw`-driven and round-trip safe.
-//!
-//! The crate does **not** implement command behavior — it only encodes/decodes
-//! the wire bytes. The server crate owns dispatch and state.
+//! One submodule per SMB2 command (MS-SMB2 §2.2.3 to §2.2.40), plus the ERROR
+//! response (§2.2.2). The structs are `binrw` encoders and decoders for the
+//! wire bytes only.
 
 pub mod cancel;
 pub mod change_notify;
@@ -41,8 +38,8 @@ pub use ioctl::{Fsctl, IoctlRequest, IoctlResponse};
 pub use lock::{LockElement, LockRequest, LockResponse};
 pub use logoff::{LogoffRequest, LogoffResponse};
 pub use negotiate::{
-    Dialect, EncryptionCapabilities, NegotiateContext, NegotiateContextData, NegotiateRequest,
-    NegotiateResponse, PreauthIntegrityCapabilities, SigningCapabilities,
+    Dialect, EncryptionCapabilities, NegotiateContext, NegotiateRequest, NegotiateResponse,
+    PreauthIntegrityCapabilities, SigningCapabilities,
 };
 pub use oplock_break::{OplockBreakAck, OplockBreakNotification};
 pub use query_directory::{FileInfoClass, QueryDirectoryRequest, QueryDirectoryResponse};

@@ -41,8 +41,8 @@ pub struct QueryInfoRequest {
     pub reserved: u16,
     pub input_buffer_length: u32,
     /// `AdditionalInformation`: which fields of the security descriptor to
-    /// return when `info_type == Security`. Otherwise an additional info-class
-    /// selector for FS info.
+    /// return when `info_type == Security`, or the starting EA index for a
+    /// `FileFullEaInformation` query. Zero for all other queries.
     pub additional_information: u32,
     pub flags: u32,
     pub file_id: FileId,

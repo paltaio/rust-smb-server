@@ -93,8 +93,8 @@ pub async fn handle(
 
             // Determine total size with padding for chaining.
             let entry_aligned = align8(bytes.len());
-            // If this is *not* the first entry, we already padded the previous
-            // entry up to entry_aligned. We commit only if total fits.
+            // Every entry is padded to 8 bytes. Stop once the next one would
+            // overflow the output buffer; the first entry is always included.
             let prev_len = buf.len();
             let total_after = prev_len + entry_aligned;
             if total_after > cap && !buf.is_empty() {

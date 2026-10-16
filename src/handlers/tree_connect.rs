@@ -1,4 +1,4 @@
-//! TREE_CONNECT handler — share lookup + authorization.
+//! TREE_CONNECT handler: share lookup and authorization.
 
 use std::sync::Arc;
 
@@ -50,8 +50,8 @@ pub async fn handle(
     drop(sess);
 
     // IPC$: synthetic share. Accept at TREE_CONNECT (Windows always probes
-    // it before mounting an actual share); downstream CREATE/IOCTL on it
-    // return NotSupported via the no-op backend.
+    // it before mounting an actual share); CREATE on it returns
+    // STATUS_NOT_SUPPORTED.
     let share = if share_name.eq_ignore_ascii_case("IPC$") {
         crate::server::ShareBindings::ipc()
     } else {

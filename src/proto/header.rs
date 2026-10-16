@@ -1,29 +1,24 @@
 //! SMB2 fixed 64-byte packet header (sync + async forms).
 //!
 //! References:
-//! * MS-SMB2 §2.2.1   — Common header preamble.
-//! * MS-SMB2 §2.2.1.1 — Async form (`Flags & SMB2_FLAGS_ASYNC_COMMAND`).
-//! * MS-SMB2 §2.2.1.2 — Sync form.
+//! * MS-SMB2 §2.2.1   - Common header preamble.
+//! * MS-SMB2 §2.2.1.1 - Async form (`Flags & SMB2_FLAGS_ASYNC_COMMAND`).
+//! * MS-SMB2 §2.2.1.2 - Sync form.
 //!
-//! ## Encoding choice
+//! ## Layout
 //!
-//! The two forms differ only in the 12-byte block at offset 0x18..0x24:
+//! The two forms differ only in the 8 bytes at 0x20..0x28:
 //!
-//! * **Sync**:  `ChannelSequence` (u16) + `Reserved` (u16) + `Reserved2` (u32) + `TreeId` (u32)
-//!   wait — actually the sync form is: `Reserved` (u32) + `TreeId` (u32) (bytes 0x20..0x28).
-//! * **Async**: `AsyncId` (u64) at bytes 0x20..0x28.
+//! * **Sync**:  `Reserved` (u32) + `TreeId` (u32).
+//! * **Async**: `AsyncId` (u64).
 //!
-//! In *both* forms, bytes 0x10..0x14 are `Status` (or `ChannelSequence + Reserved` on
-//! 3.x channel-sequence-aware requests; we treat them as a single u32 named
-//! `channel_sequence_status`). Bytes 0x14..0x18 are `Command + CreditReqResp`,
-//! 0x18..0x1C are `Flags`, 0x1C..0x20 are `NextCommand`, 0x20..0x28 are `MessageId`.
-//! The discriminated 8-byte block lives at 0x28..0x30, followed by the 16-byte
-//! `Signature` at 0x30..0x40 — totalling 64 bytes.
+//! Bytes 0x08..0x0C hold `Status` on responses and `ChannelSequence` +
+//! `Reserved` on 3.x requests; both are kept as one u32 named
+//! `channel_sequence_status`. The 16-byte `Signature` sits at 0x30..0x40.
 //!
-//! We model this as a single `Smb2Header` struct with a `tail: HeaderTail` enum
-//! that is `Sync { reserved: u32, tree_id: u32 }` or `Async { async_id: u64 }`,
-//! discriminated by `Flags & SMB2_FLAGS_ASYNC_COMMAND`. This is the cleanest
-//! mapping to the spec — every other field is shared.
+//! [`Smb2Header`] holds the shared fields plus a `tail: HeaderTail` enum that
+//! is `Sync { reserved: u32, tree_id: u32 }` or `Async { async_id: u64 }`,
+//! selected by `Flags & SMB2_FLAGS_ASYNC_COMMAND`.
 
 use binrw::{BinRead, BinWrite, binrw};
 use std::io::Cursor;
@@ -43,15 +38,15 @@ pub const SMB2_HEADER_LEN: usize = 64;
 // Flags (MS-SMB2 §2.2.1.2 Flags field)
 // ---------------------------------------------------------------------------
 
-/// `SMB2_FLAGS_SERVER_TO_REDIR` — set on responses.
+/// `SMB2_FLAGS_SERVER_TO_REDIR` - set on responses.
 pub const SMB2_FLAGS_SERVER_TO_REDIR: u32 = 0x0000_0001;
-/// `SMB2_FLAGS_ASYNC_COMMAND` — selects the async header form.
+/// `SMB2_FLAGS_ASYNC_COMMAND` - selects the async header form.
 pub const SMB2_FLAGS_ASYNC_COMMAND: u32 = 0x0000_0002;
-/// `SMB2_FLAGS_RELATED_OPERATIONS` — compound chain marker.
+/// `SMB2_FLAGS_RELATED_OPERATIONS` - compound chain marker.
 pub const SMB2_FLAGS_RELATED_OPERATIONS: u32 = 0x0000_0004;
-/// `SMB2_FLAGS_SIGNED` — message is signed.
+/// `SMB2_FLAGS_SIGNED` - message is signed.
 pub const SMB2_FLAGS_SIGNED: u32 = 0x0000_0008;
-/// `SMB2_FLAGS_PRIORITY_MASK` — bits 4..6 hold priority (3.1.1+).
+/// `SMB2_FLAGS_PRIORITY_MASK` - bits 4..6 hold priority (3.1.1+).
 pub const SMB2_FLAGS_PRIORITY_MASK: u32 = 0x0000_0070;
 /// `SMB2_FLAGS_DFS_OPERATIONS`.
 pub const SMB2_FLAGS_DFS_OPERATIONS: u32 = 0x1000_0000;
@@ -62,7 +57,7 @@ pub const SMB2_FLAGS_REPLAY_OPERATION: u32 = 0x2000_0000;
 // Command opcodes (MS-SMB2 §2.2.1.2 Command field)
 // ---------------------------------------------------------------------------
 
-/// SMB2 command opcodes (the 19 commands in v1).
+/// SMB2 command opcodes.
 #[binrw]
 #[brw(little, repr = u16)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -99,23 +94,21 @@ impl Command {
 // Header struct
 // ---------------------------------------------------------------------------
 
-/// The 12-byte tail of the header that differs between sync and async forms.
+/// The 8 bytes of the header that differ between sync and async forms.
 ///
-/// The discriminant is `flags & SMB2_FLAGS_ASYNC_COMMAND`. We can't easily use
-/// binrw's args+if without making the parent struct generic over the runtime
-/// flag value, so the parent reads/writes this manually via `parse` / `write`
-/// helpers and we expose a regular Rust enum here.
+/// The discriminant is `flags & SMB2_FLAGS_ASYNC_COMMAND`.
+/// [`Smb2Header::parse`] and [`Smb2Header::write`] convert it to and from the
+/// raw bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HeaderTail {
-    /// Sync form: `Reserved (u32)` + `TreeId (u32)` at bytes 0x24..0x2C.
-    /// (See note in module docs about offsets.)
+    /// Sync form: `Reserved (u32)` + `TreeId (u32)` at bytes 0x20..0x28.
     Sync { reserved: u32, tree_id: u32 },
-    /// Async form: `AsyncId (u64)` at bytes 0x24..0x2C.
+    /// Async form: `AsyncId (u64)` at bytes 0x20..0x28.
     Async { async_id: u64 },
 }
 
 impl HeaderTail {
-    /// Default sync tail with `TreeId = 0`.
+    /// Sync tail with `Reserved = 0`.
     pub const fn sync(tree_id: u32) -> Self {
         HeaderTail::Sync {
             reserved: 0,
@@ -123,7 +116,7 @@ impl HeaderTail {
         }
     }
 
-    /// Default async tail.
+    /// Async tail with the given `AsyncId`.
     pub const fn async_(async_id: u64) -> Self {
         HeaderTail::Async { async_id }
     }
@@ -131,7 +124,7 @@ impl HeaderTail {
 
 /// SMB2 fixed 64-byte header.
 ///
-/// On the wire the layout is (offsets in decimal — total 64 bytes):
+/// On the wire the layout is (offsets in decimal - total 64 bytes):
 ///
 /// | Offset | Size | Field |
 /// |-------:|-----:|-------|
@@ -150,10 +143,9 @@ impl HeaderTail {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Smb2Header {
     pub credit_charge: u16,
-    /// Bytes 8..12: in client→server requests on 3.x this can split into
-    /// `ChannelSequence(u16)` + `Reserved(u16)`; in server→client responses
-    /// it carries `Status` (NTSTATUS). We expose the raw u32 — handlers/
-    /// signing code interpret it.
+    /// Bytes 8..12: in client-to-server requests on 3.x this splits into
+    /// `ChannelSequence(u16)` + `Reserved(u16)`; in server-to-client responses
+    /// it carries `Status` (NTSTATUS). Kept as the raw u32.
     pub channel_sequence_status: u32,
     pub command: Command,
     /// On requests this is `CreditRequest`; on responses, `CreditResponse`.
@@ -188,17 +180,17 @@ impl Default for Smb2Header {
 }
 
 impl Smb2Header {
-    /// Convenience: is this an async-form header?
+    /// Is this an async-form header?
     pub fn is_async(&self) -> bool {
         self.flags & SMB2_FLAGS_ASYNC_COMMAND != 0
     }
 
-    /// Convenience: is this a server→client response?
+    /// Is this a server-to-client response?
     pub fn is_response(&self) -> bool {
         self.flags & SMB2_FLAGS_SERVER_TO_REDIR != 0
     }
 
-    /// Convenience: tree_id from a sync header (panics if async).
+    /// `TreeId` of a sync header, `None` for async.
     pub fn tree_id(&self) -> Option<u32> {
         match self.tail {
             HeaderTail::Sync { tree_id, .. } => Some(tree_id),
@@ -206,7 +198,7 @@ impl Smb2Header {
         }
     }
 
-    /// Convenience: async_id from an async header.
+    /// `AsyncId` of an async header, `None` for sync.
     pub fn async_id(&self) -> Option<u64> {
         match self.tail {
             HeaderTail::Async { async_id } => Some(async_id),

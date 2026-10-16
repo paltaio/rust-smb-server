@@ -1,4 +1,4 @@
-//! SESSION_SETUP handler — drives the SPNEGO + NTLMv2 state machine.
+//! SESSION_SETUP handler: drives the SPNEGO + NTLMv2 state machine.
 
 use std::sync::Arc;
 
@@ -47,9 +47,9 @@ pub async fn handle(
     }
 
     // Decide which form the security blob takes:
-    //   * GSS-API NegTokenInit       — starts with 0x60.
-    //   * SPNEGO NegTokenResp        — starts with 0xa1 ([1] context tag).
-    //   * Raw NTLMSSP message        — starts with "NTLMSSP\0" (RFC 4178
+    //   * GSS-API NegTokenInit       - starts with 0x60.
+    //   * SPNEGO NegTokenResp        - starts with 0xa1 ([1] context tag).
+    //   * Raw NTLMSSP message        - starts with "NTLMSSP\0" (RFC 4178
     //     §4.2.1 lets the client skip SPNEGO once the mech is settled; both
     //     Win11 reauth and Linux cifs.ko use this form).
     const NTLMSSP_MAGIC: &[u8] = b"NTLMSSP\0";
@@ -68,7 +68,7 @@ pub async fn handle(
         is_raw_ntlmssp = true;
         inner_token = blob.to_vec();
     } else if blob[0] == 0x60 {
-        // GSS-API outer wrapper — NegTokenInit.
+        // GSS-API outer wrapper: NegTokenInit.
         let init = match decode_init_token(&blob) {
             Ok(t) => t,
             Err(e) => {
@@ -100,7 +100,10 @@ pub async fn handle(
         // Allocate a fresh session id and start the NTLM state machine.
         let new_sid = conn.alloc_session_id();
         let mut server_challenge = [0u8; 8];
-        fill_random(&mut server_challenge);
+        if let Err(e) = fill_random(&mut server_challenge) {
+            tracing::error!(error = %e, "OS RNG failed; cannot generate NTLM challenge");
+            return HandlerResponse::err(ntstatus::STATUS_INTERNAL_ERROR);
+        }
         let netbios = server.config.netbios_name.clone();
         let mut acceptor = NtlmServer::new(
             server_challenge,

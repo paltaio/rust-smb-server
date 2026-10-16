@@ -1,18 +1,17 @@
-//! `LocalFsBackend` — a `ShareBackend` backed by a real on-disk directory.
+//! `LocalFsBackend`: a `ShareBackend` backed by a real on-disk directory.
 //!
 //! The share root is opened once via `cap_std::fs::Dir::open_ambient_dir` and
 //! kept as the sole authority handle. All subsequent path operations are
 //! resolved relative to that handle, so a malicious symlink or `..` smuggled
-//! through `SmbPath` cannot escape the sandbox — `cap-std` enforces this at
+//! through `SmbPath` cannot escape the sandbox; `cap-std` enforces this at
 //! every step.
 //!
-//! Per the v1 design (spec §3.4) this backend is intentionally minimal:
+//! Notes:
 //!
-//! - Sync FS calls are wrapped in `tokio::task::spawn_blocking` so the async
-//!   `ShareBackend`/`Handle` methods integrate cleanly with the dispatcher.
+//! - Blocking FS calls run on `tokio::task::spawn_blocking`.
 //! - `read_only()` flips a flag that makes write-class opens reject early
 //!   with `SmbError::AccessDenied`.
-//! - DOS-style glob matching for `list_dir` is handled here (case-insensitive,
+//! - DOS-style glob matching for `list_dir` is handled here (ASCII case-insensitive,
 //!   `?` and `*`), since cap-std only provides raw `entries()`.
 
 use std::io;
@@ -33,14 +32,13 @@ use crate::backend::{
 };
 use crate::error::{SmbError, SmbResult};
 use crate::path::SmbPath;
+use crate::utils::{FILETIME_OFFSET, system_time_to_filetime};
 
 // ---------------------------------------------------------------------------
 // Backend
 // ---------------------------------------------------------------------------
 
 /// Local-filesystem backend, sandboxed at a single root directory.
-///
-/// Cheap to clone: internally an `Arc<cap_std::fs::Dir>` plus a flag.
 pub struct LocalFsBackend {
     root: Arc<Dir>,
     read_only: bool,
@@ -75,7 +73,7 @@ impl LocalFsBackend {
 ///
 /// `SmbPath` is already validated (no `..`, no forbidden chars, no doubled
 /// separators), so this is purely a join. The empty `SmbPath` (root) yields
-/// `PathBuf::from(".")` — cap-std accepts this for `metadata` etc.
+/// `PathBuf::from(".")`, which cap-std accepts for `metadata` etc.
 fn to_rel_path(path: &SmbPath) -> PathBuf {
     if path.is_root() {
         return PathBuf::from(".");
@@ -105,9 +103,8 @@ fn io_to_smb(err: io::Error) -> SmbError {
     }
 }
 
-/// Convert a panic from `spawn_blocking` into an `io::Error`. Panics in the
-/// blocking pool are exotic; we surface them as a generic `Other` rather than
-/// re-panicking on the async side.
+/// Convert a `spawn_blocking` join error (panic or cancellation) into
+/// `io::ErrorKind::Other`.
 fn join_to_io(_e: tokio::task::JoinError) -> io::Error {
     io::Error::other("blocking task panicked or was cancelled")
 }
@@ -115,17 +112,6 @@ fn join_to_io(_e: tokio::task::JoinError) -> io::Error {
 // ---------------------------------------------------------------------------
 // FILETIME conversion
 // ---------------------------------------------------------------------------
-
-/// Number of 100-nanosecond intervals between 1601-01-01 (Windows FILETIME
-/// epoch) and 1970-01-01 (UNIX epoch).
-const FILETIME_OFFSET: u64 = 116_444_736_000_000_000;
-
-fn system_time_to_filetime(t: SystemTime) -> u64 {
-    match t.duration_since(UNIX_EPOCH) {
-        Ok(d) => FILETIME_OFFSET + (d.as_secs() * 10_000_000) + u64::from(d.subsec_nanos() / 100),
-        Err(_) => 0,
-    }
-}
 
 fn filetime_to_system_time(ft: u64) -> Option<SystemTime> {
     if ft < FILETIME_OFFSET {
@@ -147,9 +133,8 @@ fn file_info_from_metadata(name: String, md: &cap_std::fs::Metadata) -> FileInfo
     let accessed = md.accessed().ok().map(|t| t.into_std());
     let created = md.created().ok().map(|t| t.into_std());
 
-    // Fall back: if a particular timestamp isn't available on the platform,
-    // use whichever timestamp is available, then `now()` as last resort. SMB
-    // clients tolerate equal timestamps fine.
+    // A missing timestamp falls back to another available one, then to the
+    // UNIX epoch.
     let modified = modified
         .or(created)
         .or(accessed)
@@ -166,8 +151,7 @@ fn file_info_from_metadata(name: String, md: &cap_std::fs::Metadata) -> FileInfo
         last_write_time: system_time_to_filetime(modified),
         change_time: system_time_to_filetime(modified),
         is_directory: md.is_dir(),
-        // `cap-std` does not expose a stable inode-style identifier in its
-        // public API; the dispatcher substitutes the FileId where needed.
+        // No portable inode accessor in cap-std; directory listings report 0.
         file_index: 0,
     }
 }
@@ -177,12 +161,10 @@ fn file_info_from_metadata(name: String, md: &cap_std::fs::Metadata) -> FileInfo
 // ---------------------------------------------------------------------------
 
 /// Match `name` against a DOS-style pattern. `?` matches any single char,
-/// `*` matches any sequence (possibly empty). Comparison is case-insensitive
-/// (ASCII fold) — sufficient for the v1 use-case where names are validated to
-/// be free of weird Unicode tricks.
+/// `*` matches any sequence (possibly empty). Comparison folds ASCII case
+/// only.
 fn glob_match(pattern: &str, name: &str) -> bool {
-    // Walk both strings as char vectors so `?` matches a char rather than a
-    // byte, without going through grapheme territory.
+    // Compare by `char` so `?` matches one character.
     let p: Vec<char> = pattern.chars().collect();
     let n: Vec<char> = name.chars().collect();
     glob_match_inner(&p, &n)
@@ -322,7 +304,7 @@ impl ShareBackend for LocalFsBackend {
             }
         }
 
-        // 2. Translate OpenIntent → cap-std OpenOptions.
+        // 2. Translate OpenIntent -> cap-std OpenOptions.
         let mut cap_opts = CapOpenOptions::new();
         match opts.intent {
             OpenIntent::Open => {
@@ -354,8 +336,7 @@ impl ShareBackend for LocalFsBackend {
 
         // Convert to a `std::fs::File`. We only need cap-std for the safe
         // *open*; once we hold a verified file handle, std's API gives us
-        // `set_times`, `set_len`, `sync_data`, and `FileExt::{read,write}_at`
-        // without pulling in extra crates.
+        // `set_times`, `set_len`, `sync_data`, and `FileExt::{read,write}_at`.
         let std_file: std::fs::File = cap_file.into_std();
 
         Ok(Box::new(LocalHandle::File {
@@ -407,8 +388,8 @@ impl ShareBackend for LocalFsBackend {
         let root2 = Arc::clone(&self.root);
 
         spawn_blocking(move || -> io::Result<()> {
-            // Reject overwrite — SMB rename semantics require explicit
-            // replace-if-exists which we do not implement in v1.
+            // Rename never replaces an existing target; ReplaceIfExists is
+            // not supported.
             if root2.exists(&to_path) {
                 return Err(io::Error::from(io::ErrorKind::AlreadyExists));
             }
@@ -423,8 +404,7 @@ impl ShareBackend for LocalFsBackend {
     fn capabilities(&self) -> BackendCapabilities {
         BackendCapabilities {
             is_read_only: self.read_only,
-            // POSIX filesystems are typically case-sensitive. We don't try to
-            // emulate case-insensitive lookup in v1 (see spec §3.4).
+            // Lookups use the host filesystem's case rules.
             case_sensitive: cfg!(any(target_os = "linux", target_os = "freebsd")),
         }
     }
@@ -645,7 +625,7 @@ impl Handle for LocalHandle {
     }
 
     async fn close(self: Box<Self>) -> SmbResult<()> {
-        // Drop is sufficient — closing the underlying handle is what the OS
+        // Drop is sufficient: closing the underlying handle is what the OS
         // does when the last `Arc` ref goes away. No flush here: SMB CLOSE
         // does not imply fsync.
         Ok(())
@@ -791,11 +771,12 @@ mod tests {
             .unwrap();
         assert!(matches!(err, SmbError::AccessDenied));
 
-        // Pure read open is fine.
+        // Pure read open is fine; writes through it are rejected.
         let h = backend.open(&p("x.txt"), opts_open_ro()).await.unwrap();
-        // Writing through a handle obtained from a read-only backend would
-        // already be impossible — but if a backend ever yields one, the
-        // check still bites.
+        assert!(matches!(
+            h.write(0, b"x").await,
+            Err(SmbError::AccessDenied)
+        ));
         h.close().await.unwrap();
 
         // unlink rejected.
@@ -915,7 +896,7 @@ mod tests {
             .duration_since(back)
             .or_else(|e| Ok::<_, std::time::SystemTimeError>(e.duration()))
             .unwrap();
-        // 100ns granularity — round-trip should be sub-microsecond.
+        // 100ns granularity: round-trip should be sub-microsecond.
         assert!(delta < Duration::from_micros(1), "delta = {delta:?}");
     }
 }

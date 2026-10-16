@@ -1,4 +1,4 @@
-//! CHANGE_NOTIFY handler — v1 always returns NOT_SUPPORTED.
+//! CHANGE_NOTIFY handler. Returns STATUS_NOT_SUPPORTED.
 
 use std::sync::Arc;
 

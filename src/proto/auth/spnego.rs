@@ -1,8 +1,7 @@
 //! Minimal hand-rolled DER codec for SPNEGO (MS-SPNG / RFC 4178).
 //!
-//! v1 advertises **only** the NTLMSSP mechanism. We don't pull in a full
-//! ASN.1 crate; this is a tiny subset of DER for the few SPNEGO tokens we
-//! need to encode/decode during SESSION_SETUP.
+//! Advertises only the NTLMSSP mechanism. Covers the DER subset used by the
+//! SPNEGO tokens exchanged during SESSION_SETUP.
 //!
 //! ASN.1 sketch:
 //!
@@ -41,7 +40,7 @@ const TAG_OBJECT: u8 = 0x06; // OBJECT IDENTIFIER
 const TAG_OCTET: u8 = 0x04; // OCTET STRING
 const TAG_ENUMERATED: u8 = 0x0a; // ENUMERATED
 
-const TAG_APP_0: u8 = 0x60; // [APPLICATION 0] IMPLICIT — GSS-API outer
+const TAG_APP_0: u8 = 0x60; // [APPLICATION 0] IMPLICIT - GSS-API outer
 const TAG_CTX_0: u8 = 0xa0;
 const TAG_CTX_1: u8 = 0xa1;
 const TAG_CTX_2: u8 = 0xa2;
@@ -114,8 +113,8 @@ fn read_len(buf: &[u8], pos: usize) -> ProtoResult<(usize, usize)> {
     }
     let nb = (first & 0x7f) as usize;
     if nb == 0 || nb > 4 {
-        // Indefinite (nb=0) — never used by SPNEGO.
-        // We cap at 4 bytes (max ~4 GiB), more than enough for tokens.
+        // Indefinite (nb=0) - never used by SPNEGO.
+        // Length fields longer than 4 bytes are rejected.
         return Err(ProtoError::Auth("DER length form unsupported"));
     }
     if pos + 1 + nb > buf.len() {
@@ -168,12 +167,12 @@ fn write_tlv(tag: u8, content: &[u8], out: &mut Vec<u8>) {
 
 // --- Public API ------------------------------------------------------------
 
-/// Decoded `NegTokenInit` payload — only the bits we care about.
+/// Decoded `NegTokenInit`: `mechTypes` and `mechToken`.
 #[derive(Debug, Clone)]
 pub struct NegTokenInit {
     /// List of mechanism OIDs (each entry is the OID content bytes, no 0x06 tag).
     pub mech_types: Vec<Vec<u8>>,
-    /// `mechToken [2]` if present — typically the NTLMSSP NEGOTIATE_MESSAGE bytes.
+    /// `mechToken [2]` if present - typically the NTLMSSP NEGOTIATE_MESSAGE bytes.
     pub mech_token: Option<Vec<u8>>,
 }
 
@@ -183,7 +182,7 @@ pub struct NegTokenResp {
     pub neg_state: Option<NegState>,
     /// `supportedMech [1]` (OID content bytes).
     pub supported_mech: Option<Vec<u8>>,
-    /// `responseToken [2]` — typically inner NTLMSSP CHALLENGE/AUTHENTICATE bytes.
+    /// `responseToken [2]` - typically inner NTLMSSP CHALLENGE/AUTHENTICATE bytes.
     pub response_token: Option<Vec<u8>>,
     pub mech_list_mic: Option<Vec<u8>>,
 }
@@ -203,7 +202,7 @@ pub fn decode_init_token(buf: &[u8]) -> ProtoResult<NegTokenInit> {
         return Err(ProtoError::Auth("not an SPNEGO token"));
     }
 
-    // NegotiationToken — choice tagged [0] for init.
+    // NegotiationToken - choice tagged [0] for init.
     let (init_inner, _) = read_tlv(gss_inner, after_mech, TAG_CTX_0)?;
     parse_neg_token_init_body(init_inner)
 }
@@ -229,7 +228,7 @@ fn parse_neg_token_init_body(inner: &[u8]) -> ProtoResult<NegTokenInit> {
                 }
             }
             TAG_CTX_1 => {
-                // reqFlags — ignored.
+                // reqFlags - ignored.
             }
             TAG_CTX_2 => {
                 // mechToken [2] OCTET STRING
@@ -237,10 +236,10 @@ fn parse_neg_token_init_body(inner: &[u8]) -> ProtoResult<NegTokenInit> {
                 mech_token = Some(oct.to_vec());
             }
             TAG_CTX_3 => {
-                // mechListMIC — ignored on init.
+                // mechListMIC - ignored on init.
             }
             _ => {
-                // Unknown — skip silently (forward-compat).
+                // Unknown - skip silently (forward-compat).
             }
         }
         pos = next;
@@ -253,7 +252,7 @@ fn parse_neg_token_init_body(inner: &[u8]) -> ProtoResult<NegTokenInit> {
 }
 
 /// Decode a subsequent `NegTokenResp`. These are sent without the GSS-API
-/// outer wrapper — they begin directly with the `[1]` choice tag.
+/// outer wrapper - they begin directly with the `[1]` choice tag.
 pub fn decode_resp_token(buf: &[u8]) -> ProtoResult<NegTokenResp> {
     let (resp_inner, _) = read_tlv(buf, 0, TAG_CTX_1)?;
     let (seq_body, _) = read_tlv(resp_inner, 0, TAG_SEQUENCE)?;
@@ -290,7 +289,7 @@ pub fn decode_resp_token(buf: &[u8]) -> ProtoResult<NegTokenResp> {
     Ok(out)
 }
 
-/// Encode the **initial** server response to NEGOTIATE — a GSS-API-wrapped
+/// Encode the **initial** server response to NEGOTIATE - a GSS-API-wrapped
 /// `NegTokenInit` advertising NTLMSSP only. Used during SMB2 NEGOTIATE
 /// when the server publishes its security blob.
 pub fn encode_init_response() -> Vec<u8> {
@@ -325,7 +324,7 @@ pub fn encode_init_response() -> Vec<u8> {
 /// the NTLMSSP CHALLENGE_MESSAGE or a final empty-token AcceptCompleted).
 ///
 /// `supported_mech` is included only with `AcceptIncomplete` (i.e. the very
-/// first response to a NegTokenInit) — per RFC 4178 §4.2.2.
+/// first response to a NegTokenInit) - per RFC 4178 §4.2.2.
 pub fn encode_resp_token(
     state: NegState,
     supported_mech: Option<&[u8]>,
@@ -411,10 +410,7 @@ mod tests {
         let blob = encode_init_response();
         // Must start with [APPLICATION 0] (0x60) tag.
         assert_eq!(blob[0], TAG_APP_0);
-        // Decode with our own decoder going via decode_init_token.
-        // We craft a synthetic "init" by appending an empty mechToken? — not
-        // needed; decode_init_token tolerates absence. Test that the OID and
-        // the [0] mechTypes are reachable.
+        // decode_init_token accepts a NegTokenInit without a mechToken.
         let init = decode_init_token(&blob).unwrap();
         assert_eq!(init.mech_types.len(), 1);
         assert_eq!(init.mech_types[0], OID_NTLMSSP);

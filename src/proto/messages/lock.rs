@@ -6,7 +6,7 @@ use std::io::Cursor;
 use super::create::FileId;
 use crate::proto::error::ProtoResult;
 
-/// SMB2_LOCK_ELEMENT (MS-SMB2 §2.2.26.1) — exactly 24 bytes.
+/// SMB2_LOCK_ELEMENT (MS-SMB2 §2.2.26.1) - exactly 24 bytes.
 #[binrw]
 #[brw(little)]
 #[derive(Debug, Clone, PartialEq, Eq)]

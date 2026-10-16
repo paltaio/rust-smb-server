@@ -23,10 +23,8 @@ use crate::utils::{fill_random, now_filetime};
 // matching SMB3 signing keys.
 pub(crate) const NEGOTIATE_SECURITY_MODE: u16 = 0x0001;
 
-const CAP_DFS: u32 = 0x0000_0001;
-const CAP_LEASING: u32 = 0x0000_0002;
 const CAP_LARGE_MTU: u32 = 0x0000_0004;
-pub(crate) const NEGOTIATE_CAPABILITIES: u32 = CAP_DFS | CAP_LEASING | CAP_LARGE_MTU;
+pub(crate) const NEGOTIATE_CAPABILITIES: u32 = CAP_LARGE_MTU;
 
 pub async fn handle(
     server: &Arc<ServerState>,
@@ -79,7 +77,10 @@ pub async fn handle(
     if dialect == Dialect::Smb311 {
         // PREAUTH_INTEGRITY_CAPABILITIES
         let mut salt = [0u8; 32];
-        fill_random(&mut salt);
+        if let Err(e) = fill_random(&mut salt) {
+            tracing::error!(error = %e, "OS RNG failed; cannot generate preauth salt");
+            return HandlerResponse::err(ntstatus::STATUS_INTERNAL_ERROR);
+        }
         let preauth_caps = PreauthIntegrityCapabilities {
             hash_algorithm_count: 1,
             salt_length: 32,
@@ -99,7 +100,7 @@ pub async fn handle(
             data: preauth_data,
         };
 
-        // SIGNING_CAPABILITIES — advertise AES-CMAC.
+        // SIGNING_CAPABILITIES: advertise AES-CMAC.
         let signing_caps = SigningCapabilities {
             signing_algorithm_count: 1,
             signing_algorithms: vec![SigningCapabilities::ALGORITHM_AES_CMAC],
@@ -132,7 +133,7 @@ pub async fn handle(
 
     let max_read_size = *conn.max_read_size.read().await;
     let max_write_size = *conn.max_write_size.read().await;
-    let max_transact_size = max_read_size; // common practice
+    let max_transact_size = max_read_size;
 
     let resp = NegotiateResponse {
         structure_size: 65,
@@ -175,9 +176,8 @@ pub async fn handle(
 /// Build the SMB2 NEGOTIATE response sent in reply to an SMB1 multi-protocol
 /// NEGOTIATE_REQUEST that listed an SMB2 dialect (MS-SMB2 §3.3.5.3.1).
 ///
-/// We do NOT commit the connection dialect here — the client will follow up
-/// with a real SMB2 NEGOTIATE which goes through [`handle`]. This response
-/// only tells the client "yes, I speak SMB2; send me an SMB2 NEGOTIATE next".
+/// Leaves the connection dialect unset. The client follows up with an SMB2
+/// NEGOTIATE, which goes through [`handle`].
 pub async fn multi_protocol_response(
     server: &Arc<ServerState>,
     conn: &Arc<Connection>,

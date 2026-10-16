@@ -1,4 +1,4 @@
-//! Crate-wide error type for the internal SMB protocol layer.
+//! Error type for the SMB protocol layer.
 
 use thiserror::Error;
 

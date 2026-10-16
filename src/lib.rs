@@ -1,7 +1,6 @@
 //! SMB2/3 file-sharing server with pluggable storage backends.
 //!
-//! See `docs/superpowers/specs/2026-04-27-rust-smb-server-design.md` for the
-//! v1 design. The public API is small on purpose:
+//! Example:
 //!
 //! ```no_run
 //! use smb_server::{SmbServer, Share, Access, ShareBackend};
@@ -31,12 +30,18 @@ mod proto;
 mod server;
 mod utils;
 
-pub use backend::{DirEntry, FileInfo, Handle, OpenIntent, OpenOptions, ShareBackend};
-pub use builder::{Access, Share};
+pub use backend::{
+    BackendCapabilities, DirEntry, FileInfo, FileTimes, Handle, OpenIntent, OpenOptions,
+    ShareBackend,
+};
+pub use builder::{Access, BuildError, Share, SmbServerBuilder};
+pub use bytes::Bytes;
+pub use error::{SmbError, SmbResult};
 #[cfg(feature = "localfs")]
 pub use fs::LocalFsBackend;
+pub use path::SmbPath;
 pub use proto::auth::ntlm::Identity;
-pub use server::{ConfigHandle, ShareMode, ShutdownHandle, SmbServer};
+pub use server::{ConfigError, ConfigHandle, ShareMode, ShutdownHandle, SmbServer};
 
 pub mod wire {
     pub use crate::proto::header;

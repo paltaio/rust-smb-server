@@ -88,14 +88,14 @@ pub async fn handle(
             }
         }
         InfoType::FileSystem => {
-            // For FS info we use the open's tree's backend for context.
+            // Filesystem info is fixed apart from the volume creation time.
             let creation_time = info_res.as_ref().map(|i| i.creation_time).unwrap_or(0);
             match req.file_information_class {
                 ic::FS_VOLUME_INFORMATION => {
                     ic::encode_fs_volume_information(creation_time, 0xCAFE_BABE, "smb-server")
                 }
                 ic::FS_SIZE_INFORMATION => {
-                    // 1 PiB free pseudo-volume, 4 KiB cluster.
+                    // Fixed 4 PiB volume, 2 PiB free, 4 KiB clusters.
                     ic::encode_fs_size_information(
                         1u64 << 40, // total
                         1u64 << 39, // free
@@ -106,17 +106,25 @@ pub async fn handle(
                 ic::FS_DEVICE_INFORMATION => {
                     ic::encode_fs_device_information(FILE_DEVICE_DISK, FILE_REMOTE_DEVICE)
                 }
-                ic::FS_ATTRIBUTE_INFORMATION => ic::encode_fs_attribute_information(
-                    FILE_CASE_SENSITIVE_SEARCH
-                        | FILE_CASE_PRESERVED_NAMES
-                        | FILE_UNICODE_ON_DISK
-                        | FILE_PERSISTENT_ACLS
-                        | FILE_FILE_COMPRESSION
-                        | FILE_SUPPORTS_HARD_LINKS
-                        | FILE_SUPPORTS_EXTENDED_ATTRIBUTES,
-                    255,
-                    "NTFS",
-                ),
+                ic::FS_ATTRIBUTE_INFORMATION => {
+                    let caps = tree_arc.read().await.share.backend.capabilities();
+                    let case_sensitive = if caps.case_sensitive {
+                        FILE_CASE_SENSITIVE_SEARCH
+                    } else {
+                        0
+                    };
+                    ic::encode_fs_attribute_information(
+                        case_sensitive
+                            | FILE_CASE_PRESERVED_NAMES
+                            | FILE_UNICODE_ON_DISK
+                            | FILE_PERSISTENT_ACLS
+                            | FILE_FILE_COMPRESSION
+                            | FILE_SUPPORTS_HARD_LINKS
+                            | FILE_SUPPORTS_EXTENDED_ATTRIBUTES,
+                        255,
+                        "NTFS",
+                    )
+                }
                 ic::FS_FULL_SIZE_INFORMATION => {
                     ic::encode_fs_full_size_information(1u64 << 40, 1u64 << 39, 1u64 << 39, 1, 4096)
                 }

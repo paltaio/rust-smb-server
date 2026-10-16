@@ -58,7 +58,7 @@ pub async fn handle(
             let access = u64::from_le_bytes(buffer[8..16].try_into().unwrap());
             let write = u64::from_le_bytes(buffer[16..24].try_into().unwrap());
             let change = u64::from_le_bytes(buffer[24..32].try_into().unwrap());
-            // 0 means "do not change", -1 (u64::MAX) means "do not change" too per spec.
+            // 0 and -1 (u64::MAX) both leave the timestamp unchanged (MS-FSCC §2.4.7).
             let to_some = |v: u64| {
                 if v == 0 || v == u64::MAX {
                     None

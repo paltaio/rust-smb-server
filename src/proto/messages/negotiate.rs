@@ -10,7 +10,7 @@ use crate::proto::error::ProtoResult;
 // Dialect
 // ---------------------------------------------------------------------------
 
-/// SMB2 dialect revision codes (MS-SMB2 §2.2.3 — DialectRevision).
+/// SMB2 dialect revision codes (MS-SMB2 §2.2.3 - DialectRevision).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u16)]
 pub enum Dialect {
@@ -19,8 +19,8 @@ pub enum Dialect {
     Smb300 = 0x0300,
     Smb302 = 0x0302,
     Smb311 = 0x0311,
-    /// Sent by SMB 2.0.2/2.1 clients via SMB1 negotiate; we accept it as a
-    /// signal to multi-protocol-negotiate. Value 0x02FF.
+    /// "SMB 2.???" wildcard (0x02FF), returned in reply to an SMB1 NEGOTIATE
+    /// that offers it.
     Smb2Wildcard = 0x02FF,
 }
 
@@ -52,12 +52,9 @@ impl Dialect {
 /// the trailing `negotiate_context_list` carries variable-length contexts at
 /// `negotiate_context_offset`.
 ///
-/// Note on parsing: we deliberately don't try to read `negotiate_context_list`
-/// here automatically, because its position is given by an absolute offset
-/// from the *start of the SMB2 header*, not from the start of this body.
-/// The server crate decodes this body, then if `dialects` includes 3.1.1 it
-/// resolves `negotiate_context_offset` against the original packet buffer
-/// and parses the contexts via [`NegotiateContext::parse_list`].
+/// `negotiate_context_list` is not read here: its offset is relative to the
+/// *start of the SMB2 header*, not to this body. Resolve it against the full
+/// packet and decode the contexts with [`NegotiateContext::parse_list`].
 #[binrw]
 #[brw(little)]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,12 +91,11 @@ impl NegotiateRequest {
 ///
 /// The trailing `security_buffer` and (3.1.1) `negotiate_context_list` are
 /// referenced by absolute offsets from the start of the SMB2 header. This
-/// struct encodes the *fixed* portion plus a `security_buffer` that we treat
-/// as a length-counted blob immediately following the fixed portion (the
-/// common server layout). For 3.1.1 contexts, the server crate writes the
-/// fixed portion via [`NegotiateResponse::write_to`], then appends 8-byte-
-/// aligned negotiate contexts and patches `negotiate_context_offset` to the
-/// post-padding offset.
+/// struct holds the *fixed* portion and a `security_buffer` read immediately
+/// after it. For 3.1.1, set `negotiate_context_offset_or_reserved2` to the
+/// 8-aligned offset after the security buffer, write this struct with
+/// [`NegotiateResponse::write_to`], then pad and append the
+/// [`NegotiateContext::encode_list`] output.
 #[binrw]
 #[brw(little)]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,7 +137,7 @@ impl NegotiateResponse {
 // Negotiate contexts (SMB 3.1.1)
 // ---------------------------------------------------------------------------
 
-/// MS-SMB2 §2.2.3.1 / §2.2.4.x — NEGOTIATE_CONTEXT generic header.
+/// MS-SMB2 §2.2.3.1 / §2.2.4.x - NEGOTIATE_CONTEXT generic header.
 ///
 /// Contexts are 8-byte-aligned in the chain (the trailing padding is between
 /// contexts; see §2.2.3.1 "Each NEGOTIATE_CONTEXT MUST be 8-byte aligned").
@@ -209,21 +205,6 @@ impl NegotiateContext {
         }
         Ok(())
     }
-}
-
-/// Parsed payload of a known [`NegotiateContext`] type. Convenience wrapper —
-/// the wire form is always [`NegotiateContext`]; this enum is for callers who
-/// prefer typed access.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum NegotiateContextData {
-    PreauthIntegrity(PreauthIntegrityCapabilities),
-    Encryption(EncryptionCapabilities),
-    Signing(SigningCapabilities),
-    /// Unknown / unhandled context — preserve raw bytes for round-tripping.
-    Other {
-        context_type: u16,
-        data: Vec<u8>,
-    },
 }
 
 /// MS-SMB2 §2.2.3.1.1 / §2.2.4.1 SMB2_PREAUTH_INTEGRITY_CAPABILITIES.

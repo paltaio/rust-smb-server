@@ -12,9 +12,9 @@ pub struct FlushRequest {
     pub structure_size: u16,
     pub reserved1: u16,
     pub reserved2: u32,
-    /// Volatile portion of the FileId.
-    pub file_id_persistent: u64,
     /// Persistent portion of the FileId.
+    pub file_id_persistent: u64,
+    /// Volatile portion of the FileId.
     pub file_id_volatile: u64,
 }
 

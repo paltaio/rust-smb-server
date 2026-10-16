@@ -8,18 +8,17 @@ use crate::proto::error::ProtoResult;
 
 /// File-system control codes we recognize at the wire layer.
 ///
-/// MS-FSCC catalogues the FSCTL codes; we only enumerate the ones referenced
-/// in the spec for v1. Unknown codes round-trip via [`Fsctl::Other`].
+/// MS-FSCC lists the full set. Unknown codes round-trip via [`Fsctl::Other`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fsctl {
-    /// `FSCTL_VALIDATE_NEGOTIATE_INFO` — required handler in v1.
+    /// `FSCTL_VALIDATE_NEGOTIATE_INFO`.
     ValidateNegotiateInfo,
     /// `FSCTL_DFS_GET_REFERRALS`.
     DfsGetReferrals,
     /// `FSCTL_DFS_GET_REFERRALS_EX`.
     DfsGetReferralsEx,
     /// `FSCTL_PIPE_TRANSCEIVE`.
-    PipeTranscede,
+    PipeTransceive,
     /// `FSCTL_PIPE_PEEK`.
     PipePeek,
     /// `FSCTL_PIPE_WAIT`.
@@ -47,7 +46,7 @@ impl Fsctl {
             Self::VALIDATE_NEGOTIATE_INFO => Self::ValidateNegotiateInfo,
             Self::DFS_GET_REFERRALS => Self::DfsGetReferrals,
             Self::DFS_GET_REFERRALS_EX => Self::DfsGetReferralsEx,
-            Self::PIPE_TRANSCEIVE => Self::PipeTranscede,
+            Self::PIPE_TRANSCEIVE => Self::PipeTransceive,
             Self::PIPE_PEEK => Self::PipePeek,
             Self::PIPE_WAIT => Self::PipeWait,
             Self::LMR_REQUEST_RESILIENCY => Self::LmrRequestResiliency,
@@ -61,7 +60,7 @@ impl Fsctl {
             Self::ValidateNegotiateInfo => Self::VALIDATE_NEGOTIATE_INFO,
             Self::DfsGetReferrals => Self::DFS_GET_REFERRALS,
             Self::DfsGetReferralsEx => Self::DFS_GET_REFERRALS_EX,
-            Self::PipeTranscede => Self::PIPE_TRANSCEIVE,
+            Self::PipeTransceive => Self::PIPE_TRANSCEIVE,
             Self::PipePeek => Self::PIPE_PEEK,
             Self::PipeWait => Self::PIPE_WAIT,
             Self::LmrRequestResiliency => Self::LMR_REQUEST_RESILIENCY,
@@ -74,9 +73,7 @@ impl Fsctl {
 /// SMB2_IOCTL_REQUEST (MS-SMB2 §2.2.31).
 ///
 /// `input_offset` and `output_offset` are absolute (from the start of the
-/// SMB2 header). We model the input buffer immediately following the fixed
-/// prefix; the output buffer area is unused on requests but kept for round
-/// tripping and extension scenarios.
+/// SMB2 header). `input` is read immediately after the fixed prefix.
 #[binrw]
 #[brw(little)]
 #[derive(Debug, Clone, PartialEq, Eq)]

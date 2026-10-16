@@ -2,11 +2,10 @@
 //!
 //! Defaults:
 //! - listen on `0.0.0.0:4445` (override with `SMB_LISTEN`),
-//! - share root rooted under `$TMPDIR/smb-example` (override with `SMB_ROOT`),
+//! - share root at `smb-example` in the system temp directory (override with
+//!   `SMB_ROOT`),
 //! - three shares: `public` (anonymous read+write), `media` (anonymous
 //!   read-only), `home` (alice = read+write, bob = read).
-//!
-//! See `docs/SMOKE.md` for cross-client mount instructions.
 
 use std::path::PathBuf;
 

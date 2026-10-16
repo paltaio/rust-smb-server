@@ -1,5 +1,6 @@
-//! IOCTL handler — handles FSCTL_VALIDATE_NEGOTIATE_INFO; everything else
-//! returns NOT_SUPPORTED.
+//! IOCTL handler: answers FSCTL_VALIDATE_NEGOTIATE_INFO, returns
+//! STATUS_FS_DRIVER_REQUIRED for DFS referrals and STATUS_NOT_SUPPORTED for
+//! the rest.
 
 use std::sync::Arc;
 

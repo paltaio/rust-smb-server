@@ -1,5 +1,5 @@
-//! Per-connection writer task: serializes responses, applies signing, and
-//! frames the bytes onto the wire.
+//! Per-connection writer task: adds the transport length prefix and writes
+//! responses to the socket.
 
 use crate::proto::framing::encode_frame;
 use tokio::io::{AsyncWriteExt, WriteHalf};
@@ -11,8 +11,7 @@ use tracing::{debug, error};
 /// body, *with signing already applied if required*.
 pub type FramePayload = Vec<u8>;
 
-/// Writer-task channel size: large enough that a slow remote rarely backs up
-/// the dispatcher.
+/// Capacity of the reader-to-writer channel.
 pub const WRITER_CHANNEL: usize = 64;
 
 pub async fn writer_task(mut writer: WriteHalf<TcpStream>, mut rx: mpsc::Receiver<FramePayload>) {
@@ -25,7 +24,7 @@ pub async fn writer_task(mut writer: WriteHalf<TcpStream>, mut rx: mpsc::Receive
         }
         debug!(len = out.len(), "wrote frame");
     }
-    // Channel closed — flush and bail.
+    // Channel closed: flush and bail.
     if let Err(e) = writer.shutdown().await {
         debug!(error = %e, "writer shutdown error (best-effort)");
     }

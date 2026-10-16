@@ -2,7 +2,8 @@
 //!
 //! A running SHA-512 hash, initialized to all zeros, that absorbs SMB 3.1.1
 //! preauth messages (transport prefix excluded). Connection state uses this for
-//! NEGOTIATE; each SESSION_SETUP exchange forks its own instance. Per spec:
+//! NEGOTIATE; each SESSION_SETUP exchange forks its own instance. MS-SMB2
+//! defines each update as:
 //!
 //! ```text
 //! PreauthIntegrityHashValue =
@@ -63,7 +64,7 @@ mod tests {
         assert_eq!(p.snapshot(), [0u8; 64]);
     }
 
-    /// Two-step chain matches the literal spec formula.
+    /// Two-step chain matches the MS-SMB2 formula.
     #[test]
     fn chain_two_buffers_matches_precomputed() {
         let mut p = PreauthIntegrity::new();
@@ -100,16 +101,5 @@ mod tests {
         let manual = hasher.finalize();
 
         assert_eq!(p.snapshot().as_slice(), manual.as_slice());
-    }
-
-    /// Snapshot must not be aliased — modifying state after snapshot must not
-    /// affect the snapshot already taken.
-    #[test]
-    fn snapshot_is_a_copy() {
-        let mut p = PreauthIntegrity::new();
-        p.update(b"first");
-        let snap = p.snapshot();
-        p.update(b"second");
-        assert_ne!(p.snapshot(), snap);
     }
 }

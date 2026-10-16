@@ -1,10 +1,7 @@
-//! Cross-stack integration test: drive a real `SmbServer` backed by
-//! `LocalFsBackend` over a TCP loopback through the full
-//! NEGOTIATE → SESSION_SETUP (anonymous) → TREE_CONNECT → CREATE → READ →
-//! CLOSE → TREE_DISCONNECT → LOGOFF flow.
-//!
-//! Hand-crafts the request bytes since the workspace does not depend on an SMB
-//! client crate.
+//! Drives `SmbServer` with `LocalFsBackend` over TCP loopback: NEGOTIATE,
+//! anonymous SESSION_SETUP, TREE_CONNECT, a related CREATE + QUERY_INFO + CLOSE
+//! compound, QUERY_INFO (EA and filesystem attributes), QUERY_DIRECTORY,
+//! CREATE, READ, CLOSE, TREE_DISCONNECT and LOGOFF.
 
 mod common;
 
@@ -20,23 +17,49 @@ use smb_server::wire::messages::{
     LogoffResponse, QueryDirectoryRequest, QueryDirectoryResponse, QueryInfoRequest,
     QueryInfoResponse, ReadRequest, ReadResponse, TreeDisconnectRequest, TreeDisconnectResponse,
 };
-use smb_server::{Share, SmbServer};
+use smb_server::{
+    BackendCapabilities, Handle, OpenOptions, Share, ShareBackend, SmbPath, SmbResult, SmbServer,
+};
 use tempfile::tempdir;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
+/// `LocalFsBackend` that reports case-insensitive names.
+struct CaseInsensitive(LocalFsBackend);
+
+#[async_trait::async_trait]
+impl ShareBackend for CaseInsensitive {
+    async fn open(&self, path: &SmbPath, opts: OpenOptions) -> SmbResult<Box<dyn Handle>> {
+        self.0.open(path, opts).await
+    }
+
+    async fn unlink(&self, path: &SmbPath) -> SmbResult<()> {
+        self.0.unlink(path).await
+    }
+
+    async fn rename(&self, from: &SmbPath, to: &SmbPath) -> SmbResult<()> {
+        self.0.rename(from, to).await
+    }
+
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities {
+            case_sensitive: false,
+            ..self.0.capabilities()
+        }
+    }
+}
+
 #[tokio::test]
 async fn end_to_end_anon_read_localfs() {
-    // 1. Pre-populate a temp dir: one file with known contents + one empty subdir.
+    // hello.txt with known contents and an empty subdirectory.
     let td = tempdir().expect("tempdir");
     std::fs::write(td.path().join("hello.txt"), b"hi").expect("write hello.txt");
     std::fs::create_dir(td.path().join("sub")).expect("mkdir sub");
 
-    // 2. Stand up an `SmbServer` with a single anonymous share over LocalFsBackend.
     let backend = LocalFsBackend::new(td.path()).expect("open root");
     let server = SmbServer::builder()
         .listen("127.0.0.1:0".parse().unwrap())
-        .share(Share::new("share", backend).public())
+        .share(Share::new("share", CaseInsensitive(backend)).public())
         .netbios_name("TESTSERVER")
         .build()
         .expect("build");
@@ -175,7 +198,7 @@ async fn end_to_end_anon_read_localfs() {
         "root is a directory"
     );
 
-    // ---- QUERY_INFO FileFullEaInformation returns no-EA, not invalid -----
+    // ---- QUERY_INFO FileFullEaInformation -> STATUS_NO_EAS_ON_FILE ------
     let ea_req = QueryInfoRequest {
         structure_size: 41,
         info_type: InfoType::File as u8,
@@ -198,6 +221,36 @@ async fn end_to_end_anon_read_localfs() {
     assert_eq!(rh.command, Command::QueryInfo);
     assert_eq!(rh.channel_sequence_status, 0xC000_0052);
 
+    // ---- QUERY_INFO FileFsAttributeInformation ---------------------------
+    let fs_req = QueryInfoRequest {
+        structure_size: 41,
+        info_type: InfoType::FileSystem as u8,
+        file_information_class: 0x05,
+        output_buffer_length: 4096,
+        input_buffer_offset: 0,
+        reserved: 0,
+        input_buffer_length: 0,
+        additional_information: 0,
+        flags: 0,
+        file_id: root_dir_id,
+        input_buffer: vec![],
+    };
+    let mut body = Vec::new();
+    fs_req.write_to(&mut body).expect("write");
+    let hdr = build_header(Command::QueryInfo, 9, session_id, tree_id);
+    write_frame(&mut s, &hdr, &body).await;
+    let resp = read_frame(&mut s).await;
+    let (rh, rb) = parse_response_header(&resp);
+    assert_eq!(rh.command, Command::QueryInfo);
+    assert_eq!(rh.channel_sequence_status, STATUS_SUCCESS);
+    let fs_resp = QueryInfoResponse::parse(rb).expect("parse fs attribute resp");
+    let fs_attrs = u32::from_le_bytes(fs_resp.buffer[0..4].try_into().unwrap());
+    assert_eq!(
+        fs_attrs & 0x1,
+        0,
+        "FILE_CASE_SENSITIVE_SEARCH follows the backend"
+    );
+
     // ---- QUERY_DIRECTORY FileIdBothDirectoryInformation ------------------
     let pat = utf16le("*");
     let qd_req = QueryDirectoryRequest {
@@ -213,7 +266,7 @@ async fn end_to_end_anon_read_localfs() {
     };
     let mut body = Vec::new();
     qd_req.write_to(&mut body).expect("write");
-    let hdr = build_header(Command::QueryDirectory, 9, session_id, tree_id);
+    let hdr = build_header(Command::QueryDirectory, 10, session_id, tree_id);
     write_frame(&mut s, &hdr, &body).await;
     let resp = read_frame(&mut s).await;
     let (rh, rb) = parse_response_header(&resp);
@@ -234,7 +287,7 @@ async fn end_to_end_anon_read_localfs() {
     };
     let mut body = Vec::new();
     cl_root_req.write_to(&mut body).expect("write");
-    let hdr = build_header(Command::Close, 10, session_id, tree_id);
+    let hdr = build_header(Command::Close, 11, session_id, tree_id);
     write_frame(&mut s, &hdr, &body).await;
     let resp = read_frame(&mut s).await;
     let (rh, rb) = parse_response_header(&resp);
@@ -265,7 +318,7 @@ async fn end_to_end_anon_read_localfs() {
     };
     let mut body = Vec::new();
     cr_req.write_to(&mut body).expect("write");
-    let hdr = build_header(Command::Create, 11, session_id, tree_id);
+    let hdr = build_header(Command::Create, 12, session_id, tree_id);
     write_frame(&mut s, &hdr, &body).await;
     let resp = read_frame(&mut s).await;
     let (rh, rb) = parse_response_header(&resp);
@@ -295,7 +348,7 @@ async fn end_to_end_anon_read_localfs() {
     };
     let mut body = Vec::new();
     rd_req.write_to(&mut body).expect("write");
-    let hdr = build_header(Command::Read, 12, session_id, tree_id);
+    let hdr = build_header(Command::Read, 13, session_id, tree_id);
     write_frame(&mut s, &hdr, &body).await;
     let resp = read_frame(&mut s).await;
     let (rh, rb) = parse_response_header(&resp);
@@ -313,7 +366,7 @@ async fn end_to_end_anon_read_localfs() {
     };
     let mut body = Vec::new();
     cl_req.write_to(&mut body).expect("write");
-    let hdr = build_header(Command::Close, 13, session_id, tree_id);
+    let hdr = build_header(Command::Close, 14, session_id, tree_id);
     write_frame(&mut s, &hdr, &body).await;
     let resp = read_frame(&mut s).await;
     let (rh, rb) = parse_response_header(&resp);
@@ -325,7 +378,7 @@ async fn end_to_end_anon_read_localfs() {
     let td_req = TreeDisconnectRequest::default();
     let mut body = Vec::new();
     td_req.write_to(&mut body).expect("write");
-    let hdr = build_header(Command::TreeDisconnect, 14, session_id, tree_id);
+    let hdr = build_header(Command::TreeDisconnect, 15, session_id, tree_id);
     write_frame(&mut s, &hdr, &body).await;
     let resp = read_frame(&mut s).await;
     let (rh, rb) = parse_response_header(&resp);
@@ -337,7 +390,7 @@ async fn end_to_end_anon_read_localfs() {
     let lo_req = LogoffRequest::default();
     let mut body = Vec::new();
     lo_req.write_to(&mut body).expect("write");
-    let hdr = build_header(Command::Logoff, 15, session_id, 0);
+    let hdr = build_header(Command::Logoff, 16, session_id, 0);
     write_frame(&mut s, &hdr, &body).await;
     let resp = read_frame(&mut s).await;
     let (rh, rb) = parse_response_header(&resp);

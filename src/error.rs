@@ -1,4 +1,4 @@
-//! Public error type for the server, plus the NTSTATUS mapping per spec §8.
+//! Backend error type and its NTSTATUS mapping.
 
 use thiserror::Error;
 
@@ -8,9 +8,9 @@ pub type SmbResult<T> = Result<T, SmbError>;
 
 /// Errors returned by `ShareBackend` and surfaced through the SMB protocol.
 ///
-/// `to_nt_status` maps each variant onto a single NTSTATUS code per the spec
-/// §8 table. Internal protocol-layer failures (malformed frames, signing
-/// errors) never become `SmbError`; the connection loop logs them and aborts.
+/// `to_nt_status` maps each variant to one NTSTATUS code. Protocol-layer
+/// failures (malformed frames, bad signatures) are handled by the dispatcher
+/// and never become `SmbError`.
 #[derive(Debug, Error)]
 pub enum SmbError {
     #[error("not found")]
@@ -38,7 +38,7 @@ pub enum SmbError {
 }
 
 impl SmbError {
-    /// Map this error onto an NTSTATUS code per the v1 spec §8 table.
+    /// NTSTATUS code for this error.
     pub fn to_nt_status(&self) -> u32 {
         match self {
             SmbError::NotFound => ntstatus::STATUS_OBJECT_NAME_NOT_FOUND,
@@ -61,7 +61,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn nt_status_table_matches_spec() {
+    fn maps_each_variant_to_nt_status() {
         assert_eq!(SmbError::NotFound.to_nt_status(), 0xC000_000F);
         assert_eq!(SmbError::PathNotFound.to_nt_status(), 0xC000_003A);
         assert_eq!(SmbError::AccessDenied.to_nt_status(), 0xC000_0022);

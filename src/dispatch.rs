@@ -20,7 +20,7 @@ use crate::server::ServerState;
 /// to set in the header. The dispatcher patches the header, applies signing
 /// (if required), and ships the bytes.
 pub struct HandlerResponse {
-    /// Bytes after the SMB2 header — the body. The handler owns body
+    /// Bytes after the SMB2 header - the body. The handler owns body
     /// construction.
     pub body: Vec<u8>,
     /// NTSTATUS for the response header.
@@ -314,7 +314,7 @@ async fn dispatch_one(
             return Some(build_response_bytes(conn, &req_hdr, HandlerResponse::err(status)).await);
         }
 
-        // CANCEL is fire-and-forget — no response.
+        // CANCEL is fire-and-forget - no response.
         if cmd == Command::Cancel {
             debug!("CANCEL received; no response");
             return None;
@@ -347,7 +347,7 @@ async fn dispatch_one(
                 .as_ref()
                 .expect("SMB 3.1.1 SessionSetup snapshot requires per-session preauth")
                 .snapshot();
-            // Stash on the session — the handler already created it.
+            // Stash on the session - the handler already created it.
             let sessions = conn.sessions.read().await;
             if let Some(sess_arc) = sessions.get(&sid) {
                 let mut sess = sess_arc.write().await;
@@ -522,12 +522,12 @@ async fn build_response_bytes(
 /// Detect and answer an SMB1 multi-protocol NEGOTIATE_REQUEST.
 ///
 /// SMB1 frame layout for the request we accept:
-/// * `[0..4]`  — magic `0xFF 'S' 'M' 'B'`
-/// * `[4]`     — command (0x72 = SMB_COM_NEGOTIATE)
-/// * `[5..32]` — rest of SMB1 header (status, flags, pid, tid, mid …)
-/// * `[32]`    — `WordCount` (0 for NEGOTIATE)
-/// * `[33..35]`— `ByteCount` (u16 LE)
-/// * `[35..]`  — dialect strings, each `0x02 <ASCII> 0x00`.
+/// * `[0..4]`  - magic `0xFF 'S' 'M' 'B'`
+/// * `[4]`     - command (0x72 = SMB_COM_NEGOTIATE)
+/// * `[5..32]` - rest of SMB1 header (status, flags, pid, tid, mid ...)
+/// * `[32]`    - `WordCount` (0 for NEGOTIATE)
+/// * `[33..35]` - `ByteCount` (u16 LE)
+/// * `[35..]`  - dialect strings, each `0x02 <ASCII> 0x00`.
 ///
 /// Returns `Some(reply_bytes)` only for a SMB1 NEGOTIATE that lists at least
 /// one SMB2 dialect we recognise; otherwise `None` so the caller can fall

@@ -1,4 +1,4 @@
-//! `ShareBackend` and `Handle` traits — the storage abstraction.
+//! `ShareBackend` and `Handle` traits: the storage abstraction.
 //!
 //! Implementors of these traits plug into `Share::new(name, backend)`. The
 //! protocol layer never exposes raw FS types to backends; everything goes
@@ -14,23 +14,22 @@ use crate::path::SmbPath;
 // OpenOptions
 // ---------------------------------------------------------------------------
 
-/// Translated SMB CREATE intent — the small set of cases v1 cares about.
+/// SMB CREATE disposition as seen by a backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenIntent {
-    /// `FILE_OPEN` — open existing only; fail if missing.
+    /// `FILE_OPEN`: open existing only; fail if missing.
     Open,
-    /// `FILE_CREATE` — create new only; fail if exists.
+    /// `FILE_CREATE`: create new only; fail if exists.
     Create,
-    /// `FILE_OPEN_IF` — open existing or create new.
+    /// `FILE_OPEN_IF`: open existing or create new.
     OpenOrCreate,
-    /// `FILE_OVERWRITE_IF` — open existing (truncating) or create new.
+    /// `FILE_OVERWRITE_IF`: open existing (truncating) or create new.
     OverwriteOrCreate,
-    /// `FILE_OVERWRITE` — open existing and truncate; fail if missing.
+    /// `FILE_OVERWRITE`: open existing and truncate; fail if missing.
     Truncate,
 }
 
-/// Options passed to `ShareBackend::open`. v1 keeps this tight on purpose;
-/// extra knobs become methods later if a backend genuinely needs them.
+/// Options passed to `ShareBackend::open`.
 #[derive(Debug, Clone, Copy)]
 pub struct OpenOptions {
     /// Read access requested.
@@ -39,9 +38,9 @@ pub struct OpenOptions {
     pub write: bool,
     /// CREATE disposition.
     pub intent: OpenIntent,
-    /// `FILE_DIRECTORY_FILE` was set on CREATE — open or create a directory.
+    /// `FILE_DIRECTORY_FILE` was set on CREATE: open or create a directory.
     pub directory: bool,
-    /// `FILE_NON_DIRECTORY_FILE` was set on CREATE — fail if the target is a directory.
+    /// `FILE_NON_DIRECTORY_FILE` was set on CREATE: fail if the target is a directory.
     pub non_directory: bool,
     /// `FILE_DELETE_ON_CLOSE` was set on CREATE.
     pub delete_on_close: bool,
@@ -72,8 +71,8 @@ pub struct FileInfo {
     pub name: String,
     /// File size in bytes.
     pub end_of_file: u64,
-    /// Allocation size — typically `end_of_file` rounded up to a cluster size.
-    /// v1 backends may safely return the same value as `end_of_file`.
+    /// Allocation size, usually `end_of_file` rounded up to a cluster.
+    /// Backends may return `end_of_file`.
     pub allocation_size: u64,
     /// FILETIME (100ns ticks since 1601).
     pub creation_time: u64,
@@ -82,15 +81,15 @@ pub struct FileInfo {
     pub change_time: u64,
     /// True if this is a directory.
     pub is_directory: bool,
-    /// Optional 64-bit unique file id (for `FileInternalInformation`). v1 may
-    /// return `0` if unavailable; the dispatcher will substitute the FileId.
+    /// File id reported in QUERY_DIRECTORY entries. `0` if the backend has
+    /// none.
     pub file_index: u64,
 }
 
 impl FileInfo {
-    /// SMB2 file attributes (MS-FSCC §2.6) for this file. v1 returns
-    /// `FILE_ATTRIBUTE_DIRECTORY` for dirs, `FILE_ATTRIBUTE_NORMAL` (0x80) for
-    /// regular files. (`FILE_ATTRIBUTE_NORMAL` MUST be the only attribute set
+    /// SMB2 file attributes (MS-FSCC §2.6) for this file:
+    /// `FILE_ATTRIBUTE_DIRECTORY` for directories, `FILE_ATTRIBUTE_NORMAL`
+    /// (0x80) for regular files. (`FILE_ATTRIBUTE_NORMAL` MUST be the only attribute set
     /// when used.)
     pub fn attributes(&self) -> u32 {
         const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
@@ -119,8 +118,7 @@ pub struct FileTimes {
 }
 
 impl FileTimes {
-    /// Convenience: convert `SystemTime` into a `FileTimes` setting all four
-    /// fields to the same instant.
+    /// `FileTimes` with all four fields set to `t`.
     pub fn all(t: SystemTime) -> Self {
         let ft = crate::utils::system_time_to_filetime(t);
         Self {
@@ -137,8 +135,6 @@ impl FileTimes {
 // ---------------------------------------------------------------------------
 
 /// Static, advertised capabilities of a backend.
-///
-/// Kept small intentionally — extending requires discussing with the maintainer.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct BackendCapabilities {
     /// If true, all write-class operations are denied at the protocol layer
@@ -161,15 +157,14 @@ pub trait ShareBackend: Send + Sync + 'static {
     /// Open or create a file or directory. Returns a fresh handle.
     async fn open(&self, path: &SmbPath, opts: OpenOptions) -> SmbResult<Box<dyn Handle>>;
 
-    /// Unlink (delete) a file. Directories: must be empty. v1 does not
-    /// recursively delete.
+    /// Delete a file or an empty directory.
     async fn unlink(&self, path: &SmbPath) -> SmbResult<()>;
 
     /// Rename `from` to `to`. The backend must reject if `to` already exists.
     async fn rename(&self, from: &SmbPath, to: &SmbPath) -> SmbResult<()>;
 
-    /// Static capabilities. The dispatcher consults these at TREE_CONNECT and
-    /// uses `is_read_only` to clamp authz.
+    /// Static capabilities. TREE_CONNECT clamps access to read-only when
+    /// `is_read_only` is set.
     fn capabilities(&self) -> BackendCapabilities;
 }
 
@@ -204,18 +199,17 @@ pub trait Handle: Send + Sync {
     /// layer rejects this before reaching the backend.
     async fn truncate(&self, len: u64) -> SmbResult<()>;
 
-    /// List directory entries matching the optional pattern. v1 ignores
-    /// `pattern` if the backend doesn't implement matching — the dispatcher
-    /// post-filters as needed for QUERY_DIRECTORY.
+    /// List directory entries matching the optional DOS pattern (`*`, `?`).
+    /// QUERY_DIRECTORY returns the result as is, so the backend applies the
+    /// pattern.
     async fn list_dir(&self, pattern: Option<&str>) -> SmbResult<Vec<DirEntry>>;
 
     /// Close the handle. Boxed self lets implementors consume internal state.
     async fn close(self: Box<Self>) -> SmbResult<()>;
 }
 
-/// No-op backend used for the synthetic IPC$ share. Every method returns
-/// [`SmbError::NotSupported`]. Exists so we can hand a `ShareBackend`
-/// implementor to the IPC$ tree without any real storage attached.
+/// Backend for the synthetic IPC$ share. Every method returns
+/// [`SmbError::NotSupported`].
 pub(crate) struct NotSupportedBackend;
 
 #[async_trait]

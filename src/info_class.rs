@@ -36,7 +36,7 @@ pub const FILE_ID_BOTH_DIRECTORY_INFORMATION: u8 = 0x25;
 pub const FILE_ID_FULL_DIRECTORY_INFORMATION: u8 = 0x26;
 
 // ---------------------------------------------------------------------------
-// FileBasicInformation (MS-FSCC §2.4.7) — 40 bytes
+// FileBasicInformation (MS-FSCC §2.4.7) - 40 bytes
 // ---------------------------------------------------------------------------
 
 pub fn encode_file_basic_information(info: &FileInfo) -> Vec<u8> {
@@ -51,7 +51,7 @@ pub fn encode_file_basic_information(info: &FileInfo) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
-// FileStandardInformation (MS-FSCC §2.4.41) — 24 bytes
+// FileStandardInformation (MS-FSCC §2.4.41) - 24 bytes
 // ---------------------------------------------------------------------------
 
 pub fn encode_file_standard_information(info: &FileInfo) -> Vec<u8> {
@@ -66,7 +66,7 @@ pub fn encode_file_standard_information(info: &FileInfo) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
-// FileInternalInformation (MS-FSCC §2.4.20) — 8 bytes
+// FileInternalInformation (MS-FSCC §2.4.20) - 8 bytes
 // ---------------------------------------------------------------------------
 
 pub fn encode_file_internal_information(file_index: u64) -> Vec<u8> {
@@ -74,7 +74,7 @@ pub fn encode_file_internal_information(file_index: u64) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
-// FileEaInformation (MS-FSCC §2.4.12) — 4 bytes
+// FileEaInformation (MS-FSCC §2.4.12) - 4 bytes
 // ---------------------------------------------------------------------------
 
 pub fn encode_file_ea_information() -> Vec<u8> {
@@ -82,7 +82,7 @@ pub fn encode_file_ea_information() -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
-// FileAccessInformation (MS-FSCC §2.4.1) — 4 bytes
+// FileAccessInformation (MS-FSCC §2.4.1) - 4 bytes
 // ---------------------------------------------------------------------------
 
 pub fn encode_file_access_information(access_mask: u32) -> Vec<u8> {
@@ -90,7 +90,7 @@ pub fn encode_file_access_information(access_mask: u32) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
-// FilePositionInformation (MS-FSCC §2.4.32) — 8 bytes
+// FilePositionInformation (MS-FSCC §2.4.32) - 8 bytes
 // ---------------------------------------------------------------------------
 
 pub fn encode_file_position_information() -> Vec<u8> {
@@ -98,7 +98,7 @@ pub fn encode_file_position_information() -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
-// FileModeInformation (MS-FSCC §2.4.24) — 4 bytes
+// FileModeInformation (MS-FSCC §2.4.24) - 4 bytes
 // ---------------------------------------------------------------------------
 
 pub fn encode_file_mode_information(mode: u32) -> Vec<u8> {
@@ -106,16 +106,16 @@ pub fn encode_file_mode_information(mode: u32) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
-// FileAlignmentInformation (MS-FSCC §2.4.3) — 4 bytes
+// FileAlignmentInformation (MS-FSCC §2.4.3) - 4 bytes
 // ---------------------------------------------------------------------------
 
 pub fn encode_file_alignment_information() -> Vec<u8> {
-    // FILE_BYTE_ALIGNMENT (0) — no alignment requirement.
+    // FILE_BYTE_ALIGNMENT (0) - no alignment requirement.
     0u32.to_le_bytes().to_vec()
 }
 
 // ---------------------------------------------------------------------------
-// FileNameInformation (MS-FSCC §2.4.27) — 4 bytes + UTF-16LE name
+// FileNameInformation (MS-FSCC §2.4.27) - 4 bytes + UTF-16LE name
 // ---------------------------------------------------------------------------
 
 pub fn encode_file_name_information(name: &str) -> Vec<u8> {
@@ -127,7 +127,7 @@ pub fn encode_file_name_information(name: &str) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
-// FileAllInformation (MS-FSCC §2.4.2) — concatenation of basic, standard,
+// FileAllInformation (MS-FSCC §2.4.2) - concatenation of basic, standard,
 // internal, EA, access, position, mode, alignment, name.
 // ---------------------------------------------------------------------------
 
@@ -152,7 +152,7 @@ pub fn encode_file_all_information(info: &FileInfo, file_index: u64, access_mask
 }
 
 // ---------------------------------------------------------------------------
-// FileNetworkOpenInformation (MS-FSCC §2.4.30) — 56 bytes
+// FileNetworkOpenInformation (MS-FSCC §2.4.30) - 56 bytes
 // ---------------------------------------------------------------------------
 
 pub fn encode_file_network_open_information(info: &FileInfo) -> Vec<u8> {
@@ -169,7 +169,7 @@ pub fn encode_file_network_open_information(info: &FileInfo) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
-// FileStreamInformation (MS-FSCC §2.4.43) — for non-directories, one default
+// FileStreamInformation (MS-FSCC §2.4.43) - for non-directories, one default
 // stream entry (`::$DATA`); for directories, empty buffer.
 // ---------------------------------------------------------------------------
 
@@ -212,7 +212,7 @@ pub fn encode_fs_volume_information(creation_time: u64, serial: u32, label: &str
     out
 }
 
-/// FileFsSizeInformation (MS-FSCC §2.5.7) — 24 bytes.
+/// FileFsSizeInformation (MS-FSCC §2.5.7) - 24 bytes.
 pub fn encode_fs_size_information(
     total_alloc_units: u64,
     avail_alloc_units: u64,
@@ -227,7 +227,7 @@ pub fn encode_fs_size_information(
     out
 }
 
-/// FileFsDeviceInformation (MS-FSCC §2.5.10) — 8 bytes.
+/// FileFsDeviceInformation (MS-FSCC §2.5.10) - 8 bytes.
 pub fn encode_fs_device_information(device_type: u32, characteristics: u32) -> Vec<u8> {
     let mut out = Vec::with_capacity(8);
     out.extend_from_slice(&device_type.to_le_bytes());
@@ -235,7 +235,7 @@ pub fn encode_fs_device_information(device_type: u32, characteristics: u32) -> V
     out
 }
 
-/// FileFsAttributeInformation (MS-FSCC §2.5.1) — variable.
+/// FileFsAttributeInformation (MS-FSCC §2.5.1) - variable.
 pub fn encode_fs_attribute_information(
     attributes: u32,
     max_component_len: u32,
@@ -250,7 +250,7 @@ pub fn encode_fs_attribute_information(
     out
 }
 
-/// FileFsFullSizeInformation (MS-FSCC §2.5.4) — 32 bytes.
+/// FileFsFullSizeInformation (MS-FSCC §2.5.4) - 32 bytes.
 pub fn encode_fs_full_size_information(
     total_alloc_units: u64,
     caller_avail_alloc_units: u64,
@@ -271,11 +271,9 @@ pub fn encode_fs_full_size_information(
 // Minimal SECURITY_DESCRIPTOR with owner=Everyone, DACL=Everyone allowed.
 // ---------------------------------------------------------------------------
 
-/// Build a minimal absolute-form SECURITY_DESCRIPTOR per MS-DTYP §2.4.6.
-///
-/// Owner = Everyone (S-1-1-0). No group. DACL = single Allow ACE granting
-/// `0x001F_01FF` (FILE_ALL_ACCESS) to Everyone. Self-relative format so it
-/// embeds cleanly in the QUERY_INFO buffer.
+/// Self-relative SECURITY_DESCRIPTOR (MS-DTYP §2.4.6): owner Everyone
+/// (S-1-1-0), no group, DACL with one Allow ACE granting `0x001F_01FF`
+/// (FILE_ALL_ACCESS) to Everyone.
 pub fn encode_minimal_security_descriptor() -> Vec<u8> {
     // SID Everyone (S-1-1-0): 1, 1, [0,0,0,0,0,1], [0,0,0,0]
     // Total length: 1 (Revision) + 1 (SubAuthorityCount=1) + 6 (Identifier) + 4 (subauth) = 12
@@ -333,8 +331,8 @@ pub fn encode_minimal_security_descriptor() -> Vec<u8> {
 // Directory information classes (MS-FSCC §2.4.{8,14,17,30,31})
 // ---------------------------------------------------------------------------
 
-/// Encode a single FileBothDirectoryInformation entry. Returns the encoded
-/// bytes. The caller patches `NextEntryOffset` for chained entries.
+/// Encode one directory entry in info class `class`; empty for unsupported
+/// classes. The caller patches `NextEntryOffset` for chained entries.
 pub fn encode_dir_entry(class: u8, entry: &DirEntry, file_index: u64) -> Vec<u8> {
     let info = &entry.info;
     let name_u16 = utf16le(&info.name);

@@ -10,14 +10,13 @@
 //!   +----------------------------------------+
 //! ```
 //!
-//! The top byte is reserved (must be zero in Direct-TCP transport — it is the
+//! The top byte is reserved (must be zero in Direct-TCP transport - it is the
 //! NetBIOS session-message-type byte from RFC 1002 §4.3.1). The remaining 24
 //! bits encode the payload length, so the absolute maximum on the wire is
 //! `2^24 - 1 = 16_777_215` bytes (16 MiB - 1). We enforce that as the cap.
 //!
-//! This module is async-runtime-agnostic. Only sync helpers operating on byte
-//! slices and `Vec<u8>` live here; the server crate wraps these with tokio
-//! I/O.
+//! The helpers here are sync and work on byte slices; the connection reader
+//! and writer wrap them with tokio I/O.
 
 use crate::proto::error::{ProtoError, ProtoResult};
 
@@ -26,7 +25,7 @@ pub const FRAME_HEADER_LEN: usize = 4;
 
 /// Maximum payload size representable by the 3-byte length field.
 ///
-/// MS-SMB2 §2.1 — `2^24 - 1 = 16_777_215` bytes.
+/// MS-SMB2 §2.1 - `2^24 - 1 = 16_777_215` bytes.
 pub const MAX_FRAME_PAYLOAD: u32 = 0x00FF_FFFF;
 
 /// Encode a single Direct-TCP frame: 4-byte header + payload.

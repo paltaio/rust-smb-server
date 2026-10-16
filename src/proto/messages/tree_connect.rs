@@ -9,9 +9,7 @@ use crate::proto::error::ProtoResult;
 ///
 /// `path` is UTF-16LE. The wire format gives `PathOffset` (from the start of
 /// the SMB2 header) and `PathLength`; we encode/decode the path immediately
-/// following the fixed prefix. The 3.1.1 tree-connect-context machinery
-/// (extension `flags`, `path_offset`/`path_length` interpretation) is
-/// preserved on the wire and the server crate inspects `flags` if needed.
+/// following the fixed prefix. 3.1.1 tree-connect extensions are not decoded.
 #[binrw]
 #[brw(little)]
 #[derive(Debug, Clone, PartialEq, Eq)]

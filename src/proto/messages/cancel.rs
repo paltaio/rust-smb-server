@@ -1,4 +1,4 @@
-//! CANCEL Request (MS-SMB2 §2.2.30). No response — server cancels in place.
+//! CANCEL Request (MS-SMB2 §2.2.30). CANCEL has no response.
 
 use binrw::{BinRead, BinWrite, binrw};
 use std::io::Cursor;

@@ -1,16 +1,15 @@
-//! `SmbPath` — validated, normalized SMB path used between dispatcher and
+//! `SmbPath`: validated, normalized SMB path used between dispatcher and
 //! backend.
 //!
-//! Construction is exclusively from a `&[u16]` (UTF-16LE-decoded) buffer, per
-//! spec §7. The protocol layer turns wire bytes into `&[u16]`; this module
-//! turns `&[u16]` into a path that backends can blindly trust.
+//! Handlers decode wire names to `&[u16]` and build an `SmbPath` with
+//! `from_utf16`; backends can use it without further checks.
 
 use std::str::FromStr;
 
 use crate::error::{SmbError, SmbResult};
 
 /// A validated, component-list path. No `..`, no Windows-forbidden chars, no
-/// alternate streams. Always relative to the share root — the empty path is
+/// alternate streams. Always relative to the share root; the empty path is
 /// the root.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SmbPath {
@@ -26,9 +25,7 @@ impl SmbPath {
     /// Construct from a UTF-16 code-unit slice (already decoded from UTF-16LE
     /// wire bytes).
     pub fn from_utf16(units: &[u16]) -> SmbResult<Self> {
-        // 1. Convert to UTF-8 lossily — but reject if conversion produced any
-        //    replacement characters that didn't exist in the input. We test
-        //    the round-trip: invalid surrogates are rejected.
+        // 1. Decode strictly; unpaired surrogates are rejected.
         let s = decode_utf16_strict(units)?;
         s.parse()
     }
@@ -60,7 +57,7 @@ impl SmbPath {
         let mut components = Vec::new();
         for raw in trimmed.split(['\\', '/']) {
             if raw.is_empty() {
-                // Doubled separator like `foo\\bar` — reject.
+                // Doubled separator like `foo\\bar`: reject.
                 return Err(SmbError::NameInvalid);
             }
             if raw == "." {
@@ -103,7 +100,7 @@ impl SmbPath {
         self.components.last().map(|s| s.as_str())
     }
 
-    /// Append a single, already-validated last component to this path.
+    /// Validate `last` and append its components to this path.
     pub fn join(&self, last: &str) -> SmbResult<SmbPath> {
         // Run `last` through the same validator (treating it as a single-
         // component path).

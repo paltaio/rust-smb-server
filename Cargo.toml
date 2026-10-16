@@ -1,6 +1,6 @@
 [package]
 name = "smb-server"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
@@ -15,14 +15,14 @@ members = [
 ]
 
 [workspace.package]
-version = "0.4.1"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
 repository = "https://github.com/paltaio/rust-smb-server"
 
 [workspace.dependencies]
-smb-server = { path = ".", version = "0.4.1" }
+smb-server = { path = ".", version = "0.5.0" }
 
 tokio = { version = "1.40", features = ["full"] }
 binrw = "0.15"
@@ -49,12 +49,7 @@ async-trait.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
-# Used as the wire codec inside negotiate-context payload encoders. Justified:
-# the internal proto module exposes binrw-derived structs (`PreauthIntegrityCapabilities`
-# etc) and we need `BinWrite::write` to serialize them into a context body.
 binrw = { workspace = true }
-# Cryptographically-strong randomness for the NTLM server challenge and the
-# 3.1.1 negotiate-context salt.
 getrandom = "0.4"
 cap-std = { workspace = true, optional = true }
 hmac.workspace = true

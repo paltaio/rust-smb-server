@@ -34,16 +34,16 @@ pub struct Connection {
     /// Connection.PreauthIntegrityHashValue after NEGOTIATE. SMB 3.1.1
     /// SESSION_SETUP exchanges fork this into `session_preauth`.
     pub preauth: Mutex<PreauthIntegrity>,
-    /// Granted at NEGOTIATE: large MTU support flag etc.
+    /// Max READ/WRITE sizes advertised in the NEGOTIATE response.
     pub max_read_size: tokio::sync::RwLock<u32>,
     pub max_write_size: tokio::sync::RwLock<u32>,
 
     /// Sessions keyed by SessionId.
     pub sessions: RwLock<HashMap<u64, Arc<RwLock<Session>>>>,
 
-    /// In-flight NTLM acceptors keyed by SessionId. We keep them out of
-    /// `Session` because a session is created only after a successful first
-    /// SESSION_SETUP round — between rounds the entry lives here. The
+    /// In-flight NTLM acceptors keyed by SessionId. They live outside
+    /// `Session` because a `Session` is created only when the final
+    /// SESSION_SETUP round succeeds; until then the acceptor lives here. The
     /// `bool` records whether the client sent raw NTLMSSP (true) or
     /// SPNEGO-wrapped (false) so the second-round response matches form.
     pub pending_auths: RwLock<HashMap<u64, PendingAuth>>,
@@ -323,6 +323,7 @@ impl Open {
 pub struct DirCursor {
     pub entries: Vec<crate::backend::DirEntry>,
     pub next: usize,
-    /// The pattern fixed on the first scan; `RESTART_SCANS` resets `next`.
+    /// Pattern used for the current listing. RESTART_SCANS and REOPEN re-list
+    /// with the request's pattern.
     pub pattern: Option<String>,
 }

@@ -6,8 +6,8 @@
 //! `DataOffset` are measured from the **start of the SMB2 header**, not from
 //! the start of this structure (MS-SMB2 §2.2.20 explicitly: "DataOffset (1
 //! byte): The offset, in bytes, from the beginning of the SMB2 header to the
-//! data being read"). When constructing a response, the server crate must
-//! compute `DataOffset = SMB2_HEADER_LEN + offset_within_body_of_data`.
+//! data being read"). A response sets
+//! `DataOffset = SMB2_HEADER_LEN + offset_within_body_of_data`.
 
 use binrw::{BinRead, BinWrite, binrw};
 use std::io::Cursor;
@@ -33,8 +33,8 @@ pub struct ReadRequest {
     pub read_channel_info_offset: u16,
     pub read_channel_info_length: u16,
     /// MS-SMB2: "If ReadChannelInfoOffset and ReadChannelInfoLength are both
-    /// 0, the client MUST set this field to a single 0 byte." We follow that
-    /// — at least one byte of buffer is required on the wire.
+    /// 0, the client MUST set this field to a single 0 byte." The buffer
+    /// always holds at least one byte on the wire.
     #[br(count = if read_channel_info_length == 0 { 1 } else { read_channel_info_length as usize })]
     pub buffer: Vec<u8>,
 }
@@ -79,8 +79,6 @@ pub struct ReadResponse {
 impl ReadResponse {
     /// Canonical `DataOffset` value when the data buffer immediately follows
     /// the fixed 16-byte response prefix and the SMB2 header (64 + 16 = 80).
-    ///
-    /// Most servers (ksmbd, Samba) emit 0x50 = 80 here.
     pub const STANDARD_DATA_OFFSET: u8 = 0x50;
 
     pub const fn standard_data_offset() -> u8 {

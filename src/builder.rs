@@ -91,12 +91,8 @@ pub enum BuildError {
     DuplicateShare(String),
     #[error("share `{0}` mixes .public()/.public_read_only() with explicit .user(...) entries")]
     PublicMixedWithUsers(String),
-    #[error("share `{0}` calls `.public*()` more than once")]
-    DoublePublic(String),
     #[error("share `{share}` references unknown user `{user}`")]
     UnknownUser { share: String, user: String },
-    #[error("user `{0}` is registered twice")]
-    DuplicateUser(String),
     #[error("user name `{0}` is reserved (use .public()/.public_read_only() for anonymous)")]
     ReservedUserName(String),
     #[error("user name must be non-empty")]
@@ -180,7 +176,6 @@ impl SmbServerBuilder {
     }
 
     pub fn build(self) -> Result<SmbServer, BuildError> {
-        // 1. Validate users.
         for name in &self.user_order {
             if name.is_empty() {
                 return Err(BuildError::EmptyUserName);
@@ -190,13 +185,11 @@ impl SmbServerBuilder {
             }
         }
 
-        // 2. Validate shares.
         let mut seen_names = std::collections::HashSet::new();
         for share in &self.shares {
             if !seen_names.insert(share.name.to_ascii_lowercase()) {
                 return Err(BuildError::DuplicateShare(share.name.clone()));
             }
-            // Public-vs-users mutual exclusivity.
             let is_public = matches!(share.mode, ShareMode::Public | ShareMode::PublicReadOnly);
             if is_public && !share.users.is_empty() {
                 return Err(BuildError::PublicMixedWithUsers(share.name.clone()));
@@ -212,19 +205,15 @@ impl SmbServerBuilder {
             }
         }
 
-        // 3. Listen address required.
         let listen = self.listen_addr.ok_or(BuildError::MissingListenAddr)?;
 
-        // 4. Decide NetBIOS name.
         let netbios = self.netbios_name.unwrap_or_else(|| {
-            // Hostname or "SMBSERVER".
             std::env::var("HOSTNAME")
                 .ok()
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| "SMBSERVER".to_string())
         });
 
-        // 5. Build ShareBindings — keep mode + users + backend together.
         let mut share_bindings: Vec<Arc<ShareBindings>> = Vec::with_capacity(self.shares.len());
         for s in self.shares {
             share_bindings.push(ShareBindings::new(
@@ -232,7 +221,7 @@ impl SmbServerBuilder {
             ));
         }
 
-        // 6. Materialize the user table (precompute NT hashes to avoid retaining plaintext).
+        // Store NT hashes only; plaintext passwords are dropped.
         let mut user_table = HashMap::new();
         for name in &self.user_order {
             let pw = &self.users[name];

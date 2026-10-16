@@ -28,7 +28,7 @@ use crate::utils::now_filetime;
 pub enum ShareMode {
     Public,
     PublicReadOnly,
-    /// Default — closed share. Only users in the explicit `users` map allowed.
+    /// Default: closed share. Only users in the explicit `users` map allowed.
     AuthenticatedOnly,
 }
 
@@ -38,14 +38,12 @@ pub struct ShareAcl {
     pub users: HashMap<String, Access>,
 }
 
-/// Compiled binding for a single share — the per-server-state form of `Share`.
+/// Compiled binding for a single share: the per-server-state form of `Share`.
 pub struct ShareBindings {
     pub name: String,
     pub backend: Arc<dyn ShareBackend>,
     pub acl: RwLock<ShareAcl>,
-    /// `IPC$` synthetic share. Accepted at TREE_CONNECT for client compatibility
-    /// (Windows always probes IPC$ before mounting an actual share). All
-    /// downstream ops on an IPC$ tree return `STATUS_NOT_SUPPORTED`.
+    /// `IPC$` synthetic share. Accepted at TREE_CONNECT; opens on it fail.
     pub is_ipc: bool,
 }
 
@@ -65,8 +63,7 @@ impl ShareBindings {
         })
     }
 
-    /// Synthetic IPC$ share. The backend is a no-op; clients that try to
-    /// CREATE on it get `STATUS_NOT_SUPPORTED` from the CREATE handler.
+    /// Synthetic IPC$ share. Opens on it fail.
     pub fn ipc() -> Arc<Self> {
         Self::new(
             "IPC$".to_string(),
@@ -92,7 +89,7 @@ pub struct ServerConfig {
 }
 
 pub struct ServerUsers {
-    /// Username → precomputed NT hash record.
+    /// Username -> precomputed NT hash record.
     pub table: RwLock<HashMap<String, UserCreds>>,
 }
 
@@ -185,15 +182,15 @@ impl Default for ActiveConnections {
     }
 }
 
-/// Top-level immutable-ish state shared across connections.
+/// Server state shared across connections.
 pub struct ServerState {
     pub config: ServerConfig,
     pub users: ServerUsers,
     pub shares: ServerShares,
     pub active_connections: ActiveConnections,
     pub server_start_filetime: u64,
-    /// Set when `shutdown()` is invoked; the accept loop stops on the next
-    /// iteration and connection loops abandon their next read.
+    /// Notified by `shutdown()`. The accept loop stops; each connection
+    /// closes after reading its next frame.
     pub shutdown: Arc<Notify>,
     pub shutting_down: Arc<AtomicBool>,
 }
@@ -411,12 +408,10 @@ fn validate_share_name(name: &str) -> Result<(), ConfigError> {
 /// Use `serve()` to bind the configured listener and run until shutdown.
 pub struct SmbServer {
     state: Arc<ServerState>,
-    /// The listener is bound lazily inside `serve()` so we can return a
-    /// useful `local_addr` only after binding. Pre-bind helpers: `serve` is
-    /// the only path that opens the socket.
+    /// Listener opened by `bind()`, or by `serve()` if `bind()` was not
+    /// called.
     bound: tokio::sync::Mutex<Option<TcpListener>>,
-    /// Resolved local address once `bind_local()` has been called. Tests
-    /// expect to ask for the address before serving (port 0 case).
+    /// Bound address, set by `bind()`.
     local_addr: tokio::sync::Mutex<Option<SocketAddr>>,
 }
 
@@ -439,9 +434,9 @@ impl SmbServer {
         }
     }
 
-    /// Bind the configured listen address without yet entering the accept
-    /// loop. Required for tests that need the actual port (e.g. when the
-    /// builder used port 0).
+    /// Bind the listen address without starting the accept loop. Returns
+    /// the bound address, which gives the real port when the configured port
+    /// is 0.
     pub async fn bind(&self) -> io::Result<SocketAddr> {
         let mut bound = self.bound.lock().await;
         if let Some(l) = bound.as_ref() {
@@ -460,8 +455,8 @@ impl SmbServer {
         *self.local_addr.lock().await
     }
 
-    /// Configured listen address (the *intended* address; may be `0.0.0.0:0`
-    /// before binding).
+    /// Listen address as configured. Use `local_addr()` for the bound
+    /// address.
     pub fn configured_addr(&self) -> SocketAddr {
         self.state.config.listen_addr
     }
@@ -484,8 +479,6 @@ impl SmbServer {
 
     /// Run the accept loop until `shutdown()` is called.
     pub async fn serve(self) -> io::Result<()> {
-        // Ensure the listener is bound. (The user may also have called
-        // `bind()` to pre-extract `local_addr()` for a test.)
         if self.bound.lock().await.is_none() {
             self.bind().await?;
         }
