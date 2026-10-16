@@ -1171,29 +1171,38 @@ async fn read_only_attribute_is_applied_and_others_are_rejected() {
     handle.abort();
 }
 
+/// A creation time in the same FileBasicInformation does not stop the write
+/// time from applying.
 #[tokio::test]
-async fn creation_time_is_set_where_the_host_can() {
+async fn write_time_applies_with_a_creation_time() {
     let td = tempdir().expect("tempdir");
-    let path = td.path().join("f.txt");
-    std::fs::write(&path, b"x").expect("write file");
+    std::fs::write(td.path().join("f.txt"), b"x").expect("write file");
+    std::fs::create_dir(td.path().join("d")).expect("mkdir");
     let backend = LocalFsBackend::new(td.path()).expect("open root");
     let (mut c, handle) = Client::connect(Share::new("share", backend).public()).await;
 
-    let file_id = c.open("f.txt", FILE_WRITE_ATTRIBUTES, 0).await.unwrap();
-    let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_557_126_489);
-    let status = c
-        .set_info(
-            file_id,
-            FILE_BASIC_INFORMATION,
-            basic_info([filetime(t), 0, 0, 0], 0),
-        )
-        .await;
-    c.close(file_id).await;
-    if cfg!(any(windows, target_os = "macos")) {
-        assert_eq!(status, STATUS_SUCCESS);
-        assert_eq!(std::fs::metadata(&path).unwrap().created().unwrap(), t);
-    } else {
-        assert_eq!(status, ntstatus::STATUS_NOT_SUPPORTED);
+    let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_577_934_245);
+    for (name, options) in [("f.txt", 0), ("d", FILE_DIRECTORY_FILE)] {
+        let file_id = c
+            .open(name, FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES, options)
+            .await
+            .unwrap();
+        assert_eq!(
+            c.set_info(
+                file_id,
+                FILE_BASIC_INFORMATION,
+                basic_info([filetime(t), 0, filetime(t), 0], FILE_ATTRIBUTE_NORMAL)
+            )
+            .await,
+            STATUS_SUCCESS,
+            "{name}"
+        );
+        c.close(file_id).await;
+        let md = std::fs::metadata(td.path().join(name)).unwrap();
+        assert_eq!(md.modified().unwrap(), t, "{name}");
+        if cfg!(any(windows, target_os = "macos")) {
+            assert_eq!(md.created().unwrap(), t, "{name}");
+        }
     }
 
     handle.abort();

@@ -236,15 +236,17 @@ pub trait Handle: Send + Sync {
     /// Set timestamps on a file or directory. `None` fields leave the
     /// corresponding time alone.
     ///
-    /// Return [`SmbError::NotSupported`] for a creation, access or write
-    /// time the backend cannot store.
+    /// Return [`SmbError::NotSupported`] for an access or write time the
+    /// backend cannot store. A backend that cannot store a creation time
+    /// ignores it and applies the other fields; a request with only a
+    /// creation time then succeeds and changes nothing.
     /// `change_time` is the time of the last change: a backend whose
     /// storage moves it to the current time on every change, as POSIX ctime
     /// does, may keep doing so and not store the requested value.
     ///
-    /// `LocalFsBackend` sets access and write times on every host, creation
-    /// time on Windows and macOS, and returns `NotSupported` for a creation
-    /// time elsewhere. The host keeps the change time.
+    /// `LocalFsBackend` sets access and write times on every host and
+    /// creation time on Windows and macOS. Elsewhere it ignores the creation
+    /// time. The host keeps the change time.
     async fn set_times(&self, times: FileTimes) -> SmbResult<()>;
 
     /// Set the attributes (MS-FSCC 2.6) of a file or directory to
@@ -268,7 +270,7 @@ pub trait Handle: Send + Sync {
 
     /// List directory entries matching the optional pattern. The pattern
     /// uses the wildcards of MS-FSA 2.1.4.4: `*` and `?`, and the DOS forms
-    /// Windows clients send, `<` (DOS_STAR), `>` (DOS_QM) and `"` (DOS_DOT).
+    /// `<` (DOS_STAR), `>` (DOS_QM) and `"` (DOS_DOT).
     /// QUERY_DIRECTORY returns the result as is, so the backend applies the
     /// pattern.
     async fn list_dir(&self, pattern: Option<&str>) -> SmbResult<Vec<DirEntry>>;
@@ -277,8 +279,8 @@ pub trait Handle: Send + Sync {
     async fn close(self: Box<Self>) -> SmbResult<()>;
 }
 
-/// Backend for the synthetic IPC$ share. Every method returns
-/// [`SmbError::NotSupported`].
+/// Backend for the synthetic IPC$ share. `open`, `unlink` and `rename`
+/// return [`SmbError::NotSupported`].
 pub(crate) struct NotSupportedBackend;
 
 #[async_trait]

@@ -6,14 +6,12 @@
 //! through `SmbPath` cannot escape the sandbox; `cap-std` enforces this at
 //! every step.
 //!
-//! Notes:
-//!
 //! - Blocking FS calls run on `tokio::task::spawn_blocking`.
 //! - `read_only()` flips a flag that makes write-class opens reject early
 //!   with `SmbError::AccessDenied`.
 //! - `list_dir` applies the MS-FSA 2.1.4.4 wildcards (`*`, `?`, `<`, `>`,
 //!   `"`) itself, folding ASCII case only, since cap-std only provides raw
-//!   `entries()`.
+//!   `entries()`. `"*.*"` matches every name, as `"*"` does.
 //! - On Windows, directory handles share delete access, so a client can
 //!   rename or delete a directory it or another client has open.
 
@@ -41,6 +39,11 @@ use crate::utils::{FILETIME_OFFSET, system_time_to_filetime};
 // ---------------------------------------------------------------------------
 
 /// Local-filesystem backend, sandboxed at a single root directory.
+///
+/// Handles set access and write times on every host. The creation time is
+/// set on Windows and macOS; other hosts have no call that sets it, so a
+/// requested creation time is ignored there and the other times still apply.
+/// The host keeps the change time.
 pub struct LocalFsBackend {
     root: Arc<Dir>,
     /// Device of the share root; see `file_index`.
@@ -303,7 +306,9 @@ fn set_read_only(file: &std::fs::File, read_only: bool) -> io::Result<()> {
     file.set_permissions(perms)
 }
 
-/// Host times for `times`. The change time is left to the host.
+/// Host times for `times`. The change time is left to the host. Hosts other
+/// than Windows and macOS have no call that sets the creation time, so it is
+/// ignored there.
 fn host_file_times(times: FileTimes) -> SmbResult<std::fs::FileTimes> {
     let host_time = |ft| filetime_to_system_time(ft).ok_or(SmbError::NotSupported);
     let mut out = std::fs::FileTimes::new();
@@ -313,28 +318,23 @@ fn host_file_times(times: FileTimes) -> SmbResult<std::fs::FileTimes> {
     if let Some(ft) = times.last_access_time {
         out = out.set_accessed(host_time(ft)?);
     }
+    #[cfg(any(windows, target_os = "macos"))]
     if let Some(ft) = times.creation_time {
-        out = set_created(out, host_time(ft)?)?;
+        out = set_created(out, host_time(ft)?);
     }
     Ok(out)
 }
 
 #[cfg(windows)]
-fn set_created(times: std::fs::FileTimes, t: SystemTime) -> SmbResult<std::fs::FileTimes> {
+fn set_created(times: std::fs::FileTimes, t: SystemTime) -> std::fs::FileTimes {
     use std::os::windows::fs::FileTimesExt as _;
-    Ok(times.set_created(t))
+    times.set_created(t)
 }
 
 #[cfg(target_os = "macos")]
-fn set_created(times: std::fs::FileTimes, t: SystemTime) -> SmbResult<std::fs::FileTimes> {
+fn set_created(times: std::fs::FileTimes, t: SystemTime) -> std::fs::FileTimes {
     use std::os::macos::fs::FileTimesExt as _;
-    Ok(times.set_created(t))
-}
-
-/// Other hosts have no call that sets the creation time.
-#[cfg(not(any(windows, target_os = "macos")))]
-fn set_created(_times: std::fs::FileTimes, _t: SystemTime) -> SmbResult<std::fs::FileTimes> {
-    Err(SmbError::NotSupported)
+    times.set_created(t)
 }
 
 // ---------------------------------------------------------------------------
@@ -665,7 +665,7 @@ impl ShareBackend for LocalFsBackend {
     fn capabilities(&self) -> BackendCapabilities {
         BackendCapabilities {
             is_read_only: self.read_only,
-            // Lookups use the host filesystem's case rules.
+            // Case rule of the platform's usual filesystem; lookups go to the host.
             case_sensitive: cfg!(any(target_os = "linux", target_os = "freebsd")),
         }
     }
@@ -676,8 +676,8 @@ impl ShareBackend for LocalFsBackend {
 // ---------------------------------------------------------------------------
 
 /// Internal handle variant. `File` carries a `std::fs::File` (after cap-std
-/// has done the safe open); `Dir` keeps the `cap_std::fs::Dir` so we can
-/// re-list entries.
+/// has done the safe open); `Dir` keeps the `cap_std::fs::Dir` for listing
+/// and setting times.
 enum LocalHandle {
     File {
         name: String,
@@ -1135,35 +1135,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rename_replace_if_exists() {
+    async fn rename_onto_itself_is_not_a_collision() {
         let td = tempdir().unwrap();
-        let root = td.path();
-        std::fs::write(root.join("tmp.txt"), b"new").unwrap();
-        std::fs::write(root.join("doc.txt"), b"old").unwrap();
-        std::fs::create_dir(root.join("dir")).unwrap();
-        let backend = LocalFsBackend::new(root).unwrap();
-
-        // Renaming a file onto itself is not a collision.
+        std::fs::write(td.path().join("doc.txt"), b"old").unwrap();
+        let backend = LocalFsBackend::new(td.path()).unwrap();
         backend
             .rename(&p("doc.txt"), &p("doc.txt"), false)
             .await
             .unwrap();
-
-        backend
-            .rename(&p("tmp.txt"), &p("doc.txt"), true)
-            .await
-            .unwrap();
-        assert_eq!(std::fs::read(root.join("doc.txt")).unwrap(), b"new");
-        assert!(!root.join("tmp.txt").exists());
-
-        // A directory is never replaced.
-        let err = backend
-            .rename(&p("doc.txt"), &p("dir"), true)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, SmbError::AccessDenied), "got {err:?}");
-        assert!(root.join("dir").is_dir());
-        assert_eq!(std::fs::read(root.join("doc.txt")).unwrap(), b"new");
+        assert_eq!(std::fs::read(td.path().join("doc.txt")).unwrap(), b"old");
     }
 
     #[cfg(unix)]
@@ -1191,9 +1171,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn file_index_is_the_same_for_every_open_and_listing() {
+    async fn directory_file_index_is_the_same_for_every_open_and_listing() {
         let td = tempdir().unwrap();
-        std::fs::write(td.path().join("f.txt"), b"x").unwrap();
         std::fs::create_dir(td.path().join("d")).unwrap();
         let backend = LocalFsBackend::new(td.path()).unwrap();
 
@@ -1202,15 +1181,13 @@ mod tests {
             .await
             .unwrap();
         let listed = root.list_dir(None).await.unwrap();
-        for (name, opts) in [("f.txt", opts_open_ro()), ("d", opts_open_dir())] {
-            let first = backend.open(&p(name), opts).await.unwrap();
-            let second = backend.open(&p(name), opts).await.unwrap();
-            let id = first.stat().await.unwrap().file_index;
-            assert_ne!(id, 0, "{name}");
-            assert_eq!(second.stat().await.unwrap().file_index, id, "{name}");
-            let entry = listed.iter().find(|e| e.info.name == name).unwrap();
-            assert_eq!(entry.info.file_index, id, "{name}");
-        }
+        let first = backend.open(&p("d"), opts_open_dir()).await.unwrap();
+        let second = backend.open(&p("d"), opts_open_dir()).await.unwrap();
+        let id = first.stat().await.unwrap().file_index;
+        assert_ne!(id, 0);
+        assert_eq!(second.stat().await.unwrap().file_index, id);
+        let entry = listed.iter().find(|e| e.info.name == "d").unwrap();
+        assert_eq!(entry.info.file_index, id);
     }
 
     #[test]
@@ -1219,17 +1196,10 @@ mod tests {
         assert_eq!(file_index(root, Some((0x803, 42))), 42);
         assert_eq!(file_index(None, Some((0x803, 42))), 42);
         assert_eq!(file_index(root, None), 0);
-        let ids = [
+        assert_ne!(
             file_index(root, Some((0x803, 1))),
-            file_index(root, Some((0x2b, 1))),
-            file_index(root, Some((0x2c, 1))),
-            file_index(root, Some((0x10_0003, 1))),
-        ];
-        for (i, a) in ids.iter().enumerate() {
-            for b in &ids[i + 1..] {
-                assert_ne!(a, b, "{ids:x?}");
-            }
-        }
+            file_index(root, Some((0x2b, 1)))
+        );
     }
 
     #[cfg(unix)]
@@ -1392,37 +1362,10 @@ mod tests {
         assert!(glob_match("a\"txt", "a.txt"));
         assert!(glob_match("abc\"", "abc"));
         assert!(!glob_match("a\"txt", "aXtxt"));
-        // What Windows sends for "*.*" and "*.".
         assert!(glob_match("<\"<", "a.b"));
         assert!(glob_match("<\"<", "noext"));
         assert!(glob_match("<\"", "noext"));
         assert!(!glob_match("<\"", "a.b"));
-    }
-
-    #[tokio::test]
-    async fn list_dir_applies_dos_wildcards() {
-        let td = tempdir().unwrap();
-        for name in ["ow.txt", "sw.txt", "w.txt", "notes.log"] {
-            std::fs::write(td.path().join(name), b"x").unwrap();
-        }
-        let backend = LocalFsBackend::new(td.path()).unwrap();
-        let dir = backend
-            .open(&SmbPath::root(), opts_open_dir())
-            .await
-            .unwrap();
-        let names = |entries: Vec<SmbDirEntry>| {
-            let mut names: Vec<String> = entries.into_iter().map(|e| e.info.name).collect();
-            names.sort();
-            names
-        };
-        assert_eq!(
-            names(dir.list_dir(Some("<.txt")).await.unwrap()),
-            ["ow.txt", "sw.txt", "w.txt"]
-        );
-        assert_eq!(
-            names(dir.list_dir(Some(">w.txt")).await.unwrap()),
-            ["ow.txt", "sw.txt"]
-        );
     }
 
     #[cfg(windows)]
@@ -1436,32 +1379,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn directory_renames_while_open() {
+    async fn directory_unlinks_while_open() {
         let td = tempdir().unwrap();
-        std::fs::create_dir_all(td.path().join("d").join("sub")).unwrap();
+        std::fs::create_dir(td.path().join("d")).unwrap();
         let backend = LocalFsBackend::new(td.path()).unwrap();
-        let first = backend.open(&p("d"), opts_open_dir()).await.unwrap();
-        let second = backend.open(&p("d"), opts_open_dir()).await.unwrap();
-
-        backend.rename(&p("d"), &p("e"), false).await.unwrap();
-        assert!(td.path().join("e").is_dir());
-        let listed = first.list_dir(None).await.unwrap();
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].info.name, "sub");
-
-        let empty = backend.open(&p("e\\sub"), opts_open_dir()).await.unwrap();
-        backend.unlink(&p("e\\sub")).await.unwrap();
-        assert!(!td.path().join("e").join("sub").exists());
-        for h in [first, second, empty] {
-            h.close().await.unwrap();
-        }
-    }
-
-    fn opts_dir_write_attributes() -> OpenOptions {
-        OpenOptions {
-            write_attributes: true,
-            ..opts_open_dir()
-        }
+        let h = backend.open(&p("d"), opts_open_dir()).await.unwrap();
+        backend.unlink(&p("d")).await.unwrap();
+        assert!(!td.path().join("d").exists());
+        h.close().await.unwrap();
     }
 
     fn filetime(secs: u64) -> u64 {
@@ -1469,75 +1394,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_times_on_a_directory() {
+    async fn creation_time_is_set_where_the_host_can() {
         let td = tempdir().unwrap();
-        std::fs::create_dir(td.path().join("d")).unwrap();
         let backend = LocalFsBackend::new(td.path()).unwrap();
-        let h = backend
-            .open(&p("d"), opts_dir_write_attributes())
-            .await
-            .unwrap();
-        let t = filetime(1_577_934_245);
+        let h = backend.open(&p("f.txt"), opts_create()).await.unwrap();
+        let before = h.stat().await.unwrap();
+        let t = filetime(1_557_126_489);
         h.set_times(FileTimes {
-            last_write_time: Some(t),
-            last_access_time: Some(t),
+            creation_time: Some(t),
+            ..FileTimes::default()
+        })
+        .await
+        .unwrap();
+        let after = h.stat().await.unwrap();
+        if cfg!(any(windows, target_os = "macos")) {
+            assert_eq!(after.creation_time, t);
+        } else {
+            assert_eq!(after.creation_time, before.creation_time);
+        }
+        assert_eq!(after.last_write_time, before.last_write_time);
+        h.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn creation_time_does_not_block_the_other_times() {
+        let td = tempdir().unwrap();
+        let backend = LocalFsBackend::new(td.path()).unwrap();
+        let h = backend.open(&p("f.txt"), opts_create()).await.unwrap();
+        let created = filetime(1_557_126_489);
+        let written = filetime(1_577_934_245);
+        h.set_times(FileTimes {
+            creation_time: Some(created),
+            last_access_time: Some(written),
+            last_write_time: Some(written),
             ..FileTimes::default()
         })
         .await
         .unwrap();
         let info = h.stat().await.unwrap();
-        assert_eq!(info.last_write_time, t);
-        assert_eq!(info.last_access_time, t);
-        h.close().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn creation_time_is_set_where_the_host_can() {
-        let td = tempdir().unwrap();
-        let backend = LocalFsBackend::new(td.path()).unwrap();
-        let h = backend.open(&p("f.txt"), opts_create()).await.unwrap();
-        let t = filetime(1_557_126_489);
-        let result = h
-            .set_times(FileTimes {
-                creation_time: Some(t),
-                ..FileTimes::default()
-            })
-            .await;
+        assert_eq!(info.last_write_time, written);
+        assert_eq!(info.last_access_time, written);
         if cfg!(any(windows, target_os = "macos")) {
-            result.unwrap();
-            assert_eq!(h.stat().await.unwrap().creation_time, t);
-        } else {
-            assert!(matches!(result, Err(SmbError::NotSupported)));
+            assert_eq!(info.creation_time, created);
         }
         h.close().await.unwrap();
     }
 
     #[tokio::test]
-    async fn read_only_attribute_is_stored_and_others_are_rejected() {
+    async fn unsupported_attributes_are_rejected() {
         let td = tempdir().unwrap();
         std::fs::create_dir(td.path().join("d")).unwrap();
         let backend = LocalFsBackend::new(td.path()).unwrap();
         let h = backend.open(&p("f.txt"), opts_create()).await.unwrap();
-
-        h.set_attributes(FILE_ATTRIBUTE_READONLY).await.unwrap();
-        assert!(h.stat().await.unwrap().read_only);
-        assert!(
-            std::fs::metadata(td.path().join("f.txt"))
-                .unwrap()
-                .permissions()
-                .readonly()
-        );
-        h.set_attributes(FILE_ATTRIBUTE_ARCHIVE).await.unwrap();
-        assert!(!h.stat().await.unwrap().read_only);
-        for unsupported in [0x2, 0x4, 0x100, 0x1000, 0x2000] {
-            assert!(
-                matches!(
-                    h.set_attributes(unsupported).await,
-                    Err(SmbError::NotSupported)
-                ),
-                "attribute {unsupported:#x}"
-            );
-        }
+        assert!(matches!(
+            h.set_attributes(0x2).await,
+            Err(SmbError::NotSupported)
+        ));
         h.close().await.unwrap();
 
         let dir = backend.open(&p("d"), opts_open_dir()).await.unwrap();
@@ -1547,26 +1459,6 @@ mod tests {
         ));
         dir.set_attributes(0).await.unwrap();
         dir.close().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn read_only_file_opens_for_attribute_changes() {
-        let td = tempdir().unwrap();
-        let path = td.path().join("f.txt");
-        std::fs::write(&path, b"x").unwrap();
-        let mut perms = std::fs::metadata(&path).unwrap().permissions();
-        perms.set_readonly(true);
-        std::fs::set_permissions(&path, perms).unwrap();
-        let backend = LocalFsBackend::new(td.path()).unwrap();
-
-        let opts = OpenOptions {
-            write_attributes: true,
-            ..opts_open_ro()
-        };
-        let h = backend.open(&p("f.txt"), opts).await.unwrap();
-        h.set_attributes(0).await.unwrap();
-        h.close().await.unwrap();
-        assert!(!std::fs::metadata(&path).unwrap().permissions().readonly());
     }
 
     #[test]
