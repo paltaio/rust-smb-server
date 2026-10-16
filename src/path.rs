@@ -116,6 +116,19 @@ impl SmbPath {
     }
 }
 
+/// True if `a` and `b` name the same entry, comparing names the way the
+/// backend does.
+pub(crate) fn same_path(a: &SmbPath, b: &SmbPath, case_sensitive: bool) -> bool {
+    if case_sensitive {
+        return a == b;
+    }
+    a.components().len() == b.components().len()
+        && a.components()
+            .iter()
+            .zip(b.components())
+            .all(|(x, y)| x.to_lowercase() == y.to_lowercase())
+}
+
 impl FromStr for SmbPath {
     type Err = SmbError;
 

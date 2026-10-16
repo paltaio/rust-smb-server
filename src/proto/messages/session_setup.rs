@@ -22,7 +22,7 @@ pub struct SessionSetupRequest {
     pub security_buffer_offset: u16,
     pub security_buffer_length: u16,
     pub previous_session_id: u64,
-    #[br(count = security_buffer_length as usize)]
+    #[br(parse_with = super::read_buf, args(security_buffer_length as usize))]
     pub security_buffer: Vec<u8>,
 }
 
@@ -50,7 +50,7 @@ pub struct SessionSetupResponse {
     pub session_flags: u16,
     pub security_buffer_offset: u16,
     pub security_buffer_length: u16,
-    #[br(count = security_buffer_length as usize)]
+    #[br(parse_with = super::read_buf, args(security_buffer_length as usize))]
     pub security_buffer: Vec<u8>,
 }
 

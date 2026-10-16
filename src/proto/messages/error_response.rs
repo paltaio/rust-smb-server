@@ -23,7 +23,7 @@ pub struct ErrorResponse {
     pub error_context_count: u8,
     pub reserved: u8,
     pub byte_count: u32,
-    #[br(count = if byte_count == 0 { 1 } else { byte_count as usize })]
+    #[br(parse_with = super::read_buf, args(if byte_count == 0 { 1 } else { byte_count as usize }))]
     pub error_data: Vec<u8>,
 }
 
@@ -64,7 +64,7 @@ impl ErrorResponse {
 pub struct ErrorContext {
     pub error_data_length: u32,
     pub error_id: u32,
-    #[br(count = error_data_length as usize)]
+    #[br(parse_with = super::read_buf, args(error_data_length as usize))]
     pub error_context_data: Vec<u8>,
 }
 

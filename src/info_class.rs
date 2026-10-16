@@ -131,11 +131,11 @@ pub fn encode_file_name_information(name: &str) -> Vec<u8> {
 // internal, EA, access, position, mode, alignment, name.
 // ---------------------------------------------------------------------------
 
-pub fn encode_file_all_information(info: &FileInfo, file_index: u64, access_mask: u32) -> Vec<u8> {
+pub fn encode_file_all_information(info: &FileInfo, access_mask: u32) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&encode_file_basic_information(info));
     out.extend_from_slice(&encode_file_standard_information(info));
-    out.extend_from_slice(&encode_file_internal_information(file_index));
+    out.extend_from_slice(&encode_file_internal_information(info.file_index));
     out.extend_from_slice(&encode_file_ea_information());
     out.extend_from_slice(&encode_file_access_information(access_mask));
     out.extend_from_slice(&encode_file_position_information());
@@ -333,27 +333,27 @@ pub fn encode_minimal_security_descriptor() -> Vec<u8> {
 
 /// Encode one directory entry in info class `class`; empty for unsupported
 /// classes. The caller patches `NextEntryOffset` for chained entries.
-pub fn encode_dir_entry(class: u8, entry: &DirEntry, file_index: u64) -> Vec<u8> {
+pub fn encode_dir_entry(class: u8, entry: &DirEntry) -> Vec<u8> {
     let info = &entry.info;
     let name_u16 = utf16le(&info.name);
     match class {
         FILE_DIRECTORY_INFORMATION => {
             // 64 bytes fixed + name
             let mut out = Vec::new();
-            write_dir_entry_prefix(&mut out, info, file_index, name_u16.len());
+            write_dir_entry_prefix(&mut out, info, name_u16.len());
             out.extend_from_slice(&name_u16);
             out
         }
         FILE_FULL_DIRECTORY_INFORMATION => {
             let mut out = Vec::new();
-            write_dir_entry_prefix(&mut out, info, file_index, name_u16.len());
+            write_dir_entry_prefix(&mut out, info, name_u16.len());
             out.extend_from_slice(&0u32.to_le_bytes()); // EaSize
             out.extend_from_slice(&name_u16);
             out
         }
         FILE_BOTH_DIRECTORY_INFORMATION => {
             let mut out = Vec::new();
-            write_dir_entry_prefix(&mut out, info, file_index, name_u16.len());
+            write_dir_entry_prefix(&mut out, info, name_u16.len());
             out.extend_from_slice(&0u32.to_le_bytes()); // EaSize
             out.push(0); // ShortNameLength
             out.push(0); // Reserved1
@@ -364,29 +364,29 @@ pub fn encode_dir_entry(class: u8, entry: &DirEntry, file_index: u64) -> Vec<u8>
         }
         FILE_ID_BOTH_DIRECTORY_INFORMATION => {
             let mut out = Vec::new();
-            write_dir_entry_prefix(&mut out, info, file_index, name_u16.len());
+            write_dir_entry_prefix(&mut out, info, name_u16.len());
             out.extend_from_slice(&0u32.to_le_bytes()); // EaSize
             out.push(0); // ShortNameLength
             out.push(0); // Reserved1
             out.extend_from_slice(&[0u8; 24]); // ShortName
             out.extend_from_slice(&0u16.to_le_bytes()); // Reserved2
-            out.extend_from_slice(&file_index.to_le_bytes()); // FileId
+            out.extend_from_slice(&info.file_index.to_le_bytes()); // FileId
             out.extend_from_slice(&name_u16);
             out
         }
         FILE_ID_FULL_DIRECTORY_INFORMATION => {
             let mut out = Vec::new();
-            write_dir_entry_prefix(&mut out, info, file_index, name_u16.len());
+            write_dir_entry_prefix(&mut out, info, name_u16.len());
             out.extend_from_slice(&0u32.to_le_bytes()); // EaSize
             out.extend_from_slice(&0u32.to_le_bytes()); // Reserved
-            out.extend_from_slice(&file_index.to_le_bytes()); // FileId
+            out.extend_from_slice(&info.file_index.to_le_bytes()); // FileId
             out.extend_from_slice(&name_u16);
             out
         }
         FILE_NAMES_INFORMATION => {
             let mut out = Vec::new();
             out.extend_from_slice(&0u32.to_le_bytes());
-            out.extend_from_slice(&(file_index as u32).to_le_bytes());
+            out.extend_from_slice(&(info.file_index as u32).to_le_bytes());
             out.extend_from_slice(&(name_u16.len() as u32).to_le_bytes());
             out.extend_from_slice(&name_u16);
             out
@@ -395,9 +395,9 @@ pub fn encode_dir_entry(class: u8, entry: &DirEntry, file_index: u64) -> Vec<u8>
     }
 }
 
-fn write_dir_entry_prefix(out: &mut Vec<u8>, info: &FileInfo, file_index: u64, name_len: usize) {
+fn write_dir_entry_prefix(out: &mut Vec<u8>, info: &FileInfo, name_len: usize) {
     out.extend_from_slice(&0u32.to_le_bytes()); // NextEntryOffset (patched later)
-    out.extend_from_slice(&(file_index as u32).to_le_bytes()); // FileIndex
+    out.extend_from_slice(&(info.file_index as u32).to_le_bytes()); // FileIndex
     out.extend_from_slice(&info.creation_time.to_le_bytes());
     out.extend_from_slice(&info.last_access_time.to_le_bytes());
     out.extend_from_slice(&info.last_write_time.to_le_bytes());
@@ -453,7 +453,7 @@ mod tests {
     fn file_all_information_empty_name_keeps_linux_minimum_size() {
         let mut info = fake_info();
         info.name.clear();
-        let bytes = encode_file_all_information(&info, 1, 0x001F_01FF);
+        let bytes = encode_file_all_information(&info, 0x001F_01FF);
         assert_eq!(bytes.len(), 101);
     }
 

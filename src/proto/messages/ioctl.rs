@@ -90,7 +90,7 @@ pub struct IoctlRequest {
     pub max_output_response: u32,
     pub flags: u32,
     pub reserved2: u32,
-    #[br(count = input_count as usize)]
+    #[br(parse_with = super::read_buf, args(input_count as usize))]
     pub input: Vec<u8>,
 }
 
@@ -129,7 +129,7 @@ pub struct IoctlResponse {
     pub flags: u32,
     pub reserved2: u32,
     /// Output buffer immediately following the fixed prefix.
-    #[br(count = output_count as usize)]
+    #[br(parse_with = super::read_buf, args(output_count as usize))]
     pub output: Vec<u8>,
 }
 

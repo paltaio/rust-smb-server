@@ -84,8 +84,7 @@ pub async fn handle(
                 break;
             }
             let entry = &cursor.entries[cursor.next];
-            let file_index = entry.info.file_index;
-            let mut bytes = encode_dir_entry(class_byte, entry, file_index);
+            let mut bytes = encode_dir_entry(class_byte, entry);
             if bytes.is_empty() {
                 cursor.next += 1;
                 continue;

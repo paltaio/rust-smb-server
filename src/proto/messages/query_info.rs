@@ -48,7 +48,7 @@ pub struct QueryInfoRequest {
     pub file_id: FileId,
     /// Optional input buffer (used by FILE/FS info classes that need it, e.g.
     /// `FileFullEaInformation` extended-attribute name lists).
-    #[br(count = input_buffer_length as usize)]
+    #[br(parse_with = super::read_buf, args(input_buffer_length as usize))]
     pub input_buffer: Vec<u8>,
 }
 
@@ -83,7 +83,7 @@ pub struct QueryInfoResponse {
     pub structure_size: u16,
     pub output_buffer_offset: u16,
     pub output_buffer_length: u32,
-    #[br(count = output_buffer_length as usize)]
+    #[br(parse_with = super::read_buf, args(output_buffer_length as usize))]
     pub buffer: Vec<u8>,
 }
 

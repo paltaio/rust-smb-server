@@ -6,8 +6,12 @@ use crate::proto::header::Smb2Header;
 use crate::proto::messages::{CreateRequest, CreateResponse};
 use tracing::{debug, warn};
 
+use crate::access_mask::{
+    DELETE, FILE_APPEND_DATA, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_WRITE_ATTRIBUTES,
+    FILE_WRITE_DATA, GENERIC_ALL, GENERIC_READ, GENERIC_WRITE, MAXIMUM_ALLOWED, granted_access,
+    maximal_access,
+};
 use crate::backend::{OpenIntent, OpenOptions};
-use crate::builder::Access;
 use crate::conn::state::{Connection, Open};
 use crate::dispatch::HandlerResponse;
 use crate::handlers::shared::lookup_session_tree;
@@ -15,18 +19,6 @@ use crate::ntstatus;
 use crate::path::SmbPath;
 use crate::server::ServerState;
 use crate::utils::utf16le_to_units;
-
-// MS-SMB2 §2.2.13 access mask flags
-const FILE_READ_DATA: u32 = 0x0000_0001;
-const FILE_WRITE_DATA: u32 = 0x0000_0002;
-const FILE_APPEND_DATA: u32 = 0x0000_0004;
-const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
-const FILE_WRITE_ATTRIBUTES: u32 = 0x0000_0100;
-const DELETE: u32 = 0x0001_0000;
-const GENERIC_READ: u32 = 0x8000_0000;
-const GENERIC_WRITE: u32 = 0x4000_0000;
-const GENERIC_ALL: u32 = 0x1000_0000;
-const MAX_ALLOWED: u32 = 0x0200_0000;
 
 // CreateOptions
 const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
@@ -87,7 +79,7 @@ pub async fn handle(
 
     // Translate desired access into read/write hints.
     let want_read = req.desired_access
-        & (FILE_READ_DATA | FILE_READ_ATTRIBUTES | GENERIC_READ | GENERIC_ALL | MAX_ALLOWED)
+        & (FILE_READ_DATA | FILE_READ_ATTRIBUTES | GENERIC_READ | GENERIC_ALL | MAXIMUM_ALLOWED)
         != 0;
     let want_write = req.desired_access
         & (FILE_WRITE_DATA
@@ -96,7 +88,7 @@ pub async fn handle(
             | DELETE
             | GENERIC_WRITE
             | GENERIC_ALL
-            | MAX_ALLOWED)
+            | MAXIMUM_ALLOWED)
         != 0;
 
     // Reject writes on a read-only tree.
@@ -122,7 +114,20 @@ pub async fn handle(
     if directory && non_directory {
         return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
     }
+    let maximal = maximal_access(granted);
+    let open_access = granted_access(req.desired_access, maximal);
     let delete_on_close = req.create_options & FILE_DELETE_ON_CLOSE != 0;
+    if delete_on_close {
+        // MS-SMB2 3.3.5.9: the tree must allow DELETE.
+        if maximal & DELETE == 0 {
+            warn!(path = %path, "delete-on-close open on read-only tree");
+            return HandlerResponse::err(ntstatus::STATUS_ACCESS_DENIED);
+        }
+        // MS-FSA 2.1.5.1: the open itself must request DELETE.
+        if open_access & DELETE == 0 {
+            return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
+        }
+    }
 
     let opts = OpenOptions {
         read: want_read || !want_write,
@@ -156,7 +161,7 @@ pub async fn handle(
     let open = Open::new(
         file_id,
         handle,
-        if want_write { granted } else { Access::Read },
+        open_access,
         path,
         info.is_directory,
         delete_on_close,

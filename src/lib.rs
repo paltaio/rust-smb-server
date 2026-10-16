@@ -15,6 +15,7 @@
 //! # Ok(()) }
 //! ```
 
+mod access_mask;
 mod backend;
 mod builder;
 pub(crate) mod conn;

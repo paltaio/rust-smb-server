@@ -7,6 +7,7 @@ use crate::proto::header::Smb2Header;
 use crate::proto::messages::{TreeConnectRequest, TreeConnectResponse};
 use tracing::{info, warn};
 
+use crate::access_mask::maximal_access;
 use crate::builder::Access;
 use crate::conn::state::{Connection, TreeConnect};
 use crate::dispatch::HandlerResponse;
@@ -16,10 +17,6 @@ use crate::server::{ServerState, ShareMode};
 
 const SHARE_TYPE_DISK: u8 = 0x01;
 const SHARE_TYPE_PIPE: u8 = 0x02;
-
-const FILE_GENERIC_READ: u32 = 0x0012_0089;
-const FILE_GENERIC_EXECUTE: u32 = 0x0012_00A0;
-const FILE_ALL_ACCESS: u32 = 0x001F_01FF;
 
 pub async fn handle(
     server: &Arc<ServerState>,
@@ -49,9 +46,7 @@ pub async fn handle(
     let identity = sess.identity.clone();
     drop(sess);
 
-    // IPC$: synthetic share. Accept at TREE_CONNECT (Windows always probes
-    // it before mounting an actual share); CREATE on it returns
-    // STATUS_NOT_SUPPORTED.
+    // IPC$: synthetic share. Accepted at TREE_CONNECT; opens on it fail.
     let share = if share_name.eq_ignore_ascii_case("IPC$") {
         crate::server::ShareBindings::ipc()
     } else {
@@ -90,10 +85,7 @@ pub async fn handle(
         trees.insert(tree_id, tc);
     }
 
-    let maximal_access = match granted {
-        Access::Read => FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
-        Access::ReadWrite => FILE_ALL_ACCESS,
-    };
+    let maximal_access = maximal_access(granted);
     let resp = TreeConnectResponse {
         structure_size: 16,
         share_type: if share.is_ipc {

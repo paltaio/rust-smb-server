@@ -19,10 +19,6 @@ const FILE_REMOTE_DEVICE: u32 = 0x0000_0010;
 const FILE_CASE_SENSITIVE_SEARCH: u32 = 0x0000_0001;
 const FILE_CASE_PRESERVED_NAMES: u32 = 0x0000_0002;
 const FILE_UNICODE_ON_DISK: u32 = 0x0000_0004;
-const FILE_PERSISTENT_ACLS: u32 = 0x0000_0008;
-const FILE_FILE_COMPRESSION: u32 = 0x0000_0010;
-const FILE_SUPPORTS_HARD_LINKS: u32 = 0x0040_0000;
-const FILE_SUPPORTS_EXTENDED_ATTRIBUTES: u32 = 0x0080_0000;
 
 pub async fn handle(
     _server: &Arc<ServerState>,
@@ -48,12 +44,10 @@ pub async fn handle(
         None => return HandlerResponse::err(ntstatus::STATUS_FILE_CLOSED),
     };
 
-    // Pull the file index (we use FileId.volatile as the unique handle id).
-    let (file_index, info_res) = {
+    let info_res = {
         let open = open_arc.read().await;
-        let fid = open.file_id;
         match open.handle.as_ref() {
-            Some(h) => (fid.volatile, h.stat().await),
+            Some(h) => h.stat().await,
             None => return HandlerResponse::err(ntstatus::STATUS_FILE_CLOSED),
         }
     };
@@ -67,7 +61,9 @@ pub async fn handle(
             match req.file_information_class {
                 ic::FILE_BASIC_INFORMATION => ic::encode_file_basic_information(&info),
                 ic::FILE_STANDARD_INFORMATION => ic::encode_file_standard_information(&info),
-                ic::FILE_INTERNAL_INFORMATION => ic::encode_file_internal_information(file_index),
+                ic::FILE_INTERNAL_INFORMATION => {
+                    ic::encode_file_internal_information(info.file_index)
+                }
                 ic::FILE_EA_INFORMATION => ic::encode_file_ea_information(),
                 ic::FILE_FULL_EA_INFORMATION => {
                     return HandlerResponse::err(ntstatus::STATUS_NO_EAS_ON_FILE);
@@ -77,9 +73,7 @@ pub async fn handle(
                 ic::FILE_MODE_INFORMATION => ic::encode_file_mode_information(0),
                 ic::FILE_ALIGNMENT_INFORMATION => ic::encode_file_alignment_information(),
                 ic::FILE_NAME_INFORMATION => ic::encode_file_name_information(&info.name),
-                ic::FILE_ALL_INFORMATION => {
-                    ic::encode_file_all_information(&info, file_index, 0x001F_01FF)
-                }
+                ic::FILE_ALL_INFORMATION => ic::encode_file_all_information(&info, 0x001F_01FF),
                 ic::FILE_NETWORK_OPEN_INFORMATION => {
                     ic::encode_file_network_open_information(&info)
                 }
@@ -114,13 +108,7 @@ pub async fn handle(
                         0
                     };
                     ic::encode_fs_attribute_information(
-                        case_sensitive
-                            | FILE_CASE_PRESERVED_NAMES
-                            | FILE_UNICODE_ON_DISK
-                            | FILE_PERSISTENT_ACLS
-                            | FILE_FILE_COMPRESSION
-                            | FILE_SUPPORTS_HARD_LINKS
-                            | FILE_SUPPORTS_EXTENDED_ATTRIBUTES,
+                        case_sensitive | FILE_CASE_PRESERVED_NAMES | FILE_UNICODE_ON_DISK,
                         255,
                         "NTFS",
                     )

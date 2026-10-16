@@ -47,7 +47,7 @@ pub struct QueryDirectoryRequest {
     pub file_name_length: u16,
     pub output_buffer_length: u32,
     /// UTF-16LE search pattern (e.g. "*").
-    #[br(count = file_name_length as usize)]
+    #[br(parse_with = super::read_buf, args(file_name_length as usize))]
     pub file_name: Vec<u8>,
 }
 
@@ -78,7 +78,7 @@ pub struct QueryDirectoryResponse {
     pub output_buffer_offset: u16,
     pub output_buffer_length: u32,
     /// Variable-length info-class-specific buffer.
-    #[br(count = output_buffer_length as usize)]
+    #[br(parse_with = super::read_buf, args(output_buffer_length as usize))]
     pub buffer: Vec<u8>,
 }
 

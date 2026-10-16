@@ -20,7 +20,7 @@ pub struct TreeConnectRequest {
     pub path_offset: u16,
     pub path_length: u16,
     /// UTF-16LE share path bytes (e.g. `\\server\share`).
-    #[br(count = path_length as usize)]
+    #[br(parse_with = super::read_buf, args(path_length as usize))]
     pub path: Vec<u8>,
 }
 

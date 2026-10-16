@@ -1,11 +1,13 @@
 //! NEGOTIATE, anonymous SESSION_SETUP and TREE_CONNECT over TCP loopback, then
-//! FSCTL_VALIDATE_NEGOTIATE_INFO, CREATE and READ.
+//! FSCTL_VALIDATE_NEGOTIATE_INFO, CREATE and READ. Also the per-connection
+//! limit on NTLM exchanges waiting for their final round.
 
 mod common;
 
 use common::{
-    STATUS_SUCCESS, anonymous_session_setup, build_header, negotiate, parse_response_header,
-    read_frame, tree_connect, utf16le, write_frame,
+    STATUS_MORE_PROCESSING_REQUIRED, STATUS_SUCCESS, anonymous_session_setup, build_header,
+    finish_anonymous_session_setup, negotiate, parse_response_header, read_frame,
+    start_ntlm_session_setup, start_server, tree_connect, utf16le, write_frame,
 };
 
 use smb_server::wire::header::Command;
@@ -13,7 +15,7 @@ use smb_server::wire::messages::{
     CreateRequest, CreateResponse, FileId, Fsctl, IoctlRequest, IoctlResponse, ReadRequest,
     ReadResponse,
 };
-use smb_server::{LocalFsBackend, Share, SmbServer};
+use smb_server::{LocalFsBackend, Share, SmbServer, ntstatus};
 use tempfile::tempdir;
 use tokio::net::TcpStream;
 
@@ -23,17 +25,12 @@ async fn validate_negotiate_info_then_anon_read() {
     let td = tempdir().expect("tempdir");
     std::fs::write(td.path().join("hello.txt"), b"hello world\n").expect("write hello.txt");
     let backend = LocalFsBackend::new(td.path()).expect("open root");
-    let server = SmbServer::builder()
-        .listen("127.0.0.1:0".parse().unwrap())
-        .share(Share::new("downloads", backend).public())
-        .netbios_name("TESTSERVER")
-        .build()
-        .expect("build");
-
-    server.bind().await.expect("bind");
-    let addr = server.local_addr().await.expect("addr");
-    let handle = tokio::spawn(async move { server.serve().await });
-    tokio::task::yield_now().await;
+    let (addr, handle) = start_server(
+        SmbServer::builder()
+            .share(Share::new("downloads", backend).public())
+            .netbios_name("TESTSERVER"),
+    )
+    .await;
 
     let mut s = TcpStream::connect(addr).await.expect("connect");
 
@@ -135,5 +132,49 @@ async fn validate_negotiate_info_then_anon_read() {
     drop(s);
     // The server keeps accepting; abort the spawned task so the test
     // process exits cleanly.
+    handle.abort();
+}
+
+#[tokio::test]
+async fn pending_ntlm_exchanges_are_capped_per_connection() {
+    const MAX_PENDING: usize = 16;
+
+    let td = tempdir().expect("tempdir");
+    let backend = LocalFsBackend::new(td.path()).expect("open root");
+    let (addr, handle) =
+        start_server(SmbServer::builder().share(Share::new("share", backend).public())).await;
+
+    let mut s = TcpStream::connect(addr).await.expect("connect");
+    let _ = negotiate(&mut s).await;
+    let mut mid = 1;
+    let mut next_mid = || {
+        mid += 1;
+        mid
+    };
+
+    let mut pending = Vec::new();
+    for _ in 0..MAX_PENDING {
+        let (status, sid) = start_ntlm_session_setup(&mut s, next_mid()).await;
+        assert_eq!(status, STATUS_MORE_PROCESSING_REQUIRED);
+        pending.push(sid);
+    }
+    let (status, _) = start_ntlm_session_setup(&mut s, next_mid()).await;
+    assert_eq!(status, ntstatus::STATUS_INSUFFICIENT_RESOURCES);
+
+    // Interleaved exchanges each complete, and completing one frees a slot.
+    for sid in pending.iter().rev().take(3) {
+        assert_eq!(
+            finish_anonymous_session_setup(&mut s, next_mid(), *sid).await,
+            STATUS_SUCCESS
+        );
+    }
+    let (status, sid) = start_ntlm_session_setup(&mut s, next_mid()).await;
+    assert_eq!(status, STATUS_MORE_PROCESSING_REQUIRED);
+    assert_eq!(
+        finish_anonymous_session_setup(&mut s, next_mid(), sid).await,
+        STATUS_SUCCESS
+    );
+
+    drop(s);
     handle.abort();
 }

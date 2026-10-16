@@ -38,12 +38,18 @@ impl FileId {
     }
 }
 
-/// MS-SMB2 §2.2.13 CREATE Request - fixed prefix.
+/// Offset of the first byte after the fixed CREATE request fields, counted
+/// from the start of the SMB2 header: 64 + 56.
+const CREATE_BUFFER_OFFSET: u64 = 0x78;
+
+/// MS-SMB2 §2.2.13 CREATE Request.
 ///
-/// Variable-length tail: the file `name` (UTF-16LE) and `create_contexts`
-/// blob, each at absolute offsets from the start of the SMB2 header. We hold
-/// them as length-counted byte buffers immediately following the fixed
-/// portion. [`CreateContext::parse_chain`] decodes the `create_contexts` blob.
+/// The file `name` (UTF-16LE) and the `create_contexts` blob sit at
+/// `name_offset` and `create_contexts_offset`, counted from the start of the
+/// SMB2 header, after the fixed fields. `parse` reads them from those offsets
+/// and fails when either points outside the request. `write_to` writes them
+/// back to back after the fixed fields, so the offsets must match that layout.
+/// [`CreateContext::parse_chain`] decodes the `create_contexts` blob.
 #[binrw]
 #[brw(little)]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,11 +70,19 @@ pub struct CreateRequest {
     pub create_contexts_offset: u32,
     pub create_contexts_length: u32,
     /// UTF-16LE filename.
-    #[br(count = name_length as usize)]
+    #[br(parse_with = super::read_buf_at, args(
+        name_offset.into(),
+        name_length.into(),
+        CREATE_BUFFER_OFFSET,
+    ))]
     pub name: Vec<u8>,
     /// Raw create-contexts chain bytes; parse with
     /// [`CreateContext::parse_chain`].
-    #[br(count = create_contexts_length as usize)]
+    #[br(parse_with = super::read_buf_at, args(
+        create_contexts_offset.into(),
+        create_contexts_length as usize,
+        CREATE_BUFFER_OFFSET,
+    ))]
     pub create_contexts: Vec<u8>,
 }
 
@@ -117,7 +131,7 @@ pub struct CreateResponse {
     pub file_id: FileId,
     pub create_contexts_offset: u32,
     pub create_contexts_length: u32,
-    #[br(count = create_contexts_length as usize)]
+    #[br(parse_with = super::read_buf, args(create_contexts_length as usize))]
     pub create_contexts: Vec<u8>,
 }
 
@@ -360,6 +374,99 @@ mod tests {
         let decoded = CreateRequest::parse(&buf).unwrap();
         assert_eq!(decoded, r);
         assert_eq!(decoded.name_str().unwrap(), "dir\\file.txt");
+    }
+
+    /// CREATE body with `name` at `name_offset` and `contexts` at
+    /// `contexts_offset`, zero-filling any gap after the fixed fields.
+    fn body_with_buffers(
+        name: &[u8],
+        name_offset: u16,
+        contexts: &[u8],
+        contexts_offset: u32,
+    ) -> Vec<u8> {
+        let fixed = CreateRequest {
+            structure_size: 57,
+            security_flags: 0,
+            requested_oplock_level: 0,
+            impersonation_level: ImpersonationLevel::Impersonation as u32,
+            smb_create_flags: 0,
+            reserved: 0,
+            desired_access: 0x0012_0089,
+            file_attributes: 0,
+            share_access: 0x0000_0007,
+            create_disposition: 1,
+            create_options: 0,
+            name_offset,
+            name_length: name.len() as u16,
+            create_contexts_offset: contexts_offset,
+            create_contexts_length: contexts.len() as u32,
+            name: vec![],
+            create_contexts: vec![],
+        };
+        let mut body = Vec::new();
+        fixed.write_to(&mut body).unwrap();
+        for (data, offset) in [(name, u32::from(name_offset)), (contexts, contexts_offset)] {
+            if data.is_empty() {
+                continue;
+            }
+            let start = offset as usize - 64;
+            if body.len() < start + data.len() {
+                body.resize(start + data.len(), 0);
+            }
+            body[start..start + data.len()].copy_from_slice(data);
+        }
+        body
+    }
+
+    #[test]
+    fn request_reads_name_and_contexts_at_their_offsets() {
+        let name = utf16le("dir\\file.txt");
+        let ctxs = vec![CreateContext {
+            name: CreateContext::NAME_MXAC.to_vec(),
+            data: vec![],
+        }];
+        let mut chain = Vec::new();
+        CreateContext::encode_chain(&ctxs, &mut chain).unwrap();
+        // Name 8 bytes past the fixed fields, contexts 8-aligned after it.
+        let name_offset = 0x80;
+        let contexts_offset = (u32::from(name_offset) + name.len() as u32).next_multiple_of(8);
+        let body = body_with_buffers(&name, name_offset, &chain, contexts_offset);
+
+        let req = CreateRequest::parse(&body).unwrap();
+        assert_eq!(req.name_str().unwrap(), "dir\\file.txt");
+        assert_eq!(
+            CreateContext::parse_chain(&req.create_contexts).unwrap(),
+            ctxs
+        );
+    }
+
+    #[test]
+    fn request_rejects_buffers_outside_the_request() {
+        // Byte position of NameOffset in the request body.
+        const NAME_OFFSET_FIELD: usize = 44;
+        let name = utf16le("a.txt");
+        // Inside the SMB2 header, inside the fixed fields, past the end.
+        for name_offset in [0x40, 0x70, 0x200] {
+            let mut body = body_with_buffers(&name, 0x78, &[], 0x78);
+            body[NAME_OFFSET_FIELD..NAME_OFFSET_FIELD + 2]
+                .copy_from_slice(&u16::to_le_bytes(name_offset));
+            assert!(
+                CreateRequest::parse(&body).is_err(),
+                "name offset {name_offset:#x}"
+            );
+        }
+        // Contexts that run past the end of the request.
+        let mut body = body_with_buffers(&name, 0x78, &[0; 16], 0x88);
+        body.truncate(body.len() - 1);
+        assert!(CreateRequest::parse(&body).is_err());
+    }
+
+    #[test]
+    fn request_accepts_empty_buffers_at_any_offset() {
+        let body = body_with_buffers(&[], 0, &[], 0);
+        let req = CreateRequest::parse(&body).unwrap();
+        assert_eq!(req.name_str().unwrap(), "");
+        assert!(req.create_contexts.is_empty());
     }
 
     #[test]

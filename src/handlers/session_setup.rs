@@ -11,7 +11,7 @@ use crate::proto::header::Smb2Header;
 use crate::proto::messages::{Dialect, SessionSetupRequest, SessionSetupResponse};
 use tracing::{debug, info, warn};
 
-use crate::conn::state::{Connection, Session};
+use crate::conn::state::{Connection, MAX_PENDING_AUTHS, Session};
 use crate::dispatch::HandlerResponse;
 use crate::ntstatus;
 use crate::server::ServerState;
@@ -134,6 +134,13 @@ pub async fn handle(
         // success response can match.
         {
             let mut pa = conn.pending_auths.write().await;
+            if pa.len() >= MAX_PENDING_AUTHS {
+                warn!(
+                    pending = pa.len(),
+                    "too many pending NTLM exchanges on connection"
+                );
+                return HandlerResponse::err(ntstatus::STATUS_INSUFFICIENT_RESOURCES);
+            }
             pa.insert(
                 new_sid,
                 Arc::new(std::sync::Mutex::new((acceptor, is_raw_ntlmssp))),

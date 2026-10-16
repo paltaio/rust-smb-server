@@ -35,7 +35,7 @@ pub struct ReadRequest {
     /// MS-SMB2: "If ReadChannelInfoOffset and ReadChannelInfoLength are both
     /// 0, the client MUST set this field to a single 0 byte." The buffer
     /// always holds at least one byte on the wire.
-    #[br(count = if read_channel_info_length == 0 { 1 } else { read_channel_info_length as usize })]
+    #[br(parse_with = super::read_buf, args(if read_channel_info_length == 0 { 1 } else { read_channel_info_length as usize }))]
     pub buffer: Vec<u8>,
 }
 
@@ -72,7 +72,7 @@ pub struct ReadResponse {
     pub data_remaining: u32,
     /// 3.x: `Flags`. 2.x: reserved.
     pub flags: u32,
-    #[br(count = data_length as usize)]
+    #[br(parse_with = super::read_buf, args(data_length as usize))]
     pub data: Vec<u8>,
 }
 

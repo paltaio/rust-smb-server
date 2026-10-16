@@ -1,5 +1,8 @@
 //! Helpers for hand-building SMB2 client requests in integration tests.
 
+use std::net::SocketAddr;
+
+use smb_server::SmbServerBuilder;
 use smb_server::wire::header::{Command, HeaderTail, SMB2_FLAGS_SERVER_TO_REDIR, Smb2Header};
 use smb_server::wire::messages::{
     NegotiateRequest, NegotiateResponse, SessionSetupRequest, SessionSetupResponse,
@@ -7,6 +10,7 @@ use smb_server::wire::messages::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::task::JoinHandle;
 
 pub const NTLMSSP_SIGNATURE: &[u8] = b"NTLMSSP\0";
 pub const OID_SPNEGO: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x02];
@@ -15,6 +19,19 @@ const FRAME_HEADER_LEN: usize = 4;
 
 pub const STATUS_SUCCESS: u32 = 0x0000_0000;
 pub const STATUS_MORE_PROCESSING_REQUIRED: u32 = 0xC000_0016;
+
+/// Builds the server on a loopback port, binds it and serves it on a task.
+pub async fn start_server(builder: SmbServerBuilder) -> (SocketAddr, JoinHandle<()>) {
+    let server = builder
+        .listen("127.0.0.1:0".parse().unwrap())
+        .build()
+        .expect("build");
+    let addr = server.bind().await.expect("bind");
+    let handle = tokio::spawn(async move {
+        let _ = server.serve().await;
+    });
+    (addr, handle)
+}
 
 pub fn utf16le(s: &str) -> Vec<u8> {
     s.encode_utf16().flat_map(u16::to_le_bytes).collect()
@@ -185,7 +202,9 @@ pub async fn negotiate(s: &mut TcpStream) -> NegotiateResponse {
     neg_resp
 }
 
-pub async fn anonymous_session_setup(s: &mut TcpStream) -> u64 {
+/// Sends SESSION_SETUP with an SPNEGO-wrapped NTLM NEGOTIATE; returns the
+/// response status and SessionId.
+pub async fn start_ntlm_session_setup(s: &mut TcpStream, message_id: u64) -> (u32, u64) {
     let mut ntlm_negotiate = Vec::new();
     ntlm_negotiate.extend_from_slice(NTLMSSP_SIGNATURE);
     ntlm_negotiate.extend_from_slice(&1u32.to_le_bytes());
@@ -207,18 +226,27 @@ pub async fn anonymous_session_setup(s: &mut TcpStream) -> u64 {
     };
     let mut body = Vec::new();
     ss_req.write_to(&mut body).expect("write session setup");
-    let hdr = build_header(Command::SessionSetup, 1, 0, 0);
+    let hdr = build_header(Command::SessionSetup, message_id, 0, 0);
     write_frame(s, &hdr, &body).await;
 
     let resp = read_frame(s).await;
     let (rh, rb) = parse_response_header(&resp);
     assert_eq!(rh.command, Command::SessionSetup);
-    assert_eq!(rh.channel_sequence_status, STATUS_MORE_PROCESSING_REQUIRED);
-    let session_id = rh.session_id;
-    assert_ne!(session_id, 0);
-    let ss_resp = SessionSetupResponse::parse(rb).expect("parse ss resp");
-    assert!(!ss_resp.security_buffer.is_empty());
+    if rh.channel_sequence_status == STATUS_MORE_PROCESSING_REQUIRED {
+        assert_ne!(rh.session_id, 0);
+        let ss_resp = SessionSetupResponse::parse(rb).expect("parse ss resp");
+        assert!(!ss_resp.security_buffer.is_empty());
+    }
+    (rh.channel_sequence_status, rh.session_id)
+}
 
+/// Sends the anonymous NTLM AUTHENTICATE round for `session_id`; returns the
+/// response status.
+pub async fn finish_anonymous_session_setup(
+    s: &mut TcpStream,
+    message_id: u64,
+    session_id: u64,
+) -> u32 {
     let mut ntlm_auth = Vec::new();
     ntlm_auth.extend_from_slice(NTLMSSP_SIGNATURE);
     ntlm_auth.extend_from_slice(&3u32.to_le_bytes());
@@ -245,22 +273,33 @@ pub async fn anonymous_session_setup(s: &mut TcpStream) -> u64 {
     };
     let mut body = Vec::new();
     ss_req2.write_to(&mut body).expect("write session setup");
-    let hdr = build_header(Command::SessionSetup, 2, session_id, 0);
+    let hdr = build_header(Command::SessionSetup, message_id, session_id, 0);
     write_frame(s, &hdr, &body).await;
 
     let resp = read_frame(s).await;
     let (rh, rb) = parse_response_header(&resp);
     assert_eq!(rh.command, Command::SessionSetup);
-    assert_eq!(rh.channel_sequence_status, STATUS_SUCCESS);
-    assert_eq!(rh.session_id, session_id);
-    let ss_resp = SessionSetupResponse::parse(rb).expect("parse ss success resp");
+    if rh.channel_sequence_status == STATUS_SUCCESS {
+        assert_eq!(rh.session_id, session_id);
+        let ss_resp = SessionSetupResponse::parse(rb).expect("parse ss success resp");
+        assert_eq!(
+            ss_resp.session_flags & SessionSetupResponse::FLAG_IS_GUEST,
+            SessionSetupResponse::FLAG_IS_GUEST
+        );
+        assert_eq!(
+            ss_resp.session_flags & SessionSetupResponse::FLAG_IS_NULL,
+            0
+        );
+    }
+    rh.channel_sequence_status
+}
+
+pub async fn anonymous_session_setup(s: &mut TcpStream) -> u64 {
+    let (status, session_id) = start_ntlm_session_setup(s, 1).await;
+    assert_eq!(status, STATUS_MORE_PROCESSING_REQUIRED);
     assert_eq!(
-        ss_resp.session_flags & SessionSetupResponse::FLAG_IS_GUEST,
-        SessionSetupResponse::FLAG_IS_GUEST
-    );
-    assert_eq!(
-        ss_resp.session_flags & SessionSetupResponse::FLAG_IS_NULL,
-        0
+        finish_anonymous_session_setup(s, 2, session_id).await,
+        STATUS_SUCCESS
     );
     session_id
 }
@@ -288,4 +327,31 @@ pub async fn tree_connect(s: &mut TcpStream, path: &str, session_id: u64, messag
     let tc_resp = TreeConnectResponse::parse(rb).expect("parse tc resp");
     assert_eq!(tc_resp.share_type, TreeConnectResponse::SHARE_TYPE_DISK);
     tree_id
+}
+
+/// Name and FileId of each entry in a FileIdBothDirectoryInformation buffer.
+#[allow(dead_code, reason = "not every test crate lists directories")]
+pub fn decode_file_id_both_directory_info(mut buf: &[u8]) -> Vec<(String, u64)> {
+    let mut entries = Vec::new();
+    loop {
+        assert!(
+            buf.len() >= 104,
+            "short FileIdBothDirectoryInformation entry"
+        );
+        let next = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize;
+        let name_len = u32::from_le_bytes(buf[60..64].try_into().unwrap()) as usize;
+        let file_id = u64::from_le_bytes(buf[96..104].try_into().unwrap());
+        let name_end = 104 + name_len;
+        assert!(buf.len() >= name_end, "short file name");
+        let units: Vec<u16> = buf[104..name_end]
+            .chunks_exact(2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .collect();
+        entries.push((String::from_utf16(&units).expect("utf16 name"), file_id));
+        if next == 0 {
+            break entries;
+        }
+        assert!(buf.len() >= next, "invalid NextEntryOffset");
+        buf = &buf[next..];
+    }
 }

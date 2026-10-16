@@ -12,6 +12,7 @@ pub type SmbResult<T> = Result<T, SmbError>;
 /// failures (malformed frames, bad signatures) are handled by the dispatcher
 /// and never become `SmbError`.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum SmbError {
     #[error("not found")]
     NotFound,
@@ -33,6 +34,8 @@ pub enum SmbError {
     Sharing,
     #[error("not supported")]
     NotSupported,
+    #[error("source and target are on different devices")]
+    NotSameDevice,
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -51,6 +54,7 @@ impl SmbError {
             SmbError::NameInvalid => ntstatus::STATUS_OBJECT_NAME_INVALID,
             SmbError::Sharing => ntstatus::STATUS_SHARING_VIOLATION,
             SmbError::NotSupported => ntstatus::STATUS_NOT_SUPPORTED,
+            SmbError::NotSameDevice => ntstatus::STATUS_NOT_SAME_DEVICE,
             SmbError::Io(_) => ntstatus::STATUS_UNEXPECTED_IO_ERROR,
         }
     }
@@ -72,6 +76,7 @@ mod tests {
         assert_eq!(SmbError::NameInvalid.to_nt_status(), 0xC000_0033);
         assert_eq!(SmbError::Sharing.to_nt_status(), 0xC000_0043);
         assert_eq!(SmbError::NotSupported.to_nt_status(), 0xC000_00BB);
+        assert_eq!(SmbError::NotSameDevice.to_nt_status(), 0xC000_00D4);
 
         let io_err = SmbError::Io(std::io::Error::other("boom"));
         assert_eq!(io_err.to_nt_status(), 0xC000_009C);

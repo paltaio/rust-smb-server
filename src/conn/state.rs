@@ -21,6 +21,10 @@ use crate::server::ShareBindings;
 /// same form the client opened with.
 pub type PendingAuth = Arc<Mutex<(NtlmServer, bool)>>;
 
+/// Most NTLM exchanges one connection may have waiting for their final
+/// SESSION_SETUP round.
+pub const MAX_PENDING_AUTHS: usize = 16;
+
 // ---------------------------------------------------------------------------
 // Connection
 // ---------------------------------------------------------------------------
@@ -289,7 +293,8 @@ impl TreeConnect {
 pub struct Open {
     pub file_id: FileId,
     pub handle: Option<Box<dyn Handle>>,
-    pub granted_access: Access,
+    /// Open.GrantedAccess: access mask bits, generic rights already mapped.
+    pub granted_access: u32,
     pub last_path: SmbPath,
     pub is_directory: bool,
     pub delete_on_close: bool,
@@ -300,7 +305,7 @@ impl Open {
     pub fn new(
         file_id: FileId,
         handle: Box<dyn Handle>,
-        granted_access: Access,
+        granted_access: u32,
         last_path: SmbPath,
         is_directory: bool,
         delete_on_close: bool,

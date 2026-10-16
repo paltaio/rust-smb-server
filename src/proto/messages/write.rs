@@ -29,7 +29,7 @@ pub struct WriteRequest {
     pub flags: u32,
     /// MS-SMB2: at least 1 byte of payload buffer is required on the wire
     /// even when length=0.
-    #[br(count = if length == 0 { 1 } else { length as usize })]
+    #[br(parse_with = super::read_buf, args(if length == 0 { 1 } else { length as usize }))]
     pub data: Vec<u8>,
 }
 

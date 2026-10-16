@@ -42,7 +42,7 @@ pub struct ChangeNotifyResponse {
     pub structure_size: u16,
     pub output_buffer_offset: u16,
     pub output_buffer_length: u32,
-    #[br(count = output_buffer_length as usize)]
+    #[br(parse_with = super::read_buf, args(output_buffer_length as usize))]
     pub buffer: Vec<u8>,
 }
 

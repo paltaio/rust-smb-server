@@ -7,8 +7,8 @@ mod common;
 
 use common::encode_frame;
 use common::{
-    STATUS_SUCCESS, anonymous_session_setup, build_header, negotiate, parse_response_header,
-    read_frame, tree_connect, utf16le, write_frame,
+    STATUS_SUCCESS, anonymous_session_setup, build_header, decode_file_id_both_directory_info,
+    negotiate, parse_response_header, read_frame, start_server, tree_connect, utf16le, write_frame,
 };
 use smb_server::LocalFsBackend;
 use smb_server::wire::header::{Command, SMB2_FLAGS_RELATED_OPERATIONS, Smb2Header};
@@ -24,11 +24,11 @@ use tempfile::tempdir;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
-/// `LocalFsBackend` that reports case-insensitive names.
-struct CaseInsensitive(LocalFsBackend);
+/// `LocalFsBackend` that reports the given `case_sensitive` capability.
+struct CaseRule(LocalFsBackend, bool);
 
 #[async_trait::async_trait]
-impl ShareBackend for CaseInsensitive {
+impl ShareBackend for CaseRule {
     async fn open(&self, path: &SmbPath, opts: OpenOptions) -> SmbResult<Box<dyn Handle>> {
         self.0.open(path, opts).await
     }
@@ -37,13 +37,13 @@ impl ShareBackend for CaseInsensitive {
         self.0.unlink(path).await
     }
 
-    async fn rename(&self, from: &SmbPath, to: &SmbPath) -> SmbResult<()> {
-        self.0.rename(from, to).await
+    async fn rename(&self, from: &SmbPath, to: &SmbPath, replace_if_exists: bool) -> SmbResult<()> {
+        self.0.rename(from, to, replace_if_exists).await
     }
 
     fn capabilities(&self) -> BackendCapabilities {
         BackendCapabilities {
-            case_sensitive: false,
+            case_sensitive: self.1,
             ..self.0.capabilities()
         }
     }
@@ -57,17 +57,12 @@ async fn end_to_end_anon_read_localfs() {
     std::fs::create_dir(td.path().join("sub")).expect("mkdir sub");
 
     let backend = LocalFsBackend::new(td.path()).expect("open root");
-    let server = SmbServer::builder()
-        .listen("127.0.0.1:0".parse().unwrap())
-        .share(Share::new("share", CaseInsensitive(backend)).public())
-        .netbios_name("TESTSERVER")
-        .build()
-        .expect("build");
-
-    server.bind().await.expect("bind");
-    let addr = server.local_addr().await.expect("addr");
-    let handle = tokio::spawn(async move { server.serve().await });
-    tokio::task::yield_now().await;
+    let (addr, handle) = start_server(
+        SmbServer::builder()
+            .share(Share::new("share", CaseRule(backend, false)).public())
+            .netbios_name("TESTSERVER"),
+    )
+    .await;
 
     let mut s = TcpStream::connect(addr).await.expect("connect");
 
@@ -245,11 +240,9 @@ async fn end_to_end_anon_read_localfs() {
     assert_eq!(rh.channel_sequence_status, STATUS_SUCCESS);
     let fs_resp = QueryInfoResponse::parse(rb).expect("parse fs attribute resp");
     let fs_attrs = u32::from_le_bytes(fs_resp.buffer[0..4].try_into().unwrap());
-    assert_eq!(
-        fs_attrs & 0x1,
-        0,
-        "FILE_CASE_SENSITIVE_SEARCH follows the backend"
-    );
+    // FILE_CASE_PRESERVED_NAMES | FILE_UNICODE_ON_DISK; no
+    // FILE_CASE_SENSITIVE_SEARCH for a case-insensitive backend.
+    assert_eq!(fs_attrs, 0x2 | 0x4, "fs attributes {fs_attrs:#x}");
 
     // ---- QUERY_DIRECTORY FileIdBothDirectoryInformation ------------------
     let pat = utf16le("*");
@@ -274,9 +267,15 @@ async fn end_to_end_anon_read_localfs() {
     assert_eq!(rh.channel_sequence_status, STATUS_SUCCESS);
     let qd_resp = QueryDirectoryResponse::parse(rb).expect("parse query directory resp");
     assert!(qd_resp.output_buffer_length >= 104);
-    let names = decode_file_id_both_names(&qd_resp.buffer);
-    assert!(names.iter().any(|n| n == "hello.txt"), "names={names:?}");
-    assert!(names.iter().any(|n| n == "sub"), "names={names:?}");
+    let entries = decode_file_id_both_directory_info(&qd_resp.buffer);
+    assert!(
+        entries.iter().any(|(n, _)| n == "hello.txt"),
+        "entries={entries:?}"
+    );
+    assert!(
+        entries.iter().any(|(n, _)| n == "sub"),
+        "entries={entries:?}"
+    );
 
     // ---- CLOSE root dir --------------------------------------------------
     let cl_root_req = CloseRequest {
@@ -402,30 +401,77 @@ async fn end_to_end_anon_read_localfs() {
     handle.abort();
 }
 
-fn decode_file_id_both_names(mut buf: &[u8]) -> Vec<String> {
-    let mut names = Vec::new();
-    loop {
-        assert!(
-            buf.len() >= 104,
-            "short FileIdBothDirectoryInformation entry"
-        );
-        let next = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize;
-        let name_len = u32::from_le_bytes(buf[60..64].try_into().unwrap()) as usize;
-        let name_start = 104;
-        let name_end = name_start + name_len;
-        assert!(buf.len() >= name_end, "short file name");
-        let units: Vec<u16> = buf[name_start..name_end]
-            .chunks_exact(2)
-            .map(|b| u16::from_le_bytes([b[0], b[1]]))
-            .collect();
-        names.push(String::from_utf16(&units).expect("utf16 name"));
-        if next == 0 {
-            break;
-        }
-        assert!(buf.len() >= next, "invalid NextEntryOffset");
-        buf = &buf[next..];
+#[tokio::test]
+async fn fs_attributes_report_case_sensitive_search() {
+    let td = tempdir().expect("tempdir");
+    let backend = CaseRule(LocalFsBackend::new(td.path()).expect("open root"), true);
+    let (addr, handle) =
+        start_server(SmbServer::builder().share(Share::new("share", backend).public())).await;
+    let mut s = TcpStream::connect(addr).await.expect("connect");
+    let _ = negotiate(&mut s).await;
+    let session_id = anonymous_session_setup(&mut s).await;
+    let tree_id = tree_connect(&mut s, "\\\\127.0.0.1\\share", session_id, 3).await;
+
+    let mut body = Vec::new();
+    CreateRequest {
+        structure_size: 57,
+        security_flags: 0,
+        requested_oplock_level: 0,
+        impersonation_level: 2,
+        smb_create_flags: 0,
+        reserved: 0,
+        desired_access: 0x0012_0089, // FILE_GENERIC_READ
+        file_attributes: 0,
+        share_access: 0x0000_0007,
+        create_disposition: 1, // FILE_OPEN
+        create_options: 0,
+        name_offset: 0x78,
+        name_length: 0,
+        create_contexts_offset: 0,
+        create_contexts_length: 0,
+        name: vec![],
+        create_contexts: vec![],
     }
-    names
+    .write_to(&mut body)
+    .expect("write");
+    let hdr = build_header(Command::Create, 4, session_id, tree_id);
+    write_frame(&mut s, &hdr, &body).await;
+    let resp = read_frame(&mut s).await;
+    let (rh, rb) = parse_response_header(&resp);
+    assert_eq!(rh.channel_sequence_status, STATUS_SUCCESS);
+    let root = CreateResponse::parse(rb)
+        .expect("parse create resp")
+        .file_id;
+
+    let mut body = Vec::new();
+    QueryInfoRequest {
+        structure_size: 41,
+        info_type: InfoType::FileSystem as u8,
+        file_information_class: 0x05, // FileFsAttributeInformation
+        output_buffer_length: 4096,
+        input_buffer_offset: 0,
+        reserved: 0,
+        input_buffer_length: 0,
+        additional_information: 0,
+        flags: 0,
+        file_id: root,
+        input_buffer: vec![],
+    }
+    .write_to(&mut body)
+    .expect("write");
+    let hdr = build_header(Command::QueryInfo, 5, session_id, tree_id);
+    write_frame(&mut s, &hdr, &body).await;
+    let resp = read_frame(&mut s).await;
+    let (rh, rb) = parse_response_header(&resp);
+    assert_eq!(rh.channel_sequence_status, STATUS_SUCCESS);
+    let buffer = QueryInfoResponse::parse(rb)
+        .expect("parse query resp")
+        .buffer;
+    let fs_attrs = u32::from_le_bytes(buffer[0..4].try_into().unwrap());
+    // FILE_CASE_SENSITIVE_SEARCH | FILE_CASE_PRESERVED_NAMES | FILE_UNICODE_ON_DISK.
+    assert_eq!(fs_attrs, 0x1 | 0x2 | 0x4, "fs attributes {fs_attrs:#x}");
+
+    handle.abort();
 }
 
 fn append_compound_part(

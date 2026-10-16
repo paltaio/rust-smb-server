@@ -32,6 +32,7 @@ tracing = "0.1"
 thiserror = "1"
 uuid = { version = "1.10", features = ["v4"] }
 cap-std = "3"
+cap-primitives = "~3.4"
 
 # RustCrypto family
 hmac  = "0.12"
@@ -60,9 +61,12 @@ aes.workspace = true
 cmac.workspace = true
 rc4.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+cap-primitives = { workspace = true, optional = true }
+
 [features]
 default = ["localfs"]
-localfs = ["dep:cap-std"]
+localfs = ["dep:cap-std", "dep:cap-primitives"]
 
 [dev-dependencies]
 tokio = { workspace = true }

@@ -15,7 +15,6 @@
 //!   `?` and `*`), since cap-std only provides raw `entries()`.
 
 use std::io;
-use std::os::unix::fs::FileExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -23,7 +22,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use bytes::Bytes;
 use cap_std::ambient_authority;
-use cap_std::fs::{Dir, OpenOptions as CapOpenOptions};
+use cap_std::fs::{Dir, Metadata, OpenOptions as CapOpenOptions};
 use tokio::task::spawn_blocking;
 
 use crate::backend::{
@@ -31,7 +30,7 @@ use crate::backend::{
     OpenOptions, ShareBackend,
 };
 use crate::error::{SmbError, SmbResult};
-use crate::path::SmbPath;
+use crate::path::{SmbPath, same_path};
 use crate::utils::{FILETIME_OFFSET, system_time_to_filetime};
 
 // ---------------------------------------------------------------------------
@@ -99,6 +98,7 @@ fn io_to_smb(err: io::Error) -> SmbError {
         IsADirectory => SmbError::IsDirectory,
         NotADirectory => SmbError::NotADirectory,
         InvalidInput | InvalidFilename => SmbError::NameInvalid,
+        CrossesDevices => SmbError::NotSameDevice,
         _ => SmbError::Io(err),
     }
 }
@@ -107,6 +107,99 @@ fn io_to_smb(err: io::Error) -> SmbError {
 /// `io::ErrorKind::Other`.
 fn join_to_io(_e: tokio::task::JoinError) -> io::Error {
     io::Error::other("blocking task panicked or was cancelled")
+}
+
+// ---------------------------------------------------------------------------
+// Host-specific file access
+// ---------------------------------------------------------------------------
+
+// On Windows these also move the file cursor, which nothing here reads.
+
+fn read_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::FileExt::read_at(file, buf, offset)
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::FileExt::seek_read(file, buf, offset)
+    }
+}
+
+fn write_at(file: &std::fs::File, data: &[u8], offset: u64) -> io::Result<usize> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::FileExt::write_at(file, data, offset)
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::FileExt::seek_write(file, data, offset)
+    }
+}
+
+/// Host identity of a file: device and inode number on Unix, volume serial
+/// number and file index on Windows. `None` if `md` does not carry it.
+fn file_key(md: &Metadata) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use cap_std::fs::MetadataExt as _;
+        Some((md.dev(), md.ino()))
+    }
+    #[cfg(windows)]
+    {
+        // The hidden trait returns `None` where `cap_fs_ext::MetadataExt` panics on scan metadata.
+        use cap_primitives::fs::_WindowsByHandle;
+        let volume = _WindowsByHandle::volume_serial_number(md)?;
+        let index = _WindowsByHandle::file_index(md)?;
+        Some((volume.into(), index))
+    }
+}
+
+/// Number of hard links to a file. `None` if `md` does not carry it.
+fn link_count(md: &Metadata) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        use cap_std::fs::MetadataExt as _;
+        Some(md.nlink())
+    }
+    #[cfg(windows)]
+    {
+        cap_primitives::fs::_WindowsByHandle::number_of_links(md).map(u64::from)
+    }
+}
+
+/// Whether an entry, given its metadata read without following a final
+/// symlink, is a directory to the host and is deleted with `remove_dir`. On
+/// Unix that holds for directories only; a symlink to a directory is a plain
+/// link. On Windows it holds for anything with the directory attribute,
+/// which includes directory symlinks and junctions.
+fn is_dir_entry(md: &Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        md.is_dir()
+    }
+    #[cfg(windows)]
+    {
+        const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+        cap_std::fs::MetadataExt::file_attributes(md) & FILE_ATTRIBUTE_DIRECTORY != 0
+    }
+}
+
+/// Metadata for a directory listing entry, carrying the host file id. On
+/// Windows, `DirEntry::metadata` comes from the directory scan and has no
+/// file index, so the entry is opened for it, falling back to the scan data
+/// when the open fails.
+#[cfg_attr(unix, expect(unused_variables, reason = "dir is used on Windows only"))]
+fn entry_metadata(dir: &Dir, entry: &cap_std::fs::DirEntry) -> io::Result<Metadata> {
+    #[cfg(unix)]
+    {
+        entry.metadata()
+    }
+    #[cfg(windows)]
+    {
+        dir.symlink_metadata(entry.file_name())
+            .or_else(|_| entry.metadata())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -127,7 +220,7 @@ fn filetime_to_system_time(ft: u64) -> Option<SystemTime> {
 // FileInfo construction
 // ---------------------------------------------------------------------------
 
-fn file_info_from_metadata(name: String, md: &cap_std::fs::Metadata) -> FileInfo {
+fn file_info_from_metadata(name: String, md: &Metadata) -> FileInfo {
     let len = md.len();
     let modified = md.modified().ok().map(|t| t.into_std());
     let accessed = md.accessed().ok().map(|t| t.into_std());
@@ -151,8 +244,7 @@ fn file_info_from_metadata(name: String, md: &cap_std::fs::Metadata) -> FileInfo
         last_write_time: system_time_to_filetime(modified),
         change_time: system_time_to_filetime(modified),
         is_directory: md.is_dir(),
-        // No portable inode accessor in cap-std; directory listings report 0.
-        file_index: 0,
+        file_index: file_key(md).map_or(0, |(_, id)| id),
     }
 }
 
@@ -358,15 +450,13 @@ impl ShareBackend for LocalFsBackend {
         let root = Arc::clone(&self.root);
 
         spawn_blocking(move || -> io::Result<()> {
-            match root.remove_file(&rel) {
-                Ok(()) => Ok(()),
-                Err(e) if e.kind() == io::ErrorKind::IsADirectory => {
-                    // Caller's intent was "delete this name"; if it turned
-                    // out to be a directory, fall back to remove_dir which
-                    // refuses non-empty dirs (mapped to NotEmpty above).
-                    root.remove_dir(&rel)
-                }
-                Err(e) => Err(e),
+            // Pick the call from the entry itself: the error `remove_file`
+            // returns for a directory differs between hosts. Neither call
+            // follows a final symlink, so a link is removed as a link.
+            if is_dir_entry(&root.symlink_metadata(&rel)?) {
+                root.remove_dir(&rel)
+            } else {
+                root.remove_file(&rel)
             }
         })
         .await
@@ -375,25 +465,47 @@ impl ShareBackend for LocalFsBackend {
         .map_err(io_to_smb)
     }
 
-    async fn rename(&self, from: &SmbPath, to: &SmbPath) -> SmbResult<()> {
+    async fn rename(&self, from: &SmbPath, to: &SmbPath, replace_if_exists: bool) -> SmbResult<()> {
         if self.read_only {
             return Err(SmbError::AccessDenied);
         }
         if from.is_root() || to.is_root() {
             return Err(SmbError::NameInvalid);
         }
+        let same_name = same_path(from, to, self.capabilities().case_sensitive);
         let from = to_rel_path(from);
         let to_path = to_rel_path(to);
         let root = Arc::clone(&self.root);
-        let root2 = Arc::clone(&self.root);
 
         spawn_blocking(move || -> io::Result<()> {
-            // Rename never replaces an existing target; ReplaceIfExists is
-            // not supported.
-            if root2.exists(&to_path) {
-                return Err(io::Error::from(io::ErrorKind::AlreadyExists));
+            let from_md = root.symlink_metadata(&from)?;
+            match root.symlink_metadata(&to_path) {
+                Ok(to_md) => {
+                    let from_key = file_key(&from_md);
+                    let same_file = from_key.is_some() && from_key == file_key(&to_md);
+                    // A target that is the source under the same name, such
+                    // as a case-only rename on a case-insensitive host, is
+                    // not a collision.
+                    if !(same_file && same_name) {
+                        if !replace_if_exists {
+                            return Err(io::ErrorKind::AlreadyExists.into());
+                        }
+                        if is_dir_entry(&to_md) {
+                            return Err(io::ErrorKind::PermissionDenied.into());
+                        }
+                    }
+                    // The host leaves both names in place when renaming one
+                    // hard link over another, so the source link is removed.
+                    // A file with one link reached under two spellings is a
+                    // single entry and goes through the rename.
+                    if same_file && !same_name && link_count(&from_md) > Some(1) {
+                        return root.remove_file(&from);
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
             }
-            root.rename(&from, &root2, &to_path)
+            root.rename(&from, &root, &to_path)
         })
         .await
         .map_err(join_to_io)
@@ -442,7 +554,7 @@ impl Handle for LocalHandle {
                 let n = len as usize;
                 let bytes = spawn_blocking(move || -> io::Result<Bytes> {
                     let mut buf = vec![0u8; n];
-                    let read = file.read_at(&mut buf, offset)?;
+                    let read = read_at(&file, &mut buf, offset)?;
                     buf.truncate(read);
                     Ok(Bytes::from(buf))
                 })
@@ -469,7 +581,7 @@ impl Handle for LocalHandle {
                     return Err(SmbError::AccessDenied);
                 }
                 let file = Arc::clone(file);
-                let written = spawn_blocking(move || file.write_at(&data, offset))
+                let written = spawn_blocking(move || write_at(&file, &data, offset))
                     .await
                     .map_err(join_to_io)
                     .map_err(io_to_smb)?
@@ -501,11 +613,7 @@ impl Handle for LocalHandle {
                 let file = Arc::clone(file);
                 let name = name.clone();
                 spawn_blocking(move || -> io::Result<FileInfo> {
-                    let std_md = file.metadata()?;
-                    // Synthesize a cap-std Metadata from the std one so we
-                    // can reuse `file_info_from_metadata`. cap-primitives
-                    // exposes `Metadata::from_just_metadata` for this.
-                    let md = cap_std::fs::Metadata::from_just_metadata(std_md);
+                    let md = Metadata::from_file(&file)?;
                     Ok(file_info_from_metadata(name, &md))
                 })
                 .await
@@ -610,7 +718,7 @@ impl Handle for LocalHandle {
                                 continue;
                             }
                         }
-                        let md = entry.metadata()?;
+                        let md = entry_metadata(&dir_handle, &entry)?;
                         let info = file_info_from_metadata(name, &md);
                         out.push(SmbDirEntry { info });
                     }
@@ -822,7 +930,10 @@ mod tests {
         h.write(0, b"data").await.unwrap();
         h.close().await.unwrap();
 
-        backend.rename(&p("old.txt"), &p("new.txt")).await.unwrap();
+        backend
+            .rename(&p("old.txt"), &p("new.txt"), false)
+            .await
+            .unwrap();
         assert!(td.path().join("new.txt").exists());
         assert!(!td.path().join("old.txt").exists());
 
@@ -830,11 +941,126 @@ mod tests {
         let h = backend.open(&p("other.txt"), opts_create()).await.unwrap();
         h.close().await.unwrap();
         let err = backend
-            .rename(&p("other.txt"), &p("new.txt"))
+            .rename(&p("other.txt"), &p("new.txt"), false)
             .await
             .err()
             .unwrap();
         assert!(matches!(err, SmbError::Exists), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn rename_replace_if_exists() {
+        let td = tempdir().unwrap();
+        let root = td.path();
+        std::fs::write(root.join("tmp.txt"), b"new").unwrap();
+        std::fs::write(root.join("doc.txt"), b"old").unwrap();
+        std::fs::create_dir(root.join("dir")).unwrap();
+        let backend = LocalFsBackend::new(root).unwrap();
+
+        // Renaming a file onto itself is not a collision.
+        backend
+            .rename(&p("doc.txt"), &p("doc.txt"), false)
+            .await
+            .unwrap();
+
+        backend
+            .rename(&p("tmp.txt"), &p("doc.txt"), true)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(root.join("doc.txt")).unwrap(), b"new");
+        assert!(!root.join("tmp.txt").exists());
+
+        // A directory is never replaced.
+        let err = backend
+            .rename(&p("doc.txt"), &p("dir"), true)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SmbError::AccessDenied), "got {err:?}");
+        assert!(root.join("dir").is_dir());
+        assert_eq!(std::fs::read(root.join("doc.txt")).unwrap(), b"new");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rename_between_hard_links_follows_collision_rules() {
+        let td = tempdir().unwrap();
+        let root = td.path();
+        std::fs::write(root.join("a.txt"), b"data").unwrap();
+        std::fs::hard_link(root.join("a.txt"), root.join("b.txt")).unwrap();
+        let backend = LocalFsBackend::new(root).unwrap();
+
+        let err = backend
+            .rename(&p("a.txt"), &p("b.txt"), false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SmbError::Exists), "got {err:?}");
+        assert!(root.join("a.txt").exists());
+
+        backend
+            .rename(&p("a.txt"), &p("b.txt"), true)
+            .await
+            .unwrap();
+        assert!(!root.join("a.txt").exists());
+        assert_eq!(std::fs::read(root.join("b.txt")).unwrap(), b"data");
+    }
+
+    #[tokio::test]
+    async fn file_index_is_the_same_for_every_open_and_listing() {
+        let td = tempdir().unwrap();
+        std::fs::write(td.path().join("f.txt"), b"x").unwrap();
+        std::fs::create_dir(td.path().join("d")).unwrap();
+        let backend = LocalFsBackend::new(td.path()).unwrap();
+
+        let root = backend
+            .open(&SmbPath::root(), opts_open_dir())
+            .await
+            .unwrap();
+        let listed = root.list_dir(None).await.unwrap();
+        for (name, opts) in [("f.txt", opts_open_ro()), ("d", opts_open_dir())] {
+            let first = backend.open(&p(name), opts).await.unwrap();
+            let second = backend.open(&p(name), opts).await.unwrap();
+            let id = first.stat().await.unwrap().file_index;
+            assert_ne!(id, 0, "{name}");
+            assert_eq!(second.stat().await.unwrap().file_index, id, "{name}");
+            let entry = listed.iter().find(|e| e.info.name == name).unwrap();
+            assert_eq!(entry.info.file_index, id, "{name}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unlink_removes_empty_dirs_and_symlinks_as_links() {
+        use std::os::unix::fs::symlink;
+
+        let td = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        std::fs::write(outside.path().join("keep.txt"), b"x").unwrap();
+        let root = td.path();
+        std::fs::create_dir(root.join("empty")).unwrap();
+        std::fs::create_dir(root.join("target")).unwrap();
+        std::fs::write(root.join("target").join("inside.txt"), b"x").unwrap();
+        symlink(root.join("target"), root.join("link_in")).unwrap();
+        symlink(outside.path(), root.join("link_out")).unwrap();
+        symlink(root.join("missing"), root.join("dangling")).unwrap();
+        let backend = LocalFsBackend::new(root).unwrap();
+
+        backend.unlink(&p("empty")).await.unwrap();
+        assert!(!root.join("empty").exists());
+
+        for link in ["link_in", "link_out", "dangling"] {
+            backend.unlink(&p(link)).await.unwrap();
+            assert!(root.join(link).symlink_metadata().is_err(), "{link}");
+        }
+        assert!(root.join("target").join("inside.txt").exists());
+        assert!(outside.path().join("keep.txt").exists());
+    }
+
+    #[test]
+    fn cross_device_error_maps_to_not_same_device() {
+        assert!(matches!(
+            io_to_smb(io::ErrorKind::CrossesDevices.into()),
+            SmbError::NotSameDevice
+        ));
     }
 
     #[tokio::test]

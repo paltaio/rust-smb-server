@@ -81,8 +81,10 @@ pub struct FileInfo {
     pub change_time: u64,
     /// True if this is a directory.
     pub is_directory: bool,
-    /// File id reported in QUERY_DIRECTORY entries. `0` if the backend has
-    /// none.
+    /// Stable id of the file within the share, reported as the file id by
+    /// QUERY_INFO and QUERY_DIRECTORY. Backends return the same value from
+    /// `Handle::stat` and `Handle::list_dir` for the same file, across opens
+    /// and renames. `0` if the backend has none.
     pub file_index: u64,
 }
 
@@ -160,8 +162,14 @@ pub trait ShareBackend: Send + Sync + 'static {
     /// Delete a file or an empty directory.
     async fn unlink(&self, path: &SmbPath) -> SmbResult<()>;
 
-    /// Rename `from` to `to`. The backend must reject if `to` already exists.
-    async fn rename(&self, from: &SmbPath, to: &SmbPath) -> SmbResult<()>;
+    /// Rename `from` to `to`.
+    ///
+    /// If `to` names an existing file other than `from`, including another
+    /// hard link to the same file, fail with [`SmbError::Exists`] unless
+    /// `replace_if_exists` is set, in which case the existing file is
+    /// replaced. An existing directory at `to` is never
+    /// replaced: fail with [`SmbError::AccessDenied`].
+    async fn rename(&self, from: &SmbPath, to: &SmbPath, replace_if_exists: bool) -> SmbResult<()>;
 
     /// Static capabilities. TREE_CONNECT clamps access to read-only when
     /// `is_read_only` is set.
@@ -220,7 +228,7 @@ impl ShareBackend for NotSupportedBackend {
     async fn unlink(&self, _path: &SmbPath) -> SmbResult<()> {
         Err(SmbError::NotSupported)
     }
-    async fn rename(&self, _from: &SmbPath, _to: &SmbPath) -> SmbResult<()> {
+    async fn rename(&self, _from: &SmbPath, _to: &SmbPath, _replace: bool) -> SmbResult<()> {
         Err(SmbError::NotSupported)
     }
     fn capabilities(&self) -> BackendCapabilities {

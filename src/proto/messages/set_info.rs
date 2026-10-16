@@ -19,7 +19,7 @@ pub struct SetInfoRequest {
     pub reserved: u16,
     pub additional_information: u32,
     pub file_id: FileId,
-    #[br(count = buffer_length as usize)]
+    #[br(parse_with = super::read_buf, args(buffer_length as usize))]
     pub buffer: Vec<u8>,
 }
 

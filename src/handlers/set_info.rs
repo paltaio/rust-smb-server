@@ -5,18 +5,28 @@ use std::sync::Arc;
 use crate::proto::header::Smb2Header;
 use crate::proto::messages::{InfoType, SetInfoRequest, SetInfoResponse};
 
+use crate::access_mask::{DELETE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA};
 use crate::backend::FileTimes;
 use crate::conn::state::Connection;
 use crate::dispatch::HandlerResponse;
-use crate::handlers::shared::{lookup_open, lookup_session_tree};
+use crate::handlers::shared::{lookup_open, lookup_session_tree, path_is_open};
 use crate::info_class as ic;
 use crate::ntstatus;
-use crate::path::SmbPath;
+use crate::path::{SmbPath, same_path};
 use crate::server::ServerState;
 use crate::utils::utf16le_to_units;
 
+/// File information classes SET_INFO applies.
+enum Class {
+    Basic,
+    EndOfFile,
+    Disposition,
+    Rename,
+    Allocation,
+}
+
 pub async fn handle(
-    _server: &Arc<ServerState>,
+    server: &Arc<ServerState>,
     conn: &Arc<Connection>,
     hdr: &Smb2Header,
     body: &[u8],
@@ -42,15 +52,23 @@ pub async fn handle(
         None => return HandlerResponse::err(ntstatus::STATUS_FILE_CLOSED),
     };
 
-    let class = req.file_information_class;
-    let buffer = req.buffer;
-    let backend = {
-        let tree = tree_arc.read().await;
-        tree.share.backend.clone()
+    // MS-SMB2 3.3.5.21.1: access each class needs from Open.GrantedAccess.
+    let (class, required) = match req.file_information_class {
+        ic::FILE_BASIC_INFORMATION => (Class::Basic, FILE_WRITE_ATTRIBUTES),
+        ic::FILE_DISPOSITION_INFORMATION => (Class::Disposition, DELETE),
+        ic::FILE_RENAME_INFORMATION => (Class::Rename, DELETE),
+        ic::FILE_END_OF_FILE_INFORMATION => (Class::EndOfFile, FILE_WRITE_DATA),
+        ic::FILE_ALLOCATION_INFORMATION => (Class::Allocation, FILE_WRITE_DATA),
+        _ => return HandlerResponse::err(ntstatus::STATUS_NOT_SUPPORTED),
     };
+    if open_arc.read().await.granted_access & required != required {
+        return HandlerResponse::err(ntstatus::STATUS_ACCESS_DENIED);
+    }
+    let buffer = req.buffer;
+    let share = tree_arc.read().await.share.clone();
 
     let result = match class {
-        ic::FILE_BASIC_INFORMATION => {
+        Class::Basic => {
             if buffer.len() < 36 {
                 return HandlerResponse::err(ntstatus::STATUS_INFO_LENGTH_MISMATCH);
             }
@@ -78,7 +96,7 @@ pub async fn handle(
                 None => return HandlerResponse::err(ntstatus::STATUS_FILE_CLOSED),
             }
         }
-        ic::FILE_END_OF_FILE_INFORMATION => {
+        Class::EndOfFile => {
             if buffer.len() < 8 {
                 return HandlerResponse::err(ntstatus::STATUS_INFO_LENGTH_MISMATCH);
             }
@@ -89,7 +107,7 @@ pub async fn handle(
                 None => return HandlerResponse::err(ntstatus::STATUS_FILE_CLOSED),
             }
         }
-        ic::FILE_DISPOSITION_INFORMATION => {
+        Class::Disposition => {
             if buffer.is_empty() {
                 return HandlerResponse::err(ntstatus::STATUS_INFO_LENGTH_MISMATCH);
             }
@@ -97,7 +115,7 @@ pub async fn handle(
             open.delete_on_close = buffer[0] != 0;
             Ok(())
         }
-        ic::FILE_RENAME_INFORMATION => {
+        Class::Rename => {
             // FILE_RENAME_INFORMATION layout (MS-FSCC §2.4.37):
             //   ReplaceIfExists (1) | Reserved (7) | RootDirectory (8) | FileNameLength (4) | FileName...
             if buffer.len() < 20 {
@@ -116,8 +134,22 @@ pub async fn handle(
                 Ok(p) => p,
                 Err(_) => return HandlerResponse::err(ntstatus::STATUS_OBJECT_NAME_INVALID),
             };
+            let replace_if_exists = buffer[0] != 0;
             let from = open_arc.read().await.last_path.clone();
-            match backend.rename(&from, &new_path).await {
+            // MS-FSA 2.1.5.15.12: an open target is not replaced. A target
+            // that names the source itself is the same file and skips this.
+            let case_sensitive = share.backend.capabilities().case_sensitive;
+            if replace_if_exists
+                && !same_path(&from, &new_path, case_sensitive)
+                && path_is_open(server, &share, &new_path).await
+            {
+                return HandlerResponse::err(ntstatus::STATUS_ACCESS_DENIED);
+            }
+            match share
+                .backend
+                .rename(&from, &new_path, replace_if_exists)
+                .await
+            {
                 Ok(()) => {
                     open_arc.write().await.last_path = new_path;
                     Ok(())
@@ -125,11 +157,10 @@ pub async fn handle(
                 Err(e) => Err(e),
             }
         }
-        ic::FILE_ALLOCATION_INFORMATION => {
+        Class::Allocation => {
             // We don't preallocate; respond OK.
             Ok(())
         }
-        _ => return HandlerResponse::err(ntstatus::STATUS_NOT_SUPPORTED),
     };
 
     if let Err(e) = result {

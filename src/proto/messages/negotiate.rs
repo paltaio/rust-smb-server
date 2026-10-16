@@ -117,7 +117,7 @@ pub struct NegotiateResponse {
     pub security_buffer_length: u16,
     /// 3.1.1: NegotiateContextOffset. 2.x/3.0/3.0.2: Reserved2.
     pub negotiate_context_offset_or_reserved2: u32,
-    #[br(count = security_buffer_length as usize)]
+    #[br(parse_with = super::read_buf, args(security_buffer_length as usize))]
     pub security_buffer: Vec<u8>,
 }
 
@@ -149,7 +149,7 @@ pub struct NegotiateContext {
     pub context_type: u16,
     pub data_length: u16,
     pub reserved: u32,
-    #[br(count = data_length as usize)]
+    #[br(parse_with = super::read_buf, args(data_length as usize))]
     pub data: Vec<u8>,
 }
 
@@ -166,7 +166,7 @@ impl NegotiateContext {
     /// of (8-byte-aligned) [`NegotiateContext`] entries. `count` comes from
     /// the parent message's `NegotiateContextCount`.
     pub fn parse_list(mut buf: &[u8], count: u16) -> ProtoResult<Vec<NegotiateContext>> {
-        let mut out = Vec::with_capacity(count as usize);
+        let mut out = Vec::new();
         let mut consumed_total = 0usize;
         for _ in 0..count {
             // Pad to 8-byte alignment relative to the start of the list.
@@ -216,7 +216,7 @@ pub struct PreauthIntegrityCapabilities {
     pub salt_length: u16,
     #[br(count = hash_algorithm_count as usize)]
     pub hash_algorithms: Vec<u16>,
-    #[br(count = salt_length as usize)]
+    #[br(parse_with = super::read_buf, args(salt_length as usize))]
     pub salt: Vec<u8>,
 }
 
