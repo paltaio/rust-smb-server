@@ -52,5 +52,5 @@ pub mod wire {
 #[cfg(test)]
 mod tests {
     mod dynamic_config;
-    mod memfs;
+    pub(crate) mod memfs;
 }

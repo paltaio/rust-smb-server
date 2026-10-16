@@ -112,12 +112,11 @@ pub async fn handle(
         }
     }
 
-    // SET_INFO timestamps go through the host handle, which needs write
-    // access for that on Windows.
-    let write = open_access & (FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_ATTRIBUTES) != 0;
+    let write = open_access & (FILE_WRITE_DATA | FILE_APPEND_DATA) != 0;
     let opts = OpenOptions {
         read: open_access & FILE_READ_DATA != 0 || !write,
         write,
+        write_attributes: open_access & FILE_WRITE_ATTRIBUTES != 0,
         intent,
         directory,
         non_directory,
@@ -140,6 +139,11 @@ pub async fn handle(
             return HandlerResponse::err(e.to_nt_status());
         }
     };
+    // MS-FSA 2.1.5.1.2.1: a read-only file cannot be opened for deletion.
+    if delete_on_close && info.read_only {
+        let _ = handle.close().await;
+        return HandlerResponse::err(ntstatus::STATUS_CANNOT_DELETE);
+    }
 
     // Allocate FileId, register Open.
     let tree = tree_arc.write().await;

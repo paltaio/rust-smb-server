@@ -1,29 +1,24 @@
-//! NEGOTIATE, anonymous SESSION_SETUP and TREE_CONNECT over TCP loopback, then
-//! FSCTL_VALIDATE_NEGOTIATE_INFO, CREATE and READ. Also the per-connection
-//! limit on NTLM exchanges waiting for their final round.
+//! NEGOTIATE, SESSION_SETUP and signing over TCP loopback.
 
 mod common;
 
 use common::{
     STATUS_MORE_PROCESSING_REQUIRED, STATUS_SUCCESS, anonymous_session_setup, build_header,
-    finish_anonymous_session_setup, negotiate, parse_response_header, read_frame,
-    start_ntlm_session_setup, start_server, tree_connect, utf16le, write_frame,
+    encode_frame, finish_anonymous_session_setup, negotiate, parse_response_header, read_frame,
+    smb2_signature, start_ntlm_session_setup, start_server, tree_connect, user_session_setup,
+    utf16le, write_frame,
 };
 
-use smb_server::wire::header::Command;
-use smb_server::wire::messages::{
-    CreateRequest, CreateResponse, FileId, Fsctl, IoctlRequest, IoctlResponse, ReadRequest,
-    ReadResponse,
-};
-use smb_server::{LocalFsBackend, Share, SmbServer, ntstatus};
+use smb_server::wire::header::{Command, SMB2_FLAGS_SIGNED};
+use smb_server::wire::messages::{FileId, Fsctl, IoctlRequest, IoctlResponse, TreeConnectRequest};
+use smb_server::{Access, LocalFsBackend, Share, SmbServer, ntstatus};
 use tempfile::tempdir;
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
 #[tokio::test]
-async fn validate_negotiate_info_then_anon_read() {
-    // One public share over a temp dir holding hello.txt.
+async fn validate_negotiate_info_matches_negotiate() {
     let td = tempdir().expect("tempdir");
-    std::fs::write(td.path().join("hello.txt"), b"hello world\n").expect("write hello.txt");
     let backend = LocalFsBackend::new(td.path()).expect("open root");
     let (addr, handle) = start_server(
         SmbServer::builder()
@@ -64,70 +59,11 @@ async fn validate_negotiate_info_then_anon_read() {
     assert_eq!(rh.command, Command::Ioctl);
     assert_eq!(rh.channel_sequence_status, STATUS_SUCCESS);
     let ioctl_resp = IoctlResponse::parse(rb).expect("parse ioctl resp");
-    assert_eq!(ioctl_resp.output.len(), 24);
-    let validate_security_mode = u16::from_le_bytes([ioctl_resp.output[20], ioctl_resp.output[21]]);
-    assert_eq!(validate_security_mode, neg_resp.security_mode);
-
-    // ---- CREATE hello.txt ------------------------------------------------
-    let name_u16 = utf16le("hello.txt");
-    let cr_req = CreateRequest {
-        structure_size: 57,
-        security_flags: 0,
-        requested_oplock_level: 0,
-        impersonation_level: 2,
-        smb_create_flags: 0,
-        reserved: 0,
-        desired_access: 0x0012_0089, // FILE_GENERIC_READ
-        file_attributes: 0,
-        share_access: 0x0000_0007, // FILE_SHARE_READ|WRITE|DELETE
-        create_disposition: 1,     // FILE_OPEN
-        create_options: 0,
-        name_offset: 0x78,
-        name_length: name_u16.len() as u16,
-        create_contexts_offset: 0,
-        create_contexts_length: 0,
-        name: name_u16,
-        create_contexts: vec![],
-    };
-    let mut body = Vec::new();
-    cr_req.write_to(&mut body).expect("write");
-    let hdr = build_header(Command::Create, 5, session_id, tree_id);
-    write_frame(&mut s, &hdr, &body).await;
-
-    let resp = read_frame(&mut s).await;
-    let (rh, rb) = parse_response_header(&resp);
-    assert_eq!(rh.command, Command::Create);
-    assert_eq!(rh.channel_sequence_status, STATUS_SUCCESS);
-    let cr_resp = CreateResponse::parse(rb).expect("parse create resp");
-    let file_id = cr_resp.file_id;
-    assert_eq!(cr_resp.end_of_file, 12); // "hello world\n"
-
-    // ---- READ ------------------------------------------------------------
-    let rd_req = ReadRequest {
-        structure_size: 49,
-        padding: ReadResponse::STANDARD_DATA_OFFSET,
-        flags: 0,
-        length: 32,
-        offset: 0,
-        file_id,
-        minimum_count: 0,
-        channel: 0,
-        remaining_bytes: 0,
-        read_channel_info_offset: 0,
-        read_channel_info_length: 0,
-        buffer: vec![0],
-    };
-    let mut body = Vec::new();
-    rd_req.write_to(&mut body).expect("write");
-    let hdr = build_header(Command::Read, 6, session_id, tree_id);
-    write_frame(&mut s, &hdr, &body).await;
-
-    let resp = read_frame(&mut s).await;
-    let (rh, rb) = parse_response_header(&resp);
-    assert_eq!(rh.command, Command::Read);
-    assert_eq!(rh.channel_sequence_status, STATUS_SUCCESS);
-    let rd_resp = ReadResponse::parse(rb).expect("parse read resp");
-    assert_eq!(rd_resp.data, b"hello world\n");
+    let mut expected = neg_resp.capabilities.to_le_bytes().to_vec();
+    expected.extend_from_slice(&neg_resp.server_guid);
+    expected.extend_from_slice(&neg_resp.security_mode.to_le_bytes());
+    expected.extend_from_slice(&neg_resp.dialect_revision.to_le_bytes());
+    assert_eq!(ioctl_resp.output, expected);
 
     drop(s);
     // The server keeps accepting; abort the spawned task so the test
@@ -177,4 +113,85 @@ async fn pending_ntlm_exchanges_are_capped_per_connection() {
 
     drop(s);
     handle.abort();
+}
+
+#[tokio::test]
+async fn smb2_sessions_sign_with_the_session_key() {
+    let td = tempdir().expect("tempdir");
+    let backend = LocalFsBackend::new(td.path()).expect("open root");
+    let (addr, handle) = start_server(
+        SmbServer::builder()
+            .user("alice", "password")
+            .share(Share::new("home", backend).user("alice", Access::ReadWrite)),
+    )
+    .await;
+    let mut s = TcpStream::connect(addr).await.expect("connect");
+    assert_eq!(negotiate(&mut s).await.dialect_revision, 0x0210);
+
+    let (status, session_id, key, resp) = user_session_setup(&mut s, "alice", "password").await;
+    assert_eq!(status, STATUS_SUCCESS);
+    assert_ne!(read_u32(&resp, 0x10) & SMB2_FLAGS_SIGNED, 0);
+    assert_eq!(resp[48..64], smb2_signature(&resp, &key));
+
+    // A TREE_CONNECT signed with the session key is accepted.
+    let path = utf16le("\\\\127.0.0.1\\home");
+    let mut body = Vec::new();
+    TreeConnectRequest {
+        structure_size: 9,
+        flags: 0,
+        path_offset: 64 + 8,
+        path_length: path.len() as u16,
+        path,
+    }
+    .write_to(&mut body)
+    .expect("write tree connect");
+    let mut hdr = build_header(Command::TreeConnect, 3, session_id, 0);
+    hdr.flags |= SMB2_FLAGS_SIGNED;
+    let mut msg = Vec::new();
+    hdr.write(&mut msg).expect("header");
+    msg.extend_from_slice(&body);
+    let signature = smb2_signature(&msg, &key);
+    msg[48..64].copy_from_slice(&signature);
+    let mut framed = Vec::new();
+    encode_frame(&msg, &mut framed);
+    s.write_all(&framed).await.expect("write");
+    let resp = read_frame(&mut s).await;
+    let (rh, _) = parse_response_header(&resp);
+    assert_eq!(rh.channel_sequence_status, STATUS_SUCCESS);
+    assert_eq!(resp[48..64], smb2_signature(&resp, &key));
+
+    drop(s);
+    handle.abort();
+}
+
+#[tokio::test]
+async fn user_names_match_configured_users_ignoring_case() {
+    let td = tempdir().expect("tempdir");
+    let backend = LocalFsBackend::new(td.path()).expect("open root");
+    let (addr, handle) = start_server(
+        SmbServer::builder()
+            .user("guest", "")
+            .share(Share::new("g", backend).user("guest", Access::Read)),
+    )
+    .await;
+
+    for (user, expected) in [
+        ("guest", STATUS_SUCCESS),
+        ("GUEST", STATUS_SUCCESS),
+        ("nobody", ntstatus::STATUS_LOGON_FAILURE),
+    ] {
+        let mut s = TcpStream::connect(addr).await.expect("connect");
+        negotiate(&mut s).await;
+        let (status, session_id, _, _) = user_session_setup(&mut s, user, "").await;
+        assert_eq!(status, expected, "user {user}");
+        if status == STATUS_SUCCESS {
+            tree_connect(&mut s, "\\\\127.0.0.1\\g", session_id, 3).await;
+        }
+    }
+
+    handle.abort();
+}
+
+fn read_u32(buf: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap())
 }

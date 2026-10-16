@@ -227,12 +227,17 @@ impl Handle for MemHandle {
             last_write_time: 0x01D9_0000_0000_0000,
             change_time: 0x01D9_0000_0000_0000,
             is_directory: self.is_dir,
+            read_only: false,
             file_index: 0,
         })
     }
 
     async fn set_times(&self, _times: FileTimes) -> SmbResult<()> {
         Ok(())
+    }
+
+    async fn set_attributes(&self, _attributes: u32) -> SmbResult<()> {
+        Err(SmbError::NotSupported)
     }
 
     async fn truncate(&self, len: u64) -> SmbResult<()> {
@@ -270,6 +275,7 @@ impl Handle for MemHandle {
                         last_write_time: 0x01D9_0000_0000_0000,
                         change_time: 0x01D9_0000_0000_0000,
                         is_directory: false,
+                        read_only: false,
                         file_index: 0,
                     },
                 });
@@ -290,6 +296,7 @@ impl Handle for MemHandle {
                         last_write_time: 0x01D9_0000_0000_0000,
                         change_time: 0x01D9_0000_0000_0000,
                         is_directory: true,
+                        read_only: false,
                         file_index: 0,
                     },
                 });

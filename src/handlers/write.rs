@@ -8,7 +8,7 @@ use crate::proto::messages::{WriteRequest, WriteResponse};
 use crate::access_mask::{FILE_APPEND_DATA, FILE_WRITE_DATA};
 use crate::conn::state::Connection;
 use crate::dispatch::HandlerResponse;
-use crate::handlers::shared::{lookup_open, lookup_session_tree};
+use crate::handlers::shared::{lookup_open, lookup_session_tree, restore_fixed_times};
 use crate::ntstatus;
 use crate::server::ServerState;
 
@@ -36,14 +36,19 @@ pub async fn handle(
     };
     let result = {
         let open = open_arc.read().await;
-        // Either right allows any write, as on Windows (MS-SMB2 3.3.5.13).
+        // FILE_WRITE_DATA or FILE_APPEND_DATA allows a write at any offset
+        // (MS-SMB2 3.3.5.13).
         if open.granted_access & (FILE_WRITE_DATA | FILE_APPEND_DATA) == 0 {
             return HandlerResponse::err(ntstatus::STATUS_ACCESS_DENIED);
         }
-        match open.handle.as_ref() {
+        let result = match open.handle.as_ref() {
             Some(h) => h.write_owned(req.offset, req.data).await,
             None => return HandlerResponse::err(ntstatus::STATUS_FILE_CLOSED),
+        };
+        if result.is_ok() {
+            restore_fixed_times(&open).await;
         }
+        result
     };
     let count = match result {
         Ok(n) => n,

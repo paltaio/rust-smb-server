@@ -3,6 +3,9 @@
 //! checks share and open access on delete, rename, timestamp changes, READ
 //! and WRITE, the access QUERY_INFO reports, rename with ReplaceIfExists,
 //! paths of other opens after a rename, and the file id reported for a file.
+//! Then SET_INFO allocation, basic and disposition information, directory
+//! renames while open, the alternate name query and DOS wildcards in
+//! QUERY_DIRECTORY.
 
 mod common;
 
@@ -307,6 +310,55 @@ impl Client {
         let (status, rb) = self.send(Command::QueryDirectory, &body).await;
         assert_eq!(status, STATUS_SUCCESS);
         QueryDirectoryResponse::parse(&rb).expect("parse").buffer
+    }
+
+    /// QUERY_INFO for a file information class; returns the status.
+    async fn query_file_info_status(&mut self, file_id: FileId, class: u8) -> u32 {
+        let req = QueryInfoRequest {
+            structure_size: 41,
+            info_type: InfoType::File as u8,
+            file_information_class: class,
+            output_buffer_length: 4096,
+            input_buffer_offset: 0,
+            reserved: 0,
+            input_buffer_length: 0,
+            additional_information: 0,
+            flags: 0,
+            file_id,
+            input_buffer: vec![],
+        };
+        let mut body = Vec::new();
+        req.write_to(&mut body).expect("write");
+        self.send(Command::QueryInfo, &body).await.0
+    }
+
+    /// Names QUERY_DIRECTORY returns for `pattern`, or the status.
+    async fn list(&mut self, dir_id: FileId, pattern: &str) -> Result<Vec<String>, u32> {
+        let pattern = utf16le(pattern);
+        let req = QueryDirectoryRequest {
+            structure_size: 33,
+            file_information_class: FILE_ID_BOTH_DIRECTORY_INFORMATION,
+            flags: QueryDirectoryRequest::FLAG_RESTART_SCANS,
+            file_index: 0,
+            file_id: dir_id,
+            file_name_offset: 64 + 32,
+            file_name_length: pattern.len() as u16,
+            output_buffer_length: 4096,
+            file_name: pattern,
+        };
+        let mut body = Vec::new();
+        req.write_to(&mut body).expect("write");
+        let (status, rb) = self.send(Command::QueryDirectory, &body).await;
+        if status != STATUS_SUCCESS {
+            return Err(status);
+        }
+        let buf = QueryDirectoryResponse::parse(&rb).expect("parse").buffer;
+        let mut names: Vec<String> = decode_file_id_both_directory_info(&buf)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        names.sort();
+        Ok(names)
     }
 
     /// READ of up to 64 bytes at offset 0; returns the status.
@@ -780,12 +832,23 @@ async fn rename_of_a_directory_moves_opens_below_it() {
         .await
         .unwrap();
     let dir = c.open("d", DELETE, FILE_DIRECTORY_FILE).await.unwrap();
-    assert_eq!(
-        c.set_info(dir, FILE_RENAME_INFORMATION, rename_info("e", false))
-            .await,
-        STATUS_SUCCESS
-    );
+    let status = c
+        .set_info(dir, FILE_RENAME_INFORMATION, rename_info("e", false))
+        .await;
     c.close(dir).await;
+
+    // NTFS refuses to rename a directory while a file below it is open, as
+    // MS-FSA 2.1.5.15.12 specifies; other hosts rename it and the open moves
+    // along.
+    if cfg!(windows) {
+        assert_eq!(status, ntstatus::STATUS_ACCESS_DENIED);
+        c.close(child).await;
+        assert!(!root.join("d").join("sub").join("f.txt").exists());
+        assert!(!root.join("e").exists());
+        handle.abort();
+        return;
+    }
+    assert_eq!(status, STATUS_SUCCESS);
 
     std::fs::create_dir_all(root.join("d").join("sub")).expect("mkdir");
     std::fs::write(root.join("d").join("sub").join("f.txt"), b"new").expect("write file");
@@ -796,6 +859,387 @@ async fn rename_of_a_directory_moves_opens_below_it() {
         std::fs::read(root.join("d").join("sub").join("f.txt")).unwrap(),
         b"new"
     );
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn directory_renames_while_it_is_open() {
+    let td = tempdir().expect("tempdir");
+    let root = td.path();
+    std::fs::create_dir_all(root.join("d").join("sub")).expect("mkdir");
+    let backend = LocalFsBackend::new(root).expect("open root");
+    let (mut c, handle) = Client::connect(Share::new("share", backend).public()).await;
+
+    let listing = c
+        .open("d", FILE_GENERIC_READ, FILE_DIRECTORY_FILE)
+        .await
+        .unwrap();
+    let dir = c.open("d", DELETE, FILE_DIRECTORY_FILE).await.unwrap();
+    assert_eq!(
+        c.set_info(dir, FILE_RENAME_INFORMATION, rename_info("e", false))
+            .await,
+        STATUS_SUCCESS
+    );
+    c.close(dir).await;
+    assert_eq!(c.list(listing, "*").await.unwrap(), ["sub"]);
+    c.close(listing).await;
+    assert!(root.join("e").join("sub").is_dir());
+    assert!(!root.join("d").exists());
+
+    handle.abort();
+}
+
+const FILE_GENERIC_WRITE: u32 = 0x0012_0116;
+const FILE_ALLOCATION_INFORMATION: u8 = 0x13;
+const FILE_ALTERNATE_NAME_INFORMATION: u8 = 0x15;
+const FILE_ATTRIBUTE_READONLY: u32 = 0x0000_0001;
+const FILE_ATTRIBUTE_HIDDEN: u32 = 0x0000_0002;
+const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
+const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x0000_0020;
+const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
+
+/// FileBasicInformation buffer: creation, access, write and change times,
+/// then attributes.
+fn basic_info(times: [i64; 4], attributes: u32) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(40);
+    for t in times {
+        buf.extend_from_slice(&t.to_le_bytes());
+    }
+    buf.extend_from_slice(&attributes.to_le_bytes());
+    buf.extend_from_slice(&[0; 4]);
+    buf
+}
+
+fn filetime(t: std::time::SystemTime) -> i64 {
+    let since_epoch = t.duration_since(std::time::UNIX_EPOCH).unwrap();
+    116_444_736_000_000_000 + (since_epoch.as_nanos() / 100) as i64
+}
+
+fn attributes_of(basic: &[u8]) -> u32 {
+    u32::from_le_bytes(basic[32..36].try_into().unwrap())
+}
+
+#[tokio::test]
+async fn allocation_below_end_of_file_truncates() {
+    let td = tempdir().expect("tempdir");
+    let path = td.path().join("f.txt");
+    std::fs::write(&path, b"hello world").expect("write file");
+    let backend = LocalFsBackend::new(td.path()).expect("open root");
+    let (mut c, handle) = Client::connect(Share::new("share", backend).public()).await;
+
+    let file_id = c.open("f.txt", FILE_GENERIC_WRITE, 0).await.unwrap();
+    for (size, expected) in [(100u64, &b"hello world"[..]), (5, b"hello"), (0, b"")] {
+        assert_eq!(
+            c.set_info(
+                file_id,
+                FILE_ALLOCATION_INFORMATION,
+                size.to_le_bytes().to_vec()
+            )
+            .await,
+            STATUS_SUCCESS
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), expected, "allocation {size}");
+    }
+    c.close(file_id).await;
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn basic_information_applies_to_directories() {
+    let td = tempdir().expect("tempdir");
+    let path = td.path().join("d");
+    std::fs::create_dir(&path).expect("mkdir");
+    let backend = LocalFsBackend::new(td.path()).expect("open root");
+    let (mut c, handle) = Client::connect(Share::new("share", backend).public()).await;
+
+    let dir = c
+        .open(
+            "d",
+            FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES,
+            FILE_DIRECTORY_FILE,
+        )
+        .await
+        .unwrap();
+    let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_577_934_245);
+    assert_eq!(
+        c.set_info(
+            dir,
+            FILE_BASIC_INFORMATION,
+            basic_info([0, 0, filetime(t), 0], 0)
+        )
+        .await,
+        STATUS_SUCCESS
+    );
+    assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), t);
+    // What Remove-Item -Force and robocopy send.
+    for attributes in [FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_DIRECTORY] {
+        assert_eq!(
+            c.set_info(dir, FILE_BASIC_INFORMATION, basic_info([0; 4], attributes))
+                .await,
+            STATUS_SUCCESS,
+            "attributes {attributes:#x}"
+        );
+    }
+    c.close(dir).await;
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn special_time_values_are_not_written_as_times() {
+    let td = tempdir().expect("tempdir");
+    let path = td.path().join("f.txt");
+    std::fs::write(&path, b"data").expect("write file");
+    let t0 = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_577_934_245);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_accessed(t0).set_modified(t0))
+        .unwrap();
+    let times = || {
+        let md = std::fs::metadata(&path).unwrap();
+        (md.accessed().unwrap(), md.modified().unwrap())
+    };
+    let backend = LocalFsBackend::new(td.path()).expect("open root");
+    let (mut c, handle) = Client::connect(Share::new("share", backend).public()).await;
+    let file_id = c
+        .open("f.txt", FILE_GENERIC_READ | FILE_GENERIC_WRITE, 0)
+        .await
+        .unwrap();
+
+    // Setting -2 or -1 leaves both times unchanged.
+    for t in [-2, -1] {
+        assert_eq!(
+            c.set_info(file_id, FILE_BASIC_INFORMATION, basic_info([t; 4], 0))
+                .await,
+            STATUS_SUCCESS
+        );
+        assert_eq!(times(), (t0, t0), "time value {t}");
+    }
+    // After -1 a write through the open leaves the write time alone.
+    assert_eq!(c.write(file_id, 4, b"more").await, STATUS_SUCCESS);
+    assert_eq!(times().1, t0);
+    // After -2 it updates it again. NTFS keeps a time fixed for a handle
+    // once a time is set through it, so a Windows host keeps it.
+    assert_eq!(
+        c.set_info(
+            file_id,
+            FILE_BASIC_INFORMATION,
+            basic_info([0, 0, -2, 0], 0)
+        )
+        .await,
+        STATUS_SUCCESS
+    );
+    assert_eq!(c.write(file_id, 8, b"!").await, STATUS_SUCCESS);
+    if cfg!(windows) {
+        assert_eq!(times().1, t0);
+    } else {
+        assert_ne!(times().1, t0);
+    }
+    assert_eq!(
+        c.set_info(
+            file_id,
+            FILE_BASIC_INFORMATION,
+            basic_info([0, -3, 0, 0], 0)
+        )
+        .await,
+        ntstatus::STATUS_INVALID_PARAMETER
+    );
+    c.close(file_id).await;
+    assert_eq!(std::fs::read(&path).unwrap(), b"datamore!");
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn deleting_a_non_empty_directory_fails() {
+    let td = tempdir().expect("tempdir");
+    let root = td.path();
+    std::fs::create_dir(root.join("full")).expect("mkdir");
+    std::fs::write(root.join("full").join("f.txt"), b"f").expect("write file");
+    std::fs::create_dir(root.join("empty")).expect("mkdir");
+    let backend = LocalFsBackend::new(root).expect("open root");
+    let (mut c, handle) = Client::connect(Share::new("share", backend).public()).await;
+
+    let dir = c.open("full", DELETE, FILE_DIRECTORY_FILE).await.unwrap();
+    assert_eq!(
+        c.set_info(dir, FILE_DISPOSITION_INFORMATION, vec![1]).await,
+        ntstatus::STATUS_DIRECTORY_NOT_EMPTY
+    );
+    c.close(dir).await;
+    assert!(root.join("full").join("f.txt").exists());
+
+    // MS-FSA 2.1.5.1 accepts delete-on-close on a non-empty directory and
+    // 2.1.5.5 keeps the directory at close.
+    let dir = c
+        .open("full", DELETE, FILE_DIRECTORY_FILE | FILE_DELETE_ON_CLOSE)
+        .await
+        .unwrap();
+    c.close(dir).await;
+    assert!(root.join("full").join("f.txt").exists());
+
+    let dir = c.open("empty", DELETE, FILE_DIRECTORY_FILE).await.unwrap();
+    assert_eq!(
+        c.set_info(dir, FILE_DISPOSITION_INFORMATION, vec![1]).await,
+        STATUS_SUCCESS
+    );
+    c.close(dir).await;
+    assert!(!root.join("empty").exists());
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn read_only_attribute_is_applied_and_others_are_rejected() {
+    let td = tempdir().expect("tempdir");
+    let path = td.path().join("f.txt");
+    std::fs::write(&path, b"x").expect("write file");
+    let backend = LocalFsBackend::new(td.path()).expect("open root");
+    let (mut c, handle) = Client::connect(Share::new("share", backend).public()).await;
+    let attrs_access = FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES;
+
+    let file_id = c.open("f.txt", attrs_access, 0).await.unwrap();
+    assert_eq!(
+        c.set_info(
+            file_id,
+            FILE_BASIC_INFORMATION,
+            basic_info([0; 4], FILE_ATTRIBUTE_READONLY)
+        )
+        .await,
+        STATUS_SUCCESS
+    );
+    let basic = c.query_file_info(file_id, FILE_BASIC_INFORMATION).await;
+    assert_eq!(attributes_of(&basic), FILE_ATTRIBUTE_READONLY);
+    assert!(std::fs::metadata(&path).unwrap().permissions().readonly());
+    c.close(file_id).await;
+
+    // A read-only file cannot be deleted.
+    let file_id = c.open("f.txt", DELETE, 0).await.unwrap();
+    assert_eq!(
+        c.set_info(file_id, FILE_DISPOSITION_INFORMATION, vec![1])
+            .await,
+        ntstatus::STATUS_CANNOT_DELETE
+    );
+    c.close(file_id).await;
+    assert_eq!(
+        c.open("f.txt", DELETE, FILE_DELETE_ON_CLOSE)
+            .await
+            .unwrap_err(),
+        ntstatus::STATUS_CANNOT_DELETE
+    );
+    assert!(path.exists());
+
+    let file_id = c.open("f.txt", attrs_access, 0).await.unwrap();
+    assert_eq!(
+        c.set_info(
+            file_id,
+            FILE_BASIC_INFORMATION,
+            basic_info([0; 4], FILE_ATTRIBUTE_HIDDEN)
+        )
+        .await,
+        ntstatus::STATUS_NOT_SUPPORTED
+    );
+    for attributes in [FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_ARCHIVE] {
+        assert_eq!(
+            c.set_info(
+                file_id,
+                FILE_BASIC_INFORMATION,
+                basic_info([0; 4], attributes)
+            )
+            .await,
+            STATUS_SUCCESS,
+            "attributes {attributes:#x}"
+        );
+    }
+    let basic = c.query_file_info(file_id, FILE_BASIC_INFORMATION).await;
+    assert_eq!(attributes_of(&basic), FILE_ATTRIBUTE_NORMAL);
+    assert_eq!(
+        c.set_info(
+            file_id,
+            FILE_BASIC_INFORMATION,
+            basic_info([0; 4], FILE_ATTRIBUTE_DIRECTORY)
+        )
+        .await,
+        ntstatus::STATUS_INVALID_PARAMETER
+    );
+    c.close(file_id).await;
+    assert!(!std::fs::metadata(&path).unwrap().permissions().readonly());
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn creation_time_is_set_where_the_host_can() {
+    let td = tempdir().expect("tempdir");
+    let path = td.path().join("f.txt");
+    std::fs::write(&path, b"x").expect("write file");
+    let backend = LocalFsBackend::new(td.path()).expect("open root");
+    let (mut c, handle) = Client::connect(Share::new("share", backend).public()).await;
+
+    let file_id = c.open("f.txt", FILE_WRITE_ATTRIBUTES, 0).await.unwrap();
+    let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_557_126_489);
+    let status = c
+        .set_info(
+            file_id,
+            FILE_BASIC_INFORMATION,
+            basic_info([filetime(t), 0, 0, 0], 0),
+        )
+        .await;
+    c.close(file_id).await;
+    if cfg!(any(windows, target_os = "macos")) {
+        assert_eq!(status, STATUS_SUCCESS);
+        assert_eq!(std::fs::metadata(&path).unwrap().created().unwrap(), t);
+    } else {
+        assert_eq!(status, ntstatus::STATUS_NOT_SUPPORTED);
+    }
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn alternate_name_query_reports_no_short_name() {
+    let td = tempdir().expect("tempdir");
+    std::fs::write(td.path().join("a long name.txt"), b"x").expect("write file");
+    let backend = LocalFsBackend::new(td.path()).expect("open root");
+    let (mut c, handle) = Client::connect(Share::new("share", backend).public()).await;
+
+    let file_id = c
+        .open("a long name.txt", FILE_READ_ATTRIBUTES, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        c.query_file_info_status(file_id, FILE_ALTERNATE_NAME_INFORMATION)
+            .await,
+        ntstatus::STATUS_OBJECT_NAME_NOT_FOUND
+    );
+    c.close(file_id).await;
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn query_directory_applies_dos_wildcards() {
+    let td = tempdir().expect("tempdir");
+    for name in ["ow.txt", "sw.txt", "w.txt", "notes.log"] {
+        std::fs::write(td.path().join(name), b"x").expect("write file");
+    }
+    let backend = LocalFsBackend::new(td.path()).expect("open root");
+    let (mut c, handle) = Client::connect(Share::new("share", backend).public()).await;
+
+    let root = c
+        .open("", FILE_GENERIC_READ, FILE_DIRECTORY_FILE)
+        .await
+        .unwrap();
+    // What Windows sends for "*.txt" and "?w.txt".
+    assert_eq!(
+        c.list(root, "<.txt").await.unwrap(),
+        ["ow.txt", "sw.txt", "w.txt"]
+    );
+    assert_eq!(c.list(root, ">w.txt").await.unwrap(), ["ow.txt", "sw.txt"]);
+    c.close(root).await;
 
     handle.abort();
 }

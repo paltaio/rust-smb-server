@@ -28,6 +28,7 @@ pub const FILE_ALIGNMENT_INFORMATION: u8 = 0x11;
 pub const FILE_ALL_INFORMATION: u8 = 0x12;
 pub const FILE_ALLOCATION_INFORMATION: u8 = 0x13;
 pub const FILE_END_OF_FILE_INFORMATION: u8 = 0x14;
+pub const FILE_ALTERNATE_NAME_INFORMATION: u8 = 0x15;
 pub const FILE_STREAM_INFORMATION: u8 = 0x16;
 pub const FILE_DISPOSITION_INFORMATION: u8 = 0x0D;
 pub const FILE_RENAME_INFORMATION: u8 = 0x0A;
@@ -427,6 +428,7 @@ mod tests {
             last_write_time: 0x01D9_0000_0000_0000,
             change_time: 0x01D9_0000_0000_0000,
             is_directory: false,
+            read_only: false,
             file_index: 1,
         }
     }

@@ -32,12 +32,14 @@ pub enum OpenIntent {
 /// Options passed to `ShareBackend::open`.
 #[derive(Debug, Clone, Copy)]
 pub struct OpenOptions {
-    /// The open was granted `FILE_READ_DATA`, or has no write access. At
-    /// least one of `read` and `write` is set.
+    /// The open was granted `FILE_READ_DATA`, or has no data write access.
+    /// At least one of `read` and `write` is set.
     pub read: bool,
-    /// The open was granted `FILE_WRITE_DATA`, `FILE_APPEND_DATA` or
-    /// `FILE_WRITE_ATTRIBUTES`.
+    /// The open was granted `FILE_WRITE_DATA` or `FILE_APPEND_DATA`.
     pub write: bool,
+    /// The open was granted `FILE_WRITE_ATTRIBUTES`: the handle must be able
+    /// to change times and attributes, including on a read-only file.
+    pub write_attributes: bool,
     /// CREATE disposition.
     pub intent: OpenIntent,
     /// `FILE_DIRECTORY_FILE` was set on CREATE: open or create a directory.
@@ -53,6 +55,7 @@ impl Default for OpenOptions {
         Self {
             read: true,
             write: false,
+            write_attributes: false,
             intent: OpenIntent::Open,
             directory: false,
             non_directory: false,
@@ -83,6 +86,8 @@ pub struct FileInfo {
     pub change_time: u64,
     /// True if this is a directory.
     pub is_directory: bool,
+    /// The file has `FILE_ATTRIBUTE_READONLY`.
+    pub read_only: bool,
     /// Stable id of the file, unique within the share including any mounts
     /// below the share root, reported as the file id by QUERY_INFO and
     /// QUERY_DIRECTORY. Backends return the same value from `Handle::stat`
@@ -91,18 +96,43 @@ pub struct FileInfo {
     pub file_index: u64,
 }
 
+// File attributes (MS-FSCC 2.6).
+pub(crate) const FILE_ATTRIBUTE_READONLY: u32 = 0x0000_0001;
+pub(crate) const FILE_ATTRIBUTE_HIDDEN: u32 = 0x0000_0002;
+pub(crate) const FILE_ATTRIBUTE_SYSTEM: u32 = 0x0000_0004;
+pub(crate) const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
+pub(crate) const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x0000_0020;
+pub(crate) const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
+pub(crate) const FILE_ATTRIBUTE_TEMPORARY: u32 = 0x0000_0100;
+pub(crate) const FILE_ATTRIBUTE_OFFLINE: u32 = 0x0000_1000;
+pub(crate) const FILE_ATTRIBUTE_NOT_CONTENT_INDEXED: u32 = 0x0000_2000;
+
+/// Attributes FileBasicInformation can set (MS-FSA 2.1.5.15.2).
+pub(crate) const VALID_SET_ATTRIBUTES: u32 = FILE_ATTRIBUTE_READONLY
+    | FILE_ATTRIBUTE_HIDDEN
+    | FILE_ATTRIBUTE_SYSTEM
+    | FILE_ATTRIBUTE_ARCHIVE
+    | FILE_ATTRIBUTE_TEMPORARY
+    | FILE_ATTRIBUTE_OFFLINE
+    | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED;
+
 impl FileInfo {
-    /// SMB2 file attributes (MS-FSCC §2.6) for this file:
-    /// `FILE_ATTRIBUTE_DIRECTORY` for directories, `FILE_ATTRIBUTE_NORMAL`
-    /// (0x80) for regular files. (`FILE_ATTRIBUTE_NORMAL` MUST be the only attribute set
-    /// when used.)
+    /// SMB2 file attributes (MS-FSCC 2.6) for this file:
+    /// `FILE_ATTRIBUTE_DIRECTORY` for directories and
+    /// `FILE_ATTRIBUTE_READONLY` for read-only files.
+    /// `FILE_ATTRIBUTE_NORMAL` stands alone when neither applies.
     pub fn attributes(&self) -> u32 {
-        const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
-        const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
+        let mut attributes = 0;
         if self.is_directory {
-            FILE_ATTRIBUTE_DIRECTORY
-        } else {
+            attributes |= FILE_ATTRIBUTE_DIRECTORY;
+        }
+        if self.read_only {
+            attributes |= FILE_ATTRIBUTE_READONLY;
+        }
+        if attributes == 0 {
             FILE_ATTRIBUTE_NORMAL
+        } else {
+            attributes
         }
     }
 }
@@ -114,7 +144,7 @@ pub struct DirEntry {
 }
 
 /// Optional FILETIME values for `set_times`. `None` means "leave unchanged".
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FileTimes {
     pub creation_time: Option<u64>,
     pub last_access_time: Option<u64>,
@@ -203,14 +233,42 @@ pub trait Handle: Send + Sync {
     /// Stat: current file info.
     async fn stat(&self) -> SmbResult<FileInfo>;
 
-    /// Set timestamps. `None` fields leave the corresponding field alone.
+    /// Set timestamps on a file or directory. `None` fields leave the
+    /// corresponding time alone.
+    ///
+    /// Return [`SmbError::NotSupported`] for a creation, access or write
+    /// time the backend cannot store.
+    /// `change_time` is the time of the last change: a backend whose
+    /// storage moves it to the current time on every change, as POSIX ctime
+    /// does, may keep doing so and not store the requested value.
+    ///
+    /// `LocalFsBackend` sets access and write times on every host, creation
+    /// time on Windows and macOS, and returns `NotSupported` for a creation
+    /// time elsewhere. The host keeps the change time.
     async fn set_times(&self, times: FileTimes) -> SmbResult<()>;
+
+    /// Set the attributes (MS-FSCC 2.6) of a file or directory to
+    /// `attributes`, a combination of `FILE_ATTRIBUTE_READONLY` (0x1),
+    /// `HIDDEN` (0x2), `SYSTEM` (0x4), `ARCHIVE` (0x20), `TEMPORARY`
+    /// (0x100), `OFFLINE` (0x1000) and `NOT_CONTENT_INDEXED` (0x2000).
+    /// Flags left out are cleared. The protocol layer calls this only when
+    /// the request differs from the attributes [`Handle::stat`] reports.
+    ///
+    /// Return [`SmbError::NotSupported`] if a flag cannot be stored.
+    ///
+    /// `LocalFsBackend` stores `READONLY` on files: on Unix as the absence
+    /// of write permission bits, on Windows as the host attribute. It
+    /// accepts `ARCHIVE` without storing it and never reports it. Every
+    /// other flag, and `READONLY` on a directory, returns `NotSupported`.
+    async fn set_attributes(&self, attributes: u32) -> SmbResult<()>;
 
     /// Truncate (or extend) to `len` bytes. For directories: the protocol
     /// layer rejects this before reaching the backend.
     async fn truncate(&self, len: u64) -> SmbResult<()>;
 
-    /// List directory entries matching the optional DOS pattern (`*`, `?`).
+    /// List directory entries matching the optional pattern. The pattern
+    /// uses the wildcards of MS-FSA 2.1.4.4: `*` and `?`, and the DOS forms
+    /// Windows clients send, `<` (DOS_STAR), `>` (DOS_QM) and `"` (DOS_DOT).
     /// QUERY_DIRECTORY returns the result as is, so the backend applies the
     /// pattern.
     async fn list_dir(&self, pattern: Option<&str>) -> SmbResult<Vec<DirEntry>>;

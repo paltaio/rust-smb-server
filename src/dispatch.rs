@@ -122,7 +122,8 @@ pub async fn dispatch_frame(
             next
         };
 
-        let mut sub_frame = available[..sub_len].to_vec();
+        let received = &available[..sub_len];
+        let mut sub_frame = received.to_vec();
         if req_hdr.flags & SMB2_FLAGS_RELATED_OPERATIONS != 0 {
             inherit_related_context(
                 &mut sub_frame,
@@ -136,9 +137,9 @@ pub async fn dispatch_frame(
         prev_session_id = req_hdr.session_id;
         prev_tree_id = req_hdr.tree_id().unwrap_or(0);
 
-        if let Some(response) = dispatch_one(server, conn, &sub_frame).await {
+        if let Some(response) = dispatch_one(server, conn, &sub_frame, received).await {
             if req_hdr.command == Command::Create {
-                prev_create_file_id = capture_create_file_id(&response);
+                prev_create_file_id = capture_create_file_id(&response.0);
             }
             responses.push(response);
         }
@@ -221,49 +222,33 @@ fn capture_create_file_id(response: &[u8]) -> Option<[u8; 16]> {
     Some(file_id)
 }
 
-async fn stitch_responses(conn: &Arc<Connection>, responses: Vec<Vec<u8>>) -> Vec<u8> {
+/// Joins compound responses into one frame. Each response but the last is
+/// padded to 8 bytes and signed over its padding (MS-SMB2 3.1.4.1).
+async fn stitch_responses(
+    conn: &Arc<Connection>,
+    responses: Vec<(Vec<u8>, Option<[u8; 16]>)>,
+) -> Vec<u8> {
     let mut out = Vec::new();
-    let mut ranges = Vec::with_capacity(responses.len());
+    let mut signed = Vec::with_capacity(responses.len());
     let response_count = responses.len();
 
-    for (index, mut response) in responses.into_iter().enumerate() {
+    for (index, (mut response, key)) in responses.into_iter().enumerate() {
         let start = out.len();
-        let actual_len = response.len();
+        let mut len = response.len();
         if index + 1 < response_count {
-            let next = align_8(actual_len);
-            response[0x14..0x18].copy_from_slice(&(next as u32).to_le_bytes());
+            len = align_8(len);
+            response[0x14..0x18].copy_from_slice(&(len as u32).to_le_bytes());
         }
         out.extend_from_slice(&response);
-        ranges.push((start, actual_len));
-
-        if index + 1 < response_count {
-            out.resize(start + align_8(actual_len), 0);
+        out.resize(start + len, 0);
+        if let Some(key) = key {
+            signed.push((start, len, key));
         }
     }
 
     let algo = *conn.signing_algo.read().await;
-    for (start, len) in ranges {
-        let flags = read_u32(&out, start + 0x10);
-        if flags & SMB2_FLAGS_SIGNED == 0 {
-            continue;
-        }
-
-        let session_id = read_u64(&out, start + 0x28);
-        let key = {
-            let sessions = conn.sessions.read().await;
-            sessions.get(&session_id).cloned()
-        };
-        let Some(session) = key else {
-            continue;
-        };
-        let session = session.read().await;
-        if matches!(session.identity, Identity::Anonymous) {
-            continue;
-        }
-        let signing_key = session.signing_key;
-        drop(session);
-
-        if let Err(e) = sign(&mut out[start..start + len], &signing_key, algo) {
+    for (start, len, key) in signed {
+        if let Err(e) = sign(&mut out[start..start + len], &key, algo) {
             error!(error = %e, "failed to sign compound response");
         }
     }
@@ -287,11 +272,16 @@ fn read_u64(buf: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(bytes)
 }
 
+/// Handles one request. `frame` is the request with related-operation ids
+/// filled in; `received` is the same request as it arrived, which is what
+/// the client signed and hashed. Returns the response and the key it was
+/// signed with.
 async fn dispatch_one(
     server: &Arc<ServerState>,
     conn: &Arc<Connection>,
     frame: &[u8],
-) -> Option<Vec<u8>> {
+    received: &[u8],
+) -> Option<(Vec<u8>, Option<[u8; 16]>)> {
     let (req_hdr, body_bytes) = match Smb2Header::parse(frame) {
         Ok(p) => p,
         Err(e) => {
@@ -309,9 +299,16 @@ async fn dispatch_one(
     async move {
         debug!("dispatch start");
 
+        // The request's session, kept so LOGOFF's response can still be
+        // signed with its key after the handler removes it.
+        let request_session = conn.sessions.read().await.get(&sid).cloned();
+
         // Verify signature on incoming request (when applicable).
-        if let Err(status) = verify_request_signature(server, conn, &req_hdr, frame).await {
-            return Some(build_response_bytes(conn, &req_hdr, HandlerResponse::err(status)).await);
+        if let Err(status) = verify_request_signature(server, conn, &req_hdr, received).await {
+            let resp = HandlerResponse::err(status);
+            return Some(
+                build_response_bytes(conn, &req_hdr, resp, request_session.as_ref()).await,
+            );
         }
 
         // CANCEL is fire-and-forget - no response.
@@ -330,12 +327,12 @@ async fn dispatch_one(
                 .preauth
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            p.update(frame);
+            p.update(received);
         } else if cmd == Command::SessionSetup
             && dialect == Some(crate::proto::messages::Dialect::Smb311)
         {
             let mut p = take_session_preauth(conn, req_hdr.session_id).await;
-            p.update(frame);
+            p.update(received);
             session_preauth = Some(p);
         }
 
@@ -361,7 +358,8 @@ async fn dispatch_one(
             }
         }
 
-        let bytes = build_response_bytes(conn, &req_hdr, resp).await;
+        let (bytes, key) =
+            build_response_bytes(conn, &req_hdr, resp, request_session.as_ref()).await;
 
         if cmd == Command::Negotiate {
             let mut p = conn
@@ -386,7 +384,7 @@ async fn dispatch_one(
             }
         }
 
-        Some(bytes)
+        Some((bytes, key))
     }
     .instrument(span)
     .await
@@ -455,12 +453,15 @@ async fn verify_request_signature(
 }
 
 /// Build the final on-the-wire bytes: header + body, with signing applied
-/// when the session has a key.
+/// when the session has a key. `request_session` is used when LOGOFF has
+/// already removed the session from the table. Returns the bytes and the
+/// signing key used.
 async fn build_response_bytes(
     conn: &Arc<Connection>,
     req_hdr: &Smb2Header,
     handler_resp: HandlerResponse,
-) -> Vec<u8> {
+    request_session: Option<&Arc<tokio::sync::RwLock<crate::conn::state::Session>>>,
+) -> (Vec<u8>, Option<[u8; 16]>) {
     let mut hdr = *req_hdr;
     hdr.flags |= SMB2_FLAGS_SERVER_TO_REDIR;
     hdr.flags &= !SMB2_FLAGS_ASYNC_COMMAND;
@@ -488,14 +489,16 @@ async fn build_response_bytes(
         && hdr.session_id != 0
         && (request_was_signed || is_session_setup_success)
     {
-        let sessions = conn.sessions.read().await;
-        if let Some(sess_arc) = sessions.get(&hdr.session_id) {
+        let current = conn.sessions.read().await.get(&hdr.session_id).cloned();
+        let session = current.or_else(|| {
+            request_session
+                .filter(|_| hdr.session_id == req_hdr.session_id)
+                .cloned()
+        });
+        if let Some(sess_arc) = session {
             let sess = sess_arc.read().await;
             let is_anon = matches!(sess.identity, Identity::Anonymous);
-            let is_guest_response = is_session_setup_success
-                && handler_resp.body.len() >= 4
-                && (handler_resp.body[2] & 0x01) != 0;
-            if !is_anon && !is_guest_response && sess.signing_key != [0u8; 16] {
+            if !is_anon && sess.signing_key != [0u8; 16] {
                 key = sess.signing_key;
                 should_sign = true;
             }
@@ -509,14 +512,14 @@ async fn build_response_bytes(
     let mut out = Vec::with_capacity(SMB2_HEADER_LEN + handler_resp.body.len());
     if let Err(e) = hdr.write(&mut out) {
         error!(error = %e, "failed to encode response header");
-        return Vec::new();
+        return (Vec::new(), None);
     }
     out.extend_from_slice(&handler_resp.body);
 
     if should_sign && let Err(e) = sign(&mut out, &key, algo) {
         error!(error = %e, "failed to sign response");
     }
-    out
+    (out, should_sign.then_some(key))
 }
 
 /// Detect and answer an SMB1 multi-protocol NEGOTIATE_REQUEST.
@@ -594,16 +597,212 @@ async fn handle_smb1_multi_protocol(
         ..Default::default()
     };
     let resp = handlers::negotiate::multi_protocol_response(server, conn, chosen).await;
-    Some(build_response_bytes(conn, &req_hdr, resp).await)
+    Some(build_response_bytes(conn, &req_hdr, resp, None).await.0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::conn::state::{Session, TreeConnect};
+    use crate::proto::crypto::{SigningAlgo, verify};
+    use crate::proto::messages::{
+        CloseRequest, CreateRequest, Dialect, FileId, LogoffRequest, QueryInfoRequest,
+    };
+    use crate::tests::memfs::MemFsBackend;
+    use crate::{Access, Share, SmbServer};
+    use tokio::sync::RwLock;
     use uuid::Uuid;
 
     fn test_conn() -> Arc<Connection> {
         Arc::new(Connection::new(Uuid::nil(), 1024 * 1024, 1024 * 1024))
+    }
+
+    const KEY: [u8; 16] = [0x42; 16];
+    const RELATED_FILE_ID: FileId = FileId::new(u64::MAX, u64::MAX);
+
+    /// Server with alice signed in on session 1 and connected to `home` on
+    /// tree 1, signing with `KEY`.
+    async fn signed_session() -> (Arc<ServerState>, Arc<Connection>) {
+        let server = SmbServer::builder()
+            .listen("127.0.0.1:0".parse().unwrap())
+            .user("alice", "password")
+            .share(
+                Share::new("home", MemFsBackend::new().with_file("f.txt", b"data"))
+                    .user("alice", Access::ReadWrite),
+            )
+            .build()
+            .expect("build");
+        let state = server.state();
+        let conn = test_conn();
+        *conn.dialect.write().await = Some(Dialect::Smb300);
+        *conn.signing_algo.write().await = SigningAlgo::AesCmac;
+
+        let identity = Identity::User {
+            user: "alice".to_string(),
+            domain: String::new(),
+        };
+        let session = Session::new(1, identity, [0; 16], KEY, true, None);
+        let share = state.find_share("home").await.expect("share");
+        let tree = TreeConnect::new(1, share, Access::ReadWrite);
+        session
+            .trees
+            .write()
+            .await
+            .insert(1, Arc::new(RwLock::new(tree)));
+        conn.sessions
+            .write()
+            .await
+            .insert(1, Arc::new(RwLock::new(session)));
+        (state, conn)
+    }
+
+    /// Signed requests chained into one compound frame; every request after
+    /// the first is related.
+    fn signed_compound(requests: &[(Command, Vec<u8>)]) -> Vec<u8> {
+        let mut frame = Vec::new();
+        for (index, (command, body)) in requests.iter().enumerate() {
+            let last = index + 1 == requests.len();
+            let mut flags = SMB2_FLAGS_SIGNED;
+            if index > 0 {
+                flags |= SMB2_FLAGS_RELATED_OPERATIONS;
+            }
+            let hdr = Smb2Header {
+                credit_charge: 1,
+                command: *command,
+                credit_request_response: 1,
+                flags,
+                message_id: index as u64 + 10,
+                tail: HeaderTail::sync(1),
+                session_id: 1,
+                ..Default::default()
+            };
+            let mut msg = Vec::new();
+            hdr.write(&mut msg).expect("header");
+            msg.extend_from_slice(body);
+            if !last {
+                msg.resize(align_8(msg.len()), 0);
+                let next = msg.len() as u32;
+                msg[0x14..0x18].copy_from_slice(&next.to_le_bytes());
+            }
+            sign(&mut msg, &KEY, SigningAlgo::AesCmac).expect("sign");
+            frame.extend_from_slice(&msg);
+        }
+        frame
+    }
+
+    /// CREATE f.txt, then related QUERY_INFO and CLOSE on the new FileId.
+    /// The QUERY_INFO response, 86 bytes, is padded in the compound.
+    fn create_query_close() -> Vec<u8> {
+        let name = crate::utils::utf16le("f.txt");
+        let mut create = Vec::new();
+        CreateRequest {
+            structure_size: 57,
+            security_flags: 0,
+            requested_oplock_level: 0,
+            impersonation_level: 2,
+            smb_create_flags: 0,
+            reserved: 0,
+            desired_access: 0x0012_0089,
+            file_attributes: 0,
+            share_access: 0x0000_0007,
+            create_disposition: 1,
+            create_options: 0,
+            name_offset: 0x78,
+            name_length: name.len() as u16,
+            create_contexts_offset: 0,
+            create_contexts_length: 0,
+            name,
+            create_contexts: vec![],
+        }
+        .write_to(&mut create)
+        .expect("create");
+        let mut query = Vec::new();
+        QueryInfoRequest {
+            structure_size: 41,
+            info_type: 1,
+            file_information_class: crate::info_class::FILE_NAME_INFORMATION,
+            output_buffer_length: 4096,
+            input_buffer_offset: 0,
+            reserved: 0,
+            input_buffer_length: 0,
+            additional_information: 0,
+            flags: 0,
+            file_id: RELATED_FILE_ID,
+            input_buffer: vec![],
+        }
+        .write_to(&mut query)
+        .expect("query");
+        let mut close = Vec::new();
+        CloseRequest {
+            structure_size: 24,
+            flags: 0,
+            reserved: 0,
+            file_id: RELATED_FILE_ID,
+        }
+        .write_to(&mut close)
+        .expect("close");
+        signed_compound(&[
+            (Command::Create, create),
+            (Command::QueryInfo, query),
+            (Command::Close, close),
+        ])
+    }
+
+    /// Each response in a compound frame: (status, bytes up to the next).
+    fn split_responses(frame: &[u8]) -> Vec<(u32, &[u8])> {
+        let mut out = Vec::new();
+        let mut rest = frame;
+        loop {
+            let next = read_u32(rest, 0x14) as usize;
+            let len = if next == 0 { rest.len() } else { next };
+            out.push((read_u32(rest, 0x08), &rest[..len]));
+            if next == 0 {
+                return out;
+            }
+            rest = &rest[next..];
+        }
+    }
+
+    #[tokio::test]
+    async fn signed_related_compound_requests_are_accepted() {
+        let (state, conn) = signed_session().await;
+        let frame = dispatch_frame(&state, &conn, &create_query_close())
+            .await
+            .expect("response");
+        let statuses: Vec<u32> = split_responses(&frame).iter().map(|r| r.0).collect();
+        assert_eq!(statuses, [ntstatus::STATUS_SUCCESS; 3]);
+    }
+
+    #[tokio::test]
+    async fn compound_responses_are_signed_over_their_padding() {
+        let (state, conn) = signed_session().await;
+        let frame = dispatch_frame(&state, &conn, &create_query_close())
+            .await
+            .expect("response");
+        for (index, (_, response)) in split_responses(&frame).into_iter().enumerate() {
+            assert_ne!(read_u32(response, 0x10) & SMB2_FLAGS_SIGNED, 0);
+            assert!(
+                verify(response, &KEY, SigningAlgo::AesCmac).is_ok(),
+                "response {index} signature"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn logoff_response_is_signed() {
+        let (state, conn) = signed_session().await;
+        let mut body = Vec::new();
+        LogoffRequest::default()
+            .write_to(&mut body)
+            .expect("logoff");
+        let request = signed_compound(&[(Command::Logoff, body)]);
+        let response = dispatch_frame(&state, &conn, &request)
+            .await
+            .expect("response");
+        assert_eq!(read_u32(&response, 0x08), ntstatus::STATUS_SUCCESS);
+        assert_ne!(read_u32(&response, 0x10) & SMB2_FLAGS_SIGNED, 0);
+        assert!(verify(&response, &KEY, SigningAlgo::AesCmac).is_ok());
+        assert!(conn.sessions.read().await.is_empty());
     }
 
     fn negotiated_preauth() -> PreauthIntegrity {

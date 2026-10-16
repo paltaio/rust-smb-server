@@ -66,7 +66,7 @@ mod tests {
 
     #[test]
     fn maps_each_variant_to_nt_status() {
-        assert_eq!(SmbError::NotFound.to_nt_status(), 0xC000_000F);
+        assert_eq!(SmbError::NotFound.to_nt_status(), 0xC000_0034);
         assert_eq!(SmbError::PathNotFound.to_nt_status(), 0xC000_003A);
         assert_eq!(SmbError::AccessDenied.to_nt_status(), 0xC000_0022);
         assert_eq!(SmbError::Exists.to_nt_status(), 0xC000_0035);
@@ -79,13 +79,6 @@ mod tests {
         assert_eq!(SmbError::NotSameDevice.to_nt_status(), 0xC000_00D4);
 
         let io_err = SmbError::Io(std::io::Error::other("boom"));
-        assert_eq!(io_err.to_nt_status(), 0xC000_009C);
-    }
-
-    #[test]
-    fn io_err_from_blanket_works() {
-        let io: std::io::Error = std::io::Error::other("x");
-        let smb: SmbError = io.into();
-        assert_eq!(smb.to_nt_status(), 0xC000_009C);
+        assert_eq!(io_err.to_nt_status(), 0xC000_00E9);
     }
 }

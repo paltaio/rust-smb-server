@@ -4,11 +4,12 @@ use std::sync::Arc;
 
 use crate::proto::header::Smb2Header;
 use crate::proto::messages::{CloseRequest, CloseResponse};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::conn::state::Connection;
 use crate::dispatch::HandlerResponse;
-use crate::handlers::shared::lookup_session_tree;
+use crate::error::SmbError;
+use crate::handlers::shared::{lookup_session_tree, restore_fixed_times};
 use crate::ntstatus;
 use crate::server::ServerState;
 
@@ -40,7 +41,9 @@ pub async fn handle(
 
     // Pull state out, close the handle, then optionally unlink.
     let mut open = open_arc.write().await;
+    restore_fixed_times(&open).await;
     let handle = open.handle.take();
+    let is_directory = open.is_directory;
     let path = open.last_path.clone();
     let delete_on_close = open.delete_on_close;
     let want_attrs = req.flags & FLAG_POSTQUERY_ATTRIB != 0;
@@ -63,8 +66,14 @@ pub async fn handle(
         let tree = tree_arc.read().await;
         let backend = tree.share.backend.clone();
         drop(tree);
-        if let Err(e) = backend.unlink(&path).await {
-            debug!(error = %e, "delete-on-close unlink failed");
+        // A failed delete-on-close does not fail the CLOSE (MS-SMB2
+        // 3.3.4.17). A non-empty directory stays (MS-FSA 2.1.5.5).
+        match backend.unlink(&path).await {
+            Ok(()) => {}
+            Err(SmbError::NotEmpty) if is_directory => {
+                debug!(path = %path, "delete-on-close skipped a non-empty directory");
+            }
+            Err(e) => warn!(error = %e, path = %path, "delete-on-close failed"),
         }
     }
 

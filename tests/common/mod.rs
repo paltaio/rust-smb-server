@@ -205,6 +205,13 @@ pub async fn negotiate(s: &mut TcpStream) -> NegotiateResponse {
 /// Sends SESSION_SETUP with an SPNEGO-wrapped NTLM NEGOTIATE; returns the
 /// response status and SessionId.
 pub async fn start_ntlm_session_setup(s: &mut TcpStream, message_id: u64) -> (u32, u64) {
+    let (status, session_id, _) = send_ntlm_negotiate(s, message_id).await;
+    (status, session_id)
+}
+
+/// Sends the NTLM NEGOTIATE round; returns the status, SessionId and the
+/// response security buffer.
+async fn send_ntlm_negotiate(s: &mut TcpStream, message_id: u64) -> (u32, u64, Vec<u8>) {
     let mut ntlm_negotiate = Vec::new();
     ntlm_negotiate.extend_from_slice(NTLMSSP_SIGNATURE);
     ntlm_negotiate.extend_from_slice(&1u32.to_le_bytes());
@@ -232,12 +239,113 @@ pub async fn start_ntlm_session_setup(s: &mut TcpStream, message_id: u64) -> (u3
     let resp = read_frame(s).await;
     let (rh, rb) = parse_response_header(&resp);
     assert_eq!(rh.command, Command::SessionSetup);
+    let mut security_buffer = Vec::new();
     if rh.channel_sequence_status == STATUS_MORE_PROCESSING_REQUIRED {
         assert_ne!(rh.session_id, 0);
         let ss_resp = SessionSetupResponse::parse(rb).expect("parse ss resp");
         assert!(!ss_resp.security_buffer.is_empty());
+        security_buffer = ss_resp.security_buffer;
     }
-    (rh.channel_sequence_status, rh.session_id)
+    (rh.channel_sequence_status, rh.session_id, security_buffer)
+}
+
+type HmacMd5 = hmac::Hmac<md5::Md5>;
+
+fn hmac_md5(key: &[u8], parts: &[&[u8]]) -> [u8; 16] {
+    use hmac::Mac as _;
+    let mut mac = HmacMd5::new_from_slice(key).expect("hmac key");
+    for part in parts {
+        mac.update(part);
+    }
+    mac.finalize().into_bytes().into()
+}
+
+/// NTLMv2 AUTHENTICATE_MESSAGE for `user` and `password`, with an empty
+/// domain and no MIC, and the session key it yields.
+fn ntlm_authenticate(user: &str, password: &str, server_challenge: &[u8]) -> (Vec<u8>, [u8; 16]) {
+    use md4::Digest as _;
+    let nt_hash: [u8; 16] = md4::Md4::digest(utf16le(password)).into();
+    let response_key = hmac_md5(&nt_hash, &[&utf16le(&user.to_uppercase())]);
+    let mut client_blob = vec![1, 1, 0, 0, 0, 0, 0, 0];
+    client_blob.extend_from_slice(&[0; 8]); // timestamp
+    client_blob.extend_from_slice(&[0xAA; 8]); // client challenge
+    client_blob.extend_from_slice(&[0; 8]); // reserved, empty AV pair list
+    let proof = hmac_md5(&response_key, &[server_challenge, &client_blob]);
+    let session_key = hmac_md5(&response_key, &[&proof]);
+    let nt_response = [&proof[..], &client_blob].concat();
+
+    // Lm, Nt, Domain, User, Workstation, EncryptedRandomSessionKey.
+    let user = utf16le(user);
+    let lm = [0u8; 24];
+    let fields: [&[u8]; 6] = [&lm, &nt_response, &[], &user, &[], &[]];
+    let header_len = 72u32;
+    let mut msg = Vec::new();
+    let mut payload = Vec::new();
+    msg.extend_from_slice(NTLMSSP_SIGNATURE);
+    msg.extend_from_slice(&3u32.to_le_bytes());
+    for field in fields {
+        let offset = header_len + payload.len() as u32;
+        msg.extend_from_slice(&(field.len() as u16).to_le_bytes());
+        msg.extend_from_slice(&(field.len() as u16).to_le_bytes());
+        msg.extend_from_slice(&offset.to_le_bytes());
+        payload.extend_from_slice(field);
+    }
+    msg.extend_from_slice(&0x0000_0001u32.to_le_bytes()); // NTLMSSP_NEGOTIATE_UNICODE
+    msg.extend_from_slice(&[0; 8]); // Version
+    msg.extend_from_slice(&payload);
+    (msg, session_key)
+}
+
+/// NTLMv2 SESSION_SETUP as `user`; returns the final status, the SessionId,
+/// the session key and the final response frame.
+#[allow(dead_code, reason = "not every test crate signs in a user")]
+pub async fn user_session_setup(
+    s: &mut TcpStream,
+    user: &str,
+    password: &str,
+) -> (u32, u64, [u8; 16], Vec<u8>) {
+    let (status, session_id, challenge) = send_ntlm_negotiate(s, 1).await;
+    assert_eq!(status, STATUS_MORE_PROCESSING_REQUIRED);
+    let ntlm = challenge
+        .windows(NTLMSSP_SIGNATURE.len())
+        .position(|w| w == NTLMSSP_SIGNATURE)
+        .expect("NTLM CHALLENGE");
+    let server_challenge = &challenge[ntlm + 24..ntlm + 32];
+    let (auth, session_key) = ntlm_authenticate(user, password, server_challenge);
+
+    let blob = build_spnego_resp(&auth);
+    let req = SessionSetupRequest {
+        structure_size: 25,
+        flags: 0,
+        security_mode: 0x01,
+        capabilities: 0,
+        channel: 0,
+        security_buffer_offset: 88,
+        security_buffer_length: blob.len() as u16,
+        previous_session_id: 0,
+        security_buffer: blob,
+    };
+    let mut body = Vec::new();
+    req.write_to(&mut body).expect("write session setup");
+    let hdr = build_header(Command::SessionSetup, 2, session_id, 0);
+    write_frame(s, &hdr, &body).await;
+    let resp = read_frame(s).await;
+    let (rh, _) = parse_response_header(&resp);
+    assert_eq!(rh.command, Command::SessionSetup);
+    (rh.channel_sequence_status, session_id, session_key, resp)
+}
+
+/// SMB 2.x signature (HMAC-SHA256) of `msg` with its signature field zeroed.
+#[allow(dead_code, reason = "not every test crate signs messages")]
+pub fn smb2_signature(msg: &[u8], key: &[u8; 16]) -> [u8; 16] {
+    use hmac::Mac as _;
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(key).expect("hmac key");
+    mac.update(&msg[..48]);
+    mac.update(&[0; 16]);
+    mac.update(&msg[64..]);
+    mac.finalize().into_bytes()[..16]
+        .try_into()
+        .expect("16 bytes")
 }
 
 /// Sends the anonymous NTLM AUTHENTICATE round for `session_id`; returns the
@@ -283,12 +391,9 @@ pub async fn finish_anonymous_session_setup(
         assert_eq!(rh.session_id, session_id);
         let ss_resp = SessionSetupResponse::parse(rb).expect("parse ss success resp");
         assert_eq!(
-            ss_resp.session_flags & SessionSetupResponse::FLAG_IS_GUEST,
-            SessionSetupResponse::FLAG_IS_GUEST
-        );
-        assert_eq!(
-            ss_resp.session_flags & SessionSetupResponse::FLAG_IS_NULL,
-            0
+            ss_resp.session_flags,
+            SessionSetupResponse::FLAG_IS_NULL,
+            "anonymous session flags"
         );
     }
     rh.channel_sequence_status

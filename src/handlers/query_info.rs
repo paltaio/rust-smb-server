@@ -78,6 +78,15 @@ pub async fn handle(
                     ic::encode_file_network_open_information(&info)
                 }
                 ic::FILE_STREAM_INFORMATION => ic::encode_file_stream_information(&info),
+                ic::FILE_ALTERNATE_NAME_INFORMATION => {
+                    // MS-FSA 2.1.5.12.4. Files here have no 8.3 short name.
+                    let status = if req.output_buffer_length < 8 {
+                        ntstatus::STATUS_INFO_LENGTH_MISMATCH
+                    } else {
+                        ntstatus::STATUS_OBJECT_NAME_NOT_FOUND
+                    };
+                    return HandlerResponse::err(status);
+                }
                 _ => return HandlerResponse::err(ntstatus::STATUS_INVALID_INFO_CLASS),
             }
         }

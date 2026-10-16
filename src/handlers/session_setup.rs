@@ -1,5 +1,6 @@
 //! SESSION_SETUP handler: drives the SPNEGO + NTLMv2 state machine.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::proto::auth::ntlm::{Identity, NtlmServer, NtlmTargetInfo, UserCreds};
@@ -178,14 +179,23 @@ pub async fn handle(
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let (acceptor, raw_form) = (&pair.0, pair.1);
-        let lookup = |u: &str, _d: &str| -> Option<UserCreds> { users.get(u).cloned() };
-        let outcome = match acceptor.authenticate(&inner_token, lookup) {
+        let lookup = |u: &str, _d: &str| -> Option<UserCreds> {
+            configured_user(&users, u).map(|(_, creds)| creds.clone())
+        };
+        let mut outcome = match acceptor.authenticate(&inner_token, lookup) {
             Ok(o) => o,
             Err(e) => {
                 info!(error = %e, "NTLM authenticate failed");
                 return HandlerResponse::err(ntstatus::STATUS_LOGON_FAILURE);
             }
         };
+        // The session carries the configured spelling of the name, which
+        // share access is granted to.
+        if let Identity::User { user, .. } = &mut outcome.identity
+            && let Some((name, _)) = configured_user(&users, user)
+        {
+            *user = name.clone();
+        }
         (outcome, raw_form)
     };
 
@@ -196,14 +206,15 @@ pub async fn handle(
 
     let session_base_key = outcome.session_key;
     let dialect = *conn.dialect.read().await;
-    let signing_key = match dialect {
-        Some(Dialect::Smb311) => [0u8; 16],
-        Some(_) => signing_key_30(&session_base_key),
-        None => return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER),
+    let Some(dialect) = dialect else {
+        return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
     };
+    let signing_key = signing_key(dialect, &session_base_key);
 
+    // MS-SMB2 3.3.5.5.3: anonymous sessions are flagged IS_NULL. There is no
+    // guest account, so IS_GUEST is never set.
     let session_flags = if matches!(outcome.identity, Identity::Anonymous) {
-        SessionSetupResponse::FLAG_IS_GUEST
+        SessionSetupResponse::FLAG_IS_NULL
     } else {
         0
     };
@@ -232,7 +243,7 @@ pub async fn handle(
     let body_out =
         build_session_setup_response(ntstatus::STATUS_SUCCESS, &success_buf, session_flags);
 
-    let take_snapshot = if dialect == Some(Dialect::Smb311) {
+    let take_snapshot = if dialect == Dialect::Smb311 {
         Some(sid)
     } else {
         None
@@ -249,6 +260,34 @@ pub async fn handle(
         // authenticated sessions get signed by the dispatcher's normal path.
         skip_signing: matches!(outcome.identity, Identity::Anonymous),
         take_preauth_snapshot_for_session: take_snapshot,
+    }
+}
+
+/// The configured user an NTLM user name refers to. NTLM user names are not
+/// case sensitive: an exact match wins, then the one name that matches
+/// ignoring case. A name that matches several users only by case matches
+/// none of them.
+fn configured_user<'a>(
+    users: &'a HashMap<String, UserCreds>,
+    name: &str,
+) -> Option<(&'a String, &'a UserCreds)> {
+    if let Some(user) = users.get_key_value(name) {
+        return Some(user);
+    }
+    let upper = name.to_uppercase();
+    let mut matches = users.iter().filter(|(n, _)| n.to_uppercase() == upper);
+    let user = matches.next()?;
+    matches.next().is_none().then_some(user)
+}
+
+/// Session.SigningKey for `dialect` (MS-SMB2 3.3.5.5.3). SMB 2.x signs with
+/// the session key itself. For 3.1.1 the key is derived later, once the
+/// preauth hash of this exchange is known.
+fn signing_key(dialect: Dialect, session_key: &[u8; 16]) -> [u8; 16] {
+    match dialect {
+        Dialect::Smb311 => [0u8; 16],
+        Dialect::Smb202 | Dialect::Smb210 | Dialect::Smb2Wildcard => *session_key,
+        Dialect::Smb300 | Dialect::Smb302 => signing_key_30(session_key),
     }
 }
 
@@ -269,4 +308,18 @@ fn build_session_setup_response(_status: u32, spnego_blob: &[u8], session_flags:
 
 fn empty_completed() -> Vec<u8> {
     encode_resp_token(NegState::AcceptCompleted, None, None, None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn signing_key_per_dialect() {
+        let key = [0x5A; 16];
+        assert_eq!(signing_key(Dialect::Smb202, &key), key);
+        assert_eq!(signing_key(Dialect::Smb210, &key), key);
+        assert_eq!(signing_key(Dialect::Smb300, &key), signing_key_30(&key));
+        assert_eq!(signing_key(Dialect::Smb302, &key), signing_key_30(&key));
+    }
 }

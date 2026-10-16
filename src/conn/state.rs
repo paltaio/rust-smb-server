@@ -11,7 +11,7 @@ use crate::proto::messages::{Dialect, FileId};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-use crate::backend::Handle;
+use crate::backend::{FileTimes, Handle};
 use crate::builder::Access;
 use crate::path::SmbPath;
 use crate::server::ShareBindings;
@@ -299,6 +299,10 @@ pub struct Open {
     pub is_directory: bool,
     pub delete_on_close: bool,
     pub search_state: Option<DirCursor>,
+    /// Access and write times that FileBasicInformation fixed for this open
+    /// (MS-FSA 2.1.5.15.2). Writes and truncation through the open, and its
+    /// CLOSE, restore them.
+    pub fixed_times: FileTimes,
 }
 
 impl Open {
@@ -318,6 +322,7 @@ impl Open {
             is_directory,
             delete_on_close,
             search_state: None,
+            fixed_times: FileTimes::default(),
         }
     }
 }

@@ -11,8 +11,11 @@
 //! - Blocking FS calls run on `tokio::task::spawn_blocking`.
 //! - `read_only()` flips a flag that makes write-class opens reject early
 //!   with `SmbError::AccessDenied`.
-//! - DOS-style glob matching for `list_dir` is handled here (ASCII case-insensitive,
-//!   `?` and `*`), since cap-std only provides raw `entries()`.
+//! - `list_dir` applies the MS-FSA 2.1.4.4 wildcards (`*`, `?`, `<`, `>`,
+//!   `"`) itself, folding ASCII case only, since cap-std only provides raw
+//!   `entries()`.
+//! - On Windows, directory handles share delete access, so a client can
+//!   rename or delete a directory it or another client has open.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -26,8 +29,8 @@ use cap_std::fs::{Dir, Metadata, OpenOptions as CapOpenOptions};
 use tokio::task::spawn_blocking;
 
 use crate::backend::{
-    BackendCapabilities, DirEntry as SmbDirEntry, FileInfo, FileTimes, Handle, OpenIntent,
-    OpenOptions, ShareBackend,
+    BackendCapabilities, DirEntry as SmbDirEntry, FILE_ATTRIBUTE_ARCHIVE, FILE_ATTRIBUTE_READONLY,
+    FileInfo, FileTimes, Handle, OpenIntent, OpenOptions, ShareBackend,
 };
 use crate::error::{SmbError, SmbResult};
 use crate::path::{SmbPath, same_path};
@@ -94,6 +97,13 @@ fn to_rel_path(path: &SmbPath) -> PathBuf {
 
 fn io_to_smb(err: io::Error) -> SmbError {
     use io::ErrorKind::*;
+    #[cfg(windows)]
+    {
+        const ERROR_SHARING_VIOLATION: i32 = 32;
+        if err.raw_os_error() == Some(ERROR_SHARING_VIOLATION) {
+            return SmbError::Sharing;
+        }
+    }
     match err.kind() {
         NotFound => SmbError::NotFound,
         PermissionDenied => SmbError::AccessDenied,
@@ -224,6 +234,109 @@ fn entry_metadata(dir: &Dir, entry: &cap_std::fs::DirEntry) -> io::Result<Metada
     }
 }
 
+/// Opens the directory `rel` below `root`. On Windows the handle shares
+/// delete access, which `Dir::open_dir` leaves out, and has
+/// `FILE_WRITE_ATTRIBUTES` when `write_attributes` is set.
+#[cfg_attr(
+    unix,
+    expect(unused_variables, reason = "write_attributes is used on Windows only")
+)]
+fn open_dir_handle(root: &Dir, rel: &Path, write_attributes: bool) -> io::Result<Dir> {
+    #[cfg(unix)]
+    {
+        root.open_dir(rel)
+    }
+    #[cfg(windows)]
+    {
+        use cap_primitives::fs::OpenOptionsExt as _;
+        const GENERIC_READ: u32 = 0x8000_0000;
+        const FILE_WRITE_ATTRIBUTES: u32 = 0x0000_0100;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+
+        let mut opts = CapOpenOptions::new();
+        opts.read(true).custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+        if write_attributes {
+            opts.access_mode(GENERIC_READ | FILE_WRITE_ATTRIBUTES);
+        }
+        let file = root.open_with(rel, &opts)?;
+        if !file.metadata()?.is_dir() {
+            return Err(io::ErrorKind::NotADirectory.into());
+        }
+        Ok(Dir::from_std_file(file.into_std()))
+    }
+}
+
+/// A `File` on the same open directory, for setting its times. On Linux a
+/// `Dir` holds an `O_PATH` descriptor, which cannot change times, so the
+/// directory is opened again through it.
+fn dir_as_file(dir: &Dir) -> io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        Ok(dir.open(".")?.into_std())
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsHandle as _;
+        Ok(dir.as_handle().try_clone_to_owned()?.into())
+    }
+}
+
+/// Sets or clears the read-only state of an open file. On Unix a read-only
+/// file has no write permission bits, and clearing it gives the owner write
+/// permission back.
+fn set_read_only(file: &std::fs::File, read_only: bool) -> io::Result<()> {
+    let mut perms = file.metadata()?.permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = perms.mode();
+        perms.set_mode(if read_only {
+            mode & !0o222
+        } else {
+            mode | 0o200
+        });
+    }
+    #[cfg(windows)]
+    {
+        perms.set_readonly(read_only);
+    }
+    file.set_permissions(perms)
+}
+
+/// Host times for `times`. The change time is left to the host.
+fn host_file_times(times: FileTimes) -> SmbResult<std::fs::FileTimes> {
+    let host_time = |ft| filetime_to_system_time(ft).ok_or(SmbError::NotSupported);
+    let mut out = std::fs::FileTimes::new();
+    if let Some(ft) = times.last_write_time {
+        out = out.set_modified(host_time(ft)?);
+    }
+    if let Some(ft) = times.last_access_time {
+        out = out.set_accessed(host_time(ft)?);
+    }
+    if let Some(ft) = times.creation_time {
+        out = set_created(out, host_time(ft)?)?;
+    }
+    Ok(out)
+}
+
+#[cfg(windows)]
+fn set_created(times: std::fs::FileTimes, t: SystemTime) -> SmbResult<std::fs::FileTimes> {
+    use std::os::windows::fs::FileTimesExt as _;
+    Ok(times.set_created(t))
+}
+
+#[cfg(target_os = "macos")]
+fn set_created(times: std::fs::FileTimes, t: SystemTime) -> SmbResult<std::fs::FileTimes> {
+    use std::os::macos::fs::FileTimesExt as _;
+    Ok(times.set_created(t))
+}
+
+/// Other hosts have no call that sets the creation time.
+#[cfg(not(any(windows, target_os = "macos")))]
+fn set_created(_times: std::fs::FileTimes, _t: SystemTime) -> SmbResult<std::fs::FileTimes> {
+    Err(SmbError::NotSupported)
+}
+
 // ---------------------------------------------------------------------------
 // FILETIME conversion
 // ---------------------------------------------------------------------------
@@ -266,6 +379,7 @@ fn file_info_from_metadata(name: String, md: &Metadata, root_dev: Option<u64>) -
         last_write_time: system_time_to_filetime(modified),
         change_time: system_time_to_filetime(modified),
         is_directory: md.is_dir(),
+        read_only: !md.is_dir() && md.permissions().readonly(),
         file_index: file_index(root_dev, file_key(md)),
     }
 }
@@ -274,44 +388,43 @@ fn file_info_from_metadata(name: String, md: &Metadata, root_dev: Option<u64>) -
 // DOS glob matching
 // ---------------------------------------------------------------------------
 
-/// Match `name` against a DOS-style pattern. `?` matches any single char,
-/// `*` matches any sequence (possibly empty). Comparison folds ASCII case
-/// only.
+/// Match `name` against a pattern with the wildcards of MS-FSA 2.1.4.4.
+/// Comparison folds ASCII case only.
+///
+/// - `*` matches any sequence, `?` any single character.
+/// - `<` (DOS_STAR) matches any sequence that does not contain the last `.`
+///   of the name.
+/// - `>` (DOS_QM) matches any single character other than `.`, and matches
+///   nothing at a `.` or at the end of the name.
+/// - `"` (DOS_DOT) matches a `.`, or nothing at the end of the name.
 fn glob_match(pattern: &str, name: &str) -> bool {
-    // Compare by `char` so `?` matches one character.
     let p: Vec<char> = pattern.chars().collect();
     let n: Vec<char> = name.chars().collect();
-    glob_match_inner(&p, &n)
-}
+    let last_dot = n.iter().rposition(|&c| c == '.');
 
-fn glob_match_inner(p: &[char], n: &[char]) -> bool {
-    let mut pi = 0usize;
-    let mut ni = 0usize;
-    let mut star: Option<(usize, usize)> = None; // (pi after '*', ni at the time)
-
-    while ni < n.len() {
-        if pi < p.len() && (p[pi] == '?' || ascii_eq_ci(p[pi], n[ni])) {
-            pi += 1;
-            ni += 1;
-        } else if pi < p.len() && p[pi] == '*' {
-            star = Some((pi + 1, ni));
-            pi += 1;
-        } else if let Some((sp, sn)) = star {
-            pi = sp;
-            ni = sn + 1;
-            star = Some((sp, sn + 1));
-        } else {
-            return false;
+    // matches[j]: the pattern consumed so far matches the first j characters
+    // of the name. One row per pattern character.
+    let mut matches = vec![false; n.len() + 1];
+    matches[0] = true;
+    for &pc in &p {
+        let mut next = vec![false; n.len() + 1];
+        for j in 0..=n.len() {
+            let here = j < n.len();
+            next[j] = match pc {
+                '*' => matches[j] || (j > 0 && next[j - 1]),
+                '<' => matches[j] || (j > 0 && next[j - 1] && Some(j - 1) != last_dot),
+                '?' => j > 0 && matches[j - 1],
+                '>' => {
+                    (j > 0 && matches[j - 1] && n[j - 1] != '.')
+                        || (matches[j] && (!here || n[j] == '.'))
+                }
+                '"' => (j > 0 && matches[j - 1] && n[j - 1] == '.') || (matches[j] && !here),
+                c => j > 0 && matches[j - 1] && c.eq_ignore_ascii_case(&n[j - 1]),
+            };
         }
+        matches = next;
     }
-    while pi < p.len() && p[pi] == '*' {
-        pi += 1;
-    }
-    pi == p.len()
-}
-
-fn ascii_eq_ci(a: char, b: char) -> bool {
-    a.eq_ignore_ascii_case(&b)
+    matches[n.len()]
 }
 
 // ---------------------------------------------------------------------------
@@ -325,6 +438,7 @@ impl ShareBackend for LocalFsBackend {
         //    truncation, or overwrite is rejected up front. Pure read opens
         //    pass through.
         let writes = opts.write
+            || opts.write_attributes
             || matches!(
                 opts.intent,
                 OpenIntent::Create
@@ -341,25 +455,24 @@ impl ShareBackend for LocalFsBackend {
         let read_only = self.read_only;
         let directory = opts.directory;
         let non_directory = opts.non_directory;
+        let write_attributes = opts.write_attributes;
 
-        // For directories, cap-std exposes `open_dir` separately; we don't
-        // need an OpenOptions translation in that case.
         if directory {
             // Directory CREATE intents: Create / OpenOrCreate / OverwriteOrCreate
             // imply mkdir; Open / Truncate require existing.
             let intent = opts.intent;
             let dir_handle = spawn_blocking(move || -> io::Result<Dir> {
                 match intent {
-                    OpenIntent::Open => root.open_dir(&rel),
+                    OpenIntent::Open => open_dir_handle(&root, &rel, write_attributes),
                     OpenIntent::Create => {
                         root.create_dir(&rel)?;
-                        root.open_dir(&rel)
+                        open_dir_handle(&root, &rel, write_attributes)
                     }
                     OpenIntent::OpenOrCreate => {
                         if !root.exists(&rel) {
                             root.create_dir(&rel)?;
                         }
-                        root.open_dir(&rel)
+                        open_dir_handle(&root, &rel, write_attributes)
                     }
                     OpenIntent::Truncate | OpenIntent::OverwriteOrCreate => {
                         // Truncating a directory has no meaning; reject.
@@ -402,11 +515,12 @@ impl ShareBackend for LocalFsBackend {
                 OpenIntent::Open | OpenIntent::OpenOrCreate => {
                     let root = Arc::clone(&self.root);
                     let rel = rel.clone();
-                    let dir_handle = spawn_blocking(move || root.open_dir(&rel))
-                        .await
-                        .map_err(join_to_io)
-                        .map_err(io_to_smb)?
-                        .map_err(io_to_smb)?;
+                    let dir_handle =
+                        spawn_blocking(move || open_dir_handle(&root, &rel, write_attributes))
+                            .await
+                            .map_err(join_to_io)
+                            .map_err(io_to_smb)?
+                            .map_err(io_to_smb)?;
                     return Ok(Box::new(LocalHandle::Dir {
                         name: file_name_for(path),
                         root_dev: self.root_dev,
@@ -425,6 +539,16 @@ impl ShareBackend for LocalFsBackend {
         match opts.intent {
             OpenIntent::Open => {
                 cap_opts.read(true).write(opts.write);
+                // Unix sets times and permissions through a read-only
+                // descriptor. Windows needs the access right, which a
+                // read-only file grants without write access.
+                #[cfg(windows)]
+                if opts.write_attributes && !opts.write {
+                    use cap_primitives::fs::OpenOptionsExt as _;
+                    const GENERIC_READ: u32 = 0x8000_0000;
+                    const FILE_WRITE_ATTRIBUTES: u32 = 0x0000_0100;
+                    cap_opts.access_mode(GENERIC_READ | FILE_WRITE_ATTRIBUTES);
+                }
             }
             OpenIntent::Create => {
                 cap_opts.read(opts.read).write(true).create_new(true);
@@ -675,6 +799,7 @@ impl Handle for LocalHandle {
     }
 
     async fn set_times(&self, times: FileTimes) -> SmbResult<()> {
+        let host_times = host_file_times(times)?;
         match self {
             LocalHandle::File {
                 file, read_only, ..
@@ -683,30 +808,46 @@ impl Handle for LocalHandle {
                     return Err(SmbError::AccessDenied);
                 }
                 let file = Arc::clone(file);
-                spawn_blocking(move || -> io::Result<()> {
-                    let mut std_times = std::fs::FileTimes::new();
-                    if let Some(ft) = times.last_write_time
-                        && let Some(t) = filetime_to_system_time(ft)
-                    {
-                        std_times = std_times.set_modified(t);
-                    }
-                    if let Some(ft) = times.last_access_time
-                        && let Some(t) = filetime_to_system_time(ft)
-                    {
-                        std_times = std_times.set_accessed(t);
-                    }
-                    // creation_time / change_time: stable std::fs::FileTimes
-                    // does not expose setters for these; silently ignored.
-                    file.set_times(std_times)
-                })
-                .await
-                .map_err(join_to_io)
-                .map_err(io_to_smb)?
-                .map_err(io_to_smb)
+                spawn_blocking(move || file.set_times(host_times))
+                    .await
+                    .map_err(join_to_io)
+                    .map_err(io_to_smb)?
+                    .map_err(io_to_smb)
             }
-            // cap-std's directory handle does not expose set_times in its
-            // stable API; mark as unsupported on directories.
-            LocalHandle::Dir { .. } => Err(SmbError::NotSupported),
+            LocalHandle::Dir { dir_handle, .. } => {
+                let dir_handle = Arc::clone(dir_handle);
+                spawn_blocking(move || dir_as_file(&dir_handle)?.set_times(host_times))
+                    .await
+                    .map_err(join_to_io)
+                    .map_err(io_to_smb)?
+                    .map_err(io_to_smb)
+            }
+        }
+    }
+
+    async fn set_attributes(&self, attributes: u32) -> SmbResult<()> {
+        if attributes & !(FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_ARCHIVE) != 0 {
+            return Err(SmbError::NotSupported);
+        }
+        let read_only = attributes & FILE_ATTRIBUTE_READONLY != 0;
+        match self {
+            LocalHandle::File {
+                file,
+                read_only: backend_read_only,
+                ..
+            } => {
+                if *backend_read_only {
+                    return Err(SmbError::AccessDenied);
+                }
+                let file = Arc::clone(file);
+                spawn_blocking(move || set_read_only(&file, read_only))
+                    .await
+                    .map_err(join_to_io)
+                    .map_err(io_to_smb)?
+                    .map_err(io_to_smb)
+            }
+            LocalHandle::Dir { .. } if read_only => Err(SmbError::NotSupported),
+            LocalHandle::Dir { .. } => Ok(()),
         }
     }
 
@@ -800,6 +941,7 @@ mod tests {
         OpenOptions {
             read: true,
             write: true,
+            write_attributes: true,
             intent: OpenIntent::Create,
             directory: false,
             non_directory: false,
@@ -811,6 +953,7 @@ mod tests {
         OpenOptions {
             read: true,
             write: true,
+            write_attributes: true,
             intent: OpenIntent::Open,
             directory: false,
             non_directory: false,
@@ -822,6 +965,7 @@ mod tests {
         OpenOptions {
             read: true,
             write: false,
+            write_attributes: false,
             intent: OpenIntent::Open,
             directory: false,
             non_directory: false,
@@ -833,6 +977,7 @@ mod tests {
         OpenOptions {
             read: true,
             write: false,
+            write_attributes: false,
             intent: OpenIntent::Open,
             directory: true,
             non_directory: false,
@@ -1225,6 +1370,203 @@ mod tests {
         assert!(glob_match("FOO", "foo"));
         assert!(glob_match("", ""));
         assert!(!glob_match("", "a"));
+    }
+
+    #[test]
+    fn glob_match_dos_wildcards() {
+        // DOS_STAR stops before the last dot.
+        assert!(glob_match("<.txt", "ow.txt"));
+        assert!(glob_match("<.txt", "a.b.txt"));
+        assert!(glob_match("<.TXT", "ow.txt"));
+        assert!(!glob_match("<.txt", "ow.log"));
+        assert!(!glob_match("<", "a.b"));
+        assert!(glob_match("<", "noext"));
+        assert!(glob_match("<.<", "a.b"));
+        // DOS_QM takes one character, or none at a dot or the end.
+        assert!(glob_match(">w.txt", "ow.txt"));
+        assert!(!glob_match(">w.txt", "w.txt"));
+        assert!(glob_match(">>>.txt", "ab.txt"));
+        assert!(glob_match("a>>", "a"));
+        assert!(!glob_match("a>", "abc"));
+        // DOS_DOT matches a dot, or nothing at the end.
+        assert!(glob_match("a\"txt", "a.txt"));
+        assert!(glob_match("abc\"", "abc"));
+        assert!(!glob_match("a\"txt", "aXtxt"));
+        // What Windows sends for "*.*" and "*.".
+        assert!(glob_match("<\"<", "a.b"));
+        assert!(glob_match("<\"<", "noext"));
+        assert!(glob_match("<\"", "noext"));
+        assert!(!glob_match("<\"", "a.b"));
+    }
+
+    #[tokio::test]
+    async fn list_dir_applies_dos_wildcards() {
+        let td = tempdir().unwrap();
+        for name in ["ow.txt", "sw.txt", "w.txt", "notes.log"] {
+            std::fs::write(td.path().join(name), b"x").unwrap();
+        }
+        let backend = LocalFsBackend::new(td.path()).unwrap();
+        let dir = backend
+            .open(&SmbPath::root(), opts_open_dir())
+            .await
+            .unwrap();
+        let names = |entries: Vec<SmbDirEntry>| {
+            let mut names: Vec<String> = entries.into_iter().map(|e| e.info.name).collect();
+            names.sort();
+            names
+        };
+        assert_eq!(
+            names(dir.list_dir(Some("<.txt")).await.unwrap()),
+            ["ow.txt", "sw.txt", "w.txt"]
+        );
+        assert_eq!(
+            names(dir.list_dir(Some(">w.txt")).await.unwrap()),
+            ["ow.txt", "sw.txt"]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sharing_violation_maps_to_sharing() {
+        const ERROR_SHARING_VIOLATION: i32 = 32;
+        assert!(matches!(
+            io_to_smb(io::Error::from_raw_os_error(ERROR_SHARING_VIOLATION)),
+            SmbError::Sharing
+        ));
+    }
+
+    #[tokio::test]
+    async fn directory_renames_while_open() {
+        let td = tempdir().unwrap();
+        std::fs::create_dir_all(td.path().join("d").join("sub")).unwrap();
+        let backend = LocalFsBackend::new(td.path()).unwrap();
+        let first = backend.open(&p("d"), opts_open_dir()).await.unwrap();
+        let second = backend.open(&p("d"), opts_open_dir()).await.unwrap();
+
+        backend.rename(&p("d"), &p("e"), false).await.unwrap();
+        assert!(td.path().join("e").is_dir());
+        let listed = first.list_dir(None).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].info.name, "sub");
+
+        let empty = backend.open(&p("e\\sub"), opts_open_dir()).await.unwrap();
+        backend.unlink(&p("e\\sub")).await.unwrap();
+        assert!(!td.path().join("e").join("sub").exists());
+        for h in [first, second, empty] {
+            h.close().await.unwrap();
+        }
+    }
+
+    fn opts_dir_write_attributes() -> OpenOptions {
+        OpenOptions {
+            write_attributes: true,
+            ..opts_open_dir()
+        }
+    }
+
+    fn filetime(secs: u64) -> u64 {
+        system_time_to_filetime(UNIX_EPOCH + Duration::from_secs(secs))
+    }
+
+    #[tokio::test]
+    async fn set_times_on_a_directory() {
+        let td = tempdir().unwrap();
+        std::fs::create_dir(td.path().join("d")).unwrap();
+        let backend = LocalFsBackend::new(td.path()).unwrap();
+        let h = backend
+            .open(&p("d"), opts_dir_write_attributes())
+            .await
+            .unwrap();
+        let t = filetime(1_577_934_245);
+        h.set_times(FileTimes {
+            last_write_time: Some(t),
+            last_access_time: Some(t),
+            ..FileTimes::default()
+        })
+        .await
+        .unwrap();
+        let info = h.stat().await.unwrap();
+        assert_eq!(info.last_write_time, t);
+        assert_eq!(info.last_access_time, t);
+        h.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn creation_time_is_set_where_the_host_can() {
+        let td = tempdir().unwrap();
+        let backend = LocalFsBackend::new(td.path()).unwrap();
+        let h = backend.open(&p("f.txt"), opts_create()).await.unwrap();
+        let t = filetime(1_557_126_489);
+        let result = h
+            .set_times(FileTimes {
+                creation_time: Some(t),
+                ..FileTimes::default()
+            })
+            .await;
+        if cfg!(any(windows, target_os = "macos")) {
+            result.unwrap();
+            assert_eq!(h.stat().await.unwrap().creation_time, t);
+        } else {
+            assert!(matches!(result, Err(SmbError::NotSupported)));
+        }
+        h.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_only_attribute_is_stored_and_others_are_rejected() {
+        let td = tempdir().unwrap();
+        std::fs::create_dir(td.path().join("d")).unwrap();
+        let backend = LocalFsBackend::new(td.path()).unwrap();
+        let h = backend.open(&p("f.txt"), opts_create()).await.unwrap();
+
+        h.set_attributes(FILE_ATTRIBUTE_READONLY).await.unwrap();
+        assert!(h.stat().await.unwrap().read_only);
+        assert!(
+            std::fs::metadata(td.path().join("f.txt"))
+                .unwrap()
+                .permissions()
+                .readonly()
+        );
+        h.set_attributes(FILE_ATTRIBUTE_ARCHIVE).await.unwrap();
+        assert!(!h.stat().await.unwrap().read_only);
+        for unsupported in [0x2, 0x4, 0x100, 0x1000, 0x2000] {
+            assert!(
+                matches!(
+                    h.set_attributes(unsupported).await,
+                    Err(SmbError::NotSupported)
+                ),
+                "attribute {unsupported:#x}"
+            );
+        }
+        h.close().await.unwrap();
+
+        let dir = backend.open(&p("d"), opts_open_dir()).await.unwrap();
+        assert!(matches!(
+            dir.set_attributes(FILE_ATTRIBUTE_READONLY).await,
+            Err(SmbError::NotSupported)
+        ));
+        dir.set_attributes(0).await.unwrap();
+        dir.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_only_file_opens_for_attribute_changes() {
+        let td = tempdir().unwrap();
+        let path = td.path().join("f.txt");
+        std::fs::write(&path, b"x").unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&path, perms).unwrap();
+        let backend = LocalFsBackend::new(td.path()).unwrap();
+
+        let opts = OpenOptions {
+            write_attributes: true,
+            ..opts_open_ro()
+        };
+        let h = backend.open(&p("f.txt"), opts).await.unwrap();
+        h.set_attributes(0).await.unwrap();
+        h.close().await.unwrap();
+        assert!(!std::fs::metadata(&path).unwrap().permissions().readonly());
     }
 
     #[test]

@@ -5,6 +5,7 @@ use std::sync::Arc;
 use crate::proto::header::Smb2Header;
 use crate::proto::messages::FileId;
 use tokio::sync::RwLock;
+use tracing::warn;
 
 use crate::conn::state::{Connection, Open, Session, TreeConnect};
 use crate::ntstatus;
@@ -45,6 +46,19 @@ pub async fn lookup_open(
     let tree = tree.read().await;
     let opens = tree.opens.read().await;
     opens.get(&file_id).cloned()
+}
+
+/// Puts back the times `open` keeps fixed, after a change made through it.
+pub async fn restore_fixed_times(open: &Open) {
+    let fixed = open.fixed_times;
+    if fixed.last_access_time.is_none() && fixed.last_write_time.is_none() {
+        return;
+    }
+    if let Some(handle) = open.handle.as_ref()
+        && let Err(e) = handle.set_times(fixed).await
+    {
+        warn!(error = %e, path = %open.last_path, "restoring fixed times failed");
+    }
 }
 
 /// Every open on `share`, on any connection.
