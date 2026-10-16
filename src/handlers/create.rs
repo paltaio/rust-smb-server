@@ -7,9 +7,8 @@ use crate::proto::messages::{CreateRequest, CreateResponse};
 use tracing::{debug, warn};
 
 use crate::access_mask::{
-    DELETE, FILE_APPEND_DATA, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_WRITE_ATTRIBUTES,
-    FILE_WRITE_DATA, GENERIC_ALL, GENERIC_READ, GENERIC_WRITE, MAXIMUM_ALLOWED, granted_access,
-    maximal_access,
+    DELETE, FILE_APPEND_DATA, FILE_READ_DATA, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA,
+    granted_access, maximal_access,
 };
 use crate::backend::{OpenIntent, OpenOptions};
 use crate::conn::state::{Connection, Open};
@@ -53,7 +52,7 @@ pub async fn handle(
         Err(s) => return HandlerResponse::err(s),
     };
     let tree = tree_arc.read().await;
-    let granted = tree.granted_access;
+    let tree_access = tree.granted_access;
     let backend = tree.share.backend.clone();
     drop(tree);
 
@@ -77,27 +76,13 @@ pub async fn handle(
         _ => return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER),
     };
 
-    // Translate desired access into read/write hints.
-    let want_read = req.desired_access
-        & (FILE_READ_DATA | FILE_READ_ATTRIBUTES | GENERIC_READ | GENERIC_ALL | MAXIMUM_ALLOWED)
-        != 0;
-    let want_write = req.desired_access
-        & (FILE_WRITE_DATA
-            | FILE_APPEND_DATA
-            | FILE_WRITE_ATTRIBUTES
-            | DELETE
-            | GENERIC_WRITE
-            | GENERIC_ALL
-            | MAXIMUM_ALLOWED)
-        != 0;
-
-    // Reject writes on a read-only tree.
-    if want_write && !granted.allows_write() {
-        warn!(path = %path, "write open on read-only tree");
+    let maximal = maximal_access(tree_access);
+    let Some(open_access) = granted_access(req.desired_access, maximal) else {
+        warn!(path = %path, "requested access exceeds tree access");
         return HandlerResponse::err(ntstatus::STATUS_ACCESS_DENIED);
-    }
+    };
     // Disposition that creates: requires write permission.
-    if !granted.allows_write()
+    if !tree_access.allows_write()
         && matches!(
             intent,
             OpenIntent::Create
@@ -114,8 +99,6 @@ pub async fn handle(
     if directory && non_directory {
         return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
     }
-    let maximal = maximal_access(granted);
-    let open_access = granted_access(req.desired_access, maximal);
     let delete_on_close = req.create_options & FILE_DELETE_ON_CLOSE != 0;
     if delete_on_close {
         // MS-SMB2 3.3.5.9: the tree must allow DELETE.
@@ -129,9 +112,12 @@ pub async fn handle(
         }
     }
 
+    // SET_INFO timestamps go through the host handle, which needs write
+    // access for that on Windows.
+    let write = open_access & (FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_ATTRIBUTES) != 0;
     let opts = OpenOptions {
-        read: want_read || !want_write,
-        write: want_write,
+        read: open_access & FILE_READ_DATA != 0 || !write,
+        write,
         intent,
         directory,
         non_directory,

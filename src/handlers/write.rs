@@ -5,7 +5,7 @@ use std::sync::Arc;
 use crate::proto::header::Smb2Header;
 use crate::proto::messages::{WriteRequest, WriteResponse};
 
-use crate::builder::Access;
+use crate::access_mask::{FILE_APPEND_DATA, FILE_WRITE_DATA};
 use crate::conn::state::Connection;
 use crate::dispatch::HandlerResponse;
 use crate::handlers::shared::{lookup_open, lookup_session_tree};
@@ -30,19 +30,16 @@ pub async fn handle(
         Ok(t) => t,
         Err(s) => return HandlerResponse::err(s),
     };
-    let granted = {
-        let tree = tree_arc.read().await;
-        tree.granted_access
-    };
-    if !matches!(granted, Access::ReadWrite) {
-        return HandlerResponse::err(ntstatus::STATUS_ACCESS_DENIED);
-    }
     let open_arc = match lookup_open(&tree_arc, req.file_id).await {
         Some(o) => o,
         None => return HandlerResponse::err(ntstatus::STATUS_FILE_CLOSED),
     };
     let result = {
         let open = open_arc.read().await;
+        // Either right allows any write, as on Windows (MS-SMB2 3.3.5.13).
+        if open.granted_access & (FILE_WRITE_DATA | FILE_APPEND_DATA) == 0 {
+            return HandlerResponse::err(ntstatus::STATUS_ACCESS_DENIED);
+        }
         match open.handle.as_ref() {
             Some(h) => h.write_owned(req.offset, req.data).await,
             None => return HandlerResponse::err(ntstatus::STATUS_FILE_CLOSED),

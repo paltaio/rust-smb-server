@@ -9,7 +9,7 @@ use crate::access_mask::{DELETE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA};
 use crate::backend::FileTimes;
 use crate::conn::state::Connection;
 use crate::dispatch::HandlerResponse;
-use crate::handlers::shared::{lookup_open, lookup_session_tree, path_is_open};
+use crate::handlers::shared::{lookup_open, lookup_session_tree, path_is_open, rename_open_paths};
 use crate::info_class as ic;
 use crate::ntstatus;
 use crate::path::{SmbPath, same_path};
@@ -151,7 +151,7 @@ pub async fn handle(
                 .await
             {
                 Ok(()) => {
-                    open_arc.write().await.last_path = new_path;
+                    rename_open_paths(server, &share, &from, &new_path).await;
                     Ok(())
                 }
                 Err(e) => Err(e),

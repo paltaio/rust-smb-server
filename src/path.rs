@@ -25,7 +25,6 @@ impl SmbPath {
     /// Construct from a UTF-16 code-unit slice (already decoded from UTF-16LE
     /// wire bytes).
     pub fn from_utf16(units: &[u16]) -> SmbResult<Self> {
-        // 1. Decode strictly; unpaired surrogates are rejected.
         let s = decode_utf16_strict(units)?;
         s.parse()
     }
@@ -116,17 +115,42 @@ impl SmbPath {
     }
 }
 
-/// True if `a` and `b` name the same entry, comparing names the way the
-/// backend does.
+/// True if `a` and `b` name the same entry, comparing names
+/// case-insensitively unless `case_sensitive`.
 pub(crate) fn same_path(a: &SmbPath, b: &SmbPath, case_sensitive: bool) -> bool {
-    if case_sensitive {
-        return a == b;
+    a.components().len() == b.components().len() && starts_with(a, b, case_sensitive)
+}
+
+/// `path` with its leading `from` replaced by `to`, if `path` is `from` or
+/// lies below it, comparing names case-insensitively unless
+/// `case_sensitive`.
+pub(crate) fn rebase(
+    path: &SmbPath,
+    from: &SmbPath,
+    to: &SmbPath,
+    case_sensitive: bool,
+) -> Option<SmbPath> {
+    if !starts_with(path, from, case_sensitive) {
+        return None;
     }
-    a.components().len() == b.components().len()
-        && a.components()
+    let mut components = to.components.clone();
+    components.extend_from_slice(&path.components[from.components.len()..]);
+    Some(SmbPath { components })
+}
+
+fn starts_with(path: &SmbPath, prefix: &SmbPath, case_sensitive: bool) -> bool {
+    path.components.len() >= prefix.components.len()
+        && path
+            .components
             .iter()
-            .zip(b.components())
-            .all(|(x, y)| x.to_lowercase() == y.to_lowercase())
+            .zip(&prefix.components)
+            .all(|(x, y)| {
+                if case_sensitive {
+                    x == y
+                } else {
+                    x.to_lowercase() == y.to_lowercase()
+                }
+            })
 }
 
 impl FromStr for SmbPath {
@@ -182,6 +206,10 @@ mod tests {
 
     fn utf16(s: &str) -> Vec<u16> {
         s.encode_utf16().collect()
+    }
+
+    fn p(s: &str) -> SmbPath {
+        s.parse().unwrap()
     }
 
     #[test]
@@ -280,6 +308,23 @@ mod tests {
     fn rejects_unpaired_surrogate() {
         let units: [u16; 2] = [0xD800, 0x0061]; // unpaired high surrogate
         assert!(SmbPath::from_utf16(&units).is_err());
+    }
+
+    #[test]
+    fn rebase_moves_the_path_and_everything_below_it() {
+        let (from, to) = (p("Dir"), p("new\\place"));
+        assert_eq!(rebase(&p("Dir"), &from, &to, true), Some(to.clone()));
+        assert_eq!(
+            rebase(&p("Dir\\Sub\\f.txt"), &from, &to, true),
+            Some(p("new\\place\\Sub\\f.txt"))
+        );
+        assert_eq!(rebase(&p("dir\\f.txt"), &from, &to, true), None);
+        assert_eq!(
+            rebase(&p("dir\\f.txt"), &from, &to, false),
+            Some(p("new\\place\\f.txt"))
+        );
+        assert_eq!(rebase(&p("Dirt"), &from, &to, false), None);
+        assert_eq!(rebase(&p("other\\Dir"), &from, &to, false), None);
     }
 
     #[test]

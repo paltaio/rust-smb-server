@@ -40,6 +40,8 @@ use crate::utils::{FILETIME_OFFSET, system_time_to_filetime};
 /// Local-filesystem backend, sandboxed at a single root directory.
 pub struct LocalFsBackend {
     root: Arc<Dir>,
+    /// Device of the share root; see `file_index`.
+    root_dev: Option<u64>,
     read_only: bool,
 }
 
@@ -48,8 +50,10 @@ impl LocalFsBackend {
     /// not a directory.
     pub fn new(path: impl AsRef<Path>) -> io::Result<Self> {
         let dir = Dir::open_ambient_dir(path, ambient_authority())?;
+        let root_dev = file_key(&dir.dir_metadata()?).map(|(dev, _)| dev);
         Ok(Self {
             root: Arc::new(dir),
+            root_dev,
             read_only: false,
         })
     }
@@ -155,6 +159,24 @@ fn file_key(md: &Metadata) -> Option<(u64, u64)> {
     }
 }
 
+/// File id for a file with host identity `key`. Files on the share root's
+/// device report the inode (file index on Windows). Files on other mounts
+/// below the root have their device mixed into the id, so equal inodes on
+/// different devices give different ids.
+fn file_index(root_dev: Option<u64>, key: Option<(u64, u64)>) -> u64 {
+    let Some((dev, ino)) = key else {
+        return 0;
+    };
+    if root_dev.is_none_or(|root| root == dev) {
+        return ino;
+    }
+    // splitmix64 finalizer: spreads the device over all 64 bits.
+    let mut x = dev;
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    ino ^ x ^ (x >> 31)
+}
+
 /// Number of hard links to a file. `None` if `md` does not carry it.
 fn link_count(md: &Metadata) -> Option<u64> {
     #[cfg(unix)]
@@ -220,7 +242,7 @@ fn filetime_to_system_time(ft: u64) -> Option<SystemTime> {
 // FileInfo construction
 // ---------------------------------------------------------------------------
 
-fn file_info_from_metadata(name: String, md: &Metadata) -> FileInfo {
+fn file_info_from_metadata(name: String, md: &Metadata, root_dev: Option<u64>) -> FileInfo {
     let len = md.len();
     let modified = md.modified().ok().map(|t| t.into_std());
     let accessed = md.accessed().ok().map(|t| t.into_std());
@@ -244,7 +266,7 @@ fn file_info_from_metadata(name: String, md: &Metadata) -> FileInfo {
         last_write_time: system_time_to_filetime(modified),
         change_time: system_time_to_filetime(modified),
         is_directory: md.is_dir(),
-        file_index: file_key(md).map_or(0, |(_, id)| id),
+        file_index: file_index(root_dev, file_key(md)),
     }
 }
 
@@ -352,6 +374,7 @@ impl ShareBackend for LocalFsBackend {
 
             return Ok(Box::new(LocalHandle::Dir {
                 name: file_name_for(path),
+                root_dev: self.root_dev,
                 dir_handle: Arc::new(dir_handle),
             }));
         }
@@ -386,6 +409,7 @@ impl ShareBackend for LocalFsBackend {
                         .map_err(io_to_smb)?;
                     return Ok(Box::new(LocalHandle::Dir {
                         name: file_name_for(path),
+                        root_dev: self.root_dev,
                         dir_handle: Arc::new(dir_handle),
                     }));
                 }
@@ -433,6 +457,7 @@ impl ShareBackend for LocalFsBackend {
 
         Ok(Box::new(LocalHandle::File {
             name: file_name_for(path),
+            root_dev: self.root_dev,
             file: Arc::new(std_file),
             read_only,
         }))
@@ -532,11 +557,13 @@ impl ShareBackend for LocalFsBackend {
 enum LocalHandle {
     File {
         name: String,
+        root_dev: Option<u64>,
         file: Arc<std::fs::File>,
         read_only: bool,
     },
     Dir {
         name: String,
+        root_dev: Option<u64>,
         dir_handle: Arc<Dir>,
     },
 }
@@ -609,12 +636,18 @@ impl Handle for LocalHandle {
 
     async fn stat(&self) -> SmbResult<FileInfo> {
         match self {
-            LocalHandle::File { file, name, .. } => {
+            LocalHandle::File {
+                file,
+                name,
+                root_dev,
+                ..
+            } => {
                 let file = Arc::clone(file);
                 let name = name.clone();
+                let root_dev = *root_dev;
                 spawn_blocking(move || -> io::Result<FileInfo> {
                     let md = Metadata::from_file(&file)?;
-                    Ok(file_info_from_metadata(name, &md))
+                    Ok(file_info_from_metadata(name, &md, root_dev))
                 })
                 .await
                 .map_err(join_to_io)
@@ -622,13 +655,16 @@ impl Handle for LocalHandle {
                 .map_err(io_to_smb)
             }
             LocalHandle::Dir {
-                dir_handle, name, ..
+                dir_handle,
+                name,
+                root_dev,
             } => {
                 let dir_handle = Arc::clone(dir_handle);
                 let name = name.clone();
+                let root_dev = *root_dev;
                 spawn_blocking(move || -> io::Result<FileInfo> {
                     let md = dir_handle.dir_metadata()?;
-                    Ok(file_info_from_metadata(name, &md))
+                    Ok(file_info_from_metadata(name, &md, root_dev))
                 })
                 .await
                 .map_err(join_to_io)
@@ -698,8 +734,13 @@ impl Handle for LocalHandle {
     async fn list_dir(&self, pattern: Option<&str>) -> SmbResult<Vec<SmbDirEntry>> {
         match self {
             LocalHandle::File { .. } => Err(SmbError::NotADirectory),
-            LocalHandle::Dir { dir_handle, .. } => {
+            LocalHandle::Dir {
+                dir_handle,
+                root_dev,
+                ..
+            } => {
                 let dir_handle = Arc::clone(dir_handle);
+                let root_dev = *root_dev;
                 let pat = pattern.map(|s| s.to_owned());
                 spawn_blocking(move || -> io::Result<Vec<SmbDirEntry>> {
                     let mut out = Vec::new();
@@ -719,7 +760,7 @@ impl Handle for LocalHandle {
                             }
                         }
                         let md = entry_metadata(&dir_handle, &entry)?;
-                        let info = file_info_from_metadata(name, &md);
+                        let info = file_info_from_metadata(name, &md, root_dev);
                         out.push(SmbDirEntry { info });
                     }
                     Ok(out)
@@ -1025,6 +1066,79 @@ mod tests {
             let entry = listed.iter().find(|e| e.info.name == name).unwrap();
             assert_eq!(entry.info.file_index, id, "{name}");
         }
+    }
+
+    #[test]
+    fn file_index_keeps_root_device_inodes_and_separates_other_devices() {
+        let root = Some(0x803);
+        assert_eq!(file_index(root, Some((0x803, 42))), 42);
+        assert_eq!(file_index(None, Some((0x803, 42))), 42);
+        assert_eq!(file_index(root, None), 0);
+        let ids = [
+            file_index(root, Some((0x803, 1))),
+            file_index(root, Some((0x2b, 1))),
+            file_index(root, Some((0x2c, 1))),
+            file_index(root, Some((0x10_0003, 1))),
+        ];
+        for (i, a) in ids.iter().enumerate() {
+            for b in &ids[i + 1..] {
+                assert_ne!(a, b, "{ids:x?}");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_index_is_the_inode_on_the_root_device() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let td = tempdir().unwrap();
+        std::fs::write(td.path().join("f.txt"), b"x").unwrap();
+        let backend = LocalFsBackend::new(td.path()).unwrap();
+        let h = backend.open(&p("f.txt"), opts_open_ro()).await.unwrap();
+        let ino = std::fs::metadata(td.path().join("f.txt")).unwrap().ino();
+        assert_eq!(h.stat().await.unwrap().file_index, ino);
+    }
+
+    /// Needs mounts below `/` whose roots share an inode number, as procfs,
+    /// sysfs and tmpfs roots do on Linux.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn file_index_differs_across_mounts_with_equal_inodes() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let mounts: Vec<_> = ["proc", "sys", "dev", "tmp"]
+            .into_iter()
+            .filter_map(|name| {
+                let md = std::fs::metadata(Path::new("/").join(name)).ok()?;
+                Some((name, md.dev(), md.ino()))
+            })
+            .collect();
+        let pair = mounts.iter().enumerate().find_map(|(i, a)| {
+            mounts[i + 1..]
+                .iter()
+                .find(|b| a.1 != b.1 && a.2 == b.2)
+                .map(|b| (a.0, b.0))
+        });
+        let Some((a, b)) = pair else {
+            eprintln!("no two mounts below / share an inode number; skipping");
+            return;
+        };
+        let backend = LocalFsBackend::new("/").unwrap();
+        let root = backend
+            .open(&SmbPath::root(), opts_open_dir())
+            .await
+            .unwrap();
+        let listed = root.list_dir(None).await.unwrap();
+        let mut ids = Vec::new();
+        for name in [a, b] {
+            let h = backend.open(&p(name), opts_open_dir()).await.unwrap();
+            let id = h.stat().await.unwrap().file_index;
+            let entry = listed.iter().find(|e| e.info.name == name).unwrap();
+            assert_eq!(entry.info.file_index, id, "{name}");
+            ids.push(id);
+        }
+        assert_ne!(ids[0], ids[1], "{a} and {b}");
     }
 
     #[cfg(unix)]

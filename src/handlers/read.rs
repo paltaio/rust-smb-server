@@ -5,6 +5,7 @@ use std::sync::Arc;
 use crate::proto::header::Smb2Header;
 use crate::proto::messages::{ReadRequest, ReadResponse};
 
+use crate::access_mask::FILE_READ_DATA;
 use crate::conn::state::Connection;
 use crate::dispatch::HandlerResponse;
 use crate::handlers::shared::{lookup_open, lookup_session_tree};
@@ -35,6 +36,9 @@ pub async fn handle(
     };
     let result = {
         let open = open_arc.read().await;
+        if open.granted_access & FILE_READ_DATA == 0 {
+            return HandlerResponse::err(ntstatus::STATUS_ACCESS_DENIED);
+        }
         match open.handle.as_ref() {
             Some(h) => h.read(req.offset, req.length).await,
             None => return HandlerResponse::err(ntstatus::STATUS_FILE_CLOSED),

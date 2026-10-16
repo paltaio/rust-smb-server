@@ -32,9 +32,11 @@ pub enum OpenIntent {
 /// Options passed to `ShareBackend::open`.
 #[derive(Debug, Clone, Copy)]
 pub struct OpenOptions {
-    /// Read access requested.
+    /// The open was granted `FILE_READ_DATA`, or has no write access. At
+    /// least one of `read` and `write` is set.
     pub read: bool,
-    /// Write access requested.
+    /// The open was granted `FILE_WRITE_DATA`, `FILE_APPEND_DATA` or
+    /// `FILE_WRITE_ATTRIBUTES`.
     pub write: bool,
     /// CREATE disposition.
     pub intent: OpenIntent,
@@ -81,10 +83,11 @@ pub struct FileInfo {
     pub change_time: u64,
     /// True if this is a directory.
     pub is_directory: bool,
-    /// Stable id of the file within the share, reported as the file id by
-    /// QUERY_INFO and QUERY_DIRECTORY. Backends return the same value from
-    /// `Handle::stat` and `Handle::list_dir` for the same file, across opens
-    /// and renames. `0` if the backend has none.
+    /// Stable id of the file, unique within the share including any mounts
+    /// below the share root, reported as the file id by QUERY_INFO and
+    /// QUERY_DIRECTORY. Backends return the same value from `Handle::stat`
+    /// and `Handle::list_dir` for the same file, across opens and renames.
+    /// `0` if the backend has none.
     pub file_index: u64,
 }
 

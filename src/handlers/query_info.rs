@@ -44,10 +44,10 @@ pub async fn handle(
         None => return HandlerResponse::err(ntstatus::STATUS_FILE_CLOSED),
     };
 
-    let info_res = {
+    let (info_res, granted_access) = {
         let open = open_arc.read().await;
         match open.handle.as_ref() {
-            Some(h) => h.stat().await,
+            Some(h) => (h.stat().await, open.granted_access),
             None => return HandlerResponse::err(ntstatus::STATUS_FILE_CLOSED),
         }
     };
@@ -68,12 +68,12 @@ pub async fn handle(
                 ic::FILE_FULL_EA_INFORMATION => {
                     return HandlerResponse::err(ntstatus::STATUS_NO_EAS_ON_FILE);
                 }
-                ic::FILE_ACCESS_INFORMATION => ic::encode_file_access_information(0x001F_01FF),
+                ic::FILE_ACCESS_INFORMATION => ic::encode_file_access_information(granted_access),
                 ic::FILE_POSITION_INFORMATION => ic::encode_file_position_information(),
                 ic::FILE_MODE_INFORMATION => ic::encode_file_mode_information(0),
                 ic::FILE_ALIGNMENT_INFORMATION => ic::encode_file_alignment_information(),
                 ic::FILE_NAME_INFORMATION => ic::encode_file_name_information(&info.name),
-                ic::FILE_ALL_INFORMATION => ic::encode_file_all_information(&info, 0x001F_01FF),
+                ic::FILE_ALL_INFORMATION => ic::encode_file_all_information(&info, granted_access),
                 ic::FILE_NETWORK_OPEN_INFORMATION => {
                     ic::encode_file_network_open_information(&info)
                 }
