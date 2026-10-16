@@ -3,17 +3,18 @@
 use std::sync::Arc;
 
 use crate::proto::header::Smb2Header;
-use crate::proto::messages::{CreateRequest, CreateResponse};
+use crate::proto::messages::{CreateContext, CreateRequest, CreateResponse};
 use tracing::{debug, warn};
 
 use crate::access_mask::{
     DELETE, FILE_APPEND_DATA, FILE_READ_DATA, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA,
     granted_access, maximal_access,
 };
-use crate::backend::{OpenIntent, OpenOptions};
+use crate::backend::{FileInfo, OpenIntent, OpenOptions};
 use crate::conn::state::{Connection, Open};
 use crate::dispatch::HandlerResponse;
 use crate::handlers::shared::lookup_session_tree;
+use crate::info_class::VOLUME_SERIAL_NUMBER;
 use crate::ntstatus;
 use crate::path::SmbPath;
 use crate::server::ServerState;
@@ -35,6 +36,70 @@ const FILE_OVERWRITE_IF: u32 = 0x0000_0005;
 // CreateAction in response (MS-SMB2 §2.2.14)
 const FILE_OPENED: u32 = 0x0000_0001;
 const FILE_CREATED: u32 = 0x0000_0002;
+
+/// Offset of the response create contexts from the start of the SMB2
+/// header: 64 + 88.
+const RESPONSE_CONTEXTS_OFFSET: u32 = 0x98;
+
+/// Create contexts of a request that the response answers (MS-SMB2
+/// 3.3.5.9.5, 3.3.5.9.9). Other contexts are ignored.
+struct ContextQueries {
+    /// QUERY_MAXIMAL_ACCESS, with its timestamp if it has one.
+    maximal_access: Option<Option<u64>>,
+    query_on_disk_id: bool,
+}
+
+impl ContextQueries {
+    /// `None` if a context is malformed.
+    fn parse(chain: &[u8]) -> Option<Self> {
+        let contexts = CreateContext::parse_chain(chain).ok()?;
+        let find = |name: &[u8; 4]| contexts.iter().find(|c| c.name == name);
+        // The data is empty or one FILETIME (MS-SMB2 2.2.13.2.5).
+        let maximal_access = match find(CreateContext::NAME_MXAC) {
+            None => None,
+            Some(c) if c.data.is_empty() => Some(None),
+            Some(c) => Some(Some(u64::from_le_bytes(c.data.as_slice().try_into().ok()?))),
+        };
+        // Skipped when the request reconnects a durable open.
+        let query_on_disk_id = find(CreateContext::NAME_QFID).is_some()
+            && find(CreateContext::NAME_DHNC).is_none()
+            && find(CreateContext::NAME_DH2C).is_none();
+        Some(Self {
+            maximal_access,
+            query_on_disk_id,
+        })
+    }
+
+    /// Response contexts for an open of a file with `info` on a tree whose
+    /// MaximalAccess is `maximal`.
+    fn answer(&self, info: &FileInfo, maximal: u32) -> Vec<CreateContext> {
+        let mut out = Vec::new();
+        if let Some(timestamp) = self.maximal_access {
+            let (status, access) = if timestamp == Some(info.change_time) {
+                (ntstatus::STATUS_NONE_MAPPED, 0)
+            } else {
+                (ntstatus::STATUS_SUCCESS, maximal)
+            };
+            let mut data = status.to_le_bytes().to_vec();
+            data.extend_from_slice(&access.to_le_bytes());
+            out.push(CreateContext {
+                name: CreateContext::NAME_MXAC.to_vec(),
+                data,
+            });
+        }
+        if self.query_on_disk_id {
+            // DiskFileId, VolumeId, 16 reserved bytes.
+            let mut data = vec![0; 32];
+            data[..8].copy_from_slice(&info.file_index.to_le_bytes());
+            data[8..16].copy_from_slice(&u64::from(VOLUME_SERIAL_NUMBER).to_le_bytes());
+            out.push(CreateContext {
+                name: CreateContext::NAME_QFID.to_vec(),
+                data,
+            });
+        }
+        out
+    }
+}
 
 pub async fn handle(
     _server: &Arc<ServerState>,
@@ -74,6 +139,10 @@ pub async fn handle(
         FILE_OPEN_IF => OpenIntent::OpenOrCreate,
         FILE_OVERWRITE => OpenIntent::Truncate,
         _ => return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER),
+    };
+
+    let Some(queries) = ContextQueries::parse(&req.create_contexts) else {
+        return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
     };
 
     let maximal = maximal_access(tree_access);
@@ -165,6 +234,8 @@ pub async fn handle(
         OpenIntent::OpenOrCreate | OpenIntent::OverwriteOrCreate => FILE_OPENED,
         OpenIntent::Open | OpenIntent::Truncate => FILE_OPENED,
     };
+    let mut contexts = Vec::new();
+    CreateContext::encode_chain(&queries.answer(&info, maximal), &mut contexts).expect("encode");
     let resp = CreateResponse {
         structure_size: 89,
         oplock_level: 0,
@@ -179,9 +250,13 @@ pub async fn handle(
         file_attributes: info.attributes(),
         reserved2: 0,
         file_id,
-        create_contexts_offset: 0,
-        create_contexts_length: 0,
-        create_contexts: vec![],
+        create_contexts_offset: if contexts.is_empty() {
+            0
+        } else {
+            RESPONSE_CONTEXTS_OFFSET
+        },
+        create_contexts_length: contexts.len() as u32,
+        create_contexts: contexts,
     };
     let mut buf = Vec::new();
     resp.write_to(&mut buf).expect("encode");

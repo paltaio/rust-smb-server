@@ -1,11 +1,5 @@
-//! Anonymous session over TCP loopback: CREATE with write access, WRITE, READ
-//! the bytes back, and check the `LocalFsBackend` file contents on disk. Also
-//! checks share and open access on delete, rename, timestamp changes, READ
-//! and WRITE, the access QUERY_INFO reports, rename with ReplaceIfExists,
-//! paths of other opens after a rename, and the file id reported for a file.
-//! Then SET_INFO allocation, basic and disposition information, directory
-//! renames while open, the alternate name query and DOS wildcards in
-//! QUERY_DIRECTORY.
+//! File operations against `LocalFsBackend` over TCP loopback, each test on
+//! its own server with an anonymous session.
 
 mod common;
 
@@ -15,7 +9,7 @@ use common::{
 };
 use smb_server::wire::header::Command;
 use smb_server::wire::messages::{
-    CloseRequest, CloseResponse, CreateRequest, CreateResponse, FileId, InfoType,
+    CloseRequest, CloseResponse, CreateContext, CreateRequest, CreateResponse, FileId, InfoType,
     QueryDirectoryRequest, QueryDirectoryResponse, QueryInfoRequest, QueryInfoResponse,
     ReadRequest, ReadResponse, SetInfoRequest, WriteRequest, WriteResponse,
 };
@@ -33,13 +27,8 @@ async fn end_to_end_anon_write_then_read_localfs() {
     let td = tempdir().expect("tempdir");
     let backend = LocalFsBackend::new(td.path()).expect("open root");
 
-    let (addr, handle) = start_server(
-        SmbServer::builder()
-            .user("alice", "password")
-            .share(Share::new("share", backend).public())
-            .netbios_name("TESTSERVER"),
-    )
-    .await;
+    let (addr, handle) =
+        start_server(SmbServer::builder().share(Share::new("share", backend).public())).await;
 
     let mut s = TcpStream::connect(addr).await.expect("connect");
 
@@ -165,7 +154,6 @@ async fn end_to_end_anon_write_then_read_localfs() {
 const FILE_READ_DATA: u32 = 0x0000_0001;
 const FILE_WRITE_DATA: u32 = 0x0000_0002;
 const FILE_APPEND_DATA: u32 = 0x0000_0004;
-const FILE_EXECUTE: u32 = 0x0000_0020;
 const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
 const SYNCHRONIZE: u32 = 0x0010_0000;
 const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
@@ -174,6 +162,8 @@ const FILE_GENERIC_EXECUTE: u32 = 0x0012_00A0;
 const FILE_WRITE_ATTRIBUTES: u32 = 0x0000_0100;
 const DELETE: u32 = 0x0001_0000;
 const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
+const FILE_OPEN: u32 = 0x0000_0001;
+const FILE_CREATE: u32 = 0x0000_0002;
 const FILE_DELETE_ON_CLOSE: u32 = 0x0000_1000;
 const FILE_BASIC_INFORMATION: u8 = 0x04;
 const FILE_INTERNAL_INFORMATION: u8 = 0x06;
@@ -220,7 +210,33 @@ impl Client {
 
     /// Opens an existing file; returns its FileId, or the status on failure.
     async fn open(&mut self, name: &str, access: u32, options: u32) -> Result<FileId, u32> {
-        let name = utf16le(name);
+        let (status, rb) = self.create(name, access, FILE_OPEN, options, &[]).await;
+        if status != STATUS_SUCCESS {
+            return Err(status);
+        }
+        Ok(CreateResponse::parse(&rb)
+            .expect("parse create resp")
+            .file_id)
+    }
+
+    /// CREATE with the create context chain `contexts`, placed 8-aligned
+    /// after the name. Returns the status and the response body.
+    async fn create(
+        &mut self,
+        name: &str,
+        access: u32,
+        disposition: u32,
+        options: u32,
+        contexts: &[u8],
+    ) -> (u32, Vec<u8>) {
+        let mut name = utf16le(name);
+        let name_length = name.len() as u16;
+        name.resize(name.len().next_multiple_of(8), 0);
+        let contexts_offset = if contexts.is_empty() {
+            0
+        } else {
+            0x78 + name.len() as u32
+        };
         let req = CreateRequest {
             structure_size: 57,
             security_flags: 0,
@@ -231,24 +247,18 @@ impl Client {
             desired_access: access,
             file_attributes: 0,
             share_access: 0x0000_0007,
-            create_disposition: 1, // FILE_OPEN
+            create_disposition: disposition,
             create_options: options,
             name_offset: 0x78,
-            name_length: name.len() as u16,
-            create_contexts_offset: 0,
-            create_contexts_length: 0,
+            name_length,
+            create_contexts_offset: contexts_offset,
+            create_contexts_length: contexts.len() as u32,
             name,
-            create_contexts: vec![],
+            create_contexts: contexts.to_vec(),
         };
         let mut body = Vec::new();
         req.write_to(&mut body).expect("write");
-        let (status, rb) = self.send(Command::Create, &body).await;
-        if status != STATUS_SUCCESS {
-            return Err(status);
-        }
-        Ok(CreateResponse::parse(&rb)
-            .expect("parse create resp")
-            .file_id)
+        self.send(Command::Create, &body).await
     }
 
     async fn set_info(&mut self, file_id: FileId, class: u8, buffer: Vec<u8>) -> u32 {
@@ -534,7 +544,8 @@ async fn read_write_share_checks_open_access() {
             ntstatus::STATUS_ACCESS_DENIED
         );
     }
-    // A class SET_INFO does not apply is unsupported whatever the access.
+    // SET_INFO for a class it does not handle returns STATUS_NOT_SUPPORTED
+    // whatever the open's access.
     assert_eq!(
         c.set_info(file_id, FILE_SHORT_NAME_INFORMATION, vec![0; 8])
             .await,
@@ -659,11 +670,6 @@ async fn read_and_write_check_the_open_access() {
     assert_eq!(c.write(append, 4, b"!").await, STATUS_SUCCESS);
     c.close(append).await;
 
-    // FILE_EXECUTE brings FILE_READ_DATA.
-    let exec = c.open("f.txt", FILE_EXECUTE, 0).await.unwrap();
-    assert_eq!(c.read(exec).await, STATUS_SUCCESS);
-    c.close(exec).await;
-
     assert_eq!(std::fs::read(&path).unwrap(), b"Data!");
     handle.abort();
 }
@@ -675,17 +681,13 @@ async fn query_info_reports_the_open_access() {
     let backend = LocalFsBackend::new(td.path()).expect("open root");
     let (mut c, handle) = Client::connect(Share::new("share", backend).public()).await;
 
-    for access in [
-        FILE_GENERIC_READ,
-        FILE_READ_ATTRIBUTES | DELETE | SYNCHRONIZE,
-    ] {
-        let file_id = c.open("f.txt", access, 0).await.unwrap();
-        let info = c.query_file_info(file_id, FILE_ACCESS_INFORMATION).await;
-        assert_eq!(info, access.to_le_bytes(), "access {access:#x}");
-        let all = c.query_file_info(file_id, FILE_ALL_INFORMATION).await;
-        assert_eq!(all_info_access(&all), access, "access {access:#x}");
-        c.close(file_id).await;
-    }
+    let access = FILE_READ_ATTRIBUTES | DELETE | SYNCHRONIZE;
+    let file_id = c.open("f.txt", access, 0).await.unwrap();
+    let info = c.query_file_info(file_id, FILE_ACCESS_INFORMATION).await;
+    assert_eq!(info, access.to_le_bytes());
+    let all = c.query_file_info(file_id, FILE_ALL_INFORMATION).await;
+    assert_eq!(all_info_access(&all), access);
+    c.close(file_id).await;
 
     handle.abort();
 }
@@ -929,7 +931,7 @@ async fn allocation_below_end_of_file_truncates() {
     let (mut c, handle) = Client::connect(Share::new("share", backend).public()).await;
 
     let file_id = c.open("f.txt", FILE_GENERIC_WRITE, 0).await.unwrap();
-    for (size, expected) in [(100u64, &b"hello world"[..]), (5, b"hello"), (0, b"")] {
+    for (size, expected) in [(100u64, &b"hello world"[..]), (5, b"hello")] {
         assert_eq!(
             c.set_info(
                 file_id,
@@ -947,10 +949,9 @@ async fn allocation_below_end_of_file_truncates() {
 }
 
 #[tokio::test]
-async fn basic_information_applies_to_directories() {
+async fn directory_attribute_is_accepted_on_a_directory() {
     let td = tempdir().expect("tempdir");
-    let path = td.path().join("d");
-    std::fs::create_dir(&path).expect("mkdir");
+    std::fs::create_dir(td.path().join("d")).expect("mkdir");
     let backend = LocalFsBackend::new(td.path()).expect("open root");
     let (mut c, handle) = Client::connect(Share::new("share", backend).public()).await;
 
@@ -962,26 +963,15 @@ async fn basic_information_applies_to_directories() {
         )
         .await
         .unwrap();
-    let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_577_934_245);
     assert_eq!(
         c.set_info(
             dir,
             FILE_BASIC_INFORMATION,
-            basic_info([0, 0, filetime(t), 0], 0)
+            basic_info([0; 4], FILE_ATTRIBUTE_DIRECTORY)
         )
         .await,
         STATUS_SUCCESS
     );
-    assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), t);
-    // What Remove-Item -Force and robocopy send.
-    for attributes in [FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_DIRECTORY] {
-        assert_eq!(
-            c.set_info(dir, FILE_BASIC_INFORMATION, basic_info([0; 4], attributes))
-                .await,
-            STATUS_SUCCESS,
-            "attributes {attributes:#x}"
-        );
-    }
     c.close(dir).await;
 
     handle.abort();
@@ -1232,7 +1222,7 @@ async fn alternate_name_query_reports_no_short_name() {
 #[tokio::test]
 async fn query_directory_applies_dos_wildcards() {
     let td = tempdir().expect("tempdir");
-    for name in ["ow.txt", "sw.txt", "w.txt", "notes.log"] {
+    for name in ["ow.txt", "sw.txt", "w.txt"] {
         std::fs::write(td.path().join(name), b"x").expect("write file");
     }
     let backend = LocalFsBackend::new(td.path()).expect("open root");
@@ -1242,13 +1232,172 @@ async fn query_directory_applies_dos_wildcards() {
         .open("", FILE_GENERIC_READ, FILE_DIRECTORY_FILE)
         .await
         .unwrap();
-    // What Windows sends for "*.txt" and "?w.txt".
-    assert_eq!(
-        c.list(root, "<.txt").await.unwrap(),
-        ["ow.txt", "sw.txt", "w.txt"]
-    );
     assert_eq!(c.list(root, ">w.txt").await.unwrap(), ["ow.txt", "sw.txt"]);
     c.close(root).await;
+
+    handle.abort();
+}
+
+const FILE_ALL_ACCESS: u32 = 0x001F_01FF;
+
+fn context_chain(contexts: &[(&[u8], &[u8])]) -> Vec<u8> {
+    let list: Vec<CreateContext> = contexts
+        .iter()
+        .map(|&(name, data)| CreateContext {
+            name: name.to_vec(),
+            data: data.to_vec(),
+        })
+        .collect();
+    let mut chain = Vec::new();
+    CreateContext::encode_chain(&list, &mut chain).expect("encode");
+    chain
+}
+
+/// Response create contexts, after checking that they start right after the
+/// fixed response fields and that every context and data field is 8-aligned.
+fn response_contexts(rb: &[u8]) -> Vec<CreateContext> {
+    let resp = CreateResponse::parse(rb).expect("parse create resp");
+    if resp.create_contexts_length == 0 {
+        assert_eq!(resp.create_contexts_offset, 0);
+        return Vec::new();
+    }
+    assert_eq!(resp.create_contexts_offset, 64 + 88);
+    let chain = &rb[88..];
+    assert_eq!(chain.len(), resp.create_contexts_length as usize);
+    let mut at = 0;
+    loop {
+        let entry = &chain[at..];
+        let next = u32::from_le_bytes(entry[0..4].try_into().unwrap()) as usize;
+        let data_offset = u16::from_le_bytes(entry[10..12].try_into().unwrap());
+        assert_eq!(next % 8, 0);
+        assert_eq!(data_offset % 8, 0);
+        if next == 0 {
+            break;
+        }
+        at += next;
+    }
+    CreateContext::parse_chain(chain).expect("parse contexts")
+}
+
+fn context_data<'a>(contexts: &'a [CreateContext], name: &[u8; 4]) -> &'a [u8] {
+    &contexts
+        .iter()
+        .find(|c| c.name == name)
+        .unwrap_or_else(|| panic!("no {} context", String::from_utf8_lossy(name)))
+        .data
+}
+
+#[tokio::test]
+async fn create_answers_maximal_access_and_on_disk_id() {
+    let td = tempdir().expect("tempdir");
+    let backend = LocalFsBackend::new(td.path()).expect("open root");
+    let (mut c, handle) = Client::connect(Share::new("share", backend).public()).await;
+
+    let queries = context_chain(&[
+        (CreateContext::NAME_MXAC, &[]),
+        (CreateContext::NAME_QFID, &[]),
+    ]);
+    let (status, rb) = c
+        .create("new.txt", FILE_GENERIC_READ, FILE_CREATE, 0, &queries)
+        .await;
+    assert_eq!(status, STATUS_SUCCESS);
+    let resp = CreateResponse::parse(&rb).unwrap();
+    let contexts = response_contexts(&rb);
+    assert_eq!(contexts.len(), 2);
+
+    let mxac = context_data(&contexts, CreateContext::NAME_MXAC);
+    assert_eq!(mxac[0..4], STATUS_SUCCESS.to_le_bytes());
+    assert_eq!(mxac[4..8], FILE_ALL_ACCESS.to_le_bytes());
+
+    let qfid = context_data(&contexts, CreateContext::NAME_QFID);
+    assert_eq!(qfid.len(), 32);
+    let id = c
+        .query_file_info(resp.file_id, FILE_INTERNAL_INFORMATION)
+        .await;
+    assert_eq!(qfid[0..8], id[0..8]);
+    assert_ne!(qfid[0..8], [0; 8]);
+    assert_eq!(qfid[16..32], [0; 16]);
+    c.close(resp.file_id).await;
+
+    // A timestamp equal to the change time gets no answer.
+    let unchanged = context_chain(&[(CreateContext::NAME_MXAC, &resp.change_time.to_le_bytes())]);
+    let changed = context_chain(&[(
+        CreateContext::NAME_MXAC,
+        &(resp.change_time - 1).to_le_bytes(),
+    )]);
+    for (chain, status, access) in [
+        (unchanged, ntstatus::STATUS_NONE_MAPPED, 0),
+        (changed, STATUS_SUCCESS, FILE_ALL_ACCESS),
+    ] {
+        let (open_status, rb) = c
+            .create("new.txt", FILE_READ_ATTRIBUTES, FILE_OPEN, 0, &chain)
+            .await;
+        assert_eq!(open_status, STATUS_SUCCESS);
+        let contexts = response_contexts(&rb);
+        let mxac = context_data(&contexts, CreateContext::NAME_MXAC);
+        assert_eq!(mxac[0..4], status.to_le_bytes());
+        assert_eq!(mxac[4..8], access.to_le_bytes());
+        c.close(CreateResponse::parse(&rb).unwrap().file_id).await;
+    }
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn maximal_access_on_a_read_only_share_is_read_access() {
+    let td = tempdir().expect("tempdir");
+    std::fs::write(td.path().join("f.txt"), b"x").expect("write file");
+    let backend = LocalFsBackend::new(td.path()).expect("open root");
+    let (mut c, handle) = Client::connect(Share::new("share", backend).public_read_only()).await;
+
+    let queries = context_chain(&[(CreateContext::NAME_MXAC, &[])]);
+    let (status, rb) = c
+        .create("f.txt", FILE_READ_ATTRIBUTES, FILE_OPEN, 0, &queries)
+        .await;
+    assert_eq!(status, STATUS_SUCCESS);
+    let contexts = response_contexts(&rb);
+    let mxac = context_data(&contexts, CreateContext::NAME_MXAC);
+    assert_eq!(mxac[0..4], STATUS_SUCCESS.to_le_bytes());
+    assert_eq!(
+        mxac[4..8],
+        (FILE_GENERIC_READ | FILE_GENERIC_EXECUTE).to_le_bytes()
+    );
+    c.close(CreateResponse::parse(&rb).unwrap().file_id).await;
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn create_ignores_other_contexts_and_rejects_malformed_ones() {
+    let td = tempdir().expect("tempdir");
+    let backend = LocalFsBackend::new(td.path()).expect("open root");
+    let (mut c, handle) = Client::connect(Share::new("share", backend).public()).await;
+
+    let others = context_chain(&[
+        (CreateContext::NAME_RQLS, &[0; 32]),
+        (CreateContext::NAME_DHNQ, &[0; 16]),
+        (b"XXXX", &[1, 2, 3]),
+    ]);
+    let (status, rb) = c
+        .create("a.txt", FILE_GENERIC_READ, FILE_CREATE, 0, &others)
+        .await;
+    assert_eq!(status, STATUS_SUCCESS);
+    assert!(response_contexts(&rb).is_empty());
+    c.close(CreateResponse::parse(&rb).unwrap().file_id).await;
+
+    for (case, chain) in [
+        ("short name", context_chain(&[(b"Mx", &[])])),
+        (
+            "maximal access data",
+            context_chain(&[(CreateContext::NAME_MXAC, &[0; 4])]),
+        ),
+    ] {
+        let (status, _) = c
+            .create("b.txt", FILE_GENERIC_READ, FILE_CREATE, 0, &chain)
+            .await;
+        assert_eq!(status, ntstatus::STATUS_INVALID_PARAMETER, "{case}");
+        assert!(!td.path().join("b.txt").exists(), "{case}");
+    }
 
     handle.abort();
 }

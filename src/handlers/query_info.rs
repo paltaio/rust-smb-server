@@ -91,12 +91,15 @@ pub async fn handle(
             }
         }
         InfoType::FileSystem => {
-            // Filesystem info is fixed apart from the volume creation time.
+            // Filesystem info is fixed apart from the volume creation time
+            // and the case-sensitive flag.
             let creation_time = info_res.as_ref().map(|i| i.creation_time).unwrap_or(0);
             match req.file_information_class {
-                ic::FS_VOLUME_INFORMATION => {
-                    ic::encode_fs_volume_information(creation_time, 0xCAFE_BABE, "smb-server")
-                }
+                ic::FS_VOLUME_INFORMATION => ic::encode_fs_volume_information(
+                    creation_time,
+                    ic::VOLUME_SERIAL_NUMBER,
+                    "smb-server",
+                ),
                 ic::FS_SIZE_INFORMATION => {
                     // Fixed 4 PiB volume, 2 PiB free, 4 KiB clusters.
                     ic::encode_fs_size_information(

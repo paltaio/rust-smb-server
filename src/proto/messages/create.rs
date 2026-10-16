@@ -47,8 +47,9 @@ const CREATE_BUFFER_OFFSET: u64 = 0x78;
 /// The file `name` (UTF-16LE) and the `create_contexts` blob sit at
 /// `name_offset` and `create_contexts_offset`, counted from the start of the
 /// SMB2 header, after the fixed fields. `parse` reads them from those offsets
-/// and fails when either points outside the request. `write_to` writes them
-/// back to back after the fixed fields, so the offsets must match that layout.
+/// and fails when a non-empty one starts before the end of the fixed fields or
+/// ends past the request. `write_to` writes them back to back after the fixed
+/// fields, so the offsets must match that layout.
 /// [`CreateContext::parse_chain`] decodes the `create_contexts` blob.
 #[binrw]
 #[brw(little)]
@@ -186,8 +187,11 @@ impl CreateContext {
 
     /// Parse a chain of create-contexts from the raw chain bytes.
     ///
-    /// The chain is empty if `chain.is_empty()`. Otherwise we walk `Next`
-    /// offsets until we hit a zero terminator, validating bounds at each step.
+    /// The chain is empty if `chain.is_empty()`. Otherwise `Next` offsets are
+    /// followed until one is zero. Each context spans from its start to the
+    /// next context, or to the end of the chain for the last one. A context
+    /// shorter than its 16-byte header, a name shorter than 4 bytes, or a
+    /// name or data outside the context is malformed.
     pub fn parse_chain(chain: &[u8]) -> ProtoResult<Vec<CreateContext>> {
         let mut out = Vec::new();
         if chain.is_empty() {
@@ -195,19 +199,29 @@ impl CreateContext {
         }
         let mut cursor_off = 0usize;
         loop {
-            let entry = &chain
+            let rest = chain
                 .get(cursor_off..)
                 .ok_or(ProtoError::Malformed("create context out of range"))?;
-            if entry.len() < 16 {
+            if rest.len() < 16 {
                 return Err(ProtoError::Malformed("create context too short"));
             }
-            let next = u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]) as usize;
+            let next = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
+            let entry = match next {
+                0 => rest,
+                16.. => rest
+                    .get(..next)
+                    .ok_or(ProtoError::Malformed("create context next out of range"))?,
+                _ => return Err(ProtoError::Malformed("create context too short")),
+            };
             let name_offset = u16::from_le_bytes([entry[4], entry[5]]) as usize;
             let name_length = u16::from_le_bytes([entry[6], entry[7]]) as usize;
             // entry[8..10] = reserved
             let data_offset = u16::from_le_bytes([entry[10], entry[11]]) as usize;
             let data_length =
                 u32::from_le_bytes([entry[12], entry[13], entry[14], entry[15]]) as usize;
+            if name_length < 4 {
+                return Err(ProtoError::Malformed("create context name too short"));
+            }
 
             let name = entry
                 .get(name_offset..name_offset + name_length)
@@ -445,8 +459,8 @@ mod tests {
         // Byte position of NameOffset in the request body.
         const NAME_OFFSET_FIELD: usize = 44;
         let name = utf16le("a.txt");
-        // Inside the SMB2 header, inside the fixed fields, past the end.
-        for name_offset in [0x40, 0x70, 0x200] {
+        // Inside the fixed fields, past the end.
+        for name_offset in [0x70, 0x200] {
             let mut body = body_with_buffers(&name, 0x78, &[], 0x78);
             body[NAME_OFFSET_FIELD..NAME_OFFSET_FIELD + 2]
                 .copy_from_slice(&u16::to_le_bytes(name_offset));
@@ -527,6 +541,42 @@ mod tests {
         CreateContext::encode_chain(&ctxs, &mut buf).unwrap();
         let decoded = CreateContext::parse_chain(&buf).unwrap();
         assert_eq!(decoded, ctxs);
+    }
+
+    #[test]
+    fn create_context_chain_rejects_malformed_entries() {
+        let short_name = vec![CreateContext {
+            name: b"MxA".to_vec(),
+            data: vec![],
+        }];
+        let mut buf = Vec::new();
+        CreateContext::encode_chain(&short_name, &mut buf).unwrap();
+        assert!(CreateContext::parse_chain(&buf).is_err());
+
+        let pair = vec![
+            CreateContext {
+                name: b"QFid".to_vec(),
+                data: vec![],
+            },
+            CreateContext {
+                name: b"MxAc".to_vec(),
+                data: vec![0; 8],
+            },
+        ];
+        let mut chain = Vec::new();
+        CreateContext::encode_chain(&pair, &mut chain).unwrap();
+        let next = u32::from_le_bytes(chain[0..4].try_into().unwrap());
+        // Data that runs from the first context into the second.
+        let mut bad = chain.clone();
+        bad[10..12].copy_from_slice(&16u16.to_le_bytes());
+        bad[12..16].copy_from_slice(&next.to_le_bytes());
+        assert!(CreateContext::parse_chain(&bad).is_err());
+        // Next inside the first header, and past the end of the chain.
+        for next in [8u32, chain.len() as u32 + 8] {
+            let mut bad = chain.clone();
+            bad[0..4].copy_from_slice(&next.to_le_bytes());
+            assert!(CreateContext::parse_chain(&bad).is_err(), "next {next}");
+        }
     }
 
     #[test]

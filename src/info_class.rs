@@ -199,6 +199,9 @@ pub const FS_DEVICE_INFORMATION: u8 = 0x04;
 pub const FS_ATTRIBUTE_INFORMATION: u8 = 0x05;
 pub const FS_FULL_SIZE_INFORMATION: u8 = 0x07;
 
+/// Serial number of the volume behind every share.
+pub const VOLUME_SERIAL_NUMBER: u32 = 0xCAFE_BABE;
+
 /// FileFsVolumeInformation (MS-FSCC §2.5.9). Volume creation time, serial,
 /// label.
 pub fn encode_fs_volume_information(creation_time: u64, serial: u32, label: &str) -> Vec<u8> {
