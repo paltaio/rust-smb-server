@@ -4,13 +4,18 @@ use std::sync::Arc;
 
 use crate::proto::auth::ntlm::Identity;
 use crate::proto::crypto::{PreauthIntegrity, sign};
+use crate::proto::framing::MAX_FRAME_PAYLOAD;
 use crate::proto::header::{
     Command, HeaderTail, SMB2_FLAGS_ASYNC_COMMAND, SMB2_FLAGS_RELATED_OPERATIONS,
     SMB2_FLAGS_SERVER_TO_REDIR, SMB2_FLAGS_SIGNED, SMB2_HEADER_LEN, Smb2Header,
 };
-use crate::proto::messages::ErrorResponse;
+use crate::proto::messages::{Dialect, ErrorResponse};
 use tracing::{Instrument, debug, debug_span, error, warn};
 
+use crate::conn::chain;
+use crate::conn::credits::{CreditWindow, charge_covers};
+use crate::conn::limits::supports_multi_credit;
+use crate::conn::related::RelatedContext;
 use crate::conn::state::Connection;
 use crate::handlers;
 use crate::ntstatus;
@@ -76,78 +81,96 @@ pub async fn dispatch_frame(
     frame: &[u8],
 ) -> Option<Vec<u8>> {
     // SMB1 multi-protocol bootstrap (MS-SMB2 §3.3.5.3.1). The only SMB1 we
-    // accept: a NEGOTIATE_REQUEST listing "SMB 2.???" or "SMB 2.002".
-    // Reply with an SMB2 NEGOTIATE response and the client follows up with
-    // a real SMB2 NEGOTIATE.
-    if let Some(bytes) = handle_smb1_multi_protocol(server, conn, frame).await {
-        return Some(bytes);
+    // accept: a NEGOTIATE_REQUEST listing "SMB 2.???" or "SMB 2.002", as the
+    // first request on the connection (3.3.5.3).
+    if is_smb1_negotiate(frame) {
+        // Its MessageId counts as 0 (MS-SMB2 3.3.5.2.3).
+        if conn.dialect.read().await.is_some() || !lock_credits(conn).consume(0, 1) {
+            warn!("SMB1 NEGOTIATE is not the first request; closing connection");
+            conn.request_disconnect();
+            return None;
+        }
+        let reply = handle_smb1_multi_protocol(server, conn, frame).await;
+        if reply.is_none() {
+            warn!("SMB1 NEGOTIATE without an SMB2 dialect; closing connection");
+            conn.request_disconnect();
+        }
+        return reply;
     }
-    if frame.len() < SMB2_HEADER_LEN {
-        warn!(len = frame.len(), "frame too short for SMB2 header");
+    let dialect = *conn.dialect.read().await;
+    let requests = match chain::split(frame, dialect) {
+        Ok(requests) => requests,
+        Err(reason) => {
+            warn!(%reason, "malformed frame; closing connection");
+            conn.request_disconnect();
+            return None;
+        }
+    };
+    if let Err(message_id) = consume_message_ids(conn, &requests, dialect) {
+        warn!(
+            message_id,
+            "MessageId outside the window; closing connection"
+        );
+        conn.request_disconnect();
         return None;
     }
 
-    let mut sub_offset = 0;
     let mut responses = Vec::new();
-    let mut prev_session_id = 0;
-    let mut prev_tree_id = 0;
-    let mut prev_create_file_id = None;
+    let mut related = RelatedContext::default();
+    let mut response_len = 0;
+    // A chain whose first request is marked related fails as a whole
+    // (MS-SMB2 3.3.5.2.7.2).
+    let mut chain_failure = (requests[0].header.flags & SMB2_FLAGS_RELATED_OPERATIONS != 0)
+        .then_some(ntstatus::STATUS_INVALID_PARAMETER);
 
-    while sub_offset < frame.len() {
-        let available = &frame[sub_offset..];
-        if available.len() < SMB2_HEADER_LEN {
-            warn!(remaining = available.len(), "compound tail too short");
-            return None;
-        }
-
-        let (mut req_hdr, _) = match Smb2Header::parse(available) {
-            Ok(p) => p,
-            Err(e) => {
-                warn!(error = %e, "failed to parse compound sub-header");
-                return None;
-            }
-        };
-
-        let next = req_hdr.next_command as usize;
-        let sub_len = if next == 0 {
-            available.len()
-        } else if next < SMB2_HEADER_LEN || next > available.len() {
-            warn!(
-                next,
-                remaining = available.len(),
-                "invalid compound NextCommand"
-            );
-            return None;
-        } else {
-            next
-        };
-
-        let received = &available[..sub_len];
+    for request in requests {
+        let mut req_hdr = request.header;
+        let received = &frame[request.range];
         let mut sub_frame = received.to_vec();
-        if req_hdr.flags & SMB2_FLAGS_RELATED_OPERATIONS != 0 {
-            inherit_related_context(
-                &mut sub_frame,
-                &mut req_hdr,
-                prev_session_id,
-                prev_tree_id,
-                prev_create_file_id,
-            );
+        let mut failure = chain_failure;
+        if failure.is_none()
+            && req_hdr.flags & SMB2_FLAGS_RELATED_OPERATIONS != 0
+            && let Err(f) = related.apply(&mut sub_frame, &mut req_hdr)
+        {
+            failure = Some(f.status);
+            if f.rest_of_chain {
+                chain_failure = Some(f.status);
+            }
         }
 
-        prev_session_id = req_hdr.session_id;
-        prev_tree_id = req_hdr.tree_id().unwrap_or(0);
-
-        if let Some(response) = dispatch_one(server, conn, &sub_frame, received).await {
-            if req_hdr.command == Command::Create {
-                prev_create_file_id = capture_create_file_id(&response.0);
+        let response = match failure {
+            Some(_) if req_hdr.command == Command::Cancel => None,
+            Some(status) => {
+                debug!(
+                    command = ?req_hdr.command,
+                    status,
+                    "related request fails without running"
+                );
+                let granted = grant_credits(conn, &req_hdr);
+                let error = HandlerResponse::err(status);
+                Some(build_response_bytes(conn, &req_hdr, error, None, granted).await)
             }
+            None => {
+                let response = dispatch_one(server, conn, &sub_frame, received).await;
+                if let Some((bytes, _)) = &response {
+                    related.update(req_hdr.command, &sub_frame, bytes);
+                }
+                response
+            }
+        };
+        if let Some(mut response) = response {
+            // Keep room for an error response to every request in the frame.
+            if align_8(response_len) + response.0.len() + 2 * frame.len()
+                > MAX_FRAME_PAYLOAD as usize
+            {
+                warn!(len = response.0.len(), "response does not fit in one frame");
+                let error = HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
+                let granted = read_u16(&response.0, 0x0E);
+                response = build_response_bytes(conn, &req_hdr, error, None, granted).await;
+            }
+            response_len = align_8(response_len) + response.0.len();
             responses.push(response);
         }
-
-        if next == 0 {
-            break;
-        }
-        sub_offset += next;
     }
 
     if responses.is_empty() {
@@ -157,69 +180,45 @@ pub async fn dispatch_frame(
     Some(stitch_responses(conn, responses).await)
 }
 
-fn inherit_related_context(
-    sub_frame: &mut [u8],
-    req_hdr: &mut Smb2Header,
-    prev_session_id: u64,
-    prev_tree_id: u32,
-    prev_create_file_id: Option<[u8; 16]>,
-) {
-    if read_u64(sub_frame, 0x28) == u64::MAX {
-        sub_frame[0x28..0x30].copy_from_slice(&prev_session_id.to_le_bytes());
-        req_hdr.session_id = prev_session_id;
-    }
-
-    if read_u32(sub_frame, 0x24) == u32::MAX {
-        sub_frame[0x24..0x28].copy_from_slice(&prev_tree_id.to_le_bytes());
-        if let HeaderTail::Sync { reserved, .. } = req_hdr.tail {
-            req_hdr.tail = HeaderTail::Sync {
-                reserved,
-                tree_id: prev_tree_id,
-            };
+/// Takes each request's MessageIds out of the connection's window: one id,
+/// or CreditCharge ids for a multi-credit request on SMB 2.1 and 3.x. CANCEL
+/// takes none (MS-SMB2 3.3.5.2.3). Fails with the first MessageId that is not
+/// available.
+fn consume_message_ids(
+    conn: &Connection,
+    requests: &[chain::Request],
+    dialect: Option<Dialect>,
+) -> Result<(), u64> {
+    let mut window = lock_credits(conn);
+    for request in requests {
+        let hdr = &request.header;
+        if hdr.command == Command::Cancel {
+            continue;
+        }
+        let count = if supports_multi_credit(dialect) {
+            u64::from(hdr.credit_charge.max(1))
+        } else {
+            1
+        };
+        if !window.consume(hdr.message_id, count) {
+            return Err(hdr.message_id);
         }
     }
-
-    let Some(file_id) = prev_create_file_id else {
-        return;
-    };
-    let Some(body_offset) = file_id_body_offset(req_hdr.command) else {
-        return;
-    };
-    let offset = SMB2_HEADER_LEN + body_offset;
-    if offset + 16 <= sub_frame.len()
-        && read_u64(sub_frame, offset) == u64::MAX
-        && read_u64(sub_frame, offset + 8) == u64::MAX
-    {
-        sub_frame[offset..offset + 16].copy_from_slice(&file_id);
-    }
+    Ok(())
 }
 
-fn file_id_body_offset(command: Command) -> Option<usize> {
-    match command {
-        Command::Close
-        | Command::Flush
-        | Command::Lock
-        | Command::Ioctl
-        | Command::QueryDirectory
-        | Command::ChangeNotify
-        | Command::OplockBreak => Some(8),
-        Command::Read | Command::Write => Some(16),
-        Command::QueryInfo => Some(24),
-        Command::SetInfo => Some(16),
-        _ => None,
-    }
+fn lock_credits(conn: &Connection) -> std::sync::MutexGuard<'_, CreditWindow> {
+    conn.credits
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn capture_create_file_id(response: &[u8]) -> Option<[u8; 16]> {
-    if response.len() < SMB2_HEADER_LEN + 80 || read_u32(response, 0x08) != ntstatus::STATUS_SUCCESS
-    {
-        return None;
-    }
-
-    let mut file_id = [0u8; 16];
-    let offset = SMB2_HEADER_LEN + 64;
-    file_id.copy_from_slice(&response[offset..offset + 16]);
-    Some(file_id)
+/// Credits to grant in the response to `req_hdr`.
+fn grant_credits(conn: &Connection, req_hdr: &Smb2Header) -> u16 {
+    lock_credits(conn).grant(
+        req_hdr.credit_request_response,
+        req_hdr.command == Command::Negotiate,
+    )
 }
 
 /// Joins compound responses into one frame. Each response but the last is
@@ -258,6 +257,10 @@ async fn stitch_responses(
 
 const fn align_8(n: usize) -> usize {
     (n + 7) & !7
+}
+
+fn read_u16(buf: &[u8], offset: usize) -> u16 {
+    u16::from_le_bytes([buf[offset], buf[offset + 1]])
 }
 
 fn read_u32(buf: &[u8], offset: usize) -> u32 {
@@ -306,8 +309,9 @@ async fn dispatch_one(
         // Verify signature on incoming request (when applicable).
         if let Err(status) = verify_request_signature(server, conn, &req_hdr, received).await {
             let resp = HandlerResponse::err(status);
+            let granted = grant_credits(conn, &req_hdr);
             return Some(
-                build_response_bytes(conn, &req_hdr, resp, request_session.as_ref()).await,
+                build_response_bytes(conn, &req_hdr, resp, request_session.as_ref(), granted).await,
             );
         }
 
@@ -318,6 +322,26 @@ async fn dispatch_one(
         }
 
         let dialect = *conn.dialect.read().await;
+        let malformed = !chain::body_is_well_formed(cmd, body_bytes);
+        if malformed {
+            warn!("request body does not match its StructureSize");
+        }
+        let undercharged = supports_multi_credit(dialect)
+            && !charge_covers(req_hdr.credit_charge, chain::payload_size(cmd, body_bytes));
+        if undercharged {
+            warn!(
+                credit_charge = req_hdr.credit_charge,
+                "CreditCharge does not cover the payload"
+            );
+        }
+        if malformed || undercharged {
+            let resp = HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
+            let granted = grant_credits(conn, &req_hdr);
+            return Some(
+                build_response_bytes(conn, &req_hdr, resp, request_session.as_ref(), granted).await,
+            );
+        }
+
         let mut session_preauth = None;
 
         // 3.1.1 preauth is connection-scoped for NEGOTIATE, then per
@@ -336,7 +360,13 @@ async fn dispatch_one(
             session_preauth = Some(p);
         }
 
+        if cmd == Command::SessionSetup {
+            drop_stale_auths(conn, server.config.limits.handshake_timeout).await;
+        }
         let resp = handlers::dispatch_command(server, conn, &req_hdr, body_bytes).await;
+        if cmd == Command::SessionSetup {
+            track_pending_auth(conn, &req_hdr, &resp);
+        }
 
         // If the handler asked for a preauth snapshot (3.1.1), take it now.
         if let Some(sid) = resp.take_preauth_snapshot_for_session {
@@ -358,8 +388,9 @@ async fn dispatch_one(
             }
         }
 
+        let granted = grant_credits(conn, &req_hdr);
         let (bytes, key) =
-            build_response_bytes(conn, &req_hdr, resp, request_session.as_ref()).await;
+            build_response_bytes(conn, &req_hdr, resp, request_session.as_ref(), granted).await;
 
         if cmd == Command::Negotiate {
             let mut p = conn
@@ -390,6 +421,53 @@ async fn dispatch_one(
     .await
 }
 
+/// Drops SESSION_SETUP exchanges that started more than `timeout` ago, so
+/// abandoned ones do not use up the connection's pending slots.
+async fn drop_stale_auths(conn: &Connection, timeout: std::time::Duration) {
+    let stale: Vec<u64> = {
+        let mut started = conn
+            .pending_auth_started
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let stale = started
+            .iter()
+            .filter(|(_, at)| at.elapsed() >= timeout)
+            .map(|(&id, _)| id)
+            .collect();
+        for id in &stale {
+            started.remove(id);
+        }
+        stale
+    };
+    if stale.is_empty() {
+        return;
+    }
+    debug!(
+        count = stale.len(),
+        "dropping unfinished SESSION_SETUP exchanges"
+    );
+    let mut pending = conn.pending_auths.write().await;
+    let mut preauth = conn.session_preauth.write().await;
+    for id in stale {
+        pending.remove(&id);
+        preauth.remove(&id);
+    }
+}
+
+/// Notes when a SESSION_SETUP exchange starts, and forgets it once it ends.
+fn track_pending_auth(conn: &Connection, req_hdr: &Smb2Header, resp: &HandlerResponse) {
+    let mut started = conn
+        .pending_auth_started
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if resp.status == ntstatus::STATUS_MORE_PROCESSING_REQUIRED {
+        let id = resp.override_session_id.unwrap_or(req_hdr.session_id);
+        started.entry(id).or_insert_with(std::time::Instant::now);
+    } else {
+        started.remove(&req_hdr.session_id);
+    }
+}
+
 async fn take_session_preauth(conn: &Arc<Connection>, session_id: u64) -> PreauthIntegrity {
     if session_id != 0
         && let Some(preauth) = conn.session_preauth.write().await.remove(&session_id)
@@ -410,6 +488,9 @@ async fn verify_request_signature(
     frame: &[u8],
 ) -> Result<(), u32> {
     if hdr.command == Command::Negotiate {
+        if hdr.flags & SMB2_FLAGS_SIGNED != 0 {
+            return Err(ntstatus::STATUS_INVALID_PARAMETER);
+        }
         return Ok(());
     }
     if hdr.session_id == 0 {
@@ -452,17 +533,19 @@ async fn verify_request_signature(
     Ok(())
 }
 
-/// Build the final on-the-wire bytes: header + body, with signing applied
-/// when the session has a key. `request_session` is used when LOGOFF has
-/// already removed the session from the table. Returns the bytes and the
-/// signing key used.
+/// Build the final on-the-wire bytes: header + body, granting `granted`
+/// credits, with signing applied when the session has a key.
+/// `request_session` is used when LOGOFF has already removed the session
+/// from the table. Returns the bytes and the signing key used.
 async fn build_response_bytes(
     conn: &Arc<Connection>,
     req_hdr: &Smb2Header,
     handler_resp: HandlerResponse,
     request_session: Option<&Arc<tokio::sync::RwLock<crate::conn::state::Session>>>,
+    granted: u16,
 ) -> (Vec<u8>, Option<[u8; 16]>) {
     let mut hdr = *req_hdr;
+    hdr.credit_request_response = granted;
     hdr.flags |= SMB2_FLAGS_SERVER_TO_REDIR;
     hdr.flags &= !SMB2_FLAGS_ASYNC_COMMAND;
     hdr.next_command = 0;
@@ -533,14 +616,14 @@ async fn build_response_bytes(
 /// * `[35..]`  - dialect strings, each `0x02 <ASCII> 0x00`.
 ///
 /// Returns `Some(reply_bytes)` only for a SMB1 NEGOTIATE that lists at least
-/// one SMB2 dialect we recognise; otherwise `None` so the caller can fall
-/// through to the normal SMB2 path.
+/// one SMB2 dialect we recognise, and sets Connection.NegotiateDialect to
+/// 0x02FF ("SMB 2.???") or 0x0202 ("SMB 2.002" alone).
 async fn handle_smb1_multi_protocol(
     server: &Arc<ServerState>,
     conn: &Arc<Connection>,
     frame: &[u8],
 ) -> Option<Vec<u8>> {
-    if frame.len() < 35 || frame[0..4] != [0xFF, b'S', b'M', b'B'] || frame[4] != 0x72 {
+    if frame.len() < 35 {
         return None;
     }
     let body_start = 33; // 32-byte header + 1-byte WordCount(=0)
@@ -570,13 +653,14 @@ async fn handle_smb1_multi_protocol(
         i += nul + 1;
     }
 
-    let chosen = if wants_wildcard {
-        crate::proto::messages::Dialect::Smb2Wildcard.as_u16()
+    let dialect = if wants_wildcard {
+        Dialect::Smb2Wildcard
     } else if wants_smb202 {
-        crate::proto::messages::Dialect::Smb202.as_u16()
+        Dialect::Smb202
     } else {
         return None;
     };
+    let chosen = dialect.as_u16();
 
     debug!(
         chosen = %format_args!("0x{chosen:04X}"),
@@ -597,7 +681,19 @@ async fn handle_smb1_multi_protocol(
         ..Default::default()
     };
     let resp = handlers::negotiate::multi_protocol_response(server, conn, chosen).await;
-    Some(build_response_bytes(conn, &req_hdr, resp, None).await.0)
+    if resp.status == ntstatus::STATUS_SUCCESS {
+        *conn.dialect.write().await = Some(dialect);
+    }
+    let granted = grant_credits(conn, &req_hdr);
+    Some(
+        build_response_bytes(conn, &req_hdr, resp, None, granted)
+            .await
+            .0,
+    )
+}
+
+fn is_smb1_negotiate(frame: &[u8]) -> bool {
+    frame.len() >= 5 && frame[0..4] == [0xFF, b'S', b'M', b'B'] && frame[4] == 0x72
 }
 
 #[cfg(test)]
@@ -636,6 +732,11 @@ mod tests {
         let conn = test_conn();
         *conn.dialect.write().await = Some(Dialect::Smb300);
         *conn.signing_algo.write().await = SigningAlgo::AesCmac;
+        {
+            let mut credits = conn.credits.lock().expect("credits");
+            assert!(credits.consume(0, 1));
+            credits.grant(64, false);
+        }
 
         let identity = Identity::User {
             user: "alice".to_string(),

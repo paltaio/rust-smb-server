@@ -58,6 +58,15 @@ pub struct Connection {
 
     /// Monotonic SessionId allocator.
     next_session_id: AtomicU64,
+
+    /// Set when the connection must close without sending a reply.
+    disconnect: std::sync::atomic::AtomicBool,
+
+    /// Connection.CommandSequenceWindow: the MessageIds the client may use.
+    pub credits: Mutex<crate::conn::credits::CreditWindow>,
+
+    /// When each SESSION_SETUP exchange in `pending_auths` started.
+    pub pending_auth_started: Mutex<HashMap<u64, std::time::Instant>>,
 }
 
 impl Connection {
@@ -74,7 +83,21 @@ impl Connection {
             pending_auths: RwLock::new(HashMap::new()),
             session_preauth: RwLock::new(HashMap::new()),
             next_session_id: AtomicU64::new(1),
+            disconnect: std::sync::atomic::AtomicBool::new(false),
+            credits: Mutex::new(crate::conn::credits::CreditWindow::new()),
+            pending_auth_started: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Close the connection after the current request, without a reply.
+    pub fn request_disconnect(&self) {
+        self.disconnect
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// True once a handler has asked to close the connection.
+    pub fn disconnect_requested(&self) -> bool {
+        self.disconnect.load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub fn alloc_session_id(&self) -> u64 {

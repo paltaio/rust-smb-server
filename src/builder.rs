@@ -3,11 +3,13 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use thiserror::Error;
 use uuid::Uuid;
 
 use crate::backend::ShareBackend;
+use crate::conn::limits::Limits;
 use crate::server::{ServerConfig, ServerState, ServerUsers, ShareBindings, ShareMode, SmbServer};
 
 // ---------------------------------------------------------------------------
@@ -97,6 +99,15 @@ pub enum BuildError {
     ReservedUserName(String),
     #[error("user name must be non-empty")]
     EmptyUserName,
+    #[error("share name `{0}` is reserved")]
+    ReservedShareName(String),
+    #[error("share name `{0}` must be non-empty and contain no `\\` or `/`")]
+    InvalidShareName(String),
+    #[error("`{setting}` must be {expected}")]
+    OutOfRange {
+        setting: &'static str,
+        expected: &'static str,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -113,6 +124,7 @@ pub struct SmbServerBuilder {
     max_read_size: u32,
     max_write_size: u32,
     server_guid: Option<Uuid>,
+    limits: Limits,
 }
 
 impl Default for SmbServerBuilder {
@@ -132,6 +144,7 @@ impl SmbServerBuilder {
             max_read_size: 1024 * 1024,
             max_write_size: 1024 * 1024,
             server_guid: None,
+            limits: Limits::default(),
         }
     }
 
@@ -175,7 +188,77 @@ impl SmbServerBuilder {
         self
     }
 
+    /// Most connections served at once. A connection accepted beyond the
+    /// limit is closed straight away. Defaults to 1024.
+    pub fn max_connections(mut self, connections: usize) -> Self {
+        self.limits.max_connections = connections;
+        self
+    }
+
+    /// Time a new connection has to establish a session, and each
+    /// SESSION_SETUP exchange has to finish. A connection still without a
+    /// session at the deadline is closed, and an unfinished exchange is
+    /// dropped. Defaults to 30 seconds.
+    pub fn handshake_timeout(mut self, timeout: Duration) -> Self {
+        self.limits.handshake_timeout = timeout;
+        self
+    }
+
+    /// Closes a connection that has sent no request for this long and has no
+    /// open files. Defaults to 15 minutes.
+    pub fn idle_timeout(mut self, timeout: Duration) -> Self {
+        self.limits.idle_timeout = timeout;
+        self
+    }
+
+    /// Time allowed to receive the rest of a request once its first bytes
+    /// have arrived, and to send one response. The connection closes when
+    /// either takes longer. Defaults to 60 seconds.
+    pub fn io_timeout(mut self, timeout: Duration) -> Self {
+        self.limits.io_timeout = timeout;
+        self
+    }
+
+    /// Idle time before TCP keepalive probes start on accepted connections,
+    /// or `None` to leave keepalive off. Defaults to 60 seconds.
+    pub fn tcp_keepalive(mut self, idle: Option<Duration>) -> Self {
+        self.limits.tcp_keepalive = idle;
+        self
+    }
+
     pub fn build(self) -> Result<SmbServer, BuildError> {
+        let limits = &self.limits;
+        if limits.max_connections == 0 {
+            return Err(BuildError::OutOfRange {
+                setting: "max_connections",
+                expected: "at least 1",
+            });
+        }
+        for (setting, size) in [
+            ("max_read_size", self.max_read_size),
+            ("max_write_size", self.max_write_size),
+        ] {
+            if !(MIN_IO_SIZE..=MAX_IO_SIZE).contains(&size) {
+                return Err(BuildError::OutOfRange {
+                    setting,
+                    expected: "between 65536 and 8388608 bytes",
+                });
+            }
+        }
+        for (setting, timeout) in [
+            ("handshake_timeout", Some(limits.handshake_timeout)),
+            ("idle_timeout", Some(limits.idle_timeout)),
+            ("io_timeout", Some(limits.io_timeout)),
+            ("tcp_keepalive", limits.tcp_keepalive),
+        ] {
+            if timeout == Some(Duration::ZERO) {
+                return Err(BuildError::OutOfRange {
+                    setting,
+                    expected: "greater than zero",
+                });
+            }
+        }
+
         for name in &self.user_order {
             if name.is_empty() {
                 return Err(BuildError::EmptyUserName);
@@ -187,6 +270,12 @@ impl SmbServerBuilder {
 
         let mut seen_names = std::collections::HashSet::new();
         for share in &self.shares {
+            if share.name.eq_ignore_ascii_case("IPC$") {
+                return Err(BuildError::ReservedShareName(share.name.clone()));
+            }
+            if share.name.is_empty() || share.name.contains(['\\', '/']) {
+                return Err(BuildError::InvalidShareName(share.name.clone()));
+            }
             if !seen_names.insert(share.name.to_ascii_lowercase()) {
                 return Err(BuildError::DuplicateShare(share.name.clone()));
             }
@@ -207,12 +296,7 @@ impl SmbServerBuilder {
 
         let listen = self.listen_addr.ok_or(BuildError::MissingListenAddr)?;
 
-        let netbios = self.netbios_name.unwrap_or_else(|| {
-            std::env::var("HOSTNAME")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "SMBSERVER".to_string())
-        });
+        let netbios = self.netbios_name.unwrap_or_else(default_netbios_name);
 
         let mut share_bindings: Vec<Arc<ShareBindings>> = Vec::with_capacity(self.shares.len());
         for s in self.shares {
@@ -237,6 +321,7 @@ impl SmbServerBuilder {
             max_read_size: self.max_read_size,
             max_write_size: self.max_write_size,
             server_guid,
+            limits: self.limits,
         };
         let users = ServerUsers {
             table: tokio::sync::RwLock::new(user_table),
@@ -244,5 +329,116 @@ impl SmbServerBuilder {
 
         let state = ServerState::new(cfg, users, share_bindings);
         Ok(SmbServer::from_state(state))
+    }
+}
+
+/// Smallest and largest accepted `max_read_size` and `max_write_size`.
+const MIN_IO_SIZE: u32 = 64 * 1024;
+const MAX_IO_SIZE: u32 = 8 * 1024 * 1024;
+
+/// The host name's first label, uppercased and cut to the 15 characters a
+/// NetBIOS name holds, or `SMBSERVER` when the host name is unknown.
+fn default_netbios_name() -> String {
+    let host = host_name().unwrap_or_default();
+    let label: String = host
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .chars()
+        .take(15)
+        .collect();
+    if label.is_empty() {
+        "SMBSERVER".to_string()
+    } else {
+        label.to_uppercase()
+    }
+}
+
+#[cfg(unix)]
+fn host_name() -> Option<String> {
+    let mut buf = [0u8; 256];
+    // SAFETY: `buf` is valid for writes of `buf.len()` bytes.
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+    if rc != 0 {
+        return None;
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    String::from_utf8(buf[..end].to_vec()).ok()
+}
+
+#[cfg(windows)]
+fn host_name() -> Option<String> {
+    std::env::var("COMPUTERNAME").ok()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn host_name() -> Option<String> {
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::memfs::MemFsBackend;
+
+    fn build_with_share(name: &str) -> Result<SmbServer, BuildError> {
+        SmbServer::builder()
+            .listen("127.0.0.1:0".parse().unwrap())
+            .share(Share::new(name, MemFsBackend::new()).public())
+            .build()
+    }
+
+    #[test]
+    fn reserved_and_unreachable_share_names_are_rejected() {
+        for name in ["IPC$", "ipc$"] {
+            assert!(matches!(
+                build_with_share(name),
+                Err(BuildError::ReservedShareName(n)) if n == name
+            ));
+        }
+        for name in ["", "a\\b", "a/b", "\\share"] {
+            assert!(matches!(
+                build_with_share(name),
+                Err(BuildError::InvalidShareName(n)) if n == name
+            ));
+        }
+        assert!(build_with_share("share$").is_ok());
+    }
+
+    #[test]
+    fn io_sizes_must_fit_a_frame() {
+        let build = |read: u32, write: u32| {
+            SmbServer::builder()
+                .listen("127.0.0.1:0".parse().unwrap())
+                .max_read_size(read)
+                .max_write_size(write)
+                .build()
+        };
+        const MIB: u32 = 1024 * 1024;
+        assert!(build(64 * 1024, 8 * MIB).is_ok());
+        for (read, write, setting) in [
+            (64 * 1024 - 1, MIB, "max_read_size"),
+            (8 * MIB + 1, MIB, "max_read_size"),
+            (MIB, 0, "max_write_size"),
+            (MIB, 16 * MIB, "max_write_size"),
+        ] {
+            assert!(matches!(
+                build(read, write),
+                Err(BuildError::OutOfRange { setting: s, .. }) if s == setting
+            ));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn default_netbios_name_comes_from_the_host_name() {
+        let host = std::fs::read_to_string("/proc/sys/kernel/hostname").expect("hostname");
+        let label = host.trim().split('.').next().expect("label");
+        let expected: String = label.chars().take(15).collect::<String>().to_uppercase();
+        let server = SmbServer::builder()
+            .listen("127.0.0.1:0".parse().unwrap())
+            .build()
+            .expect("build");
+        assert_eq!(server.state().config.netbios_name, expected);
     }
 }

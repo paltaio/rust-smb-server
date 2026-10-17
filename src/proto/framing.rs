@@ -30,13 +30,12 @@ pub const MAX_FRAME_PAYLOAD: u32 = 0x00FF_FFFF;
 
 /// Encode a single Direct-TCP frame: 4-byte header + payload.
 ///
-/// Panics in debug if the payload exceeds [`MAX_FRAME_PAYLOAD`]; release builds
-/// silently truncate the high byte.
-pub fn encode_frame(payload: &[u8], out: &mut Vec<u8>) {
-    debug_assert!(
-        payload.len() as u64 <= MAX_FRAME_PAYLOAD as u64,
-        "frame payload exceeds 16 MiB - 1"
-    );
+/// Fails with [`ProtoError::Malformed`] if the payload exceeds
+/// [`MAX_FRAME_PAYLOAD`].
+pub fn encode_frame(payload: &[u8], out: &mut Vec<u8>) -> ProtoResult<()> {
+    if payload.len() > MAX_FRAME_PAYLOAD as usize {
+        return Err(ProtoError::Malformed("frame payload exceeds 16 MiB - 1"));
+    }
     let len = payload.len() as u32;
     // Top byte is the NetBIOS session-message type (0x00 for Direct-TCP).
     // Lower 3 bytes are payload length, big-endian.
@@ -46,6 +45,7 @@ pub fn encode_frame(payload: &[u8], out: &mut Vec<u8>) {
     out.push(((len >> 8) & 0xFF) as u8);
     out.push((len & 0xFF) as u8);
     out.extend_from_slice(payload);
+    Ok(())
 }
 
 /// Decode the 4-byte frame header, returning the payload length.
@@ -88,14 +88,14 @@ mod tests {
     #[test]
     fn encodes_empty_frame() {
         let mut out = Vec::new();
-        encode_frame(&[], &mut out);
+        encode_frame(&[], &mut out).unwrap();
         assert_eq!(out, [0x00, 0x00, 0x00, 0x00]);
     }
 
     #[test]
     fn encodes_simple_frame() {
         let mut out = Vec::new();
-        encode_frame(&[0xAA, 0xBB, 0xCC], &mut out);
+        encode_frame(&[0xAA, 0xBB, 0xCC], &mut out).unwrap();
         assert_eq!(out, [0x00, 0x00, 0x00, 0x03, 0xAA, 0xBB, 0xCC]);
     }
 
@@ -103,11 +103,25 @@ mod tests {
     fn round_trips_random_payload() {
         let payload: Vec<u8> = (0u8..=200).collect();
         let mut wire = Vec::new();
-        encode_frame(&payload, &mut wire);
+        encode_frame(&payload, &mut wire).unwrap();
 
         let (decoded, rest) = decode_frame(&wire).unwrap();
         assert_eq!(decoded, payload.as_slice());
         assert!(rest.is_empty());
+    }
+
+    #[test]
+    fn rejects_payload_over_the_length_field() {
+        let mut out = Vec::new();
+        let max = vec![0u8; MAX_FRAME_PAYLOAD as usize];
+        encode_frame(&max, &mut out).unwrap();
+        assert_eq!(&out[..4], [0x00, 0xFF, 0xFF, 0xFF]);
+
+        let mut out = Vec::new();
+        let over = vec![0u8; MAX_FRAME_PAYLOAD as usize + 1];
+        let err = encode_frame(&over, &mut out).unwrap_err();
+        assert!(matches!(err, ProtoError::Malformed(_)));
+        assert!(out.is_empty());
     }
 
     #[test]
@@ -132,7 +146,7 @@ mod tests {
     #[test]
     fn decode_frame_handles_trailing_data() {
         let mut wire = Vec::new();
-        encode_frame(&[1, 2, 3], &mut wire);
+        encode_frame(&[1, 2, 3], &mut wire).unwrap();
         wire.extend_from_slice(&[9, 9, 9]); // simulate a partial second frame
 
         let (payload, rest) = decode_frame(&wire).unwrap();

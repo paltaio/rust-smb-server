@@ -60,6 +60,7 @@ md4.workspace = true
 aes.workspace = true
 cmac.workspace = true
 rc4.workspace = true
+socket2 = "0.6"
 
 [target.'cfg(windows)'.dependencies]
 cap-primitives = { workspace = true, optional = true }
@@ -95,3 +96,6 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

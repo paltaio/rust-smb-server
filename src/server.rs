@@ -10,13 +10,16 @@ use std::sync::{Arc, Weak};
 use crate::proto::auth::ntlm::UserCreds;
 use thiserror::Error;
 use tokio::net::TcpListener;
-use tokio::sync::{Notify, RwLock};
-use tracing::{Instrument, error, info, info_span};
+use tokio::sync::{Notify, RwLock, Semaphore};
+use tokio::task::JoinSet;
+use tracing::{Instrument, debug, error, info, info_span, warn};
 use uuid::Uuid;
 
 use crate::backend::ShareBackend;
 use crate::builder::{Access, Share, SmbServerBuilder};
 use crate::conn::connection_loop;
+use crate::conn::limits::Limits;
+use crate::conn::listener::{AcceptBackoff, configure_socket};
 use crate::conn::state::Connection;
 use crate::utils::now_filetime;
 
@@ -86,6 +89,7 @@ pub struct ServerConfig {
     pub max_read_size: u32,
     pub max_write_size: u32,
     pub server_guid: Uuid,
+    pub limits: Limits,
 }
 
 pub struct ServerUsers {
@@ -190,7 +194,7 @@ pub struct ServerState {
     pub active_connections: ActiveConnections,
     pub server_start_filetime: u64,
     /// Notified by `shutdown()`. The accept loop stops; each connection
-    /// closes after reading its next frame.
+    /// closes once it has answered the frame it is receiving, if any.
     pub shutdown: Arc<Notify>,
     pub shutting_down: Arc<AtomicBool>,
 }
@@ -461,8 +465,9 @@ impl SmbServer {
         self.state.config.listen_addr
     }
 
-    /// Initiate a graceful shutdown. Stops the accept loop and lets in-flight
-    /// connection tasks complete.
+    /// Initiate a graceful shutdown. Stops the accept loop and closes each
+    /// connection once its current request is answered. Takes effect even
+    /// when called before `serve()`.
     pub fn shutdown(&self) {
         self.state.shutting_down.store(true, Ordering::Release);
         self.state.shutdown.notify_waiters();
@@ -477,7 +482,8 @@ impl SmbServer {
         }
     }
 
-    /// Run the accept loop until `shutdown()` is called.
+    /// Run the accept loop until `shutdown()` is called. Returns once every
+    /// connection has closed.
     pub async fn serve(self) -> io::Result<()> {
         if self.bound.lock().await.is_none() {
             self.bind().await?;
@@ -495,39 +501,89 @@ impl SmbServer {
             let state = self.state.clone();
             let shutdown = state.shutdown.clone();
             let shutting_down = state.shutting_down.clone();
+            let mut backoff = AcceptBackoff::new();
+            let mut connections = JoinSet::new();
+            let limits = &state.config.limits;
+            let slots = Arc::new(Semaphore::new(
+                limits.max_connections.min(Semaphore::MAX_PERMITS),
+            ));
+            let mut at_capacity = false;
 
             loop {
-                tokio::select! {
+                let stopped = shutdown.notified();
+                tokio::pin!(stopped);
+                stopped.as_mut().enable();
+                if shutting_down.load(Ordering::Acquire) {
+                    info!("shutdown requested; stopping accept loop");
+                    break;
+                }
+                let retry_after = tokio::select! {
                     biased;
-                    _ = shutdown.notified() => {
+                    _ = &mut stopped => {
                         info!("shutdown requested; stopping accept loop");
                         break;
                     }
+                    Some(_) = connections.join_next(), if !connections.is_empty() => None,
                     accept = listener.accept() => {
                         match accept {
                             Ok((stream, peer)) => {
+                                backoff.succeeded();
                                 if shutting_down.load(Ordering::Acquire) {
                                     drop(stream);
                                     break;
                                 }
+                                let Ok(slot) = slots.clone().try_acquire_owned() else {
+                                    if !at_capacity {
+                                        warn!(
+                                            max = limits.max_connections,
+                                            "connection limit reached; closing new connections"
+                                        );
+                                        at_capacity = true;
+                                    }
+                                    debug!(%peer, "connection refused: limit reached");
+                                    drop(stream);
+                                    continue;
+                                };
+                                if at_capacity {
+                                    info!("below the connection limit again");
+                                    at_capacity = false;
+                                }
+                                configure_socket(&stream, limits.tcp_keepalive);
                                 let server_state = state.clone();
                                 let span = info_span!("conn", peer = %peer);
-                                tokio::spawn(async move {
+                                connections.spawn(async move {
+                                    let _slot = slot;
                                     if let Err(e) = connection_loop(stream, server_state).await {
                                         error!(error = %e, "connection loop exited with error");
                                     }
                                 }.instrument(span));
+                                None
                             }
                             Err(e) => {
-                                error!(error = %e, "accept failed");
                                 if shutting_down.load(Ordering::Acquire) {
                                     break;
                                 }
+                                Some(backoff.failed(&e))
                             }
                         }
                     }
+                };
+                if let Some(delay) = retry_after {
+                    tokio::select! {
+                        biased;
+                        _ = &mut stopped => {
+                            info!("shutdown requested; stopping accept loop");
+                            break;
+                        }
+                        _ = tokio::time::sleep(delay) => {}
+                    }
                 }
             }
+            drop(listener);
+            if !connections.is_empty() {
+                info!(open = connections.len(), "waiting for connections to close");
+            }
+            while connections.join_next().await.is_some() {}
             info!("server stopped");
             Ok::<(), io::Error>(())
         }

@@ -1,6 +1,11 @@
 //! Per-connection task layout.
 
+pub mod chain;
+pub mod credits;
+pub mod limits;
+pub mod listener;
 pub mod reader;
+pub mod related;
 pub mod state;
 pub mod writer;
 
@@ -8,7 +13,6 @@ use std::io;
 use std::sync::Arc;
 
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
 use tracing::{debug, info};
 
 use crate::server::ServerState;
@@ -24,9 +28,13 @@ pub async fn connection_loop(stream: TcpStream, server: Arc<ServerState>) -> io:
         server.config.max_write_size,
     ));
     let conn_id = server.active_connections.register(&conn).await;
-    let (tx, rx) = mpsc::channel::<writer::FramePayload>(writer::WRITER_CHANNEL);
+    let (tx, rx) = writer::response_queue();
 
-    let writer_handle = tokio::spawn(writer::writer_task(write_half, rx));
+    let writer_handle = tokio::spawn(writer::writer_task(
+        write_half,
+        rx,
+        server.config.limits.io_timeout,
+    ));
 
     info!("connection accepted");
     let reader_result = reader::reader_task(read_half, server.clone(), conn.clone(), tx).await;
