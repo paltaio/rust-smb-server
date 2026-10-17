@@ -29,6 +29,8 @@ pub struct SessionSetupRequest {
 impl SessionSetupRequest {
     /// Flag: SMB2_SESSION_FLAG_BINDING - bind to existing session (3.x).
     pub const FLAG_BINDING: u8 = 0x01;
+    /// SecurityMode bit: SMB2_NEGOTIATE_SIGNING_REQUIRED.
+    pub const SECURITY_SIGNING_REQUIRED: u8 = 0x02;
 
     pub fn parse(buf: &[u8]) -> ProtoResult<Self> {
         Ok(Self::read(&mut Cursor::new(buf))?)

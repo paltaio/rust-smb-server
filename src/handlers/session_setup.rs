@@ -2,21 +2,82 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
-use crate::proto::auth::ntlm::{Identity, NtlmServer, NtlmTargetInfo, UserCreds};
+use crate::proto::auth::ntlm::{
+    AuthOutcome, Direction, Identity, NtlmAuthenticate, NtlmMac, NtlmServer, NtlmTargetInfo,
+    UserCreds,
+};
 use crate::proto::auth::spnego::{
-    NegState, OID_NTLMSSP, decode_init_token, decode_resp_token, encode_resp_token,
+    NegState, NegTokenInit, OID_NTLMSSP, decode_init_token, decode_resp_token, encode_resp_token,
 };
 use crate::proto::crypto::signing_key_30;
 use crate::proto::header::Smb2Header;
 use crate::proto::messages::{Dialect, SessionSetupRequest, SessionSetupResponse};
 use tracing::{debug, info, warn};
 
-use crate::conn::state::{Connection, MAX_PENDING_AUTHS, Session};
+use crate::conn::state::{Connection, MAX_PENDING_AUTHS, PendingAuth, Session};
 use crate::dispatch::HandlerResponse;
 use crate::ntstatus;
 use crate::server::ServerState;
 use crate::utils::{fill_random, now_filetime};
+
+const NTLMSSP_MAGIC: &[u8] = b"NTLMSSP\0";
+
+/// A SESSION_SETUP security token, by form.
+enum Token {
+    /// Raw NTLMSSP. RFC 4178 section 4.2.1 lets the client skip SPNEGO once
+    /// the mechanism is settled; Win11 reauth and Linux cifs.ko use this
+    /// form.
+    Raw { msg_type: u32, ntlm: Vec<u8> },
+    /// GSS-API NegTokenInit (starts with 0x60).
+    Init(NegTokenInit),
+    /// SPNEGO NegTokenResp: the inner token and the client's mechListMIC.
+    Resp {
+        ntlm: Vec<u8>,
+        mech_list_mic: Option<Vec<u8>>,
+    },
+}
+
+impl Token {
+    fn decode(blob: &[u8]) -> Result<Self, u32> {
+        if blob.starts_with(NTLMSSP_MAGIC) {
+            let msg_type = blob
+                .get(8..12)
+                .map_or(0, |t| u32::from_le_bytes([t[0], t[1], t[2], t[3]]));
+            return Ok(Token::Raw {
+                msg_type,
+                ntlm: blob.to_vec(),
+            });
+        }
+        if blob[0] == 0x60 {
+            return match decode_init_token(blob) {
+                Ok(init) => Ok(Token::Init(init)),
+                Err(e) => {
+                    warn!(error = %e, "SPNEGO init decode failed");
+                    Err(ntstatus::STATUS_LOGON_FAILURE)
+                }
+            };
+        }
+        match decode_resp_token(blob) {
+            Ok(resp) => Ok(Token::Resp {
+                ntlm: resp.response_token.unwrap_or_default(),
+                mech_list_mic: resp.mech_list_mic,
+            }),
+            Err(e) => {
+                warn!(error = %e, "SPNEGO resp decode failed");
+                Err(ntstatus::STATUS_LOGON_FAILURE)
+            }
+        }
+    }
+}
+
+/// The token that opens an exchange.
+enum Opening {
+    /// Raw NTLM NEGOTIATE_MESSAGE.
+    Raw(Vec<u8>),
+    Spnego(NegTokenInit),
+}
 
 pub async fn handle(
     server: &Arc<ServerState>,
@@ -29,7 +90,7 @@ pub async fn handle(
         Err(_) => return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER),
     };
 
-    let blob = req.security_buffer;
+    let blob = &req.security_buffer;
     if blob.is_empty() {
         return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
     }
@@ -47,157 +108,261 @@ pub async fn handle(
         );
     }
 
-    // Decide which form the security blob takes:
-    //   * GSS-API NegTokenInit       - starts with 0x60.
-    //   * SPNEGO NegTokenResp        - starts with 0xa1 ([1] context tag).
-    //   * Raw NTLMSSP message        - starts with "NTLMSSP\0" (RFC 4178
-    //     §4.2.1 lets the client skip SPNEGO once the mech is settled; both
-    //     Win11 reauth and Linux cifs.ko use this form).
-    const NTLMSSP_MAGIC: &[u8] = b"NTLMSSP\0";
-    let inner_token: Vec<u8>;
-    let is_first_round: bool;
-    let is_raw_ntlmssp: bool;
-    if blob.starts_with(NTLMSSP_MAGIC) {
-        // Raw NTLMSSP. Decide round by message-type at offset 8.
-        let msg_type = if blob.len() >= 12 {
-            u32::from_le_bytes([blob[8], blob[9], blob[10], blob[11]])
-        } else {
-            0
-        };
-        // 1 = NEGOTIATE (first), 3 = AUTHENTICATE (second). 2 is server-only.
-        is_first_round = msg_type == 1;
-        is_raw_ntlmssp = true;
-        inner_token = blob.to_vec();
-    } else if blob[0] == 0x60 {
-        // GSS-API outer wrapper: NegTokenInit.
-        let init = match decode_init_token(&blob) {
-            Ok(t) => t,
-            Err(e) => {
-                warn!(error = %e, "SPNEGO init decode failed");
-                return HandlerResponse::err(ntstatus::STATUS_LOGON_FAILURE);
-            }
-        };
-        if !init.mech_types.iter().any(|m| m == OID_NTLMSSP) {
-            return HandlerResponse::err(ntstatus::STATUS_NOT_SUPPORTED);
-        }
-        inner_token = init.mech_token.unwrap_or_default();
-        is_first_round = true;
-        is_raw_ntlmssp = false;
-    } else {
-        // NegTokenResp follow-up.
-        let resp = match decode_resp_token(&blob) {
-            Ok(r) => r,
-            Err(e) => {
-                warn!(error = %e, "SPNEGO resp decode failed");
-                return HandlerResponse::err(ntstatus::STATUS_LOGON_FAILURE);
-            }
-        };
-        inner_token = resp.response_token.unwrap_or_default();
-        is_first_round = false;
-        is_raw_ntlmssp = false;
-    }
-
-    if is_first_round {
-        // Allocate a fresh session id and start the NTLM state machine.
-        let new_sid = conn.alloc_session_id();
-        let mut server_challenge = [0u8; 8];
-        if let Err(e) = fill_random(&mut server_challenge) {
-            tracing::error!(error = %e, "OS RNG failed; cannot generate NTLM challenge");
-            return HandlerResponse::err(ntstatus::STATUS_INTERNAL_ERROR);
-        }
-        let netbios = server.config.netbios_name.clone();
-        let mut acceptor = NtlmServer::new(
-            server_challenge,
-            NtlmTargetInfo::new(netbios.clone(), netbios.clone(), netbios, "", ""),
-            now_filetime(),
-        );
-
-        // Step 1: parse client NEGOTIATE.
-        if let Err(e) = acceptor.step1_negotiate(&inner_token) {
-            warn!(error = %e, "NTLM step1 failed");
-            return HandlerResponse::err(ntstatus::STATUS_LOGON_FAILURE);
-        }
-        let challenge_blob = acceptor.challenge();
-        // Reply form mirrors the request: raw NTLMSSP if the client skipped
-        // SPNEGO, else SPNEGO-wrapped.
-        let outbound = if is_raw_ntlmssp {
-            challenge_blob
-        } else {
-            encode_resp_token(
-                NegState::AcceptIncomplete,
-                Some(OID_NTLMSSP),
-                Some(&challenge_blob),
-                None,
-            )
-        };
-
-        // Stash the acceptor for the next round; remember the form so the
-        // success response can match.
-        {
-            let mut pa = conn.pending_auths.write().await;
-            if pa.len() >= MAX_PENDING_AUTHS {
-                warn!(
-                    pending = pa.len(),
-                    "too many pending NTLM exchanges on connection"
-                );
-                return HandlerResponse::err(ntstatus::STATUS_INSUFFICIENT_RESOURCES);
-            }
-            pa.insert(
-                new_sid,
-                Arc::new(std::sync::Mutex::new((acceptor, is_raw_ntlmssp))),
-            );
-        }
-
-        let body_out =
-            build_session_setup_response(ntstatus::STATUS_MORE_PROCESSING_REQUIRED, &outbound, 0);
-        return HandlerResponse {
-            body: body_out,
-            status: ntstatus::STATUS_MORE_PROCESSING_REQUIRED,
-            override_tree_id: None,
-            override_session_id: Some(new_sid),
-            skip_signing: true, // no key yet
-            take_preauth_snapshot_for_session: None,
-        };
-    }
-
-    // Follow-up round: look up pending acceptor by session id from header.
     let sid = hdr.session_id;
+    // MS-SMB2 3.3.5.5: multichannel is not supported, so binding fails.
+    if sid != 0 && req.flags & SessionSetupRequest::FLAG_BINDING != 0 {
+        return HandlerResponse::err(ntstatus::STATUS_REQUEST_NOT_ACCEPTED);
+    }
+
+    let token = match Token::decode(blob) {
+        Ok(t) => t,
+        Err(status) => return HandlerResponse::err(status),
+    };
+
+    let opening = match token {
+        Token::Raw { msg_type: 1, ntlm } => Opening::Raw(ntlm),
+        Token::Init(init) => Opening::Spnego(init),
+        Token::Raw { ntlm, .. } => {
+            return continue_or_reject(server, conn, &req, sid, ntlm, None).await;
+        }
+        Token::Resp {
+            ntlm,
+            mech_list_mic,
+        } => {
+            return continue_or_reject(server, conn, &req, sid, ntlm, mech_list_mic).await;
+        }
+    };
+
+    if sid == 0 {
+        if session_limit_reached(server, &*conn.sessions.read().await) {
+            warn!("session limit reached on connection");
+            return HandlerResponse::err(ntstatus::STATUS_INSUFFICIENT_RESOURCES);
+        }
+        let new_sid = server.auth.alloc_session_id();
+        return begin_exchange(server, conn, new_sid, opening).await;
+    }
+    // A first token for a known session starts over: reauthentication of
+    // an established session (MS-SMB2 3.3.5.5.2), or a restart of one in
+    // progress.
+    let known = conn.sessions.read().await.contains_key(&sid)
+        || conn.pending_auths.write().await.remove(&sid).is_some();
+    if !known {
+        return HandlerResponse::err(ntstatus::STATUS_USER_SESSION_DELETED);
+    }
+    begin_exchange(server, conn, sid, opening).await
+}
+
+/// A token that continues the exchange of `sid`.
+async fn continue_or_reject(
+    server: &Arc<ServerState>,
+    conn: &Arc<Connection>,
+    req: &SessionSetupRequest,
+    sid: u64,
+    ntlm: Vec<u8>,
+    client_mic: Option<Vec<u8>>,
+) -> HandlerResponse {
     if sid == 0 {
         return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
     }
-    let acceptor_arc = {
+    let pending = conn.pending_auths.write().await.remove(&sid);
+    let Some(pending) = pending else {
+        return HandlerResponse::err(ntstatus::STATUS_USER_SESSION_DELETED);
+    };
+    continue_exchange(server, conn, req, sid, pending, ntlm, client_mic).await
+}
+
+/// First round: start an NTLM acceptor for `sid` and answer with the
+/// CHALLENGE_MESSAGE, or with an SPNEGO counter-proposal for NTLM.
+async fn begin_exchange(
+    server: &Arc<ServerState>,
+    conn: &Arc<Connection>,
+    sid: u64,
+    opening: Opening,
+) -> HandlerResponse {
+    let mut server_challenge = [0u8; 8];
+    if let Err(e) = fill_random(&mut server_challenge) {
+        tracing::error!(error = %e, "OS RNG failed; cannot generate NTLM challenge");
+        return HandlerResponse::err(ntstatus::STATUS_INTERNAL_ERROR);
+    }
+    let netbios = server.config.netbios_name.clone();
+    let mut acceptor = NtlmServer::new(
+        server_challenge,
+        NtlmTargetInfo::new(netbios.clone(), netbios.clone(), netbios, "", ""),
+        now_filetime(),
+    );
+
+    let (outbound, raw) = match opening {
+        Opening::Raw(ntlm) => match accept_negotiate(&mut acceptor, &ntlm) {
+            Ok(challenge) => (challenge, true),
+            Err(status) => return HandlerResponse::err(status),
+        },
+        Opening::Spnego(init) => {
+            let Some(pos) = init.mech_types.iter().position(|m| m == OID_NTLMSSP) else {
+                return HandlerResponse::err(ntstatus::STATUS_NOT_SUPPORTED);
+            };
+            acceptor.mech_list = Some(init.mech_types_der);
+            acceptor.mech_list_mic_required = pos != 0;
+            // An optimistic mechToken is for the client's first mechanism,
+            // so it is used only when that mechanism is NTLM. Otherwise the
+            // reply selects NTLM and waits for its NEGOTIATE_MESSAGE.
+            match init.mech_token.filter(|_| pos == 0) {
+                Some(ntlm) => match accept_negotiate(&mut acceptor, &ntlm) {
+                    Ok(challenge) => (
+                        encode_resp_token(
+                            NegState::AcceptIncomplete,
+                            Some(OID_NTLMSSP),
+                            Some(&challenge),
+                            None,
+                        ),
+                        false,
+                    ),
+                    Err(status) => return HandlerResponse::err(status),
+                },
+                None => {
+                    let state = if pos == 0 {
+                        NegState::AcceptIncomplete
+                    } else {
+                        NegState::RequestMic
+                    };
+                    (
+                        encode_resp_token(state, Some(OID_NTLMSSP), None, None),
+                        false,
+                    )
+                }
+            }
+        }
+    };
+
+    {
         let mut pa = conn.pending_auths.write().await;
-        pa.remove(&sid)
+        if pa.len() >= MAX_PENDING_AUTHS {
+            warn!(
+                pending = pa.len(),
+                "too many pending NTLM exchanges on connection"
+            );
+            return HandlerResponse::err(ntstatus::STATUS_INSUFFICIENT_RESOURCES);
+        }
+        pa.insert(sid, Arc::new(std::sync::Mutex::new((acceptor, raw))));
+    }
+    more_processing(sid, &outbound)
+}
+
+/// Feeds the client's NEGOTIATE_MESSAGE to `acceptor` and returns the
+/// CHALLENGE_MESSAGE.
+fn accept_negotiate(acceptor: &mut NtlmServer, ntlm: &[u8]) -> Result<Vec<u8>, u32> {
+    if let Err(e) = acceptor.step1_negotiate(ntlm) {
+        warn!(error = %e, "NTLM step1 failed");
+        return Err(ntstatus::STATUS_LOGON_FAILURE);
+    }
+    Ok(acceptor.challenge())
+}
+
+fn more_processing(sid: u64, outbound: &[u8]) -> HandlerResponse {
+    let body_out =
+        build_session_setup_response(ntstatus::STATUS_MORE_PROCESSING_REQUIRED, outbound, 0);
+    HandlerResponse {
+        body: body_out,
+        status: ntstatus::STATUS_MORE_PROCESSING_REQUIRED,
+        override_tree_id: None,
+        override_session_id: Some(sid),
+        skip_signing: true, // no key yet
+        take_preauth_snapshot_for_session: None,
+    }
+}
+
+/// Later rounds of the exchange for `sid`.
+async fn continue_exchange(
+    server: &Arc<ServerState>,
+    conn: &Arc<Connection>,
+    req: &SessionSetupRequest,
+    sid: u64,
+    pending: PendingAuth,
+    ntlm: Vec<u8>,
+    client_mic: Option<Vec<u8>>,
+) -> HandlerResponse {
+    // After a counter-proposal the client's next token is the NTLM
+    // NEGOTIATE_MESSAGE.
+    let challenge = {
+        let mut pair = pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if pair.0.has_negotiate() {
+            None
+        } else {
+            match accept_negotiate(&mut pair.0, &ntlm) {
+                Ok(challenge) => Some(challenge),
+                Err(status) => return HandlerResponse::err(status),
+            }
+        }
     };
-    let acceptor_arc = match acceptor_arc {
-        Some(a) => a,
-        None => return HandlerResponse::err(ntstatus::STATUS_USER_SESSION_DELETED),
-    };
-    let users = server.users.table.read().await.clone();
-    let (outcome, raw_form) = {
-        let pair = acceptor_arc
+    if let Some(challenge) = challenge {
+        let outbound = encode_resp_token(NegState::AcceptIncomplete, None, Some(&challenge), None);
+        conn.pending_auths.write().await.insert(sid, pending);
+        return more_processing(sid, &outbound);
+    }
+
+    // A session that already exists is being reauthenticated.
+    let existing = conn.sessions.read().await.get(&sid).cloned();
+
+    // The failed-logon throttle counts by the user name the client sent.
+    let claimed_user = NtlmAuthenticate::parse(&ntlm)
+        .map(|a| a.user)
+        .unwrap_or_default();
+    if !claimed_user.is_empty() && server.auth.is_locked_out(&claimed_user) {
+        info!("logon refused: too many failed logons for this user name");
+        return logon_failed(
+            server,
+            conn,
+            sid,
+            existing.is_some(),
+            "",
+            ntstatus::STATUS_ACCOUNT_LOCKED_OUT,
+        )
+        .await;
+    }
+
+    let users = server.users.table.read().await;
+    let result = {
+        let pair = pending
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let (acceptor, raw_form) = (&pair.0, pair.1);
-        let lookup = |u: &str, _d: &str| -> Option<UserCreds> {
-            configured_user(&users, u).map(|(_, creds)| creds.clone())
-        };
-        let mut outcome = match acceptor.authenticate(&inner_token, lookup) {
-            Ok(o) => o,
-            Err(e) => {
+        let lookup = |u: &str, _d: &str| configured_user(&users, u).map(|(_, c)| c.clone());
+        acceptor
+            .authenticate(&ntlm, lookup)
+            .map_err(|e| {
                 info!(error = %e, "NTLM authenticate failed");
-                return HandlerResponse::err(ntstatus::STATUS_LOGON_FAILURE);
-            }
-        };
-        // The session carries the configured spelling of the name, which
-        // share access is granted to.
-        if let Identity::User { user, .. } = &mut outcome.identity
-            && let Some((name, _)) = configured_user(&users, user)
-        {
-            *user = name.clone();
-        }
-        (outcome, raw_form)
+                ntstatus::STATUS_LOGON_FAILURE
+            })
+            .and_then(|mut outcome| {
+                // The session carries the configured spelling of the name,
+                // which share access is granted to.
+                let mut nt_hash = None;
+                if let Identity::User { user, .. } = &mut outcome.identity
+                    && let Some((name, creds)) = configured_user(&users, user)
+                {
+                    *user = name.clone();
+                    nt_hash = Some(creds.nt_hash);
+                }
+                let mic = if raw_form {
+                    None
+                } else {
+                    mech_list_mic(acceptor, &outcome, client_mic.as_deref())?
+                };
+                Ok((outcome, raw_form, mic, nt_hash))
+            })
     };
+    drop(users);
+    let (outcome, raw_form, server_mic, nt_hash) = match result {
+        Ok(r) => r,
+        Err(status) => {
+            return logon_failed(server, conn, sid, existing.is_some(), &claimed_user, status)
+                .await;
+        }
+    };
+    if !claimed_user.is_empty() {
+        server.auth.record_success(&claimed_user);
+    }
 
     // Anonymous gating.
     if matches!(outcome.identity, Identity::Anonymous) && !server.anonymous_allowed().await {
@@ -209,17 +374,47 @@ pub async fn handle(
     let Some(dialect) = dialect else {
         return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
     };
-    let signing_key = signing_key(dialect, &session_base_key);
 
     // MS-SMB2 3.3.5.5.3: anonymous sessions are flagged IS_NULL. There is no
     // guest account, so IS_GUEST is never set.
-    let session_flags = if matches!(outcome.identity, Identity::Anonymous) {
+    let anonymous = matches!(outcome.identity, Identity::Anonymous);
+    let session_flags = if anonymous {
         SessionSetupResponse::FLAG_IS_NULL
     } else {
         0
     };
-    let signing_required = false;
+    // Empty buffer for raw NTLMSSP path; SPNEGO accept-completed for SPNEGO.
+    let success_buf: Vec<u8> = if raw_form {
+        Vec::new()
+    } else {
+        encode_resp_token(NegState::AcceptCompleted, None, None, server_mic.as_deref())
+    };
+    let body_out =
+        build_session_setup_response(ntstatus::STATUS_SUCCESS, &success_buf, session_flags);
+    let mut response = HandlerResponse {
+        body: body_out,
+        status: ntstatus::STATUS_SUCCESS,
+        override_tree_id: None,
+        override_session_id: Some(sid),
+        // Anonymous responses are not signed (no key). Signed responses for
+        // authenticated sessions get signed by the dispatcher's normal path.
+        skip_signing: anonymous,
+        take_preauth_snapshot_for_session: None,
+    };
 
+    // Reauthentication keeps the session, its key and its trees
+    // (MS-SMB2 3.3.5.5.2), for the same user only.
+    if let Some(existing) = existing {
+        if !same_user(&existing.read().await.identity, &outcome.identity) {
+            info!(?outcome.identity, "reauthentication as another user refused");
+            return HandlerResponse::err(ntstatus::STATUS_ACCESS_DENIED);
+        }
+        info!(?outcome.identity, "session reauthenticated");
+        return response;
+    }
+
+    let signing_key = signing_key(dialect, &session_base_key);
+    let signing_required = signing_required(server, conn, req, &outcome.identity);
     let session = Session::new(
         sid,
         outcome.identity.clone(),
@@ -231,53 +426,191 @@ pub async fn handle(
     let session_arc = Arc::new(tokio::sync::RwLock::new(session));
     {
         let mut sessions = conn.sessions.write().await;
+        if session_limit_reached(server, &sessions) {
+            warn!("session limit reached on connection");
+            return HandlerResponse::err(ntstatus::STATUS_INSUFFICIENT_RESOURCES);
+        }
+        // ConfigHandle::remove_user drops the user before it closes the
+        // user's sessions, and that sweep waits for this lock. A user that is
+        // gone, or whose password changed, since it authenticated gets no
+        // session.
+        if let (Identity::User { user, .. }, Some(nt_hash)) = (&outcome.identity, nt_hash)
+            && server
+                .lookup_user(user)
+                .await
+                .is_none_or(|c| c.nt_hash != nt_hash)
+        {
+            info!("user removed or changed during logon");
+            return HandlerResponse::err(ntstatus::STATUS_LOGON_FAILURE);
+        }
         sessions.insert(sid, session_arc);
     }
 
-    // Empty buffer for raw NTLMSSP path; SPNEGO accept-completed for SPNEGO.
-    let success_buf: Vec<u8> = if raw_form {
-        Vec::new()
-    } else {
-        empty_completed()
-    };
-    let body_out =
-        build_session_setup_response(ntstatus::STATUS_SUCCESS, &success_buf, session_flags);
-
-    let take_snapshot = if dialect == Dialect::Smb311 {
-        Some(sid)
-    } else {
-        None
-    };
-
-    info!(?outcome.identity, "session established");
-
-    HandlerResponse {
-        body: body_out,
-        status: ntstatus::STATUS_SUCCESS,
-        override_tree_id: None,
-        override_session_id: Some(sid),
-        // Anonymous responses are not signed (no key). Signed responses for
-        // authenticated sessions get signed by the dispatcher's normal path.
-        skip_signing: matches!(outcome.identity, Identity::Anonymous),
-        take_preauth_snapshot_for_session: take_snapshot,
+    if req.previous_session_id != 0 && req.previous_session_id != sid {
+        close_previous_session(server, req.previous_session_id, &outcome.identity).await;
     }
+
+    if dialect == Dialect::Smb311 {
+        response.take_preauth_snapshot_for_session = Some(sid);
+    }
+    info!(?outcome.identity, "session established");
+    response
+}
+
+fn session_limit_reached<T>(server: &ServerState, sessions: &HashMap<u64, T>) -> bool {
+    sessions.len() >= server.auth.settings.max_sessions_per_connection
+}
+
+/// Ends a logon that failed with `status`: counts it against `user` and the
+/// connection, closes the connection once it has failed too often, and
+/// removes a session that was being reauthenticated (MS-SMB2 3.3.5.5.3).
+async fn logon_failed(
+    server: &ServerState,
+    conn: &Connection,
+    sid: u64,
+    reauth: bool,
+    user: &str,
+    status: u32,
+) -> HandlerResponse {
+    if !user.is_empty() {
+        server.auth.record_failure(user);
+    }
+    let failures = conn.logon_failures.fetch_add(1, Ordering::Relaxed) + 1;
+    if server.auth.connection_exhausted(failures) {
+        warn!(failures, "too many failed logons; closing the connection");
+        conn.request_disconnect();
+    }
+    if reauth {
+        conn.close_session(sid).await;
+    }
+    HandlerResponse::err(status)
+}
+
+/// True when both identities are the same configured user, or both are
+/// anonymous.
+fn same_user(a: &Identity, b: &Identity) -> bool {
+    match (a, b) {
+        (Identity::Anonymous, Identity::Anonymous) => true,
+        (Identity::User { user: a, .. }, Identity::User { user: b, .. }) => a == b,
+        _ => false,
+    }
+}
+
+/// MS-SMB2 3.3.5.5.3: a logon that names a PreviousSessionId of the same
+/// user ends that session, on whichever connection holds it.
+async fn close_previous_session(server: &ServerState, previous: u64, identity: &Identity) {
+    if matches!(identity, Identity::Anonymous) {
+        return;
+    }
+    for conn in server.active_connections.live().await {
+        let old = conn.sessions.read().await.get(&previous).cloned();
+        let Some(old) = old else {
+            continue;
+        };
+        if same_user(&old.read().await.identity, identity) {
+            info!(previous, "closing the session the client reconnected from");
+            conn.close_session(previous).await;
+        }
+        return;
+    }
+}
+
+/// Checks the client's mechListMIC and returns the server's, for an SPNEGO
+/// exchange (RFC 4178 section 5, MS-SPNG 3.1.5.1). The MIC is exchanged
+/// when the client sends one, when the AUTHENTICATE_MESSAGE carried an NTLM
+/// MIC, or when NTLM was not the client's first choice; in the last case the
+/// client's MIC is required. Anonymous logons have no key and exchange none.
+fn mech_list_mic(
+    acceptor: &NtlmServer,
+    outcome: &AuthOutcome,
+    client_mic: Option<&[u8]>,
+) -> Result<Option<Vec<u8>>, u32> {
+    let required = acceptor.mech_list_mic_required;
+    let wanted = required || client_mic.is_some() || outcome.mic_present;
+    let (Some(mech_list), false) = (
+        acceptor.mech_list.as_deref(),
+        matches!(outcome.identity, Identity::Anonymous),
+    ) else {
+        return Ok(None);
+    };
+    if !wanted {
+        return Ok(None);
+    }
+    let key = &outcome.session_key;
+    let client = NtlmMac::new(outcome.flags, key, Direction::ClientToServer);
+    let server = NtlmMac::new(outcome.flags, key, Direction::ServerToClient);
+    let (Some(mut client), Some(mut server)) = (client, server) else {
+        if required || client_mic.is_some() {
+            info!("mechListMIC needed but NTLM signing was not negotiated");
+            return Err(ntstatus::STATUS_LOGON_FAILURE);
+        }
+        return Ok(None);
+    };
+    match client_mic {
+        Some(mic) if !client.verify(mech_list, mic) => {
+            info!("SPNEGO mechListMIC mismatch");
+            return Err(ntstatus::STATUS_LOGON_FAILURE);
+        }
+        None if required => {
+            info!("SPNEGO mechListMIC missing");
+            return Err(ntstatus::STATUS_LOGON_FAILURE);
+        }
+        _ => {}
+    }
+    Ok(Some(server.mac(mech_list).to_vec()))
+}
+
+/// Session.SigningRequired (MS-SMB2 3.3.5.5.3): the client asked for
+/// signing in SESSION_SETUP or NEGOTIATE, or the server requires it.
+/// Anonymous sessions have no key and are never signed.
+fn signing_required(
+    server: &ServerState,
+    conn: &Connection,
+    req: &SessionSetupRequest,
+    identity: &Identity,
+) -> bool {
+    if matches!(identity, Identity::Anonymous) {
+        return false;
+    }
+    let should_sign = conn
+        .client_negotiate
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .is_some_and(|n| n.should_sign());
+    req.security_mode & SessionSetupRequest::SECURITY_SIGNING_REQUIRED != 0
+        || should_sign
+        || server.auth.settings.require_signing
 }
 
 /// The configured user an NTLM user name refers to. NTLM user names are not
 /// case sensitive: an exact match wins, then the one name that matches
 /// ignoring case. A name that matches several users only by case matches
-/// none of them.
+/// none of them. Every entry is compared, so the time taken does not show
+/// whether or how the name matched.
 fn configured_user<'a>(
     users: &'a HashMap<String, UserCreds>,
     name: &str,
 ) -> Option<(&'a String, &'a UserCreds)> {
-    if let Some(user) = users.get_key_value(name) {
-        return Some(user);
+    let mut exact = None;
+    let mut folded = None;
+    let mut folded_count = 0usize;
+    for user in users {
+        if user.0 == name {
+            exact = Some(user);
+        }
+        if eq_ignore_case(user.0, name) {
+            folded = Some(user);
+            folded_count += 1;
+        }
     }
-    let upper = name.to_uppercase();
-    let mut matches = users.iter().filter(|(n, _)| n.to_uppercase() == upper);
-    let user = matches.next()?;
-    matches.next().is_none().then_some(user)
+    exact.or(folded.filter(|_| folded_count == 1))
+}
+
+fn eq_ignore_case(a: &str, b: &str) -> bool {
+    a.chars()
+        .flat_map(char::to_uppercase)
+        .eq(b.chars().flat_map(char::to_uppercase))
 }
 
 /// Session.SigningKey for `dialect` (MS-SMB2 3.3.5.5.3). SMB 2.x signs with
@@ -306,10 +639,6 @@ fn build_session_setup_response(_status: u32, spnego_blob: &[u8], session_flags:
     buf
 }
 
-fn empty_completed() -> Vec<u8> {
-    encode_resp_token(NegState::AcceptCompleted, None, None, None)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,5 +650,190 @@ mod tests {
         assert_eq!(signing_key(Dialect::Smb210, &key), key);
         assert_eq!(signing_key(Dialect::Smb300, &key), signing_key_30(&key));
         assert_eq!(signing_key(Dialect::Smb302, &key), signing_key_30(&key));
+    }
+
+    #[test]
+    fn configured_user_matches_case_insensitively_once() {
+        let mut users = HashMap::new();
+        users.insert("Alice".to_string(), UserCreds::from_password("a"));
+        users.insert("bob".to_string(), UserCreds::from_password("b"));
+        users.insert("BOB".to_string(), UserCreds::from_password("c"));
+        assert_eq!(configured_user(&users, "alice").unwrap().0, "Alice");
+        assert_eq!(configured_user(&users, "bob").unwrap().0, "bob");
+        assert_eq!(configured_user(&users, "BOB").unwrap().0, "BOB");
+        assert!(configured_user(&users, "Bob").is_none());
+        assert!(configured_user(&users, "carol").is_none());
+    }
+
+    use crate::proto::auth::ntlm::{nt_hash, ntowf_v2, utf16le};
+    use crate::proto::header::{Command, HeaderTail};
+    use hmac::{Hmac, Mac};
+    use std::time::Duration;
+
+    fn header(session_id: u64) -> Smb2Header {
+        Smb2Header {
+            credit_charge: 1,
+            channel_sequence_status: 0,
+            command: Command::SessionSetup,
+            credit_request_response: 1,
+            flags: 0,
+            next_command: 0,
+            message_id: 1,
+            tail: HeaderTail::sync(0),
+            session_id,
+            signature: [0; 16],
+        }
+    }
+
+    fn body(token: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        SessionSetupRequest {
+            structure_size: 25,
+            flags: 0,
+            security_mode: 1,
+            capabilities: 0,
+            channel: 0,
+            security_buffer_offset: 88,
+            security_buffer_length: token.len() as u16,
+            previous_session_id: 0,
+            security_buffer: token.to_vec(),
+        }
+        .write_to(&mut body)
+        .unwrap();
+        body
+    }
+
+    fn ntlm_negotiate() -> Vec<u8> {
+        let mut msg = b"NTLMSSP\0".to_vec();
+        msg.extend_from_slice(&1u32.to_le_bytes());
+        msg.extend_from_slice(&0x0008_0201u32.to_le_bytes());
+        msg.extend_from_slice(&[0u8; 16]);
+        msg
+    }
+
+    /// NTLMv2 AUTHENTICATE_MESSAGE without a MIC or key exchange.
+    fn ntlm_authenticate(challenge: &[u8], user: &str, password: &str) -> Vec<u8> {
+        let hmac = |key: &[u8], parts: &[&[u8]]| -> [u8; 16] {
+            let mut mac = Hmac::<md5::Md5>::new_from_slice(key).unwrap();
+            for p in parts {
+                mac.update(p);
+            }
+            mac.finalize().into_bytes().into()
+        };
+        let key = ntowf_v2(&nt_hash(password), user, "");
+        let mut blob = vec![1, 1, 0, 0, 0, 0, 0, 0];
+        blob.extend_from_slice(&[0; 8]);
+        blob.extend_from_slice(&[0xAA; 8]);
+        blob.extend_from_slice(&[0; 8]);
+        let proof = hmac(&key, &[&challenge[24..32], &blob]);
+        let nt = [&proof[..], &blob].concat();
+        let user = utf16le(user);
+        let fields: [&[u8]; 6] = [&[], &nt, &[], &user, &[], &[]];
+        let mut msg = b"NTLMSSP\0".to_vec();
+        msg.extend_from_slice(&3u32.to_le_bytes());
+        let mut payload = Vec::new();
+        for field in fields {
+            let offset = 72 + payload.len() as u32;
+            msg.extend_from_slice(&(field.len() as u16).to_le_bytes());
+            msg.extend_from_slice(&(field.len() as u16).to_le_bytes());
+            msg.extend_from_slice(&offset.to_le_bytes());
+            payload.extend_from_slice(field);
+        }
+        msg.extend_from_slice(&1u32.to_le_bytes());
+        msg.extend_from_slice(&[0u8; 8]);
+        msg.extend_from_slice(&payload);
+        msg
+    }
+
+    fn server(builder: crate::SmbServerBuilder) -> crate::SmbServer {
+        builder
+            .listen("127.0.0.1:0".parse().unwrap())
+            .user("alice", "password")
+            .build()
+            .expect("build")
+    }
+
+    async fn connection(state: &Arc<ServerState>) -> Arc<Connection> {
+        let conn = Arc::new(Connection::new(state.config.server_guid, 65536, 65536));
+        state.active_connections.register(&conn).await;
+        *conn.dialect.write().await = Some(Dialect::Smb210);
+        conn
+    }
+
+    /// First round; returns the SessionId and the CHALLENGE_MESSAGE.
+    async fn first_round(state: &Arc<ServerState>, conn: &Arc<Connection>) -> (u64, Vec<u8>) {
+        let resp = handle(state, conn, &header(0), &body(&ntlm_negotiate())).await;
+        assert_eq!(resp.status, ntstatus::STATUS_MORE_PROCESSING_REQUIRED);
+        let sid = resp.override_session_id.unwrap();
+        let challenge = SessionSetupResponse::parse(&resp.body)
+            .unwrap()
+            .security_buffer;
+        (sid, challenge)
+    }
+
+    async fn logon(
+        state: &Arc<ServerState>,
+        conn: &Arc<Connection>,
+        user: &str,
+        password: &str,
+    ) -> u32 {
+        let (sid, challenge) = first_round(state, conn).await;
+        let auth = ntlm_authenticate(&challenge, user, password);
+        handle(state, conn, &header(sid), &body(&auth)).await.status
+    }
+
+    #[tokio::test]
+    async fn repeated_failures_close_the_connection() {
+        let server = server(crate::SmbServer::builder().logon_throttle(2, Duration::from_secs(60)));
+        let state = server.state();
+        let conn = connection(&state).await;
+        assert_eq!(
+            logon(&state, &conn, "alice", "wrong").await,
+            ntstatus::STATUS_LOGON_FAILURE
+        );
+        assert!(!conn.disconnect_requested());
+        assert_eq!(
+            logon(&state, &conn, "nobody", "wrong").await,
+            ntstatus::STATUS_LOGON_FAILURE
+        );
+        assert!(conn.disconnect_requested());
+    }
+
+    #[tokio::test]
+    async fn sessions_per_connection_are_capped() {
+        let server = server(crate::SmbServer::builder().max_sessions_per_connection(1));
+        let state = server.state();
+        let conn = connection(&state).await;
+        assert_eq!(logon(&state, &conn, "alice", "password").await, 0);
+        let resp = handle(&state, &conn, &header(0), &body(&ntlm_negotiate())).await;
+        assert_eq!(resp.status, ntstatus::STATUS_INSUFFICIENT_RESOURCES);
+    }
+
+    /// A logon that authenticated before `remove_user` and inserts its
+    /// session after the sweep does not leave a session behind.
+    #[tokio::test]
+    async fn logon_racing_remove_user_leaves_no_session() {
+        let server = server(crate::SmbServer::builder());
+        let state = server.state();
+        let config = server.config_handle();
+        let conn = connection(&state).await;
+        let (sid, challenge) = first_round(&state, &conn).await;
+        let auth = ntlm_authenticate(&challenge, "alice", "password");
+
+        // Hold the dialect so the logon stops after authenticating.
+        let dialect = conn.dialect.write().await;
+        let logon = tokio::spawn({
+            let (state, conn) = (state.clone(), conn.clone());
+            async move {
+                handle(&state, &conn, &header(sid), &body(&auth))
+                    .await
+                    .status
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        config.remove_user("alice").await.unwrap();
+        drop(dialect);
+        assert_ne!(logon.await.unwrap(), ntstatus::STATUS_SUCCESS);
+        assert!(conn.sessions.read().await.is_empty());
     }
 }

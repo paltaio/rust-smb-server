@@ -5,9 +5,10 @@ use std::io;
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use smb_server::ntstatus::STATUS_MORE_PROCESSING_REQUIRED;
 use smb_server::wire::header::{Command, HeaderTail, SMB2_FLAGS_SERVER_TO_REDIR, Smb2Header};
 use smb_server::wire::messages::{
-    CreateRequest, CreateResponse, FileId, NegotiateRequest, ReadRequest,
+    CreateRequest, CreateResponse, FileId, NegotiateRequest, ReadRequest, SessionSetupRequest,
 };
 use smb_server::{ShutdownHandle, SmbServerBuilder};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -120,6 +121,47 @@ pub async fn connect_negotiated(addr: SocketAddr) -> TcpStream {
     let (hdr, _) = read_response(&mut s).await;
     assert_eq!(hdr.command, Command::Negotiate);
     assert_eq!(hdr.channel_sequence_status, 0, "NEGOTIATE status");
+    s
+}
+
+/// Sends the first leg of a raw NTLM SESSION_SETUP, which leaves a session
+/// in progress on the connection, and returns the credits granted.
+pub async fn begin_session_setup(s: &mut TcpStream, message_id: u64, credit_request: u16) -> u16 {
+    let mut ntlm = b"NTLMSSP\0".to_vec();
+    ntlm.extend_from_slice(&1u32.to_le_bytes());
+    ntlm.extend_from_slice(&0x6209_8215u32.to_le_bytes());
+    ntlm.extend_from_slice(&[0u8; 16]);
+    let req = SessionSetupRequest {
+        structure_size: 25,
+        flags: 0,
+        security_mode: 0x01,
+        capabilities: 0,
+        channel: 0,
+        security_buffer_offset: 88,
+        security_buffer_length: ntlm.len() as u16,
+        previous_session_id: 0,
+        security_buffer: ntlm,
+    };
+    let mut body = Vec::new();
+    req.write_to(&mut body).expect("session setup");
+    let mut hdr = header(Command::SessionSetup, message_id, 0, 0);
+    hdr.credit_request_response = credit_request;
+    s.write_all(&framed(&message(&hdr, &body)))
+        .await
+        .expect("write");
+    let (hdr, _) = read_response(s).await;
+    assert_eq!(
+        hdr.channel_sequence_status, STATUS_MORE_PROCESSING_REQUIRED,
+        "SESSION_SETUP status"
+    );
+    hdr.credit_request_response
+}
+
+/// Connects, completes NEGOTIATE (MessageId 0) and starts a SESSION_SETUP
+/// (MessageId 1), so the server answers ECHO.
+pub async fn connect_in_session_setup(addr: SocketAddr) -> TcpStream {
+    let mut s = connect_negotiated(addr).await;
+    begin_session_setup(&mut s, 1, 64).await;
     s
 }
 

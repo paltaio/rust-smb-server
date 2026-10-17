@@ -19,7 +19,17 @@ pub async fn handle(
     if hdr.session_id == 0 {
         return HandlerResponse::err(ntstatus::STATUS_USER_SESSION_DELETED);
     }
-    conn.close_session(hdr.session_id).await;
+    // MS-SMB2 3.3.5.6: the session must exist; one still logging on counts.
+    let closed = conn.close_session(hdr.session_id).await
+        || conn
+            .pending_auths
+            .write()
+            .await
+            .remove(&hdr.session_id)
+            .is_some();
+    if !closed {
+        return HandlerResponse::err(ntstatus::STATUS_USER_SESSION_DELETED);
+    }
     let mut buf = Vec::new();
     LogoffResponse::default()
         .write_to(&mut buf)

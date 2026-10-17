@@ -7,7 +7,10 @@ use std::time::Duration;
 
 use smb_server::SmbServer;
 use smb_server::wire::header::Command;
-use support::{WAIT, assert_closed, connect_negotiated, echo, read_response, start_with_shutdown};
+use support::{
+    WAIT, assert_closed, connect_in_session_setup, connect_negotiated, echo, read_response,
+    start_with_shutdown,
+};
 use tokio::io::AsyncWriteExt;
 
 #[tokio::test]
@@ -44,9 +47,9 @@ async fn serve_returns_after_idle_connections_close() {
 #[tokio::test]
 async fn a_request_arriving_during_shutdown_is_answered() {
     let (addr, shutdown, serve) = start_with_shutdown(SmbServer::builder()).await;
-    let mut s = connect_negotiated(addr).await;
+    let mut s = connect_in_session_setup(addr).await;
 
-    let request = echo(1);
+    let request = echo(2);
     s.write_all(&request[..10]).await.expect("write");
     tokio::time::sleep(Duration::from_millis(100)).await;
     shutdown.shutdown();

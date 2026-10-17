@@ -27,6 +27,8 @@ pub enum Fsctl {
     LmrRequestResiliency,
     /// `FSCTL_QUERY_NETWORK_INTERFACE_INFO`.
     QueryNetworkInterfaceInfo,
+    /// `FSCTL_SRV_ENUMERATE_SNAPSHOTS`.
+    SrvEnumerateSnapshots,
     /// Anything else.
     Other(u32),
 }
@@ -34,12 +36,13 @@ pub enum Fsctl {
 impl Fsctl {
     pub const VALIDATE_NEGOTIATE_INFO: u32 = 0x0014_0204;
     pub const DFS_GET_REFERRALS: u32 = 0x0006_0194;
-    pub const DFS_GET_REFERRALS_EX: u32 = 0x0006_0198;
+    pub const DFS_GET_REFERRALS_EX: u32 = 0x0006_01B0;
     pub const PIPE_TRANSCEIVE: u32 = 0x0011_C017;
     pub const PIPE_PEEK: u32 = 0x0011_400C;
-    pub const PIPE_WAIT: u32 = 0x0011_C018;
-    pub const LMR_REQUEST_RESILIENCY: u32 = 0x001C_0017;
-    pub const QUERY_NETWORK_INTERFACE_INFO: u32 = 0x001F_C017;
+    pub const PIPE_WAIT: u32 = 0x0011_0018;
+    pub const LMR_REQUEST_RESILIENCY: u32 = 0x0014_01D4;
+    pub const QUERY_NETWORK_INTERFACE_INFO: u32 = 0x0014_01FC;
+    pub const SRV_ENUMERATE_SNAPSHOTS: u32 = 0x0014_4064;
 
     pub fn from_u32(code: u32) -> Self {
         match code {
@@ -51,6 +54,7 @@ impl Fsctl {
             Self::PIPE_WAIT => Self::PipeWait,
             Self::LMR_REQUEST_RESILIENCY => Self::LmrRequestResiliency,
             Self::QUERY_NETWORK_INTERFACE_INFO => Self::QueryNetworkInterfaceInfo,
+            Self::SRV_ENUMERATE_SNAPSHOTS => Self::SrvEnumerateSnapshots,
             other => Self::Other(other),
         }
     }
@@ -65,6 +69,7 @@ impl Fsctl {
             Self::PipeWait => Self::PIPE_WAIT,
             Self::LmrRequestResiliency => Self::LMR_REQUEST_RESILIENCY,
             Self::QueryNetworkInterfaceInfo => Self::QUERY_NETWORK_INTERFACE_INFO,
+            Self::SrvEnumerateSnapshots => Self::SRV_ENUMERATE_SNAPSHOTS,
             Self::Other(c) => c,
         }
     }
@@ -155,6 +160,24 @@ mod tests {
         assert_eq!(Fsctl::from_u32(0xDEAD_BEEF), Fsctl::Other(0xDEAD_BEEF));
         assert_eq!(Fsctl::ValidateNegotiateInfo.as_u32(), 0x0014_0204);
         assert_eq!(Fsctl::Other(0xDEAD_BEEF).as_u32(), 0xDEAD_BEEF);
+    }
+
+    /// Codes from the MS-SMB2 2.2.31 CtlCode table.
+    #[test]
+    fn fsctl_codes_match_ms_smb2() {
+        for (code, fsctl) in [
+            (0x0006_0194, Fsctl::DfsGetReferrals),
+            (0x0011_0018, Fsctl::PipeWait),
+            (0x0011_C017, Fsctl::PipeTransceive),
+            (0x0014_4064, Fsctl::SrvEnumerateSnapshots),
+            (0x0014_01D4, Fsctl::LmrRequestResiliency),
+            (0x0014_01FC, Fsctl::QueryNetworkInterfaceInfo),
+            (0x0014_0204, Fsctl::ValidateNegotiateInfo),
+            (0x0006_01B0, Fsctl::DfsGetReferralsEx),
+        ] {
+            assert_eq!(Fsctl::from_u32(code), fsctl, "0x{code:08X}");
+            assert_eq!(fsctl.as_u32(), code);
+        }
     }
 
     #[test]

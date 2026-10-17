@@ -9,8 +9,8 @@ use smb_server::ntstatus::STATUS_INVALID_PARAMETER;
 use smb_server::wire::header::Command;
 use smb_server::{LocalFsBackend, Share, SmbServer};
 use support::{
-    ECHO_BODY, WAIT, assert_closed, connect, connect_negotiated, framed, header, message,
-    open_file, read_body, read_response, start,
+    ECHO_BODY, WAIT, assert_closed, connect, connect_in_session_setup, connect_negotiated, framed,
+    header, message, open_file, read_body, read_response, start,
 };
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
@@ -30,11 +30,11 @@ async fn echo(s: &mut TcpStream, message_id: u64, credit_request: u16) -> u16 {
 #[tokio::test]
 async fn message_ids_are_accepted_once_in_any_order() {
     let (addr, handle) = start(SmbServer::builder()).await;
-    let mut s = connect_negotiated(addr).await;
-    for message_id in [3, 1, 2] {
+    let mut s = connect_in_session_setup(addr).await;
+    for message_id in [4, 2, 3] {
         echo(&mut s, message_id, 1).await;
     }
-    let replay = message(&header(Command::Echo, 2, 0, 0), &ECHO_BODY);
+    let replay = message(&header(Command::Echo, 3, 0, 0), &ECHO_BODY);
     s.write_all(&framed(&replay)).await.expect("write");
     assert_closed(&mut s, WAIT).await;
     handle.abort();
@@ -65,8 +65,9 @@ async fn grants_stay_between_one_and_the_server_maximum() {
     assert_eq!(hdr.credit_request_response, 1, "NEGOTIATE grant");
 
     // Holding no other credit, a request for none still gets one.
-    assert_eq!(echo(&mut s, 1, 0).await, 1);
-    let granted = echo(&mut s, 2, u16::MAX).await;
+    assert_eq!(support::begin_session_setup(&mut s, 1, 0).await, 1);
+    assert_eq!(echo(&mut s, 2, 0).await, 1);
+    let granted = echo(&mut s, 3, u16::MAX).await;
     assert!((1..=512).contains(&granted), "granted {granted}");
     handle.abort();
 }

@@ -8,8 +8,9 @@ use crate::proto::error::ProtoResult;
 /// SMB2_TREE_CONNECT_REQUEST (MS-SMB2 §2.2.9).
 ///
 /// `path` is UTF-16LE. The wire format gives `PathOffset` (from the start of
-/// the SMB2 header) and `PathLength`; we encode/decode the path immediately
-/// following the fixed prefix. 3.1.1 tree-connect extensions are not decoded.
+/// the SMB2 header) and `PathLength`; `path` is encoded and decoded
+/// immediately following the fixed prefix, and [`TreeConnectRequest::path_in`]
+/// finds it by `PathOffset`. 3.1.1 tree-connect extensions are not decoded.
 #[binrw]
 #[brw(little)]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +47,19 @@ impl TreeConnectRequest {
         Some(String::from_utf16_lossy(&units))
     }
 
+    /// The share path bytes in `body`, the request after the SMB2 header,
+    /// located by `PathOffset` and `PathLength`. With
+    /// SMB2_TREE_CONNECT_FLAG_EXTENSION_PRESENT the path follows the
+    /// extension and `PathOffset` points at it. `None` when the path lies
+    /// outside the request's buffer.
+    pub fn path_in<'a>(&self, body: &'a [u8]) -> Option<&'a [u8]> {
+        let start = usize::from(self.path_offset).checked_sub(SMB2_HEADER_LEN)?;
+        if start < FIXED_LEN {
+            return None;
+        }
+        body.get(start..start + usize::from(self.path_length))
+    }
+
     pub fn parse(buf: &[u8]) -> ProtoResult<Self> {
         Ok(Self::read(&mut Cursor::new(buf))?)
     }
@@ -56,6 +70,10 @@ impl TreeConnectRequest {
         Ok(())
     }
 }
+
+/// Size of the fixed part of a TREE_CONNECT request, before Buffer.
+const FIXED_LEN: usize = 8;
+const SMB2_HEADER_LEN: usize = 64;
 
 /// SMB2_TREE_CONNECT_RESPONSE (MS-SMB2 §2.2.10).
 #[binrw]
@@ -110,6 +128,27 @@ mod tests {
         let decoded = TreeConnectRequest::parse(&buf).unwrap();
         assert_eq!(decoded, r);
         assert_eq!(decoded.path_str().unwrap(), r"\\server\share");
+    }
+
+    #[test]
+    fn path_is_found_by_path_offset() {
+        let path = utf16le(r"\\srv\data");
+        // A 16-byte extension header comes before the path.
+        let mut body = vec![9, 0, 4, 0];
+        body.extend_from_slice(&(64u16 + 8 + 16).to_le_bytes());
+        body.extend_from_slice(&(path.len() as u16).to_le_bytes());
+        body.extend_from_slice(&[0u8; 16]);
+        body.extend_from_slice(&path);
+        let req = TreeConnectRequest::parse(&body).unwrap();
+        assert_eq!(req.path_in(&body), Some(&path[..]));
+
+        let mut short = req.clone();
+        short.path_offset = 64 + 4;
+        assert_eq!(short.path_in(&body), None);
+        short.path_offset = 64 + 30;
+        assert_eq!(short.path_in(&body), None);
+        short.path_offset = 10;
+        assert_eq!(short.path_in(&body), None);
     }
 
     #[test]

@@ -34,20 +34,27 @@ async fn validate_negotiate_info_matches_negotiate() {
     let tree_id = tree_connect(&mut s, "\\\\TESTSERVER\\downloads", session_id, 3).await;
 
     // ---- FSCTL_VALIDATE_NEGOTIATE_INFO mirrors NEGOTIATE ----------------
+    // Capabilities, ClientGuid, SecurityMode and Dialects as sent by negotiate().
+    let mut input = 0u32.to_le_bytes().to_vec();
+    input.extend_from_slice(&[0xCD; 16]);
+    input.extend_from_slice(&0x0001u16.to_le_bytes());
+    input.extend_from_slice(&2u16.to_le_bytes());
+    input.extend_from_slice(&0x0202u16.to_le_bytes());
+    input.extend_from_slice(&0x0210u16.to_le_bytes());
     let ioctl_req = IoctlRequest {
         structure_size: 57,
         reserved: 0,
         ctl_code: Fsctl::VALIDATE_NEGOTIATE_INFO,
         file_id: FileId::any(),
-        input_offset: 0,
-        input_count: 0,
+        input_offset: 0x78,
+        input_count: input.len() as u32,
         max_input_response: 0,
         output_offset: 0,
         output_count: 0,
         max_output_response: 24,
         flags: IoctlRequest::FLAG_IS_FSCTL,
         reserved2: 0,
-        input: vec![],
+        input,
     };
     let mut body = Vec::new();
     ioctl_req.write_to(&mut body).expect("write");

@@ -197,6 +197,8 @@ pub struct ServerState {
     /// closes once it has answered the frame it is receiving, if any.
     pub shutdown: Arc<Notify>,
     pub shutting_down: Arc<AtomicBool>,
+    /// Signing policy, session and tree limits, and the logon throttle.
+    pub auth: crate::auth_policy::AuthPolicy,
 }
 
 impl ServerState {
@@ -209,6 +211,7 @@ impl ServerState {
             server_start_filetime: now_filetime(),
             shutdown: Arc::new(Notify::new()),
             shutting_down: Arc::new(AtomicBool::new(false)),
+            auth: crate::auth_policy::AuthPolicy::default(),
         }
     }
 

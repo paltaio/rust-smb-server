@@ -136,10 +136,7 @@ fn read_tlv(buf: &[u8], pos: usize, expected_tag: u8) -> ProtoResult<(&[u8], usi
         return Err(ProtoError::Auth("unexpected DER tag"));
     }
     let (len, after_len) = read_len(buf, pos + 1)?;
-    let end = after_len + len;
-    if end > buf.len() {
-        return Err(ProtoError::Auth("DER content truncated"));
-    }
+    let end = content_end(buf, after_len, len)?;
     Ok((&buf[after_len..end], end))
 }
 
@@ -150,11 +147,16 @@ fn read_any_tlv(buf: &[u8], pos: usize) -> ProtoResult<(u8, &[u8], usize)> {
     }
     let tag = buf[pos];
     let (len, after_len) = read_len(buf, pos + 1)?;
-    let end = after_len + len;
-    if end > buf.len() {
-        return Err(ProtoError::Auth("DER content truncated"));
-    }
+    let end = content_end(buf, after_len, len)?;
     Ok((tag, &buf[after_len..end], end))
+}
+
+/// End of a `len`-byte content that starts at `start`, if it fits in `buf`.
+fn content_end(buf: &[u8], start: usize, len: usize) -> ProtoResult<usize> {
+    start
+        .checked_add(len)
+        .filter(|&end| end <= buf.len())
+        .ok_or(ProtoError::Auth("DER content truncated"))
 }
 
 // --- TLV writer helper -----------------------------------------------------
@@ -172,6 +174,9 @@ fn write_tlv(tag: u8, content: &[u8], out: &mut Vec<u8>) {
 pub struct NegTokenInit {
     /// List of mechanism OIDs (each entry is the OID content bytes, no 0x06 tag).
     pub mech_types: Vec<Vec<u8>>,
+    /// DER encoding of the MechTypeList as received. The mechListMIC is
+    /// computed over these bytes (RFC 4178 section 5).
+    pub mech_types_der: Vec<u8>,
     /// `mechToken [2]` if present - typically the NTLMSSP NEGOTIATE_MESSAGE bytes.
     pub mech_token: Option<Vec<u8>>,
 }
@@ -212,6 +217,7 @@ fn parse_neg_token_init_body(inner: &[u8]) -> ProtoResult<NegTokenInit> {
     let (seq_body, _) = read_tlv(inner, 0, TAG_SEQUENCE)?;
     let mut pos = 0usize;
     let mut mech_types: Vec<Vec<u8>> = Vec::new();
+    let mut mech_types_der = Vec::new();
     let mut mech_token: Option<Vec<u8>> = None;
 
     while pos < seq_body.len() {
@@ -219,7 +225,8 @@ fn parse_neg_token_init_body(inner: &[u8]) -> ProtoResult<NegTokenInit> {
         match tag {
             TAG_CTX_0 => {
                 // mechTypes [0] MechTypeList ::= SEQUENCE OF MechType (OID)
-                let (mt_seq, _) = read_tlv(content, 0, TAG_SEQUENCE)?;
+                let (mt_seq, mt_end) = read_tlv(content, 0, TAG_SEQUENCE)?;
+                mech_types_der = content[..mt_end].to_vec();
                 let mut p = 0usize;
                 while p < mt_seq.len() {
                     let (oid, e) = read_tlv(mt_seq, p, TAG_OBJECT)?;
@@ -247,6 +254,7 @@ fn parse_neg_token_init_body(inner: &[u8]) -> ProtoResult<NegTokenInit> {
 
     Ok(NegTokenInit {
         mech_types,
+        mech_types_der,
         mech_token,
     })
 }
@@ -490,6 +498,7 @@ mod tests {
         let dec = decode_init_token(&blob).unwrap();
         assert_eq!(dec.mech_types.len(), 1);
         assert_eq!(dec.mech_types[0], OID_NTLMSSP);
+        assert_eq!(dec.mech_types_der, mts_seq);
         assert_eq!(dec.mech_token.as_deref(), Some(&inner_token[..]));
     }
 
@@ -510,6 +519,17 @@ mod tests {
 
         let err = decode_init_token(&blob).unwrap_err();
         assert!(matches!(err, ProtoError::Auth(_)));
+    }
+
+    /// A 4-byte length that would wrap a 32-bit `usize` is reported as
+    /// truncated content.
+    #[test]
+    fn rejects_length_that_wraps() {
+        let buf = [0x60, 0x84, 0xFF, 0xFF, 0xFF, 0xFF, 0x00];
+        assert!(decode_init_token(&buf).is_err());
+        assert!(content_end(&buf, 6, usize::MAX).is_err());
+        assert!(content_end(&buf, usize::MAX, 1).is_err());
+        assert_eq!(content_end(&buf, 6, 1).unwrap(), 7);
     }
 
     #[test]

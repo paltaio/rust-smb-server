@@ -54,3 +54,5 @@ mod tests {
     mod dynamic_config;
     pub(crate) mod memfs;
 }
+
+mod auth_policy;

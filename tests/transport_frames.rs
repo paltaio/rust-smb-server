@@ -13,8 +13,8 @@ use smb_server::ntstatus::STATUS_INVALID_PARAMETER;
 use smb_server::wire::header::{Command, Smb2Header};
 use smb_server::{LocalFsBackend, Share, SmbServer};
 use support::{
-    ECHO_BODY, WAIT, assert_closed, assert_open, connect, connect_negotiated, framed, header,
-    message, open_file, read_body, read_response, start,
+    ECHO_BODY, WAIT, assert_closed, assert_open, connect, connect_in_session_setup,
+    connect_negotiated, framed, header, message, open_file, read_body, read_response, start,
 };
 use tokio::io::AsyncWriteExt;
 
@@ -79,11 +79,11 @@ async fn frames_longer_than_the_negotiated_limit_close_the_connection() {
 #[tokio::test]
 async fn small_commands_over_68_kib_close_the_connection() {
     let (addr, handle) = start(SmbServer::builder()).await;
-    let mut s = connect_negotiated(addr).await;
+    let mut s = connect_in_session_setup(addr).await;
 
     let mut body = ECHO_BODY.to_vec();
     body.resize(64 * 1024, 0);
-    let hdr = header(Command::Echo, 1, 0, 0);
+    let hdr = header(Command::Echo, 2, 0, 0);
     s.write_all(&framed(&message(&hdr, &body)))
         .await
         .expect("write");
@@ -91,7 +91,7 @@ async fn small_commands_over_68_kib_close_the_connection() {
     assert_eq!(hdr.command, Command::Echo);
 
     body.resize(68 * 1024 + 1, 0);
-    let hdr = header(Command::Echo, 2, 0, 0);
+    let hdr = header(Command::Echo, 3, 0, 0);
     s.write_all(&framed(&message(&hdr, &body)))
         .await
         .expect("write");

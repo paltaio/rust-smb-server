@@ -38,6 +38,7 @@ pub mod flags {
     pub const NTLMSSP_NEGOTIATE_UNICODE: u32 = 0x0000_0001;
     pub const NTLMSSP_REQUEST_TARGET: u32 = 0x0000_0004;
     pub const NTLMSSP_NEGOTIATE_SIGN: u32 = 0x0000_0010;
+    pub const NTLMSSP_NEGOTIATE_SEAL: u32 = 0x0000_0020;
     pub const NTLMSSP_NEGOTIATE_NTLM: u32 = 0x0000_0200;
     #[cfg(test)]
     pub const NTLMSSP_NEGOTIATE_ANONYMOUS: u32 = 0x0000_0800;
@@ -102,7 +103,6 @@ pub fn encode_av_pairs(pairs: &[AvPair]) -> Vec<u8> {
 }
 
 /// Decode AV_PAIRs from a byte slice; stops at (and consumes) the EOL entry.
-#[cfg(test)]
 pub fn decode_av_pairs(buf: &[u8]) -> ProtoResult<Vec<AvPair>> {
     let mut out = Vec::new();
     let mut i = 0usize;
@@ -195,13 +195,13 @@ struct Field {
 }
 
 fn read_field(buf: &[u8], at: usize) -> ProtoResult<Field> {
-    if buf.len() < at + 8 {
-        return Err(ProtoError::Auth("field descriptor truncated"));
-    }
-    let _max_len = u16::from_le_bytes([buf[at + 2], buf[at + 3]]);
+    let d = at
+        .checked_add(8)
+        .and_then(|end| buf.get(at..end))
+        .ok_or(ProtoError::Auth("field descriptor truncated"))?;
     Ok(Field {
-        len: u16::from_le_bytes([buf[at], buf[at + 1]]),
-        offset: u32::from_le_bytes([buf[at + 4], buf[at + 5], buf[at + 6], buf[at + 7]]),
+        len: u16::from_le_bytes([d[0], d[1]]),
+        offset: u32::from_le_bytes([d[4], d[5], d[6], d[7]]),
     })
 }
 
@@ -398,9 +398,9 @@ impl NtlmAuthenticate {
     /// 72 : MIC (16 bytes - present only in some versions)
     /// 88 : Payload...
     /// ```
-    /// The MIC is present only when an `MsvAvFlags` AV_PAIR with bit 0x2 was
-    /// echoed by the client. The MIC counts as present when the smallest
-    /// field-payload offset is >= 88; bytes 72..88 are then read as the MIC.
+    /// The MIC is present when the AV_PAIR list of the NTLMv2 response has
+    /// an `MsvAvFlags` entry with bit 0x2 set (MS-NLMP 3.2.5.1.2); bytes
+    /// 72..88 are then read as the MIC.
     pub fn parse(buf: &[u8]) -> ProtoResult<Self> {
         check_signature(buf, MSG_AUTHENTICATE)?;
         if buf.len() < 64 {
@@ -413,31 +413,6 @@ impl NtlmAuthenticate {
         let ws_field = read_field(buf, 44)?;
         let key_field = read_field(buf, 52)?;
         let flags = u32::from_le_bytes([buf[60], buf[61], buf[62], buf[63]]);
-
-        // Determine where the payload starts to know whether the MIC field is present.
-        // The smallest non-zero offset among the fields tells us.
-        let mut min_off: u32 = u32::MAX;
-        for f in [
-            lm_field,
-            nt_field,
-            domain_field,
-            user_field,
-            ws_field,
-            key_field,
-        ] {
-            if f.len > 0 && f.offset > 0 && f.offset < min_off {
-                min_off = f.offset;
-            }
-        }
-
-        let (mic, mic_offset) = if min_off != u32::MAX && min_off as usize >= 88 && buf.len() >= 88
-        {
-            let mut mic = [0u8; 16];
-            mic.copy_from_slice(&buf[72..88]);
-            (Some(mic), Some(72usize))
-        } else {
-            (None, None)
-        };
 
         let lm_response = if lm_field.len == 0 {
             Vec::new()
@@ -458,6 +433,16 @@ impl NtlmAuthenticate {
             Vec::new()
         } else {
             slice_field(buf, user_field)?.to_vec()
+        };
+        let (mic, mic_offset) = if ntlmv2_av_flags(&nt_response) & MSV_AV_FLAG_MIC != 0 {
+            let field = buf
+                .get(MIC_OFFSET..MIC_OFFSET + 16)
+                .ok_or(ProtoError::Auth("MIC field missing"))?;
+            let mut mic = [0u8; 16];
+            mic.copy_from_slice(field);
+            (Some(mic), Some(MIC_OFFSET))
+        } else {
+            (None, None)
         };
         let ws_bytes = if ws_field.len == 0 {
             Vec::new()
@@ -490,6 +475,126 @@ impl NtlmAuthenticate {
     }
 }
 
+/// Offset of the MIC field in an AUTHENTICATE_MESSAGE.
+const MIC_OFFSET: usize = 72;
+
+/// `MsvAvFlags` bit 0x2: the AUTHENTICATE_MESSAGE carries a MIC.
+const MSV_AV_FLAG_MIC: u32 = 0x0000_0002;
+
+/// Offset of the AV_PAIR list in an NTLMv2 response: NTProofStr (16) and
+/// the NTLMv2_CLIENT_CHALLENGE header up to AvPairs (28).
+const NTLMV2_AV_PAIRS_OFFSET: usize = 44;
+
+/// `MsvAvFlags` from the AV_PAIR list of an NTLMv2 response, or 0 when the
+/// response has no such entry or no parseable list.
+fn ntlmv2_av_flags(nt_response: &[u8]) -> u32 {
+    let Some(list) = nt_response.get(NTLMV2_AV_PAIRS_OFFSET..) else {
+        return 0;
+    };
+    let Ok(pairs) = decode_av_pairs(list) else {
+        return 0;
+    };
+    pairs
+        .iter()
+        .find(|p| p.id == AvId::Flags as u16)
+        .and_then(|p| p.value.get(..4))
+        .map_or(0, |v| u32::from_le_bytes([v[0], v[1], v[2], v[3]]))
+}
+
+/// RC4K(key, data) from MS-NLMP 6.
+fn rc4k(key: &[u8; 16], data: &[u8; 16]) -> [u8; 16] {
+    let mut out = *data;
+    Rc4::new_from_slice(key)
+        .expect("RC4 accepts a 16-byte key")
+        .apply_keystream(&mut out);
+    out
+}
+
+fn md5_concat(key: &[u8], constant: &[u8]) -> [u8; 16] {
+    let mut h = Md5::new();
+    h.update(key);
+    h.update(constant);
+    h.finalize().into()
+}
+
+/// Which side's keys an [`NtlmMac`] uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    ClientToServer,
+    ServerToClient,
+}
+
+/// NTLM message integrity for one direction, with extended session security
+/// (MS-NLMP 3.4.4.2). Keys come from SIGNKEY and SEALKEY (3.4.5.2, 3.4.5.3).
+pub struct NtlmMac {
+    signing_key: [u8; 16],
+    /// RC4 state over the sealing key. The checksum is encrypted with it
+    /// when NTLMSSP_NEGOTIATE_KEY_EXCH is negotiated.
+    handle: Option<Rc4>,
+    seq: u32,
+}
+
+impl NtlmMac {
+    /// Integrity state for `direction`, or `None` when the flags do not
+    /// negotiate both extended session security and signing or sealing.
+    pub fn new(flags: u32, exported_session_key: &[u8; 16], direction: Direction) -> Option<Self> {
+        if flags & flags::NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY == 0
+            || flags & (flags::NTLMSSP_NEGOTIATE_SIGN | flags::NTLMSSP_NEGOTIATE_SEAL) == 0
+        {
+            return None;
+        }
+        let (sign_magic, seal_magic): (&[u8], &[u8]) = match direction {
+            Direction::ClientToServer => (
+                b"session key to client-to-server signing key magic constant\0",
+                b"session key to client-to-server sealing key magic constant\0",
+            ),
+            Direction::ServerToClient => (
+                b"session key to server-to-client signing key magic constant\0",
+                b"session key to server-to-client sealing key magic constant\0",
+            ),
+        };
+        let seal_len = if flags & flags::NTLMSSP_NEGOTIATE_128 != 0 {
+            16
+        } else if flags & flags::NTLMSSP_NEGOTIATE_56 != 0 {
+            7
+        } else {
+            5
+        };
+        let sealing_key = md5_concat(&exported_session_key[..seal_len], seal_magic);
+        let handle = (flags & flags::NTLMSSP_NEGOTIATE_KEY_EXCH != 0)
+            .then(|| Rc4::new_from_slice(&sealing_key).expect("RC4 accepts a 16-byte key"));
+        Some(Self {
+            signing_key: md5_concat(exported_session_key, sign_magic),
+            handle,
+            seq: 0,
+        })
+    }
+
+    /// NTLMSSP_MESSAGE_SIGNATURE of `message` at the next sequence number.
+    pub fn mac(&mut self, message: &[u8]) -> [u8; 16] {
+        let mut hmac = HmacMd5::new_from_slice(&self.signing_key).expect("hmac key");
+        hmac.update(&self.seq.to_le_bytes());
+        hmac.update(message);
+        let digest = hmac.finalize().into_bytes();
+        let mut checksum = [0u8; 8];
+        checksum.copy_from_slice(&digest[..8]);
+        if let Some(handle) = self.handle.as_mut() {
+            handle.apply_keystream(&mut checksum);
+        }
+        let mut out = [0u8; 16];
+        out[..4].copy_from_slice(&1u32.to_le_bytes());
+        out[4..12].copy_from_slice(&checksum);
+        out[12..].copy_from_slice(&self.seq.to_le_bytes());
+        self.seq = self.seq.wrapping_add(1);
+        out
+    }
+
+    /// Checks `signature` against the MAC of `message`, in constant time.
+    pub fn verify(&mut self, message: &[u8], signature: &[u8]) -> bool {
+        ct_eq_16(&self.mac(message), signature)
+    }
+}
+
 // --- Public state machine ---------------------------------------------------
 
 /// Identity recovered from a successful (or anonymous) authentication.
@@ -500,16 +605,35 @@ pub enum Identity {
 }
 
 /// Successful authentication outcome: identity + 16-byte session key.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AuthOutcome {
     pub identity: Identity,
+    /// ExportedSessionKey (MS-NLMP 3.2.5.1.2).
     pub session_key: [u8; 16],
+    /// NegotiateFlags of the AUTHENTICATE_MESSAGE.
+    pub flags: u32,
+    /// The AUTHENTICATE_MESSAGE carried a MIC that matched.
+    pub mic_present: bool,
+}
+
+impl std::fmt::Debug for AuthOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthOutcome")
+            .field("identity", &self.identity)
+            .finish_non_exhaustive()
+    }
 }
 
 /// User record holding only the NT hash.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct UserCreds {
     pub nt_hash: [u8; 16],
+}
+
+impl std::fmt::Debug for UserCreds {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UserCreds").finish_non_exhaustive()
+    }
 }
 
 impl UserCreds {
@@ -577,6 +701,13 @@ pub struct NtlmServer {
     negotiate_bytes: Vec<u8>,
     /// Bytes of the server CHALLENGE_MESSAGE (for MIC HMAC).
     challenge_bytes: Vec<u8>,
+
+    /// DER MechTypeList of the client's SPNEGO NegTokenInit, which the
+    /// mechListMIC covers. `None` when the client sent raw NTLMSSP.
+    pub mech_list: Option<Vec<u8>>,
+    /// NTLM was not the client's preferred mechanism, so both sides must
+    /// send a mechListMIC (RFC 4178 section 5).
+    pub mech_list_mic_required: bool,
 }
 
 impl NtlmServer {
@@ -608,7 +739,14 @@ impl NtlmServer {
             negotiated_flags: server_flags,
             negotiate_bytes: Vec::new(),
             challenge_bytes: Vec::new(),
+            mech_list: None,
+            mech_list_mic_required: false,
         }
+    }
+
+    /// True once the client's NEGOTIATE_MESSAGE has been processed.
+    pub fn has_negotiate(&self) -> bool {
+        !self.negotiate_bytes.is_empty()
     }
 
     /// Record the client's NEGOTIATE_MESSAGE bytes and intersect flags.
@@ -643,31 +781,40 @@ impl NtlmServer {
     /// Validate the AUTHENTICATE_MESSAGE.
     ///
     /// `lookup` is the application's user-database hook: given the user/domain
-    /// from the wire, return `Some(UserCreds)` if known, `None` otherwise.
+    /// from the wire, return `Some(UserCreds)` if known, `None` otherwise. An
+    /// unknown user goes through the same computation as a wrong password.
     ///
     /// Returns `AuthOutcome::session_key` to be plugged into SMB2 KDF.
-    /// Anonymous logon (empty user + empty NT response) returns a zeroed key
-    /// and `Identity::Anonymous`.
+    /// Anonymous logon (empty user, empty NT response, and an empty or
+    /// single zero byte LM response) returns a zeroed key and
+    /// `Identity::Anonymous`.
     pub fn authenticate<F>(&self, blob: &[u8], lookup: F) -> ProtoResult<AuthOutcome>
     where
         F: Fn(&str, &str) -> Option<UserCreds>,
     {
         let auth = NtlmAuthenticate::parse(blob)?;
 
-        // ---- Anonymous fast path. MS-NLMP §3.2.5.1.2: empty user + empty NT
-        // response (or single-zero-byte LM response) means anonymous logon.
-        if auth.user.is_empty() && auth.nt_response.is_empty() {
+        // ---- Anonymous (MS-NLMP 3.2.5.1.2 NullSession).
+        if auth.user.is_empty()
+            && auth.nt_response.is_empty()
+            && (auth.lm_response.is_empty() || auth.lm_response == [0])
+        {
             return Ok(AuthOutcome {
                 identity: Identity::Anonymous,
                 session_key: [0u8; 16],
+                flags: auth.flags,
+                mic_present: false,
             });
         }
 
-        // ---- Locate creds.
-        let creds = lookup(&auth.user, &auth.domain).ok_or(ProtoError::Auth("unknown user"))?;
+        // ---- Locate creds. An unknown user is checked against a fixed hash
+        // so that it takes as long as a wrong password.
+        let creds = lookup(&auth.user, &auth.domain);
+        let known_user = creds.is_some();
+        let nt_hash = creds.map_or([0u8; 16], |c| c.nt_hash);
 
         // ---- NTOWFv2 = HMAC_MD5(NT_hash, UTF-16LE(UPPER(user) || domain))
-        let response_key_nt = ntowf_v2(&creds.nt_hash, &auth.user, &auth.domain);
+        let response_key_nt = ntowf_v2(&nt_hash, &auth.user, &auth.domain);
 
         // ---- NTLMv2 response layout (MS-NLMP §2.2.2.8):
         //   16 bytes NTProofStr || NTLMv2_CLIENT_CHALLENGE blob
@@ -682,7 +829,8 @@ impl NtlmServer {
         mac.update(client_challenge);
         let nt_proof_computed = mac.finalize().into_bytes();
 
-        if !ct_eq_16(nt_proof_supplied, &nt_proof_computed) {
+        let proof_ok = ct_eq_16(nt_proof_supplied, &nt_proof_computed);
+        if !(proof_ok && known_user) {
             return Err(ProtoError::Auth("NT proof mismatch"));
         }
 
@@ -694,37 +842,30 @@ impl NtlmServer {
         let mut key_exchange_key = [0u8; 16];
         key_exchange_key.copy_from_slice(&session_base_key_bytes);
 
-        // ---- Optional RC4-wrapped random session key.
-        let session_key = if (auth.flags & flags::NTLMSSP_NEGOTIATE_KEY_EXCH) != 0
-            && !auth.encrypted_random_session_key.is_empty()
-        {
-            if auth.encrypted_random_session_key.len() != 16 {
-                return Err(ProtoError::Auth("encrypted session key not 16 bytes"));
+        // ---- ExportedSessionKey. KEY_EXCH requires a 16-byte
+        // EncryptedRandomSessionKey; it is RC4-unwrapped only when signing
+        // or sealing is negotiated too.
+        let session_key = if auth.flags & flags::NTLMSSP_NEGOTIATE_KEY_EXCH != 0 {
+            let encrypted: [u8; 16] = auth
+                .encrypted_random_session_key
+                .as_slice()
+                .try_into()
+                .map_err(|_| ProtoError::Auth("encrypted session key not 16 bytes"))?;
+            if auth.flags & (flags::NTLMSSP_NEGOTIATE_SIGN | flags::NTLMSSP_NEGOTIATE_SEAL) != 0 {
+                rc4k(&key_exchange_key, &encrypted)
+            } else {
+                key_exchange_key
             }
-            let mut buf = [0u8; 16];
-            buf.copy_from_slice(&auth.encrypted_random_session_key);
-            // RC4(KeyExchangeKey) over the encrypted session key.
-            let mut rc4 = Rc4::new_from_slice(&key_exchange_key)
-                .map_err(|_| ProtoError::Auth("rc4 key length"))?;
-            rc4.apply_keystream(&mut buf);
-            buf
         } else {
             key_exchange_key
         };
 
-        // ---- MIC validation: HMAC_MD5(SessionKey, NEGOTIATE || CHALLENGE || AUTHENTICATE-with-MIC-zeroed).
-        // Validated only when the client sent a MIC and the NEGOTIATE bytes
-        // were recorded. MsvAvFlags bit 0x2 is not enforced.
-        if let (Some(mic_off), true) = (auth.mic_offset, !self.negotiate_bytes.is_empty())
-            && let Some(supplied) = auth.mic
-        {
+        // ---- MIC: HMAC_MD5(ExportedSessionKey, NEGOTIATE || CHALLENGE ||
+        // AUTHENTICATE with the MIC zeroed), required when MsvAvFlags says
+        // the message carries one.
+        if let (Some(mic_off), Some(supplied)) = (auth.mic_offset, auth.mic) {
             let mut auth_zeroed = auth.raw.clone();
-            if auth_zeroed.len() < mic_off + 16 {
-                return Err(ProtoError::Auth("MIC offset out of range"));
-            }
-            for b in &mut auth_zeroed[mic_off..mic_off + 16] {
-                *b = 0;
-            }
+            auth_zeroed[mic_off..mic_off + 16].fill(0);
             let mut mac = HmacMd5::new_from_slice(&session_key).expect("hmac key");
             mac.update(&self.negotiate_bytes);
             mac.update(&self.challenge_bytes);
@@ -741,6 +882,8 @@ impl NtlmServer {
                 domain: auth.domain.clone(),
             },
             session_key,
+            flags: auth.flags,
+            mic_present: auth.mic.is_some(),
         })
     }
 }
@@ -1013,6 +1156,20 @@ mod tests {
     }
 
     #[test]
+    fn debug_output_hides_keys() {
+        let creds = UserCreds::from_nt_hash([0xAB; 16]);
+        assert_eq!(format!("{creds:?}"), "UserCreds { .. }");
+        let outcome = AuthOutcome {
+            identity: Identity::Anonymous,
+            session_key: [0xCD; 16],
+            flags: 0,
+            mic_present: false,
+        };
+        let shown = format!("{outcome:?}");
+        assert_eq!(shown, "AuthOutcome { identity: Anonymous, .. }");
+    }
+
+    #[test]
     fn anonymous_logon() {
         let mut srv = NtlmServer::new(
             [0u8; 8],
@@ -1040,5 +1197,299 @@ mod tests {
             .expect("anonymous should succeed");
         assert_eq!(outcome.identity, Identity::Anonymous);
         assert_eq!(outcome.session_key, [0u8; 16]);
+    }
+
+    fn hmac_md5(key: &[u8], parts: &[&[u8]]) -> [u8; 16] {
+        let mut mac = HmacMd5::new_from_slice(key).unwrap();
+        for part in parts {
+            mac.update(part);
+        }
+        mac.finalize().into_bytes().into()
+    }
+
+    /// Fields of a hand-built AUTHENTICATE_MESSAGE.
+    struct AuthMsg<'a> {
+        user: &'a str,
+        password: &'a str,
+        flags: u32,
+        /// `MsvAvFlags` value to put in the NTLMv2 response.
+        av_flags: Option<u32>,
+        /// Leave room for a MIC at offset 72.
+        mic_field: bool,
+        lm: &'a [u8],
+        nt: Option<&'a [u8]>,
+        encrypted_key: &'a [u8],
+    }
+
+    impl Default for AuthMsg<'_> {
+        fn default() -> Self {
+            Self {
+                user: "User",
+                password: "Password",
+                flags: flags::NTLMSSP_NEGOTIATE_UNICODE,
+                av_flags: None,
+                mic_field: false,
+                lm: &[],
+                nt: None,
+                encrypted_key: &[],
+            }
+        }
+    }
+
+    const CHALLENGE: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef];
+
+    fn server() -> NtlmServer {
+        let mut srv = NtlmServer::new(
+            CHALLENGE,
+            NtlmTargetInfo::new("SERVER", "DOMAIN", "SERVER", "d.local", "s.d.local"),
+            0,
+        );
+        let mut negotiate = NTLMSSP_SIGNATURE.to_vec();
+        negotiate.extend_from_slice(&MSG_NEGOTIATE.to_le_bytes());
+        negotiate.extend_from_slice(&0xE288_8235u32.to_le_bytes());
+        negotiate.extend_from_slice(&[0u8; 16]);
+        srv.step1_negotiate(&negotiate).unwrap();
+        srv.challenge();
+        srv
+    }
+
+    /// The message and the KeyExchangeKey the server derives from it.
+    fn build_auth(m: &AuthMsg<'_>) -> (Vec<u8>, [u8; 16]) {
+        let key_nt = ntowf_v2(&nt_hash(m.password), m.user, "");
+        let mut blob = vec![1, 1, 0, 0, 0, 0, 0, 0];
+        blob.extend_from_slice(&[0; 8]);
+        blob.extend_from_slice(&[0xAA; 8]);
+        blob.extend_from_slice(&[0; 4]);
+        if let Some(av) = m.av_flags {
+            blob.extend_from_slice(&encode_av_pairs(&[AvPair::new(
+                AvId::Flags,
+                av.to_le_bytes().to_vec(),
+            )]));
+        } else {
+            blob.extend_from_slice(&encode_av_pairs(&[]));
+        }
+        let proof = hmac_md5(&key_nt, &[&CHALLENGE, &blob]);
+        let key_exchange_key = hmac_md5(&key_nt, &[&proof]);
+        let nt =
+            m.nt.map_or_else(|| [&proof[..], &blob].concat(), <[u8]>::to_vec);
+
+        let user = utf16le(m.user);
+        let fields: [&[u8]; 6] = [m.lm, &nt, &[], &user, &[], m.encrypted_key];
+        let header_len = if m.mic_field { 88u32 } else { 72 };
+        let mut msg = NTLMSSP_SIGNATURE.to_vec();
+        msg.extend_from_slice(&MSG_AUTHENTICATE.to_le_bytes());
+        let mut payload = Vec::new();
+        for field in fields {
+            let offset = header_len + payload.len() as u32;
+            msg.extend_from_slice(&(field.len() as u16).to_le_bytes());
+            msg.extend_from_slice(&(field.len() as u16).to_le_bytes());
+            msg.extend_from_slice(&offset.to_le_bytes());
+            payload.extend_from_slice(field);
+        }
+        msg.extend_from_slice(&m.flags.to_le_bytes());
+        msg.extend_from_slice(&[0u8; 8]);
+        if m.mic_field {
+            msg.extend_from_slice(&[0u8; 16]);
+        }
+        msg.extend_from_slice(&payload);
+        (msg, key_exchange_key)
+    }
+
+    fn sign_mic(srv: &NtlmServer, msg: &mut [u8], key: &[u8; 16]) {
+        let mic = hmac_md5(key, &[&srv.negotiate_bytes, &srv.challenge_bytes, msg]);
+        msg[72..88].copy_from_slice(&mic);
+    }
+
+    fn user_creds(u: &str, _d: &str) -> Option<UserCreds> {
+        (u == "User").then(|| UserCreds::from_password("Password"))
+    }
+
+    #[test]
+    fn mic_is_checked_when_msv_av_flags_announces_it() {
+        let srv = server();
+        let m = AuthMsg {
+            av_flags: Some(MSV_AV_FLAG_MIC),
+            mic_field: true,
+            ..AuthMsg::default()
+        };
+        let (mut msg, key) = build_auth(&m);
+        sign_mic(&srv, &mut msg, &key);
+        let outcome = srv.authenticate(&msg, user_creds).expect("valid MIC");
+        assert!(outcome.mic_present);
+
+        msg[80] ^= 1;
+        assert!(srv.authenticate(&msg, user_creds).is_err(), "bad MIC");
+
+        // MsvAvFlags announces a MIC, but the header has no room for one.
+        let m = AuthMsg {
+            av_flags: Some(MSV_AV_FLAG_MIC),
+            ..AuthMsg::default()
+        };
+        let (msg, _) = build_auth(&m);
+        assert!(srv.authenticate(&msg, user_creds).is_err(), "stripped MIC");
+    }
+
+    #[test]
+    fn padding_without_msv_av_flags_is_not_a_mic() {
+        let srv = server();
+        let m = AuthMsg {
+            mic_field: true,
+            ..AuthMsg::default()
+        };
+        let (msg, _) = build_auth(&m);
+        let outcome = srv.authenticate(&msg, user_creds).expect("no MIC");
+        assert!(!outcome.mic_present);
+    }
+
+    #[test]
+    fn key_exch_needs_a_16_byte_session_key() {
+        let srv = server();
+        let flags = flags::NTLMSSP_NEGOTIATE_UNICODE
+            | flags::NTLMSSP_NEGOTIATE_KEY_EXCH
+            | flags::NTLMSSP_NEGOTIATE_SIGN;
+        let m = AuthMsg {
+            flags,
+            ..AuthMsg::default()
+        };
+        let (msg, _) = build_auth(&m);
+        assert!(srv.authenticate(&msg, user_creds).is_err(), "empty key");
+
+        let random = [0x55u8; 16];
+        let (_, kxkey) = build_auth(&m);
+        let encrypted = rc4k(&kxkey, &random);
+        let m = AuthMsg {
+            flags,
+            encrypted_key: &encrypted,
+            ..AuthMsg::default()
+        };
+        let (msg, _) = build_auth(&m);
+        let outcome = srv.authenticate(&msg, user_creds).expect("16-byte key");
+        assert_eq!(outcome.session_key, random);
+
+        // Without SIGN or SEAL the key is checked but not unwrapped.
+        let m = AuthMsg {
+            flags: flags::NTLMSSP_NEGOTIATE_UNICODE | flags::NTLMSSP_NEGOTIATE_KEY_EXCH,
+            encrypted_key: &encrypted,
+            ..AuthMsg::default()
+        };
+        let (msg, kxkey) = build_auth(&m);
+        let outcome = srv.authenticate(&msg, user_creds).expect("no signing");
+        assert_eq!(outcome.session_key, kxkey);
+    }
+
+    #[test]
+    fn anonymous_needs_an_empty_or_zero_lm_response() {
+        let srv = server();
+        for lm in [&[][..], &[0u8][..]] {
+            let m = AuthMsg {
+                user: "",
+                nt: Some(&[]),
+                lm,
+                ..AuthMsg::default()
+            };
+            let (msg, _) = build_auth(&m);
+            let outcome = srv.authenticate(&msg, |_, _| None).expect("anonymous");
+            assert_eq!(outcome.identity, Identity::Anonymous);
+        }
+        let m = AuthMsg {
+            user: "",
+            nt: Some(&[]),
+            lm: &[0x11; 24],
+            ..AuthMsg::default()
+        };
+        let (msg, _) = build_auth(&m);
+        assert!(srv.authenticate(&msg, |_, _| None).is_err());
+    }
+
+    #[test]
+    fn unknown_user_fails() {
+        let srv = server();
+        let m = AuthMsg {
+            user: "Nobody",
+            ..AuthMsg::default()
+        };
+        let (msg, _) = build_auth(&m);
+        assert!(srv.authenticate(&msg, user_creds).is_err());
+        // Even when the response was computed against the fixed hash.
+        let m = AuthMsg {
+            user: "Nobody",
+            password: "",
+            ..AuthMsg::default()
+        };
+        let (mut msg, _) = build_auth(&m);
+        let key_nt = ntowf_v2(&[0u8; 16], "Nobody", "");
+        let nt_off = u32::from_le_bytes(msg[24..28].try_into().unwrap()) as usize;
+        let nt_len = u16::from_le_bytes(msg[20..22].try_into().unwrap()) as usize;
+        let client_blob = msg[nt_off + 16..nt_off + nt_len].to_vec();
+        let proof = hmac_md5(&key_nt, &[&CHALLENGE, &client_blob]);
+        msg[nt_off..nt_off + 16].copy_from_slice(&proof);
+        assert!(srv.authenticate(&msg, user_creds).is_err());
+    }
+
+    /// MS-NLMP 4.2.4.2.3: RC4(SessionBaseKey, RandomSessionKey).
+    #[test]
+    fn encrypted_session_key_known_answer() {
+        let session_base_key = [
+            0x8d, 0xe4, 0x0c, 0xca, 0xdb, 0xc1, 0x4a, 0x82, 0xf1, 0x5c, 0xb0, 0xad, 0x0d, 0xe9,
+            0x5c, 0xa3,
+        ];
+        let encrypted = [
+            0xc5, 0xda, 0xd2, 0x54, 0x4f, 0xc9, 0x79, 0x90, 0x94, 0xce, 0x1c, 0xe9, 0x0b, 0xc9,
+            0xd0, 0x3e,
+        ];
+        assert_eq!(rc4k(&session_base_key, &encrypted), [0x55; 16]);
+    }
+
+    /// MS-NLMP 4.2.4.4: client sealing and signing keys, and the signature
+    /// of "Plaintext" sealed and signed at sequence number 0.
+    #[test]
+    fn gss_wrap_ex_known_answer() {
+        let flags = 0xE28A_8233;
+        let mut mac = NtlmMac::new(flags, &[0x55; 16], Direction::ClientToServer).unwrap();
+        assert_eq!(
+            mac.signing_key,
+            [
+                0x47, 0x88, 0xdc, 0x86, 0x1b, 0x47, 0x82, 0xf3, 0x5d, 0x43, 0xfd, 0x98, 0xfe, 0x1a,
+                0x2d, 0x39
+            ]
+        );
+        let plaintext = utf16le("Plaintext");
+        let mut sealed = plaintext.clone();
+        mac.handle.as_mut().unwrap().apply_keystream(&mut sealed);
+        assert_eq!(
+            sealed,
+            [
+                0x54, 0xe5, 0x01, 0x65, 0xbf, 0x19, 0x36, 0xdc, 0x99, 0x60, 0x20, 0xc1, 0x81, 0x1b,
+                0x0f, 0x06, 0xfb, 0x5f
+            ]
+        );
+        assert_eq!(
+            mac.mac(&plaintext),
+            [
+                0x01, 0x00, 0x00, 0x00, 0x7f, 0xb3, 0x8e, 0xc5, 0xc5, 0x5d, 0x49, 0x76, 0x00, 0x00,
+                0x00, 0x00
+            ]
+        );
+        assert_eq!(mac.seq, 1);
+    }
+
+    #[test]
+    fn mac_needs_extended_session_security_and_signing() {
+        let key = [0x55; 16];
+        let ess = flags::NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY;
+        let sign = flags::NTLMSSP_NEGOTIATE_SIGN;
+        assert!(NtlmMac::new(sign, &key, Direction::ServerToClient).is_none());
+        assert!(NtlmMac::new(ess, &key, Direction::ServerToClient).is_none());
+        let mut mac = NtlmMac::new(ess | sign, &key, Direction::ServerToClient).unwrap();
+        assert!(mac.handle.is_none());
+        let sig = mac.mac(b"message");
+        let expected = hmac_md5(
+            &md5_concat(
+                &key,
+                b"session key to server-to-client signing key magic constant\0",
+            ),
+            &[&0u32.to_le_bytes(), b"message"],
+        );
+        assert_eq!(sig[4..12], expected[..8]);
     }
 }

@@ -67,6 +67,12 @@ pub struct Connection {
 
     /// When each SESSION_SETUP exchange in `pending_auths` started.
     pub pending_auth_started: Mutex<HashMap<u64, std::time::Instant>>,
+
+    /// The client's NEGOTIATE request, kept for FSCTL_VALIDATE_NEGOTIATE_INFO
+    /// and the session signing rules.
+    pub client_negotiate: Mutex<Option<crate::handlers::negotiate::ClientNegotiate>>,
+    /// Failed logons on this connection.
+    pub logon_failures: AtomicU32,
 }
 
 impl Connection {
@@ -86,6 +92,8 @@ impl Connection {
             disconnect: std::sync::atomic::AtomicBool::new(false),
             credits: Mutex::new(crate::conn::credits::CreditWindow::new()),
             pending_auth_started: Mutex::new(HashMap::new()),
+            client_negotiate: Mutex::new(None),
+            logon_failures: AtomicU32::new(0),
         }
     }
 

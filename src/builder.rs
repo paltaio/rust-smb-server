@@ -125,6 +125,7 @@ pub struct SmbServerBuilder {
     max_write_size: u32,
     server_guid: Option<Uuid>,
     limits: Limits,
+    auth: crate::auth_policy::AuthSettings,
 }
 
 impl Default for SmbServerBuilder {
@@ -145,6 +146,7 @@ impl SmbServerBuilder {
             max_write_size: 1024 * 1024,
             server_guid: None,
             limits: Limits::default(),
+            auth: crate::auth_policy::AuthSettings::default(),
         }
     }
 
@@ -169,6 +171,42 @@ impl SmbServerBuilder {
 
     pub fn netbios_name(mut self, name: impl Into<String>) -> Self {
         self.netbios_name = Some(name.into());
+        self
+    }
+
+    /// Require every authenticated session to sign its requests, and set
+    /// SMB2_NEGOTIATE_SIGNING_REQUIRED in the NEGOTIATE response. Anonymous
+    /// sessions have no key and stay unsigned. Off by default; a client can
+    /// still require signing for its own sessions.
+    pub fn require_signing(mut self, required: bool) -> Self {
+        self.auth.require_signing = required;
+        self
+    }
+
+    /// Most sessions one connection may hold. SESSION_SETUP past the limit
+    /// fails with STATUS_INSUFFICIENT_RESOURCES. Default 64.
+    pub fn max_sessions_per_connection(mut self, sessions: usize) -> Self {
+        self.auth.max_sessions_per_connection = sessions;
+        self
+    }
+
+    /// Most tree connects one session may hold. TREE_CONNECT past the limit
+    /// fails with STATUS_INSUFFICIENT_RESOURCES. Default 128.
+    pub fn max_trees_per_session(mut self, trees: usize) -> Self {
+        self.auth.max_trees_per_session = trees;
+        self
+    }
+
+    /// Failed-logon throttle. After `max_failures` failed logons for one
+    /// user name, each within `lockout` of the one before, logons with that
+    /// name fail with STATUS_ACCOUNT_LOCKED_OUT until `lockout` has passed
+    /// since the last failure. A connection is closed after `max_failures`
+    /// failed logons. Unknown names are tracked the same way as configured
+    /// ones. `max_failures` 0 turns the throttle off. Default 10 failures
+    /// and 60 seconds.
+    pub fn logon_throttle(mut self, max_failures: u32, lockout: std::time::Duration) -> Self {
+        self.auth.max_logon_failures = max_failures;
+        self.auth.lockout = lockout;
         self
     }
 
@@ -328,6 +366,7 @@ impl SmbServerBuilder {
         };
 
         let state = ServerState::new(cfg, users, share_bindings);
+        let state = state.with_auth(self.auth);
         Ok(SmbServer::from_state(state))
     }
 }
