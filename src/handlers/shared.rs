@@ -9,7 +9,7 @@ use tracing::warn;
 
 use crate::conn::state::{Connection, Open, Session, TreeConnect};
 use crate::ntstatus;
-use crate::path::{SmbPath, rebase, same_path};
+use crate::path::{SmbPath, rebase};
 use crate::server::{ServerState, ShareBindings};
 
 /// Look up the session and tree referenced by `hdr`, returning the tree
@@ -81,23 +81,6 @@ async fn share_opens(server: &ServerState, share: &Arc<ShareBindings>) -> Vec<Ar
         }
     }
     out
-}
-
-/// True if an open on `share`, on any connection, currently has `path` as
-/// its path. Opens made through another name for the same file, such as a
-/// hard link, are not seen.
-pub async fn path_is_open(
-    server: &ServerState,
-    share: &Arc<ShareBindings>,
-    path: &SmbPath,
-) -> bool {
-    let case_sensitive = share.backend.capabilities().case_sensitive;
-    for open_arc in share_opens(server, share).await {
-        if same_path(&open_arc.read().await.last_path, path, case_sensitive) {
-            return true;
-        }
-    }
-    false
 }
 
 /// Moves every open on `share` whose path is `from`, or lies below it, to

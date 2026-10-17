@@ -1,0 +1,578 @@
+//! SMB2 client and backends for the open, lock, write and teardown tests.
+
+#![allow(dead_code, reason = "each test crate uses part of the helpers")]
+
+#[path = "common/mod.rs"]
+pub mod common;
+
+use std::net::SocketAddr;
+use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+
+use smb_server::wire::header::Command;
+use smb_server::wire::messages::{
+    CloseRequest, CloseResponse, CreateRequest, CreateResponse, FileId, FlushRequest, LockElement,
+    LockRequest, LogoffRequest, NegotiateRequest, NegotiateResponse, ReadRequest, ReadResponse,
+    SetInfoRequest, TreeDisconnectRequest, WriteRequest, WriteResponse,
+};
+use smb_server::{
+    BackendCapabilities, Bytes, ConfigHandle, DirEntry, FileInfo, FileTimes, Handle,
+    LocalFsBackend, OpenAction, OpenOptions, Share, ShareBackend, SmbPath, SmbResult, SmbServer,
+    SmbServerBuilder,
+};
+use tokio::net::TcpStream;
+use tokio::sync::Semaphore;
+use tokio::task::JoinHandle;
+
+use self::common::{
+    STATUS_SUCCESS, anonymous_session_setup, build_header, negotiate, parse_response_header,
+    read_frame, tree_connect, utf16le, write_frame,
+};
+
+pub const FILE_READ_DATA: u32 = 0x0000_0001;
+pub const FILE_WRITE_DATA: u32 = 0x0000_0002;
+pub const FILE_APPEND_DATA: u32 = 0x0000_0004;
+pub const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
+pub const DELETE: u32 = 0x0001_0000;
+pub const SYNCHRONIZE: u32 = 0x0010_0000;
+pub const FILE_GENERIC_READ: u32 = 0x0012_0089;
+pub const FILE_GENERIC_WRITE: u32 = 0x0012_0116;
+pub const RW: u32 = FILE_GENERIC_READ | FILE_GENERIC_WRITE;
+
+pub const SHARE_READ: u32 = 0x1;
+pub const SHARE_WRITE: u32 = 0x2;
+pub const SHARE_DELETE: u32 = 0x4;
+pub const SHARE_ALL: u32 = 0x7;
+
+pub const FILE_SUPERSEDE: u32 = 0;
+pub const FILE_OPEN: u32 = 1;
+pub const FILE_CREATE: u32 = 2;
+pub const FILE_OPEN_IF: u32 = 3;
+pub const FILE_OVERWRITE: u32 = 4;
+pub const FILE_OVERWRITE_IF: u32 = 5;
+
+pub const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
+pub const FILE_WRITE_THROUGH: u32 = 0x0000_0002;
+pub const FILE_NO_INTERMEDIATE_BUFFERING: u32 = 0x0000_0008;
+pub const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
+pub const FILE_DELETE_ON_CLOSE: u32 = 0x0000_1000;
+pub const FILE_OPEN_BY_FILE_ID: u32 = 0x0000_2000;
+pub const FILE_RESERVE_OPFILTER: u32 = 0x0010_0000;
+
+pub const FILE_ATTRIBUTE_READONLY: u32 = 0x1;
+
+pub const FILE_DISPOSITION_INFORMATION: u8 = 0x0D;
+pub const FILE_RENAME_INFORMATION: u8 = 0x0A;
+pub const FILE_END_OF_FILE_INFORMATION: u8 = 0x14;
+
+pub const LOCK_SHARED: u32 = LockElement::FLAG_SHARED_LOCK;
+pub const LOCK_EXCLUSIVE: u32 = LockElement::FLAG_EXCLUSIVE_LOCK;
+pub const LOCK_UNLOCK: u32 = LockElement::FLAG_UNLOCK;
+pub const LOCK_FAIL_IMMEDIATELY: u32 = LockElement::FLAG_FAIL_IMMEDIATELY;
+
+/// A server on a loopback port with its configuration handle.
+pub struct Server {
+    pub addr: SocketAddr,
+    pub config: ConfigHandle,
+    task: JoinHandle<()>,
+}
+
+impl Server {
+    pub async fn start(builder: SmbServerBuilder) -> Self {
+        let server = builder
+            .listen("127.0.0.1:0".parse().unwrap())
+            .build()
+            .expect("build");
+        let config = server.config_handle();
+        let addr = server.bind().await.expect("bind");
+        let task = tokio::spawn(async move {
+            let _ = server.serve().await;
+        });
+        Self { addr, config, task }
+    }
+
+    /// A server with one public share `share` on `backend`.
+    pub async fn public(backend: impl ShareBackend) -> Self {
+        Self::start(SmbServer::builder().share(Share::new("share", backend).public())).await
+    }
+
+    /// An anonymous client on `share`, negotiated at SMB 2.1.
+    pub async fn client(&self) -> Client {
+        Client::connect(self.addr, None).await
+    }
+
+    /// An anonymous client on `share`, negotiated at `dialect`.
+    pub async fn client_at(&self, dialect: u16) -> Client {
+        Client::connect(self.addr, Some(dialect)).await
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Status and body of a response.
+pub type Reply = (u32, Vec<u8>);
+
+/// A connected client with one session and one tree.
+pub struct Client {
+    pub s: TcpStream,
+    pub session_id: u64,
+    pub tree_id: u32,
+    next_mid: u64,
+}
+
+/// Fields of a CREATE request; `Default` opens an existing file for reading
+/// and writing, sharing everything.
+#[derive(Clone)]
+pub struct Create<'a> {
+    pub name: &'a str,
+    pub access: u32,
+    pub share: u32,
+    pub disposition: u32,
+    pub options: u32,
+    pub attributes: u32,
+    pub contexts: Vec<u8>,
+}
+
+impl Default for Create<'_> {
+    fn default() -> Self {
+        Self {
+            name: "",
+            access: RW,
+            share: SHARE_ALL,
+            disposition: FILE_OPEN,
+            options: 0,
+            attributes: 0,
+            contexts: Vec::new(),
+        }
+    }
+}
+
+impl Client {
+    pub async fn connect(addr: SocketAddr, dialect: Option<u16>) -> Self {
+        let mut s = TcpStream::connect(addr).await.expect("connect");
+        match dialect {
+            None => {
+                let _ = negotiate(&mut s).await;
+            }
+            Some(d) => negotiate_dialect(&mut s, d).await,
+        }
+        let session_id = anonymous_session_setup(&mut s).await;
+        let tree_id = tree_connect(&mut s, "\\\\127.0.0.1\\share", session_id, 3).await;
+        Self {
+            s,
+            session_id,
+            tree_id,
+            next_mid: 4,
+        }
+    }
+
+    /// A client on a connection that already has a session and a tree.
+    pub fn from_parts(s: TcpStream, session_id: u64, tree_id: u32) -> Self {
+        Self {
+            s,
+            session_id,
+            tree_id,
+            next_mid: 4,
+        }
+    }
+
+    /// Sends a request on this client's session and tree.
+    pub async fn send(&mut self, command: Command, body: &[u8]) -> Reply {
+        let hdr = build_header(command, self.next_mid, self.session_id, self.tree_id);
+        self.next_mid += 1;
+        write_frame(&mut self.s, &hdr, body).await;
+        let resp = read_frame(&mut self.s).await;
+        let (rh, rb) = parse_response_header(&resp);
+        assert_eq!(rh.command, command);
+        (rh.channel_sequence_status, rb.to_vec())
+    }
+
+    pub async fn create(&mut self, c: Create<'_>) -> Result<CreateResponse, u32> {
+        let mut name = utf16le(c.name);
+        let name_length = name.len() as u16;
+        name.resize(name.len().next_multiple_of(8), 0);
+        let contexts_offset = if c.contexts.is_empty() {
+            0
+        } else {
+            0x78 + name.len() as u32
+        };
+        let req = CreateRequest {
+            structure_size: 57,
+            security_flags: 0,
+            requested_oplock_level: 0,
+            impersonation_level: 2,
+            smb_create_flags: 0,
+            reserved: 0,
+            desired_access: c.access,
+            file_attributes: c.attributes,
+            share_access: c.share,
+            create_disposition: c.disposition,
+            create_options: c.options,
+            name_offset: 0x78,
+            name_length,
+            create_contexts_offset: contexts_offset,
+            create_contexts_length: c.contexts.len() as u32,
+            name,
+            create_contexts: c.contexts,
+        };
+        let mut body = Vec::new();
+        req.write_to(&mut body).expect("write");
+        let (status, rb) = self.send(Command::Create, &body).await;
+        if status != STATUS_SUCCESS {
+            return Err(status);
+        }
+        Ok(CreateResponse::parse(&rb).expect("parse create"))
+    }
+
+    /// Opens an existing file with `access` and `share`; returns its FileId.
+    pub async fn open(&mut self, name: &str, access: u32, share: u32) -> Result<FileId, u32> {
+        self.create(Create {
+            name,
+            access,
+            share,
+            ..Create::default()
+        })
+        .await
+        .map(|r| r.file_id)
+    }
+
+    pub async fn close_with(
+        &mut self,
+        file_id: FileId,
+        flags: u16,
+    ) -> (u32, Option<CloseResponse>) {
+        let req = CloseRequest {
+            structure_size: 24,
+            flags,
+            reserved: 0,
+            file_id,
+        };
+        let mut body = Vec::new();
+        req.write_to(&mut body).expect("write");
+        let (status, rb) = self.send(Command::Close, &body).await;
+        let resp = (status == STATUS_SUCCESS).then(|| CloseResponse::parse(&rb).expect("parse"));
+        (status, resp)
+    }
+
+    pub async fn close(&mut self, file_id: FileId) {
+        assert_eq!(self.close_with(file_id, 0).await.0, STATUS_SUCCESS);
+    }
+
+    pub async fn read_full(
+        &mut self,
+        file_id: FileId,
+        offset: u64,
+        length: u32,
+        minimum_count: u32,
+        channel: u32,
+    ) -> Result<Vec<u8>, u32> {
+        let req = ReadRequest {
+            structure_size: 49,
+            padding: ReadResponse::STANDARD_DATA_OFFSET,
+            flags: 0,
+            length,
+            offset,
+            file_id,
+            minimum_count,
+            channel,
+            remaining_bytes: 0,
+            read_channel_info_offset: 0,
+            read_channel_info_length: 0,
+            buffer: vec![0],
+        };
+        let mut body = Vec::new();
+        req.write_to(&mut body).expect("write");
+        let (status, rb) = self.send(Command::Read, &body).await;
+        if status != STATUS_SUCCESS {
+            return Err(status);
+        }
+        Ok(ReadResponse::parse(&rb).expect("parse read").data)
+    }
+
+    pub async fn read(
+        &mut self,
+        file_id: FileId,
+        offset: u64,
+        length: u32,
+    ) -> Result<Vec<u8>, u32> {
+        self.read_full(file_id, offset, length, 0, 0).await
+    }
+
+    /// WRITE with every field given. `data` follows the fixed part as is, so
+    /// it holds any padding a `data_offset` above 0x70 needs.
+    pub async fn write_raw(&mut self, req: WriteRequest) -> Result<u32, u32> {
+        let mut body = Vec::new();
+        req.write_to(&mut body).expect("write");
+        let (status, rb) = self.send(Command::Write, &body).await;
+        if status != STATUS_SUCCESS {
+            return Err(status);
+        }
+        Ok(WriteResponse::parse(&rb).expect("parse write").count)
+    }
+
+    pub async fn write(&mut self, file_id: FileId, offset: u64, data: &[u8]) -> Result<u32, u32> {
+        self.write_raw(write_request(file_id, offset, data)).await
+    }
+
+    pub async fn lock(&mut self, file_id: FileId, locks: &[(u64, u64, u32)]) -> u32 {
+        let req = LockRequest {
+            structure_size: 48,
+            lock_count: locks.len() as u16,
+            lock_sequence: 0,
+            file_id,
+            locks: locks
+                .iter()
+                .map(|&(offset, length, flags)| LockElement {
+                    offset,
+                    length,
+                    flags,
+                    reserved: 0,
+                })
+                .collect(),
+        };
+        let mut body = Vec::new();
+        req.write_to(&mut body).expect("write");
+        self.send(Command::Lock, &body).await.0
+    }
+
+    pub async fn set_info_raw(
+        &mut self,
+        file_id: FileId,
+        info_type: u8,
+        class: u8,
+        buffer: Vec<u8>,
+    ) -> u32 {
+        let req = SetInfoRequest {
+            structure_size: 33,
+            info_type,
+            file_information_class: class,
+            buffer_length: buffer.len() as u32,
+            buffer_offset: 0x60,
+            reserved: 0,
+            additional_information: 0,
+            file_id,
+            buffer,
+        };
+        let mut body = Vec::new();
+        req.write_to(&mut body).expect("write");
+        self.send(Command::SetInfo, &body).await.0
+    }
+
+    pub async fn set_info(&mut self, file_id: FileId, class: u8, buffer: Vec<u8>) -> u32 {
+        self.set_info_raw(file_id, 1, class, buffer).await
+    }
+
+    pub async fn set_delete(&mut self, file_id: FileId, delete: bool) -> u32 {
+        self.set_info(file_id, FILE_DISPOSITION_INFORMATION, vec![delete.into()])
+            .await
+    }
+
+    pub async fn flush(&mut self, file_id: FileId) -> u32 {
+        let req = FlushRequest::new(file_id.persistent, file_id.volatile);
+        let mut body = Vec::new();
+        req.write_to(&mut body).expect("write");
+        self.send(Command::Flush, &body).await.0
+    }
+
+    pub async fn tree_disconnect(&mut self) -> u32 {
+        let mut body = Vec::new();
+        TreeDisconnectRequest::default()
+            .write_to(&mut body)
+            .expect("write");
+        self.send(Command::TreeDisconnect, &body).await.0
+    }
+
+    pub async fn logoff(&mut self) -> u32 {
+        let mut body = Vec::new();
+        LogoffRequest::default().write_to(&mut body).expect("write");
+        self.send(Command::Logoff, &body).await.0
+    }
+}
+
+/// A WRITE of `data` at `offset` with the data right after the fixed part.
+pub fn write_request(file_id: FileId, offset: u64, data: &[u8]) -> WriteRequest {
+    WriteRequest {
+        structure_size: 49,
+        data_offset: WriteRequest::STANDARD_DATA_OFFSET,
+        length: data.len() as u32,
+        offset,
+        file_id,
+        channel: 0,
+        remaining_bytes: 0,
+        write_channel_info_offset: 0,
+        write_channel_info_length: 0,
+        flags: 0,
+        data: data.to_vec(),
+    }
+}
+
+/// NEGOTIATE offering only `dialect` (2.x or 3.0 to 3.0.2).
+pub async fn negotiate_dialect(s: &mut TcpStream, dialect: u16) {
+    let req = NegotiateRequest {
+        structure_size: 36,
+        dialect_count: 1,
+        security_mode: 0x0001,
+        reserved: 0,
+        capabilities: 0,
+        client_guid: [0xCD; 16],
+        negotiate_context_offset_or_client_start_time: 0,
+        dialects: vec![dialect],
+    };
+    let mut body = Vec::new();
+    req.write_to(&mut body).expect("write negotiate");
+    write_frame(s, &build_header(Command::Negotiate, 0, 0, 0), &body).await;
+    let resp = read_frame(s).await;
+    let (rh, rb) = parse_response_header(&resp);
+    assert_eq!(rh.channel_sequence_status, STATUS_SUCCESS);
+    let resp = NegotiateResponse::parse(rb).expect("parse negotiate");
+    assert_eq!(resp.dialect_revision, dialect);
+}
+
+/// Waits up to two seconds for `done` to hold.
+pub async fn eventually(mut done: impl FnMut() -> bool) -> bool {
+    for _ in 0..200 {
+        if done() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    done()
+}
+
+pub fn local(root: &Path) -> LocalFsBackend {
+    LocalFsBackend::new(root).expect("open root")
+}
+
+// ---------------------------------------------------------------------------
+// Instrumented backend
+// ---------------------------------------------------------------------------
+
+/// Counters and gates shared by a [`Probe`] backend and the test.
+#[derive(Default)]
+pub struct Counters {
+    pub opens: AtomicUsize,
+    pub closes: AtomicUsize,
+    pub flushes: AtomicUsize,
+    pub stats: AtomicUsize,
+    /// Stats after this many fail; 0 for never.
+    pub fail_stats_after: AtomicUsize,
+    /// When set, every open waits for a permit.
+    pub open_gate: Option<Semaphore>,
+    /// When set, every read waits for a permit.
+    pub read_gate: Option<Semaphore>,
+}
+
+impl Counters {
+    pub fn get(n: &AtomicUsize) -> usize {
+        n.load(Ordering::SeqCst)
+    }
+}
+
+/// `LocalFsBackend` that counts handle calls and can hold opens and reads.
+pub struct Probe {
+    pub inner: LocalFsBackend,
+    pub counters: Arc<Counters>,
+}
+
+impl Probe {
+    pub fn new(root: &Path, counters: Counters) -> (Self, Arc<Counters>) {
+        let counters = Arc::new(counters);
+        let probe = Self {
+            inner: local(root),
+            counters: Arc::clone(&counters),
+        };
+        (probe, counters)
+    }
+}
+
+#[async_trait::async_trait]
+impl ShareBackend for Probe {
+    async fn open(
+        &self,
+        path: &SmbPath,
+        opts: OpenOptions,
+    ) -> SmbResult<(Box<dyn Handle>, OpenAction)> {
+        if let Some(gate) = &self.counters.open_gate {
+            gate.acquire().await.expect("gate").forget();
+        }
+        let (inner, action) = self.inner.open(path, opts).await?;
+        self.counters.opens.fetch_add(1, Ordering::SeqCst);
+        let handle = ProbeHandle {
+            inner,
+            counters: Arc::clone(&self.counters),
+        };
+        Ok((Box::new(handle), action))
+    }
+
+    async fn unlink(&self, path: &SmbPath) -> SmbResult<()> {
+        self.inner.unlink(path).await
+    }
+
+    async fn rename(&self, from: &SmbPath, to: &SmbPath, replace_if_exists: bool) -> SmbResult<()> {
+        self.inner.rename(from, to, replace_if_exists).await
+    }
+
+    fn capabilities(&self) -> BackendCapabilities {
+        self.inner.capabilities()
+    }
+}
+
+struct ProbeHandle {
+    inner: Box<dyn Handle>,
+    counters: Arc<Counters>,
+}
+
+#[async_trait::async_trait]
+impl Handle for ProbeHandle {
+    async fn read(&self, offset: u64, len: u32) -> SmbResult<Bytes> {
+        if let Some(gate) = &self.counters.read_gate {
+            gate.acquire().await.expect("gate").forget();
+        }
+        self.inner.read(offset, len).await
+    }
+
+    async fn write(&self, offset: u64, data: &[u8]) -> SmbResult<u32> {
+        self.inner.write(offset, data).await
+    }
+
+    async fn flush(&self) -> SmbResult<()> {
+        self.counters.flushes.fetch_add(1, Ordering::SeqCst);
+        self.inner.flush().await
+    }
+
+    async fn stat(&self) -> SmbResult<FileInfo> {
+        let n = self.counters.stats.fetch_add(1, Ordering::SeqCst) + 1;
+        let limit = self.counters.fail_stats_after.load(Ordering::SeqCst);
+        if limit != 0 && n > limit {
+            return Err(smb_server::SmbError::NotSupported);
+        }
+        self.inner.stat().await
+    }
+
+    async fn set_times(&self, times: FileTimes) -> SmbResult<()> {
+        self.inner.set_times(times).await
+    }
+
+    async fn set_attributes(&self, attributes: u32) -> SmbResult<()> {
+        self.inner.set_attributes(attributes).await
+    }
+
+    async fn truncate(&self, len: u64) -> SmbResult<()> {
+        self.inner.truncate(len).await
+    }
+
+    async fn list_dir(&self, pattern: Option<&str>) -> SmbResult<Vec<DirEntry>> {
+        self.inner.list_dir(pattern).await
+    }
+
+    async fn close(self: Box<Self>) -> SmbResult<()> {
+        self.counters.closes.fetch_add(1, Ordering::SeqCst);
+        self.inner.close().await
+    }
+}

@@ -230,8 +230,9 @@ impl CreateContext {
             let data = if data_length == 0 {
                 Vec::new()
             } else {
-                entry
-                    .get(data_offset..data_offset + data_length)
+                data_offset
+                    .checked_add(data_length)
+                    .and_then(|end| entry.get(data_offset..end))
                     .ok_or(ProtoError::Malformed("create context data out of range"))?
                     .to_vec()
             };

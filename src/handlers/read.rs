@@ -9,6 +9,7 @@ use crate::access_mask::FILE_READ_DATA;
 use crate::conn::state::Connection;
 use crate::dispatch::HandlerResponse;
 use crate::handlers::shared::{lookup_open, lookup_session_tree};
+use crate::handlers::write::is_smb3;
 use crate::ntstatus;
 use crate::server::ServerState;
 
@@ -39,6 +40,16 @@ pub async fn handle(
         if open.granted_access & FILE_READ_DATA == 0 {
             return HandlerResponse::err(ntstatus::STATUS_ACCESS_DENIED);
         }
+        // Every connection is TCP, so an RDMA channel is never valid.
+        if is_smb3(*conn.dialect.read().await) && req.channel != 0 {
+            return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
+        }
+        if req.length > 0
+            && let Some(file) = open.file.as_ref()
+            && let Err(status) = file.check_io(req.offset, req.length.into(), false)
+        {
+            return HandlerResponse::err(status);
+        }
         match open.handle.as_ref() {
             Some(h) => h.read(req.offset, req.length).await,
             None => return HandlerResponse::err(ntstatus::STATUS_FILE_CLOSED),
@@ -48,7 +59,8 @@ pub async fn handle(
         Ok(b) => b,
         Err(e) => return HandlerResponse::err(e.to_nt_status()),
     };
-    if bytes.is_empty() && req.length > 0 {
+    // MS-SMB2 3.3.5.12: fewer bytes than MinimumCount is end of file.
+    if (bytes.is_empty() && req.length > 0) || bytes.len() < req.minimum_count as usize {
         return HandlerResponse::err(ntstatus::STATUS_END_OF_FILE);
     }
     let resp = ReadResponse {

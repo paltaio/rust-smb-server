@@ -32,12 +32,21 @@ pub struct ReadRequest {
     pub remaining_bytes: u32,
     pub read_channel_info_offset: u16,
     pub read_channel_info_length: u16,
-    /// MS-SMB2: "If ReadChannelInfoOffset and ReadChannelInfoLength are both
-    /// 0, the client MUST set this field to a single 0 byte." The buffer
-    /// always holds at least one byte on the wire.
-    #[br(parse_with = super::read_buf, args(if read_channel_info_length == 0 { 1 } else { read_channel_info_length as usize }))]
+    /// The channel information: `read_channel_info_length` bytes at
+    /// `read_channel_info_offset`, counted from the start of the SMB2 header
+    /// and not before the end of the fixed fields. Empty when the length is
+    /// 0; the single padding byte a client sends then is not read.
+    #[br(parse_with = super::read_buf_at, args(
+        read_channel_info_offset.into(),
+        read_channel_info_length as usize,
+        READ_BUFFER_OFFSET,
+    ))]
     pub buffer: Vec<u8>,
 }
+
+/// Offset of the first byte after the fixed READ request fields, counted
+/// from the start of the SMB2 header: 64 + 48.
+const READ_BUFFER_OFFSET: u64 = 0x70;
 
 impl ReadRequest {
     /// Flag: SMB2_READFLAG_READ_UNBUFFERED (3.0.2+).
@@ -114,10 +123,13 @@ mod tests {
             remaining_bytes: 0,
             read_channel_info_offset: 0,
             read_channel_info_length: 0,
-            buffer: vec![0],
+            buffer: vec![],
         };
         let mut buf = Vec::new();
         r.write_to(&mut buf).unwrap();
+        assert_eq!(ReadRequest::parse(&buf).unwrap(), r);
+        // The padding byte a client sends with no channel information.
+        buf.push(0);
         assert_eq!(ReadRequest::parse(&buf).unwrap(), r);
     }
 

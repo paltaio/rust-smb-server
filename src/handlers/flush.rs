@@ -5,6 +5,7 @@ use std::sync::Arc;
 use crate::proto::header::Smb2Header;
 use crate::proto::messages::{FileId, FlushRequest, FlushResponse};
 
+use crate::access_mask::{FILE_APPEND_DATA, FILE_WRITE_DATA};
 use crate::conn::state::Connection;
 use crate::dispatch::HandlerResponse;
 use crate::handlers::shared::{lookup_open, lookup_session_tree};
@@ -32,6 +33,10 @@ pub async fn handle(
     };
     let res = {
         let open = open_arc.read().await;
+        // MS-SMB2 3.3.5.11: flushing a file needs write access.
+        if !open.is_directory && open.granted_access & (FILE_WRITE_DATA | FILE_APPEND_DATA) == 0 {
+            return HandlerResponse::err(ntstatus::STATUS_ACCESS_DENIED);
+        }
         match open.handle.as_ref() {
             Some(h) => h.flush().await,
             None => return HandlerResponse::err(ntstatus::STATUS_FILE_CLOSED),

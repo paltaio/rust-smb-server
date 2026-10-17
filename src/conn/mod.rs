@@ -41,6 +41,7 @@ pub async fn connection_loop(stream: TcpStream, server: Arc<ServerState>) -> io:
     debug!(?reader_result, "reader exited");
     // Wait for writer to drain.
     let _ = writer_handle.await;
+    conn.close_all().await;
     server.active_connections.unregister(conn_id).await;
     info!("connection closed");
     reader_result

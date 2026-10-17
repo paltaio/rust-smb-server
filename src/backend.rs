@@ -64,6 +64,18 @@ impl Default for OpenOptions {
     }
 }
 
+/// What `ShareBackend::open` did to the file (MS-SMB2 2.2.14 CreateAction).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenAction {
+    /// An existing file or directory was opened.
+    Opened,
+    /// A new file or directory was created.
+    Created,
+    /// An existing file was truncated to zero length, as
+    /// [`OpenIntent::Truncate`] and [`OpenIntent::OverwriteOrCreate`] do.
+    Overwritten,
+}
+
 // ---------------------------------------------------------------------------
 // FileInfo / DirEntry / FileTimes
 // ---------------------------------------------------------------------------
@@ -189,8 +201,17 @@ pub struct BackendCapabilities {
 /// per-request handlers freely.
 #[async_trait]
 pub trait ShareBackend: Send + Sync + 'static {
-    /// Open or create a file or directory. Returns a fresh handle.
-    async fn open(&self, path: &SmbPath, opts: OpenOptions) -> SmbResult<Box<dyn Handle>>;
+    /// Open or create a file or directory. Returns a fresh handle and what
+    /// the open did to the file.
+    ///
+    /// Fail with [`SmbError::PathNotFound`] when a directory on the way to
+    /// `path` is missing and [`SmbError::NotFound`] when only the last
+    /// component is.
+    async fn open(
+        &self,
+        path: &SmbPath,
+        opts: OpenOptions,
+    ) -> SmbResult<(Box<dyn Handle>, OpenAction)>;
 
     /// Delete a file or an empty directory.
     async fn unlink(&self, path: &SmbPath) -> SmbResult<()>;
@@ -211,8 +232,8 @@ pub trait ShareBackend: Send + Sync + 'static {
 
 /// A live open file or directory handle.
 ///
-/// One handle per `CREATE`. The handle is dropped when CLOSE arrives or the
-/// session goes away.
+/// One handle per `CREATE`. `close` runs when CLOSE arrives, and when the
+/// tree, session or connection the open belongs to ends.
 #[async_trait]
 pub trait Handle: Send + Sync {
     /// Read up to `len` bytes at `offset`. May return fewer.
@@ -285,7 +306,11 @@ pub(crate) struct NotSupportedBackend;
 
 #[async_trait]
 impl ShareBackend for NotSupportedBackend {
-    async fn open(&self, _path: &SmbPath, _opts: OpenOptions) -> SmbResult<Box<dyn Handle>> {
+    async fn open(
+        &self,
+        _path: &SmbPath,
+        _opts: OpenOptions,
+    ) -> SmbResult<(Box<dyn Handle>, OpenAction)> {
         Err(SmbError::NotSupported)
     }
     async fn unlink(&self, _path: &SmbPath) -> SmbResult<()> {

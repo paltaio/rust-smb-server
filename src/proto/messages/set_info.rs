@@ -19,9 +19,19 @@ pub struct SetInfoRequest {
     pub reserved: u16,
     pub additional_information: u32,
     pub file_id: FileId,
-    #[br(parse_with = super::read_buf, args(buffer_length as usize))]
+    /// `buffer_length` bytes at `buffer_offset`, counted from the start of
+    /// the SMB2 header and not before the end of the fixed fields.
+    #[br(parse_with = super::read_buf_at, args(
+        buffer_offset.into(),
+        buffer_length as usize,
+        SET_INFO_BUFFER_OFFSET,
+    ))]
     pub buffer: Vec<u8>,
 }
+
+/// Offset of the first byte after the fixed SET_INFO request fields,
+/// counted from the start of the SMB2 header: 64 + 32.
+const SET_INFO_BUFFER_OFFSET: u64 = 0x60;
 
 impl SetInfoRequest {
     pub fn parse(buf: &[u8]) -> ProtoResult<Self> {
@@ -81,6 +91,30 @@ mod tests {
         let mut buf = Vec::new();
         r.write_to(&mut buf).unwrap();
         assert_eq!(SetInfoRequest::parse(&buf).unwrap(), r);
+    }
+
+    #[test]
+    fn buffer_is_read_at_its_offset() {
+        let mut body = Vec::new();
+        SetInfoRequest {
+            structure_size: 33,
+            info_type: 0x01,
+            file_information_class: 0x14,
+            buffer_length: 8,
+            buffer_offset: 0x68,
+            reserved: 0,
+            additional_information: 0,
+            file_id: FileId::new(1, 2),
+            buffer: vec![0xEE; 8],
+        }
+        .write_to(&mut body)
+        .unwrap();
+        body.extend_from_slice(&[7; 8]);
+        assert_eq!(SetInfoRequest::parse(&body).unwrap().buffer, [7; 8]);
+
+        let mut below = body.clone();
+        below[8..10].copy_from_slice(&0x58u16.to_le_bytes());
+        assert!(SetInfoRequest::parse(&below).is_err());
     }
 
     #[test]

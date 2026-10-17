@@ -21,6 +21,7 @@ use crate::conn::connection_loop;
 use crate::conn::limits::Limits;
 use crate::conn::listener::{AcceptBackoff, configure_socket};
 use crate::conn::state::Connection;
+use crate::files::close_opens;
 use crate::utils::now_filetime;
 
 // ---------------------------------------------------------------------------
@@ -48,6 +49,8 @@ pub struct ShareBindings {
     pub acl: RwLock<ShareAcl>,
     /// `IPC$` synthetic share. Accepted at TREE_CONNECT; opens on it fail.
     pub is_ipc: bool,
+    /// Every file on the share that has an open, on any connection.
+    pub(crate) files: crate::files::FileTable,
 }
 
 impl ShareBindings {
@@ -63,6 +66,7 @@ impl ShareBindings {
             backend,
             acl: RwLock::new(ShareAcl { mode, users }),
             is_ipc,
+            files: crate::files::FileTable::default(),
         })
     }
 
@@ -199,6 +203,10 @@ pub struct ServerState {
     pub shutting_down: Arc<AtomicBool>,
     /// Signing policy, session and tree limits, and the logon throttle.
     pub auth: crate::auth_policy::AuthPolicy,
+
+    /// Opens one connection may hold at once. CREATE past it fails with
+    /// STATUS_INSUFFICIENT_RESOURCES.
+    pub max_opens_per_connection: std::sync::atomic::AtomicUsize,
 }
 
 impl ServerState {
@@ -212,6 +220,9 @@ impl ServerState {
             shutdown: Arc::new(Notify::new()),
             shutting_down: Arc::new(AtomicBool::new(false)),
             auth: crate::auth_policy::AuthPolicy::default(),
+            max_opens_per_connection: std::sync::atomic::AtomicUsize::new(
+                crate::files::DEFAULT_MAX_OPENS_PER_CONNECTION,
+            ),
         }
     }
 
@@ -261,6 +272,8 @@ pub struct ConfigHandle {
 }
 
 impl ConfigHandle {
+    /// Add a user, or replace the password of an existing one. Replacing a
+    /// password ends the user's sessions.
     pub async fn add_user(
         &self,
         name: impl Into<String>,
@@ -269,7 +282,16 @@ impl ConfigHandle {
         let name = name.into();
         validate_user_name(&name)?;
         let creds = UserCreds::from_password(password.as_ref());
-        self.state.users.table.write().await.insert(name, creds);
+        let replaced = self
+            .state
+            .users
+            .table
+            .write()
+            .await
+            .insert(name.clone(), creds.clone());
+        if replaced.is_some_and(|old| old.nt_hash != creds.nt_hash) {
+            self.close_user_sessions(&name).await;
+        }
         Ok(())
     }
 
@@ -284,9 +306,7 @@ impl ConfigHandle {
             share.acl.write().await.users.remove(name);
         }
 
-        for conn in self.state.active_connections.live().await {
-            conn.close_sessions_for_user(name).await;
-        }
+        self.close_user_sessions(name).await;
         Ok(())
     }
 
@@ -309,17 +329,19 @@ impl ConfigHandle {
 
     pub async fn remove_share(&self, name: &str) -> Result<(), ConfigError> {
         validate_share_name(name)?;
-        let removed = self.state.shares.remove(name).await;
-        if removed.is_none() {
-            return Err(ConfigError::UnknownShare(name.to_string()));
-        }
+        let removed = self
+            .state
+            .shares
+            .remove(name)
+            .await
+            .ok_or_else(|| ConfigError::UnknownShare(name.to_string()))?;
 
-        for conn in self.state.active_connections.live().await {
-            conn.close_trees_for_share(name).await;
-        }
+        self.close_share_trees(&removed, None).await;
         Ok(())
     }
 
+    /// Grant `user` `access` to a share. Lowering a user's access ends the
+    /// user's trees on the share, so it applies to open connections too.
     pub async fn grant_share_user(
         &self,
         share_name: &str,
@@ -332,6 +354,7 @@ impl ConfigHandle {
         if !users.contains_key(user) {
             return Err(ConfigError::UnknownUser(user.to_string()));
         }
+        drop(users);
         let share = self
             .state
             .find_share(share_name)
@@ -341,7 +364,12 @@ impl ConfigHandle {
         if matches!(acl.mode, ShareMode::Public | ShareMode::PublicReadOnly) {
             return Err(ConfigError::PublicMixedWithUsers(share.name.clone()));
         }
-        acl.users.insert(user.to_string(), access);
+        let previous = acl.users.insert(user.to_string(), access);
+        drop(acl);
+
+        if previous.is_some_and(|old| old.allows_write() && !access.allows_write()) {
+            self.close_share_trees(&share, Some(user)).await;
+        }
         Ok(())
     }
 
@@ -355,9 +383,7 @@ impl ConfigHandle {
             .ok_or_else(|| ConfigError::UnknownShare(share_name.to_string()))?;
         share.acl.write().await.users.remove(user);
 
-        for conn in self.state.active_connections.live().await {
-            conn.close_trees_for_user_share(user, share_name).await;
-        }
+        self.close_share_trees(&share, Some(user)).await;
         Ok(())
     }
 
@@ -382,10 +408,41 @@ impl ConfigHandle {
         acl.mode = mode;
         drop(acl);
 
-        for conn in self.state.active_connections.live().await {
-            conn.close_trees_for_share(share_name).await;
-        }
+        self.close_share_trees(&share, None).await;
         Ok(())
+    }
+
+    /// Set how many files one connection may hold open at once. A CREATE
+    /// past the limit fails with STATUS_INSUFFICIENT_RESOURCES; opens already
+    /// held stay open. The default is 16384.
+    pub fn set_max_opens_per_connection(&self, limit: usize) {
+        self.state
+            .max_opens_per_connection
+            .store(limit, Ordering::Relaxed);
+    }
+
+    /// Ends every session of `user` on every connection. All of them are
+    /// cut off before any open is closed, and closing waits for requests
+    /// still using an open.
+    async fn close_user_sessions(&self, user: &str) {
+        let mut opens = Vec::new();
+        for conn in self.state.active_connections.live().await {
+            opens.extend(conn.detach_sessions_for_user(user).await);
+        }
+        close_opens(opens).await;
+    }
+
+    /// Ends the trees on `share`, only those of `user` when given, on every
+    /// connection, cutting all of them off before closing any open.
+    async fn close_share_trees(&self, share: &Arc<ShareBindings>, user: Option<&str>) {
+        let mut opens = Vec::new();
+        for conn in self.state.active_connections.live().await {
+            opens.extend(match user {
+                Some(user) => conn.detach_trees_for_user_share(user, share).await,
+                None => conn.detach_trees_for_share(share).await,
+            });
+        }
+        close_opens(opens).await;
     }
 }
 

@@ -12,13 +12,18 @@ use crate::backend::{
 use crate::conn::state::{Connection, Open};
 use crate::dispatch::HandlerResponse;
 use crate::handlers::shared::{
-    lookup_open, lookup_session_tree, path_is_open, rename_open_paths, restore_fixed_times,
+    lookup_open, lookup_session_tree, rename_open_paths, restore_fixed_times,
 };
 use crate::info_class as ic;
 use crate::ntstatus;
 use crate::path::{SmbPath, same_path};
 use crate::server::ServerState;
 use crate::utils::utf16le_to_units;
+
+/// Classes MS-FSCC 2.4 lists as settable: Basic, Rename, Link, Disposition,
+/// Position, FullEa, Mode, Allocation, EndOfFile, Pipe, Quota,
+/// ValidDataLength, ShortName, DispositionEx and RenameEx.
+const SETTABLE_CLASSES: [u8; 15] = [4, 10, 11, 13, 14, 15, 16, 19, 20, 23, 32, 39, 40, 64, 65];
 
 /// File information classes SET_INFO applies.
 enum Class {
@@ -39,14 +44,6 @@ pub async fn handle(
         Ok(r) => r,
         Err(_) => return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER),
     };
-    let info_type = match InfoType::from_u8(req.info_type) {
-        Some(t) => t,
-        None => return HandlerResponse::err(ntstatus::STATUS_INVALID_INFO_CLASS),
-    };
-    if !matches!(info_type, InfoType::File) {
-        return HandlerResponse::err(ntstatus::STATUS_NOT_SUPPORTED);
-    }
-
     let tree_arc = match lookup_session_tree(conn, hdr).await {
         Ok(t) => t,
         Err(s) => return HandlerResponse::err(s),
@@ -55,15 +52,30 @@ pub async fn handle(
         Some(o) => o,
         None => return HandlerResponse::err(ntstatus::STATUS_FILE_CLOSED),
     };
+    if req.buffer_length == 0 {
+        return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
+    }
+    let info_type = match InfoType::from_u8(req.info_type) {
+        Some(t) => t,
+        None => return HandlerResponse::err(ntstatus::STATUS_INVALID_INFO_CLASS),
+    };
+    if !matches!(info_type, InfoType::File) {
+        return HandlerResponse::err(ntstatus::STATUS_NOT_SUPPORTED);
+    }
 
     // MS-SMB2 3.3.5.21.1: access each class needs from Open.GrantedAccess.
+    // Other classes MS-FSCC 2.4 marks settable are not supported; the rest
+    // cannot be set.
     let (class, required) = match req.file_information_class {
         ic::FILE_BASIC_INFORMATION => (Class::Basic, FILE_WRITE_ATTRIBUTES),
         ic::FILE_DISPOSITION_INFORMATION => (Class::Disposition, DELETE),
         ic::FILE_RENAME_INFORMATION => (Class::Rename, DELETE),
         ic::FILE_END_OF_FILE_INFORMATION => (Class::EndOfFile, FILE_WRITE_DATA),
         ic::FILE_ALLOCATION_INFORMATION => (Class::Allocation, FILE_WRITE_DATA),
-        _ => return HandlerResponse::err(ntstatus::STATUS_NOT_SUPPORTED),
+        class if SETTABLE_CLASSES.contains(&class) => {
+            return HandlerResponse::err(ntstatus::STATUS_NOT_SUPPORTED);
+        }
+        _ => return HandlerResponse::err(ntstatus::STATUS_INVALID_INFO_CLASS),
     };
     if open_arc.read().await.granted_access & required != required {
         return HandlerResponse::err(ntstatus::STATUS_ACCESS_DENIED);
@@ -102,8 +114,8 @@ pub async fn handle(
             if buffer.is_empty() {
                 return HandlerResponse::err(ntstatus::STATUS_INFO_LENGTH_MISMATCH);
             }
-            let mut open = open_arc.write().await;
-            set_disposition(&mut open, buffer[0] != 0).await
+            let open = open_arc.read().await;
+            set_disposition(&open, buffer[0] != 0).await
         }
         Class::Rename => {
             // FILE_RENAME_INFORMATION layout (MS-FSCC §2.4.37):
@@ -111,11 +123,16 @@ pub async fn handle(
             if buffer.len() < 20 {
                 return HandlerResponse::err(ntstatus::STATUS_INFO_LENGTH_MISMATCH);
             }
-            let name_len = u32::from_le_bytes(buffer[16..20].try_into().unwrap()) as usize;
-            if buffer.len() < 20 + name_len {
-                return HandlerResponse::err(ntstatus::STATUS_INFO_LENGTH_MISMATCH);
+            if buffer[8..16] != [0; 8] {
+                return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
             }
-            let name_bytes = &buffer[20..20 + name_len];
+            let name_len = u32::from_le_bytes(buffer[16..20].try_into().unwrap());
+            let Some(name_bytes) = usize::try_from(name_len)
+                .ok()
+                .and_then(|len| buffer.get(20..)?.get(..len))
+            else {
+                return HandlerResponse::err(ntstatus::STATUS_INFO_LENGTH_MISMATCH);
+            };
             let units = match utf16le_to_units(name_bytes) {
                 Some(u) => u,
                 None => return HandlerResponse::err(ntstatus::STATUS_OBJECT_NAME_INVALID),
@@ -131,7 +148,7 @@ pub async fn handle(
             let case_sensitive = share.backend.capabilities().case_sensitive;
             if replace_if_exists
                 && !same_path(&from, &new_path, case_sensitive)
-                && path_is_open(server, &share, &new_path).await
+                && share.files.path_is_open(&new_path, case_sensitive)
             {
                 return HandlerResponse::err(ntstatus::STATUS_ACCESS_DENIED);
             }
@@ -141,6 +158,7 @@ pub async fn handle(
                 .await
             {
                 Ok(()) => {
+                    share.files.rename_paths(&from, &new_path, case_sensitive);
                     rename_open_paths(server, &share, &from, &new_path).await;
                     Ok(())
                 }
@@ -232,8 +250,9 @@ async fn truncate(open: &Open, size: u64, allocation: bool) -> Result<(), u32> {
     Ok(())
 }
 
-/// FileDispositionInformation (MS-FSA 2.1.5.15.3).
-async fn set_disposition(open: &mut Open, delete: bool) -> Result<(), u32> {
+/// FileDispositionInformation (MS-FSA 2.1.5.15.3). The flag belongs to the
+/// file, so clearing it through any open keeps the file.
+async fn set_disposition(open: &Open, delete: bool) -> Result<(), u32> {
     if delete {
         let handle = open.handle.as_ref().ok_or(ntstatus::STATUS_FILE_CLOSED)?;
         let info = handle.stat().await.map_err(|e| e.to_nt_status())?;
@@ -247,6 +266,7 @@ async fn set_disposition(open: &mut Open, delete: bool) -> Result<(), u32> {
             }
         }
     }
-    open.delete_on_close = delete;
+    let file = open.file.as_ref().ok_or(ntstatus::STATUS_FILE_CLOSED)?;
+    file.set_delete_pending(delete);
     Ok(())
 }

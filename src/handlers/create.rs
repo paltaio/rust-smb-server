@@ -1,6 +1,7 @@
 //! CREATE handler: open or create a file/directory and allocate a FileId.
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use crate::proto::header::Smb2Header;
 use crate::proto::messages::{CreateContext, CreateRequest, CreateResponse};
@@ -10,20 +11,59 @@ use crate::access_mask::{
     DELETE, FILE_APPEND_DATA, FILE_READ_DATA, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA,
     granted_access, maximal_access,
 };
-use crate::backend::{FileInfo, OpenIntent, OpenOptions};
+use crate::backend::{
+    FILE_ATTRIBUTE_READONLY, FileInfo, FileTimes, Handle, OpenAction, OpenIntent, OpenOptions,
+    VALID_SET_ATTRIBUTES,
+};
 use crate::conn::state::{Connection, Open};
 use crate::dispatch::HandlerResponse;
+use crate::error::SmbError;
+use crate::files::{FileRef, OpenSlot, Sharing};
 use crate::handlers::shared::lookup_session_tree;
 use crate::info_class::VOLUME_SERIAL_NUMBER;
 use crate::ntstatus;
 use crate::path::SmbPath;
-use crate::server::ServerState;
+use crate::server::{ServerState, ShareBindings};
 use crate::utils::utf16le_to_units;
 
 // CreateOptions
 const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
+const FILE_WRITE_THROUGH: u32 = 0x0000_0002;
+pub(crate) const FILE_NO_INTERMEDIATE_BUFFERING: u32 = 0x0000_0008;
+const FILE_SYNCHRONOUS_IO_ALERT: u32 = 0x0000_0010;
+const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x0000_0020;
 const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
+const FILE_COMPLETE_IF_OPLOCKED: u32 = 0x0000_0100;
+const FILE_OPEN_REMOTE_INSTANCE: u32 = 0x0000_0400;
 const FILE_DELETE_ON_CLOSE: u32 = 0x0000_1000;
+const FILE_OPEN_BY_FILE_ID: u32 = 0x0000_2000;
+const FILE_OPEN_FOR_BACKUP_INTENT: u32 = 0x0000_4000;
+const FILE_NO_COMPRESSION: u32 = 0x0000_8000;
+const FILE_OPEN_REQUIRING_OPLOCK: u32 = 0x0001_0000;
+const FILE_DISALLOW_EXCLUSIVE: u32 = 0x0002_0000;
+const FILE_RESERVE_OPFILTER: u32 = 0x0010_0000;
+const FILE_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+const FILE_OPEN_FOR_FREE_SPACE_QUERY: u32 = 0x0080_0000;
+
+/// CreateOptions allowed with FILE_DIRECTORY_FILE (MS-SMB2 2.2.13), and the
+/// flags the server ignores.
+const DIRECTORY_OPTIONS: u32 = FILE_DIRECTORY_FILE
+    | FILE_WRITE_THROUGH
+    | FILE_OPEN_FOR_BACKUP_INTENT
+    | FILE_DELETE_ON_CLOSE
+    | FILE_OPEN_REPARSE_POINT
+    | FILE_NO_COMPRESSION
+    | FILE_SYNCHRONOUS_IO_ALERT
+    | FILE_SYNCHRONOUS_IO_NONALERT
+    | FILE_COMPLETE_IF_OPLOCKED
+    | FILE_OPEN_REMOTE_INSTANCE
+    | FILE_OPEN_REQUIRING_OPLOCK
+    | FILE_DISALLOW_EXCLUSIVE
+    | FILE_OPEN_FOR_FREE_SPACE_QUERY;
+
+/// CreateOptions under which every write through the open reaches storage
+/// before it completes.
+pub(crate) const WRITE_THROUGH_OPTIONS: u32 = FILE_WRITE_THROUGH | FILE_NO_INTERMEDIATE_BUFFERING;
 
 // CreateDisposition
 const FILE_SUPERSEDE: u32 = 0x0000_0000;
@@ -33,20 +73,26 @@ const FILE_OPEN_IF: u32 = 0x0000_0003;
 const FILE_OVERWRITE: u32 = 0x0000_0004;
 const FILE_OVERWRITE_IF: u32 = 0x0000_0005;
 
-// CreateAction in response (MS-SMB2 §2.2.14)
+// CreateAction in response (MS-SMB2 2.2.14)
+const FILE_SUPERSEDED: u32 = 0x0000_0000;
 const FILE_OPENED: u32 = 0x0000_0001;
 const FILE_CREATED: u32 = 0x0000_0002;
+const FILE_OVERWRITTEN: u32 = 0x0000_0003;
 
 /// Offset of the response create contexts from the start of the SMB2
 /// header: 64 + 88.
 const RESPONSE_CONTEXTS_OFFSET: u32 = 0x98;
 
 /// Create contexts of a request that the response answers (MS-SMB2
-/// 3.3.5.9.5, 3.3.5.9.9). Other contexts are ignored.
+/// 3.3.5.9.5, 3.3.5.9.9) or that fail it. Other contexts are ignored.
 struct ContextQueries {
     /// QUERY_MAXIMAL_ACCESS, with its timestamp if it has one.
     maximal_access: Option<Option<u64>>,
     query_on_disk_id: bool,
+    /// An EA buffer, which needs extended attributes (MS-SMB2 3.3.5.9.1).
+    ea_buffer: bool,
+    /// A timewarp token, which needs snapshots (MS-SMB2 3.3.5.9.4).
+    timewarp: bool,
 }
 
 impl ContextQueries {
@@ -67,6 +113,8 @@ impl ContextQueries {
         Some(Self {
             maximal_access,
             query_on_disk_id,
+            ea_buffer: find(CreateContext::NAME_EXTA).is_some(),
+            timewarp: find(CreateContext::NAME_TWRP).is_some(),
         })
     }
 
@@ -102,7 +150,7 @@ impl ContextQueries {
 }
 
 pub async fn handle(
-    _server: &Arc<ServerState>,
+    server: &Arc<ServerState>,
     conn: &Arc<Connection>,
     hdr: &Smb2Header,
     body: &[u8],
@@ -118,13 +166,13 @@ pub async fn handle(
     };
     let tree = tree_arc.read().await;
     let tree_access = tree.granted_access;
-    let backend = tree.share.backend.clone();
+    let share = Arc::clone(&tree.share);
     drop(tree);
+    let backend = Arc::clone(&share.backend);
 
     // Decode path.
-    let units = match utf16le_to_units(&req.name) {
-        Some(u) => u,
-        None => return HandlerResponse::err(ntstatus::STATUS_OBJECT_NAME_INVALID),
+    let Some(units) = utf16le_to_units(&req.name) else {
+        return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
     };
     let path = match SmbPath::from_utf16(&units) {
         Ok(p) => p,
@@ -141,15 +189,50 @@ pub async fn handle(
         _ => return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER),
     };
 
+    let options = req.create_options;
+    if options & (FILE_OPEN_BY_FILE_ID | FILE_RESERVE_OPFILTER) != 0 {
+        return HandlerResponse::err(ntstatus::STATUS_NOT_SUPPORTED);
+    }
+    let directory = options & FILE_DIRECTORY_FILE != 0;
+    let non_directory = options & FILE_NON_DIRECTORY_FILE != 0;
+    if directory
+        && (options & !DIRECTORY_OPTIONS != 0
+            || !matches!(
+                intent,
+                OpenIntent::Create | OpenIntent::OpenOrCreate | OpenIntent::Open
+            ))
+    {
+        return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
+    }
+
     let Some(queries) = ContextQueries::parse(&req.create_contexts) else {
         return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
     };
+    if queries.timewarp {
+        // There are no snapshots, so none matches the token.
+        return HandlerResponse::err(ntstatus::STATUS_OBJECT_NAME_NOT_FOUND);
+    }
+    if queries.ea_buffer {
+        return HandlerResponse::err(ntstatus::STATUS_EAS_NOT_SUPPORTED);
+    }
 
     let maximal = maximal_access(tree_access);
-    let Some(open_access) = granted_access(req.desired_access, maximal) else {
+    let delete_on_close = options & FILE_DELETE_ON_CLOSE != 0;
+    // MS-SMB2 3.3.5.9: the tree must allow DELETE.
+    if delete_on_close && maximal & DELETE == 0 {
+        warn!(path = %path, "delete-on-close open on read-only tree");
+        return HandlerResponse::err(ntstatus::STATUS_ACCESS_DENIED);
+    }
+    if req.desired_access == 0 {
+        return HandlerResponse::err(ntstatus::STATUS_ACCESS_DENIED);
+    }
+    let Some(mut open_access) = granted_access(req.desired_access, maximal) else {
         warn!(path = %path, "requested access exceeds tree access");
         return HandlerResponse::err(ntstatus::STATUS_ACCESS_DENIED);
     };
+    if options & FILE_NO_INTERMEDIATE_BUFFERING != 0 {
+        open_access &= !FILE_APPEND_DATA;
+    }
     // Disposition that creates: requires write permission.
     if !tree_access.allows_write()
         && matches!(
@@ -163,23 +246,24 @@ pub async fn handle(
         return HandlerResponse::err(ntstatus::STATUS_ACCESS_DENIED);
     }
 
-    let directory = req.create_options & FILE_DIRECTORY_FILE != 0;
-    let non_directory = req.create_options & FILE_NON_DIRECTORY_FILE != 0;
-    if directory && non_directory {
-        return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
-    }
-    let delete_on_close = req.create_options & FILE_DELETE_ON_CLOSE != 0;
+    // Attributes for a file this CREATE makes or overwrites.
+    let new_attributes = req.file_attributes & VALID_SET_ATTRIBUTES;
     if delete_on_close {
-        // MS-SMB2 3.3.5.9: the tree must allow DELETE.
-        if maximal & DELETE == 0 {
-            warn!(path = %path, "delete-on-close open on read-only tree");
-            return HandlerResponse::err(ntstatus::STATUS_ACCESS_DENIED);
-        }
         // MS-FSA 2.1.5.1: the open itself must request DELETE.
         if open_access & DELETE == 0 {
             return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
         }
+        // MS-FSA 2.1.5.1: a file created read-only cannot be deleted.
+        if intent != OpenIntent::Open && new_attributes & FILE_ATTRIBUTE_READONLY != 0 {
+            return HandlerResponse::err(ntstatus::STATUS_CANNOT_DELETE);
+        }
     }
+
+    let limit = server.max_opens_per_connection.load(Ordering::Relaxed);
+    let Some(slot) = OpenSlot::acquire(&conn.open_count, limit) else {
+        warn!(limit, "open limit reached");
+        return HandlerResponse::err(ntstatus::STATUS_INSUFFICIENT_RESOURCES);
+    };
 
     let write = open_access & (FILE_WRITE_DATA | FILE_APPEND_DATA) != 0;
     let opts = OpenOptions {
@@ -191,17 +275,34 @@ pub async fn handle(
         non_directory,
         delete_on_close,
     };
+    let sharing = Sharing {
+        access: open_access,
+        share: req.share_access,
+    };
 
-    let handle = match backend.open(&path, opts).await {
-        Ok(h) => h,
+    // An open that truncates checks the file first, so a refused open
+    // leaves the file as it was.
+    if matches!(intent, OpenIntent::Truncate | OpenIntent::OverwriteOrCreate)
+        && let Err(status) = check_existing(&share, &path, opts, sharing).await
+    {
+        return HandlerResponse::err(status);
+    }
+
+    let (handle, action) = match backend.open(&path, opts).await {
+        Ok(opened) => opened,
         Err(e) => {
             debug!(error = %e, path = %path, "backend open failed");
+            let case_sensitive = backend.capabilities().case_sensitive;
+            if matches!(e, SmbError::Exists) && share.files.delete_pending_at(&path, case_sensitive)
+            {
+                return HandlerResponse::err(ntstatus::STATUS_DELETE_PENDING);
+            }
             return HandlerResponse::err(e.to_nt_status());
         }
     };
 
     // Stat for the response.
-    let info = match handle.stat().await {
+    let mut info = match handle.stat().await {
         Ok(i) => i,
         Err(e) => {
             let _ = handle.close().await;
@@ -213,26 +314,58 @@ pub async fn handle(
         let _ = handle.close().await;
         return HandlerResponse::err(ntstatus::STATUS_CANNOT_DELETE);
     }
+    let file = match FileRef::register(&share, &info, &path, sharing) {
+        Ok(f) => f,
+        Err(status) => {
+            let _ = handle.close().await;
+            return HandlerResponse::err(status);
+        }
+    };
 
-    // Allocate FileId, register Open.
-    let tree = tree_arc.write().await;
+    if action != OpenAction::Opened
+        && new_attributes != 0
+        && new_attributes != info.attributes() & VALID_SET_ATTRIBUTES
+    {
+        apply_attributes(handle.as_ref(), new_attributes, &path).await;
+        if let Ok(updated) = handle.stat().await {
+            info = updated;
+        }
+    }
+
+    // Allocate FileId, register Open. A tree disconnected or revoked while
+    // the backend worked takes no new opens.
+    let mut tree = tree_arc.write().await;
+    if tree.closed {
+        drop(tree);
+        let _ = handle.close().await;
+        if let Some(pending) = file.release(false) {
+            pending.finish();
+        }
+        return HandlerResponse::err(ntstatus::STATUS_NETWORK_NAME_DELETED);
+    }
     let file_id = tree.alloc_file_id();
-    let open = Open::new(
+    let open = Open {
         file_id,
-        handle,
-        open_access,
-        path,
-        info.is_directory,
+        handle: Some(handle),
+        granted_access: open_access,
+        last_path: path,
+        is_directory: info.is_directory,
         delete_on_close,
-    );
+        search_state: None,
+        fixed_times: FileTimes::default(),
+        create_options: options,
+        file: Some(file),
+        slot: Some(slot),
+    };
     let open_arc = Arc::new(tokio::sync::RwLock::new(open));
-    tree.opens.write().await.insert(file_id, open_arc);
+    tree.opens.get_mut().insert(file_id, open_arc);
     drop(tree);
 
-    let create_action = match intent {
-        OpenIntent::Create => FILE_CREATED,
-        OpenIntent::OpenOrCreate | OpenIntent::OverwriteOrCreate => FILE_OPENED,
-        OpenIntent::Open | OpenIntent::Truncate => FILE_OPENED,
+    let create_action = match action {
+        OpenAction::Opened => FILE_OPENED,
+        OpenAction::Created => FILE_CREATED,
+        OpenAction::Overwritten if req.create_disposition == FILE_SUPERSEDE => FILE_SUPERSEDED,
+        OpenAction::Overwritten => FILE_OVERWRITTEN,
     };
     let mut contexts = Vec::new();
     CreateContext::encode_chain(&queries.answer(&info, maximal), &mut contexts).expect("encode");
@@ -261,4 +394,53 @@ pub async fn handle(
     let mut buf = Vec::new();
     resp.write_to(&mut buf).expect("encode");
     HandlerResponse::ok(buf)
+}
+
+/// Checks an existing file at `path` against the opens already on it, and
+/// against delete-on-close, before a CREATE that truncates it. A file that
+/// is missing or cannot be opened for reading passes; the real open reports
+/// those.
+async fn check_existing(
+    share: &Arc<ShareBindings>,
+    path: &SmbPath,
+    opts: OpenOptions,
+    sharing: Sharing,
+) -> Result<(), u32> {
+    let probe = OpenOptions {
+        read: true,
+        write: false,
+        write_attributes: false,
+        intent: OpenIntent::Open,
+        delete_on_close: false,
+        ..opts
+    };
+    let Ok((handle, _)) = share.backend.open(path, probe).await else {
+        return Ok(());
+    };
+    let result = match handle.stat().await {
+        Ok(info) if opts.delete_on_close && info.read_only => Err(ntstatus::STATUS_CANNOT_DELETE),
+        Ok(info) => {
+            let case_sensitive = share.backend.capabilities().case_sensitive;
+            share.files.check(&info, path, case_sensitive, sharing)
+        }
+        Err(_) => Ok(()),
+    };
+    let _ = handle.close().await;
+    result
+}
+
+/// Gives a file this CREATE made or overwrote the requested attributes. A
+/// backend that cannot store all of them gets READONLY alone, when asked
+/// for; the CREATE succeeds either way.
+async fn apply_attributes(handle: &dyn Handle, attributes: u32, path: &SmbPath) {
+    let mut result = handle.set_attributes(attributes).await;
+    if matches!(result, Err(SmbError::NotSupported))
+        && attributes & FILE_ATTRIBUTE_READONLY != 0
+        && attributes != FILE_ATTRIBUTE_READONLY
+    {
+        result = handle.set_attributes(FILE_ATTRIBUTE_READONLY).await;
+    }
+    if let Err(e) = result {
+        debug!(error = %e, path = %path, attributes, "create attributes not applied");
+    }
 }

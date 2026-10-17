@@ -27,11 +27,20 @@ pub struct WriteRequest {
     pub write_channel_info_offset: u16,
     pub write_channel_info_length: u16,
     pub flags: u32,
-    /// MS-SMB2: at least 1 byte of payload buffer is required on the wire
-    /// even when length=0.
-    #[br(parse_with = super::read_buf, args(if length == 0 { 1 } else { length as usize }))]
+    /// `length` bytes at `data_offset`, counted from the start of the SMB2
+    /// header and not before the end of the fixed fields. Empty when
+    /// `length` is 0.
+    #[br(parse_with = super::read_buf_at, args(
+        data_offset.into(),
+        length as usize,
+        WRITE_BUFFER_OFFSET,
+    ))]
     pub data: Vec<u8>,
 }
+
+/// Offset of the first byte after the fixed WRITE request fields, counted
+/// from the start of the SMB2 header: 64 + 48.
+const WRITE_BUFFER_OFFSET: u64 = 0x70;
 
 impl WriteRequest {
     /// Canonical `DataOffset` placing the data buffer immediately after the
@@ -111,6 +120,47 @@ mod tests {
         let mut buf = Vec::new();
         r.write_to(&mut buf).unwrap();
         assert_eq!(WriteRequest::parse(&buf).unwrap(), r);
+    }
+
+    fn request(data_offset: u16, length: u32, data: Vec<u8>) -> WriteRequest {
+        WriteRequest {
+            structure_size: 49,
+            data_offset,
+            length,
+            offset: 0,
+            file_id: FileId::new(1, 2),
+            channel: 0,
+            remaining_bytes: 0,
+            write_channel_info_offset: 0,
+            write_channel_info_length: 0,
+            flags: 0,
+            data,
+        }
+    }
+
+    #[test]
+    fn data_is_read_at_data_offset() {
+        let mut body = Vec::new();
+        request(0x78, 3, b"PADPADPA".to_vec())
+            .write_to(&mut body)
+            .unwrap();
+        body.extend_from_slice(b"XYZ");
+        assert_eq!(WriteRequest::parse(&body).unwrap().data, b"XYZ");
+
+        let mut below = Vec::new();
+        request(0x68, 3, b"XYZ".to_vec())
+            .write_to(&mut below)
+            .unwrap();
+        assert!(WriteRequest::parse(&below).is_err());
+    }
+
+    #[test]
+    fn zero_length_write_has_no_data() {
+        let mut body = Vec::new();
+        request(WriteRequest::STANDARD_DATA_OFFSET, 0, vec![0x41])
+            .write_to(&mut body)
+            .unwrap();
+        assert!(WriteRequest::parse(&body).unwrap().data.is_empty());
     }
 
     #[test]

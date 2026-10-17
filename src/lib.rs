@@ -49,6 +49,10 @@ pub mod wire {
     pub use crate::proto::messages;
 }
 
+pub use backend::OpenAction;
+
+mod files;
+
 #[cfg(test)]
 mod tests {
     mod dynamic_config;

@@ -4,12 +4,11 @@ use std::sync::Arc;
 
 use crate::proto::header::Smb2Header;
 use crate::proto::messages::{CloseRequest, CloseResponse};
-use tracing::{debug, warn};
 
 use crate::conn::state::Connection;
 use crate::dispatch::HandlerResponse;
-use crate::error::SmbError;
-use crate::handlers::shared::{lookup_session_tree, restore_fixed_times};
+use crate::files::close_open;
+use crate::handlers::shared::lookup_session_tree;
 use crate::ntstatus;
 use crate::server::ServerState;
 
@@ -39,76 +38,25 @@ pub async fn handle(
         None => return HandlerResponse::err(ntstatus::STATUS_FILE_CLOSED),
     };
 
-    // Pull state out, close the handle, then optionally unlink.
-    let mut open = open_arc.write().await;
-    restore_fixed_times(&open).await;
-    let handle = open.handle.take();
-    let is_directory = open.is_directory;
-    let path = open.last_path.clone();
-    let delete_on_close = open.delete_on_close;
     let want_attrs = req.flags & FLAG_POSTQUERY_ATTRIB != 0;
-    drop(open);
+    let info = close_open(&open_arc, want_attrs).await;
 
-    // Stat before closing if needed.
-    let info_before_close = if want_attrs {
-        if let Some(h) = handle.as_ref() {
-            h.stat().await.ok()
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-    if let Some(h) = handle {
-        let _ = h.close().await;
-    }
-    if delete_on_close {
-        let tree = tree_arc.read().await;
-        let backend = tree.share.backend.clone();
-        drop(tree);
-        // A failed delete-on-close does not fail the CLOSE (MS-SMB2
-        // 3.3.4.17). A non-empty directory stays (MS-FSA 2.1.5.5).
-        match backend.unlink(&path).await {
-            Ok(()) => {}
-            Err(SmbError::NotEmpty) if is_directory => {
-                debug!(path = %path, "delete-on-close skipped a non-empty directory");
-            }
-            Err(e) => warn!(error = %e, path = %path, "delete-on-close failed"),
-        }
-    }
-
-    let resp = CloseResponse {
-        structure_size: 60,
-        flags: req.flags & FLAG_POSTQUERY_ATTRIB,
-        reserved: 0,
-        creation_time: info_before_close
-            .as_ref()
-            .map(|i| i.creation_time)
-            .unwrap_or(0),
-        last_access_time: info_before_close
-            .as_ref()
-            .map(|i| i.last_access_time)
-            .unwrap_or(0),
-        last_write_time: info_before_close
-            .as_ref()
-            .map(|i| i.last_write_time)
-            .unwrap_or(0),
-        change_time: info_before_close
-            .as_ref()
-            .map(|i| i.change_time)
-            .unwrap_or(0),
-        allocation_size: info_before_close
-            .as_ref()
-            .map(|i| i.allocation_size)
-            .unwrap_or(0),
-        end_of_file: info_before_close
-            .as_ref()
-            .map(|i| i.end_of_file)
-            .unwrap_or(0),
-        file_attributes: info_before_close
-            .as_ref()
-            .map(|i| i.attributes())
-            .unwrap_or(0),
+    // MS-SMB2 3.3.5.10: without the attributes, Flags and every attribute
+    // field are 0.
+    let resp = match info {
+        Some(info) => CloseResponse {
+            structure_size: 60,
+            flags: FLAG_POSTQUERY_ATTRIB,
+            reserved: 0,
+            creation_time: info.creation_time,
+            last_access_time: info.last_access_time,
+            last_write_time: info.last_write_time,
+            change_time: info.change_time,
+            allocation_size: info.allocation_size,
+            end_of_file: info.end_of_file,
+            file_attributes: info.attributes(),
+        },
+        None => CloseResponse::new(),
     };
     let mut buf = Vec::new();
     resp.write_to(&mut buf).expect("encode");

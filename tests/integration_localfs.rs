@@ -18,7 +18,8 @@ use smb_server::wire::messages::{
     QueryInfoResponse, ReadRequest, ReadResponse, TreeDisconnectRequest, TreeDisconnectResponse,
 };
 use smb_server::{
-    BackendCapabilities, Handle, OpenOptions, Share, ShareBackend, SmbPath, SmbResult, SmbServer,
+    BackendCapabilities, Handle, OpenAction, OpenOptions, Share, ShareBackend, SmbPath, SmbResult,
+    SmbServer,
 };
 use tempfile::tempdir;
 use tokio::io::AsyncWriteExt;
@@ -29,7 +30,11 @@ struct CaseRule(LocalFsBackend, bool);
 
 #[async_trait::async_trait]
 impl ShareBackend for CaseRule {
-    async fn open(&self, path: &SmbPath, opts: OpenOptions) -> SmbResult<Box<dyn Handle>> {
+    async fn open(
+        &self,
+        path: &SmbPath,
+        opts: OpenOptions,
+    ) -> SmbResult<(Box<dyn Handle>, OpenAction)> {
         self.0.open(path, opts).await
     }
 

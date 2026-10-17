@@ -28,7 +28,7 @@ use tokio::task::spawn_blocking;
 
 use crate::backend::{
     BackendCapabilities, DirEntry as SmbDirEntry, FILE_ATTRIBUTE_ARCHIVE, FILE_ATTRIBUTE_READONLY,
-    FileInfo, FileTimes, Handle, OpenIntent, OpenOptions, ShareBackend,
+    FileInfo, FileTimes, Handle, OpenAction, OpenIntent, OpenOptions, ShareBackend,
 };
 use crate::error::{SmbError, SmbResult};
 use crate::path::{SmbPath, same_path};
@@ -431,9 +431,25 @@ fn glob_match(pattern: &str, name: &str) -> bool {
 // ShareBackend impl
 // ---------------------------------------------------------------------------
 
-#[async_trait]
-impl ShareBackend for LocalFsBackend {
-    async fn open(&self, path: &SmbPath, opts: OpenOptions) -> SmbResult<Box<dyn Handle>> {
+impl LocalFsBackend {
+    /// True if a directory on the way to `path` is missing or is not a
+    /// directory.
+    async fn parent_missing(&self, path: &SmbPath) -> bool {
+        let Some(parent) = path.parent().filter(|p| !p.is_root()) else {
+            return false;
+        };
+        let rel = to_rel_path(&parent);
+        let root = Arc::clone(&self.root);
+        spawn_blocking(move || !root.metadata(&rel).is_ok_and(|md| md.is_dir()))
+            .await
+            .unwrap_or(false)
+    }
+
+    async fn open_entry(
+        &self,
+        path: &SmbPath,
+        opts: OpenOptions,
+    ) -> SmbResult<(Box<dyn Handle>, OpenAction)> {
         // 1. Read-only check: any open that requests creation, write access,
         //    truncation, or overwrite is rejected up front. Pure read opens
         //    pass through.
@@ -461,35 +477,36 @@ impl ShareBackend for LocalFsBackend {
             // Directory CREATE intents: Create / OpenOrCreate / OverwriteOrCreate
             // imply mkdir; Open / Truncate require existing.
             let intent = opts.intent;
-            let dir_handle = spawn_blocking(move || -> io::Result<Dir> {
-                match intent {
-                    OpenIntent::Open => open_dir_handle(&root, &rel, write_attributes),
+            let (dir_handle, action) = spawn_blocking(move || -> io::Result<(Dir, OpenAction)> {
+                let action = match intent {
+                    OpenIntent::Open => OpenAction::Opened,
                     OpenIntent::Create => {
                         root.create_dir(&rel)?;
-                        open_dir_handle(&root, &rel, write_attributes)
+                        OpenAction::Created
                     }
-                    OpenIntent::OpenOrCreate => {
-                        if !root.exists(&rel) {
-                            root.create_dir(&rel)?;
-                        }
-                        open_dir_handle(&root, &rel, write_attributes)
-                    }
+                    OpenIntent::OpenOrCreate => match root.create_dir(&rel) {
+                        Ok(()) => OpenAction::Created,
+                        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => OpenAction::Opened,
+                        Err(e) => return Err(e),
+                    },
                     OpenIntent::Truncate | OpenIntent::OverwriteOrCreate => {
                         // Truncating a directory has no meaning; reject.
-                        Err(io::Error::from(io::ErrorKind::InvalidInput))
+                        return Err(io::Error::from(io::ErrorKind::InvalidInput));
                     }
-                }
+                };
+                Ok((open_dir_handle(&root, &rel, write_attributes)?, action))
             })
             .await
             .map_err(join_to_io)
             .map_err(io_to_smb)?
             .map_err(io_to_smb)?;
 
-            return Ok(Box::new(LocalHandle::Dir {
+            let handle: Box<dyn Handle> = Box::new(LocalHandle::Dir {
                 name: file_name_for(path),
                 root_dev: self.root_dev,
                 dir_handle: Arc::new(dir_handle),
-            }));
+            });
+            return Ok((handle, action));
         }
 
         let existing_is_dir = {
@@ -521,11 +538,12 @@ impl ShareBackend for LocalFsBackend {
                             .map_err(join_to_io)
                             .map_err(io_to_smb)?
                             .map_err(io_to_smb)?;
-                    return Ok(Box::new(LocalHandle::Dir {
+                    let handle: Box<dyn Handle> = Box::new(LocalHandle::Dir {
                         name: file_name_for(path),
                         root_dev: self.root_dev,
                         dir_handle: Arc::new(dir_handle),
-                    }));
+                    });
+                    return Ok((handle, OpenAction::Opened));
                 }
                 OpenIntent::Create => return Err(SmbError::Exists),
                 OpenIntent::Truncate | OpenIntent::OverwriteOrCreate => {
@@ -534,41 +552,8 @@ impl ShareBackend for LocalFsBackend {
             }
         }
 
-        // 2. Translate OpenIntent -> cap-std OpenOptions.
-        let mut cap_opts = CapOpenOptions::new();
-        match opts.intent {
-            OpenIntent::Open => {
-                cap_opts.read(true).write(opts.write);
-                // Unix sets times and permissions through a read-only
-                // descriptor. Windows needs the access right, which a
-                // read-only file grants without write access.
-                #[cfg(windows)]
-                if opts.write_attributes && !opts.write {
-                    use cap_primitives::fs::OpenOptionsExt as _;
-                    const GENERIC_READ: u32 = 0x8000_0000;
-                    const FILE_WRITE_ATTRIBUTES: u32 = 0x0000_0100;
-                    cap_opts.access_mode(GENERIC_READ | FILE_WRITE_ATTRIBUTES);
-                }
-            }
-            OpenIntent::Create => {
-                cap_opts.read(opts.read).write(true).create_new(true);
-            }
-            OpenIntent::Truncate => {
-                cap_opts.read(opts.read).write(true).truncate(true);
-            }
-            OpenIntent::OpenOrCreate => {
-                cap_opts.read(opts.read).write(true).create(true);
-            }
-            OpenIntent::OverwriteOrCreate => {
-                cap_opts
-                    .read(opts.read)
-                    .write(true)
-                    .create(true)
-                    .truncate(true);
-            }
-        }
-
-        let cap_file = spawn_blocking(move || root.open_with(&rel, &cap_opts))
+        // 2. Open the file for the intent.
+        let (cap_file, action) = spawn_blocking(move || open_file(&root, &rel, opts))
             .await
             .map_err(join_to_io)
             .map_err(io_to_smb)?
@@ -579,12 +564,104 @@ impl ShareBackend for LocalFsBackend {
         // `set_times`, `set_len`, `sync_data`, and `FileExt::{read,write}_at`.
         let std_file: std::fs::File = cap_file.into_std();
 
-        Ok(Box::new(LocalHandle::File {
+        let handle: Box<dyn Handle> = Box::new(LocalHandle::File {
             name: file_name_for(path),
             root_dev: self.root_dev,
             file: Arc::new(std_file),
             read_only,
-        }))
+        });
+        Ok((handle, action))
+    }
+}
+
+/// Opens the file `rel` below `root` for `opts.intent`. OPEN_IF opens an
+/// existing file with the access `opts` asks for, so a read-only file opens
+/// for reading.
+fn open_file(
+    root: &Dir,
+    rel: &Path,
+    opts: OpenOptions,
+) -> io::Result<(cap_std::fs::File, OpenAction)> {
+    let existing = existing_file_options(&opts);
+    let mut created = CapOpenOptions::new();
+    created.read(opts.read).write(true).create_new(true);
+    let mut truncated = CapOpenOptions::new();
+    truncated.read(opts.read).write(true).truncate(true);
+    let not_found = |e: &io::Error| e.kind() == io::ErrorKind::NotFound;
+    let exists = |e: &io::Error| e.kind() == io::ErrorKind::AlreadyExists;
+    match opts.intent {
+        OpenIntent::Open => Ok((root.open_with(rel, &existing)?, OpenAction::Opened)),
+        OpenIntent::Create => Ok((root.open_with(rel, &created)?, OpenAction::Created)),
+        OpenIntent::Truncate => Ok((root.open_with(rel, &truncated)?, OpenAction::Overwritten)),
+        // The file can appear or vanish between the two calls, so each pair
+        // is tried a second time.
+        OpenIntent::OpenOrCreate => {
+            let mut attempt = 0;
+            loop {
+                attempt += 1;
+                match root.open_with(rel, &existing) {
+                    Ok(f) => return Ok((f, OpenAction::Opened)),
+                    Err(e) if not_found(&e) => {}
+                    Err(e) => return Err(e),
+                }
+                match root.open_with(rel, &created) {
+                    Ok(f) => return Ok((f, OpenAction::Created)),
+                    Err(e) if exists(&e) && attempt < 2 => {}
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        OpenIntent::OverwriteOrCreate => {
+            let mut attempt = 0;
+            loop {
+                attempt += 1;
+                match root.open_with(rel, &created) {
+                    Ok(f) => return Ok((f, OpenAction::Created)),
+                    Err(e) if exists(&e) => {}
+                    Err(e) => return Err(e),
+                }
+                match root.open_with(rel, &truncated) {
+                    Ok(f) => return Ok((f, OpenAction::Overwritten)),
+                    Err(e) if not_found(&e) && attempt < 2 => {}
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+    }
+}
+
+/// cap-std options that open an existing file with the access `opts` asks
+/// for.
+fn existing_file_options(opts: &OpenOptions) -> CapOpenOptions {
+    let mut cap_opts = CapOpenOptions::new();
+    cap_opts.read(true).write(opts.write);
+    // Unix sets times and permissions through a read-only descriptor.
+    // Windows needs the access right, which a read-only file grants without
+    // write access.
+    #[cfg(windows)]
+    if opts.write_attributes && !opts.write {
+        use cap_primitives::fs::OpenOptionsExt as _;
+        const GENERIC_READ: u32 = 0x8000_0000;
+        const FILE_WRITE_ATTRIBUTES: u32 = 0x0000_0100;
+        cap_opts.access_mode(GENERIC_READ | FILE_WRITE_ATTRIBUTES);
+    }
+    cap_opts
+}
+
+#[async_trait]
+impl ShareBackend for LocalFsBackend {
+    async fn open(
+        &self,
+        path: &SmbPath,
+        opts: OpenOptions,
+    ) -> SmbResult<(Box<dyn Handle>, OpenAction)> {
+        let result = self.open_entry(path, opts).await;
+        if matches!(result, Err(SmbError::NotFound | SmbError::NotADirectory))
+            && self.parent_missing(path).await
+        {
+            return Err(SmbError::PathNotFound);
+        }
+        result
     }
 
     async fn unlink(&self, path: &SmbPath) -> SmbResult<()> {
@@ -626,7 +703,7 @@ impl ShareBackend for LocalFsBackend {
         let to_path = to_rel_path(to);
         let root = Arc::clone(&self.root);
 
-        spawn_blocking(move || -> io::Result<()> {
+        let result = spawn_blocking(move || -> io::Result<()> {
             let from_md = root.symlink_metadata(&from)?;
             match root.symlink_metadata(&to_path) {
                 Ok(to_md) => {
@@ -659,7 +736,13 @@ impl ShareBackend for LocalFsBackend {
         .await
         .map_err(join_to_io)
         .map_err(io_to_smb)?
-        .map_err(io_to_smb)
+        .map_err(io_to_smb);
+        if matches!(result, Err(SmbError::NotFound | SmbError::NotADirectory))
+            && self.parent_missing(to).await
+        {
+            return Err(SmbError::PathNotFound);
+        }
+        result
     }
 
     fn capabilities(&self) -> BackendCapabilities {
@@ -991,7 +1074,11 @@ mod tests {
         let backend = LocalFsBackend::new(td.path()).unwrap();
 
         // Create
-        let h = backend.open(&p("hello.txt"), opts_create()).await.unwrap();
+        let h = backend
+            .open(&p("hello.txt"), opts_create())
+            .await
+            .unwrap()
+            .0;
         let n = h.write(0, b"hello world").await.unwrap();
         assert_eq!(n, 11);
         h.flush().await.unwrap();
@@ -1005,7 +1092,11 @@ mod tests {
         h.close().await.unwrap();
 
         // Reopen for read
-        let h2 = backend.open(&p("hello.txt"), opts_open_ro()).await.unwrap();
+        let h2 = backend
+            .open(&p("hello.txt"), opts_open_ro())
+            .await
+            .unwrap()
+            .0;
         let bytes = h2.read(0, 1024).await.unwrap();
         assert_eq!(&bytes[..], b"hello world");
 
@@ -1023,13 +1114,14 @@ mod tests {
     async fn list_dir_finds_created_file() {
         let td = tempdir().unwrap();
         let backend = LocalFsBackend::new(td.path()).unwrap();
-        let h = backend.open(&p("a.txt"), opts_create()).await.unwrap();
+        let h = backend.open(&p("a.txt"), opts_create()).await.unwrap().0;
         h.close().await.unwrap();
 
         let dir_h = backend
             .open(&SmbPath::root(), opts_open_dir())
             .await
-            .unwrap();
+            .unwrap()
+            .0;
         let entries = dir_h.list_dir(None).await.unwrap();
         assert!(entries.iter().any(|e| e.info.name == "a.txt"));
         dir_h.close().await.unwrap();
@@ -1042,7 +1134,7 @@ mod tests {
         // attempt to open RW.
         {
             let writable = LocalFsBackend::new(td.path()).unwrap();
-            let h = writable.open(&p("x.txt"), opts_create()).await.unwrap();
+            let h = writable.open(&p("x.txt"), opts_create()).await.unwrap().0;
             h.close().await.unwrap();
         }
 
@@ -1066,7 +1158,7 @@ mod tests {
         assert!(matches!(err, SmbError::AccessDenied));
 
         // Pure read open is fine; writes through it are rejected.
-        let h = backend.open(&p("x.txt"), opts_open_ro()).await.unwrap();
+        let h = backend.open(&p("x.txt"), opts_open_ro()).await.unwrap().0;
         assert!(matches!(
             h.write(0, b"x").await,
             Err(SmbError::AccessDenied)
@@ -1084,7 +1176,11 @@ mod tests {
         let backend = LocalFsBackend::new(td.path()).unwrap();
 
         // Create & remove a file.
-        let h = backend.open(&p("doomed.txt"), opts_create()).await.unwrap();
+        let h = backend
+            .open(&p("doomed.txt"), opts_create())
+            .await
+            .unwrap()
+            .0;
         h.close().await.unwrap();
         backend.unlink(&p("doomed.txt")).await.unwrap();
         assert!(matches!(
@@ -1112,7 +1208,7 @@ mod tests {
         let td = tempdir().unwrap();
         let backend = LocalFsBackend::new(td.path()).unwrap();
 
-        let h = backend.open(&p("old.txt"), opts_create()).await.unwrap();
+        let h = backend.open(&p("old.txt"), opts_create()).await.unwrap().0;
         h.write(0, b"data").await.unwrap();
         h.close().await.unwrap();
 
@@ -1124,7 +1220,11 @@ mod tests {
         assert!(!td.path().join("old.txt").exists());
 
         // Renaming over an existing target should fail.
-        let h = backend.open(&p("other.txt"), opts_create()).await.unwrap();
+        let h = backend
+            .open(&p("other.txt"), opts_create())
+            .await
+            .unwrap()
+            .0;
         h.close().await.unwrap();
         let err = backend
             .rename(&p("other.txt"), &p("new.txt"), false)
@@ -1179,10 +1279,11 @@ mod tests {
         let root = backend
             .open(&SmbPath::root(), opts_open_dir())
             .await
-            .unwrap();
+            .unwrap()
+            .0;
         let listed = root.list_dir(None).await.unwrap();
-        let first = backend.open(&p("d"), opts_open_dir()).await.unwrap();
-        let second = backend.open(&p("d"), opts_open_dir()).await.unwrap();
+        let first = backend.open(&p("d"), opts_open_dir()).await.unwrap().0;
+        let second = backend.open(&p("d"), opts_open_dir()).await.unwrap().0;
         let id = first.stat().await.unwrap().file_index;
         assert_ne!(id, 0);
         assert_eq!(second.stat().await.unwrap().file_index, id);
@@ -1210,7 +1311,7 @@ mod tests {
         let td = tempdir().unwrap();
         std::fs::write(td.path().join("f.txt"), b"x").unwrap();
         let backend = LocalFsBackend::new(td.path()).unwrap();
-        let h = backend.open(&p("f.txt"), opts_open_ro()).await.unwrap();
+        let h = backend.open(&p("f.txt"), opts_open_ro()).await.unwrap().0;
         let ino = std::fs::metadata(td.path().join("f.txt")).unwrap().ino();
         assert_eq!(h.stat().await.unwrap().file_index, ino);
     }
@@ -1243,11 +1344,12 @@ mod tests {
         let root = backend
             .open(&SmbPath::root(), opts_open_dir())
             .await
-            .unwrap();
+            .unwrap()
+            .0;
         let listed = root.list_dir(None).await.unwrap();
         let mut ids = Vec::new();
         for name in [a, b] {
-            let h = backend.open(&p(name), opts_open_dir()).await.unwrap();
+            let h = backend.open(&p(name), opts_open_dir()).await.unwrap().0;
             let id = h.stat().await.unwrap().file_index;
             let entry = listed.iter().find(|e| e.info.name == name).unwrap();
             assert_eq!(entry.info.file_index, id, "{name}");
@@ -1298,14 +1400,15 @@ mod tests {
         let backend = LocalFsBackend::new(td.path()).unwrap();
 
         for name in ["a.txt", "b.txt", "c.log", "README"] {
-            let h = backend.open(&p(name), opts_create()).await.unwrap();
+            let h = backend.open(&p(name), opts_create()).await.unwrap().0;
             h.close().await.unwrap();
         }
 
         let dir_h = backend
             .open(&SmbPath::root(), opts_open_dir())
             .await
-            .unwrap();
+            .unwrap()
+            .0;
 
         let txts = dir_h.list_dir(Some("*.txt")).await.unwrap();
         let names: Vec<_> = txts.iter().map(|e| e.info.name.as_str()).collect();
@@ -1383,7 +1486,7 @@ mod tests {
         let td = tempdir().unwrap();
         std::fs::create_dir(td.path().join("d")).unwrap();
         let backend = LocalFsBackend::new(td.path()).unwrap();
-        let h = backend.open(&p("d"), opts_open_dir()).await.unwrap();
+        let h = backend.open(&p("d"), opts_open_dir()).await.unwrap().0;
         backend.unlink(&p("d")).await.unwrap();
         assert!(!td.path().join("d").exists());
         h.close().await.unwrap();
@@ -1397,7 +1500,7 @@ mod tests {
     async fn creation_time_is_set_where_the_host_can() {
         let td = tempdir().unwrap();
         let backend = LocalFsBackend::new(td.path()).unwrap();
-        let h = backend.open(&p("f.txt"), opts_create()).await.unwrap();
+        let h = backend.open(&p("f.txt"), opts_create()).await.unwrap().0;
         let before = h.stat().await.unwrap();
         let t = filetime(1_557_126_489);
         h.set_times(FileTimes {
@@ -1420,7 +1523,7 @@ mod tests {
     async fn creation_time_does_not_block_the_other_times() {
         let td = tempdir().unwrap();
         let backend = LocalFsBackend::new(td.path()).unwrap();
-        let h = backend.open(&p("f.txt"), opts_create()).await.unwrap();
+        let h = backend.open(&p("f.txt"), opts_create()).await.unwrap().0;
         let created = filetime(1_557_126_489);
         let written = filetime(1_577_934_245);
         h.set_times(FileTimes {
@@ -1445,14 +1548,14 @@ mod tests {
         let td = tempdir().unwrap();
         std::fs::create_dir(td.path().join("d")).unwrap();
         let backend = LocalFsBackend::new(td.path()).unwrap();
-        let h = backend.open(&p("f.txt"), opts_create()).await.unwrap();
+        let h = backend.open(&p("f.txt"), opts_create()).await.unwrap().0;
         assert!(matches!(
             h.set_attributes(0x2).await,
             Err(SmbError::NotSupported)
         ));
         h.close().await.unwrap();
 
-        let dir = backend.open(&p("d"), opts_open_dir()).await.unwrap();
+        let dir = backend.open(&p("d"), opts_open_dir()).await.unwrap().0;
         assert!(matches!(
             dir.set_attributes(FILE_ATTRIBUTE_READONLY).await,
             Err(SmbError::NotSupported)

@@ -14,8 +14,8 @@ use smb_server::wire::messages::{
     ReadRequest, ReadResponse, SetInfoRequest, WriteRequest, WriteResponse,
 };
 use smb_server::{
-    BackendCapabilities, Handle, LocalFsBackend, OpenOptions, ShareBackend, SmbError, SmbPath,
-    SmbResult,
+    BackendCapabilities, Handle, LocalFsBackend, OpenAction, OpenOptions, ShareBackend, SmbError,
+    SmbPath, SmbResult,
 };
 use smb_server::{Share, SmbServer, ntstatus};
 use tempfile::tempdir;
@@ -722,7 +722,11 @@ struct NoWriteOpens(LocalFsBackend);
 
 #[async_trait::async_trait]
 impl ShareBackend for NoWriteOpens {
-    async fn open(&self, path: &SmbPath, opts: OpenOptions) -> SmbResult<Box<dyn Handle>> {
+    async fn open(
+        &self,
+        path: &SmbPath,
+        opts: OpenOptions,
+    ) -> SmbResult<(Box<dyn Handle>, OpenAction)> {
         if opts.write {
             return Err(SmbError::AccessDenied);
         }

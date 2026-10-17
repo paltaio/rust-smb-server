@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use crate::backend::{
-    BackendCapabilities, DirEntry, FileInfo, FileTimes, Handle, OpenIntent, OpenOptions,
-    ShareBackend,
+    BackendCapabilities, DirEntry, FileInfo, FileTimes, Handle, OpenAction, OpenIntent,
+    OpenOptions, ShareBackend,
 };
 use crate::error::{SmbError, SmbResult};
 use crate::path::SmbPath;
@@ -54,55 +54,80 @@ fn key(path: &SmbPath) -> String {
 
 #[async_trait]
 impl ShareBackend for MemFsBackend {
-    async fn open(&self, path: &SmbPath, opts: OpenOptions) -> SmbResult<Box<dyn Handle>> {
+    async fn open(
+        &self,
+        path: &SmbPath,
+        opts: OpenOptions,
+    ) -> SmbResult<(Box<dyn Handle>, OpenAction)> {
         let k = key(path);
         let mut g = self.inner.lock().unwrap();
         let exists_file = g.files.contains_key(&k);
         let exists_dir = g.dirs.contains_key(&k);
+        let parent_exists = path.parent().is_none_or(|p| g.dirs.contains_key(&key(&p)));
+        if !exists_file && !exists_dir && !parent_exists {
+            return Err(SmbError::PathNotFound);
+        }
 
         if opts.directory {
             if exists_file {
                 return Err(SmbError::NotADirectory);
             }
+            let mut action = OpenAction::Opened;
             if !exists_dir {
                 if matches!(opts.intent, OpenIntent::Create | OpenIntent::OpenOrCreate) {
                     g.dirs.insert(k.clone(), ());
+                    action = OpenAction::Created;
                 } else {
                     return Err(SmbError::NotFound);
                 }
+            } else if opts.intent == OpenIntent::Create {
+                return Err(SmbError::Exists);
             }
-            return Ok(Box::new(MemHandle::dir(self.inner.clone(), k)));
+            return Ok((Box::new(MemHandle::dir(self.inner.clone(), k)), action));
         }
 
         if exists_dir {
             return Err(SmbError::IsDirectory);
         }
-        match opts.intent {
+        let action = match opts.intent {
             OpenIntent::Open => {
                 if !exists_file {
                     return Err(SmbError::NotFound);
                 }
+                OpenAction::Opened
             }
             OpenIntent::Create => {
                 if exists_file {
                     return Err(SmbError::Exists);
                 }
                 g.files.insert(k.clone(), Vec::new());
+                OpenAction::Created
             }
             OpenIntent::OpenOrCreate => {
                 g.files.entry(k.clone()).or_default();
+                if exists_file {
+                    OpenAction::Opened
+                } else {
+                    OpenAction::Created
+                }
             }
             OpenIntent::Truncate => {
                 if !exists_file {
                     return Err(SmbError::NotFound);
                 }
                 g.files.insert(k.clone(), Vec::new());
+                OpenAction::Overwritten
             }
             OpenIntent::OverwriteOrCreate => {
                 g.files.insert(k.clone(), Vec::new());
+                if exists_file {
+                    OpenAction::Overwritten
+                } else {
+                    OpenAction::Created
+                }
             }
-        }
-        Ok(Box::new(MemHandle::file(self.inner.clone(), k)))
+        };
+        Ok((Box::new(MemHandle::file(self.inner.clone(), k)), action))
     }
 
     async fn unlink(&self, path: &SmbPath) -> SmbResult<()> {

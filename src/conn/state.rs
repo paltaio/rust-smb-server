@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 use crate::backend::{FileTimes, Handle};
 use crate::builder::Access;
+use crate::files::{FileRef, OpenSlot, close_opens};
 use crate::path::SmbPath;
 use crate::server::ShareBindings;
 
@@ -73,6 +74,9 @@ pub struct Connection {
     pub client_negotiate: Mutex<Option<crate::handlers::negotiate::ClientNegotiate>>,
     /// Failed logons on this connection.
     pub logon_failures: AtomicU32,
+
+    /// Opens held on this connection, across its sessions and trees.
+    pub open_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Connection {
@@ -94,6 +98,7 @@ impl Connection {
             pending_auth_started: Mutex::new(HashMap::new()),
             client_negotiate: Mutex::new(None),
             logon_failures: AtomicU32::new(0),
+            open_count: Arc::default(),
         }
     }
 
@@ -113,16 +118,12 @@ impl Connection {
     }
 
     pub async fn close_session(&self, session_id: u64) -> bool {
-        let removed = {
-            let mut sessions = self.sessions.write().await;
-            sessions.remove(&session_id)
+        let removed = self.sessions.write().await.remove(&session_id);
+        let Some(sess_arc) = removed else {
+            return false;
         };
-        if let Some(sess_arc) = removed {
-            close_session_state(&sess_arc).await;
-            true
-        } else {
-            false
-        }
+        close_opens(detach_session(&sess_arc).await).await;
+        true
     }
 
     pub async fn close_tree(&self, session_id: u64, tree_id: u32) -> bool {
@@ -133,12 +134,23 @@ impl Connection {
         let Some(sess_arc) = sess_arc else {
             return false;
         };
-        remove_tree_from_session(&sess_arc, tree_id).await
+        let removed = {
+            let sess = sess_arc.read().await;
+            let mut trees = sess.trees.write().await;
+            trees.remove(&tree_id)
+        };
+        let Some(tree_arc) = removed else {
+            return false;
+        };
+        close_opens(detach_tree(&tree_arc).await).await;
+        true
     }
 
-    pub async fn close_sessions_for_user(&self, user: &str) -> usize {
-        let to_remove = {
-            let sessions = self.sessions.read().await;
+    /// Removes every session of `user` and returns their opens, which the
+    /// caller closes with [`close_opens`].
+    pub async fn detach_sessions_for_user(&self, user: &str) -> Vec<Arc<RwLock<Open>>> {
+        let removed = {
+            let mut sessions = self.sessions.write().await;
             let mut ids = Vec::new();
             for (session_id, sess_arc) in sessions.iter() {
                 let sess = sess_arc.read().await;
@@ -147,45 +159,55 @@ impl Connection {
                     ids.push(*session_id);
                 }
             }
-            ids
+            ids.into_iter()
+                .filter_map(|id| sessions.remove(&id))
+                .collect::<Vec<_>>()
         };
-
-        let mut removed = 0;
-        for session_id in to_remove {
-            if self.close_session(session_id).await {
-                removed += 1;
-            }
+        let mut opens = Vec::new();
+        for sess_arc in removed {
+            opens.extend(detach_session(&sess_arc).await);
         }
-        removed
+        opens
     }
 
-    pub async fn close_trees_for_share(&self, share_name: &str) -> usize {
-        self.close_matching_trees(|_, tree| tree.share.name.eq_ignore_ascii_case(share_name))
+    /// Removes every tree connected to `share` and returns their opens,
+    /// which the caller closes with [`close_opens`].
+    pub async fn detach_trees_for_share(
+        &self,
+        share: &Arc<ShareBindings>,
+    ) -> Vec<Arc<RwLock<Open>>> {
+        self.detach_matching_trees(|_, tree| Arc::ptr_eq(&tree.share, share))
             .await
     }
 
-    pub async fn close_trees_for_user_share(&self, user: &str, share_name: &str) -> usize {
-        self.close_matching_trees(|sess, tree| {
+    /// Removes every tree `user` has connected to `share` and returns their
+    /// opens, which the caller closes with [`close_opens`].
+    pub async fn detach_trees_for_user_share(
+        &self,
+        user: &str,
+        share: &Arc<ShareBindings>,
+    ) -> Vec<Arc<RwLock<Open>>> {
+        self.detach_matching_trees(|sess, tree| {
             matches!(&sess.identity, Identity::User { user: session_user, .. } if session_user == user)
-                && tree.share.name.eq_ignore_ascii_case(share_name)
+                && Arc::ptr_eq(&tree.share, share)
         })
         .await
     }
 
-    async fn close_matching_trees(
+    async fn detach_matching_trees(
         &self,
         matches_tree: impl Fn(&Session, &TreeConnect) -> bool,
-    ) -> usize {
+    ) -> Vec<Arc<RwLock<Open>>> {
         let sessions: Vec<_> = {
             let sessions = self.sessions.read().await;
             sessions.values().cloned().collect()
         };
 
-        let mut removed = 0;
+        let mut opens = Vec::new();
         for sess_arc in sessions {
-            let tree_ids = {
+            let removed = {
                 let sess = sess_arc.read().await;
-                let trees = sess.trees.read().await;
+                let mut trees = sess.trees.write().await;
                 let mut ids = Vec::new();
                 for (tree_id, tree_arc) in trees.iter() {
                     let tree = tree_arc.read().await;
@@ -193,50 +215,51 @@ impl Connection {
                         ids.push(*tree_id);
                     }
                 }
-                ids
+                ids.into_iter()
+                    .filter_map(|id| trees.remove(&id))
+                    .collect::<Vec<_>>()
             };
-
-            for tree_id in tree_ids {
-                if remove_tree_from_session(&sess_arc, tree_id).await {
-                    removed += 1;
-                }
+            for tree_arc in removed {
+                opens.extend(detach_tree(&tree_arc).await);
             }
         }
-        removed
+        opens
+    }
+
+    /// Closes every session, tree and open of the connection. Runs when the
+    /// connection ends.
+    pub async fn close_all(&self) {
+        let sessions: Vec<_> = self.sessions.write().await.drain().collect();
+        let mut opens = Vec::new();
+        for (_, sess_arc) in sessions {
+            opens.extend(detach_session(&sess_arc).await);
+        }
+        close_opens(opens).await;
     }
 }
 
-async fn close_session_state(sess_arc: &Arc<RwLock<Session>>) {
-    let sess = sess_arc.write().await;
-    let trees: Vec<_> = sess.trees.write().await.drain().collect();
-    for (_tree_id, tree_arc) in trees {
-        close_tree_state(&tree_arc).await;
-    }
-}
-
-async fn remove_tree_from_session(sess_arc: &Arc<RwLock<Session>>, tree_id: u32) -> bool {
-    let removed = {
+/// Removes every tree of a session that is no longer reachable and returns
+/// their opens.
+async fn detach_session(sess_arc: &Arc<RwLock<Session>>) -> Vec<Arc<RwLock<Open>>> {
+    let trees: Vec<_> = {
         let sess = sess_arc.read().await;
         let mut trees = sess.trees.write().await;
-        trees.remove(&tree_id)
+        trees.drain().collect()
     };
-    if let Some(tree_arc) = removed {
-        close_tree_state(&tree_arc).await;
-        true
-    } else {
-        false
+    let mut opens = Vec::new();
+    for (_, tree_arc) in trees {
+        opens.extend(detach_tree(&tree_arc).await);
     }
+    opens
 }
 
-async fn close_tree_state(tree_arc: &Arc<RwLock<TreeConnect>>) {
-    let tree = tree_arc.write().await;
-    let opens: Vec<_> = tree.opens.write().await.drain().collect();
-    for (_fid, open_arc) in opens {
-        let mut open = open_arc.write().await;
-        if let Some(handle) = open.handle.take() {
-            let _ = handle.close().await;
-        }
-    }
+/// Marks a tree that is no longer reachable as closed, so no CREATE adds to
+/// it, and takes its opens. Waits for no request.
+async fn detach_tree(tree_arc: &Arc<RwLock<TreeConnect>>) -> Vec<Arc<RwLock<Open>>> {
+    let mut tree = tree_arc.write().await;
+    tree.closed = true;
+    let opens: Vec<_> = tree.opens.write().await.drain().map(|(_, o)| o).collect();
+    opens
 }
 
 // ---------------------------------------------------------------------------
@@ -297,8 +320,14 @@ pub struct TreeConnect {
     pub share: Arc<ShareBindings>,
     pub granted_access: Access,
     pub opens: RwLock<HashMap<FileId, Arc<RwLock<Open>>>>,
-    next_volatile: AtomicU64,
+    /// Set once the tree is disconnected or revoked. Opens are no longer
+    /// added to it.
+    pub closed: bool,
 }
+
+/// Source of FileIds. One counter for the process keeps every FileId unique
+/// within its session, and -1 is never reached.
+static NEXT_FILE_ID: AtomicU64 = AtomicU64::new(1);
 
 impl TreeConnect {
     pub fn new(id: u32, share: Arc<ShareBindings>, granted_access: Access) -> Self {
@@ -307,12 +336,12 @@ impl TreeConnect {
             share,
             granted_access,
             opens: RwLock::new(HashMap::new()),
-            next_volatile: AtomicU64::new(1),
+            closed: false,
         }
     }
 
     pub fn alloc_file_id(&self) -> FileId {
-        let v = self.next_volatile.fetch_add(1, Ordering::Relaxed);
+        let v = NEXT_FILE_ID.fetch_add(1, Ordering::Relaxed);
         FileId::new(v, v)
     }
 }
@@ -328,33 +357,28 @@ pub struct Open {
     pub granted_access: u32,
     pub last_path: SmbPath,
     pub is_directory: bool,
+    /// FILE_DELETE_ON_CLOSE was set on CREATE (MS-FSA Open.Mode): the file
+    /// becomes delete-pending when this open closes.
     pub delete_on_close: bool,
     pub search_state: Option<DirCursor>,
     /// Access and write times that FileBasicInformation fixed for this open
     /// (MS-FSA 2.1.5.15.2). Writes and truncation through the open, and its
     /// CLOSE, restore them.
     pub fixed_times: FileTimes,
+    /// CreateOptions of the CREATE request.
+    pub create_options: u32,
+    /// The open's entry in its share's table of open files. `None` once the
+    /// open is closed.
+    pub(crate) file: Option<FileRef>,
+    /// Counts the open against its connection's limit.
+    pub(crate) slot: Option<OpenSlot>,
 }
 
 impl Open {
-    pub fn new(
-        file_id: FileId,
-        handle: Box<dyn Handle>,
-        granted_access: u32,
-        last_path: SmbPath,
-        is_directory: bool,
-        delete_on_close: bool,
-    ) -> Self {
-        Self {
-            file_id,
-            handle: Some(handle),
-            granted_access,
-            last_path,
-            is_directory,
-            delete_on_close,
-            search_state: None,
-            fixed_times: FileTimes::default(),
-        }
+    /// Whether the file is delete-pending (MS-FSA Link.IsDeleted), as
+    /// FileStandardInformation reports it.
+    pub fn delete_pending(&self) -> bool {
+        self.file.as_ref().is_some_and(FileRef::delete_pending)
     }
 }
 
