@@ -21,9 +21,11 @@ smb-server = "0.5"
 cargo run -p minimal-smb-example
 ```
 
-Listens on `0.0.0.0:4445`. Override with `SMB_LISTEN` and `SMB_ROOT`.
+Listens on `127.0.0.1:4445` and serves directories under `smb-example` in the system temp directory. Override with `SMB_LISTEN` and `SMB_ROOT`. Ctrl-C stops it.
 
 Shares: `public` (anon rw), `media` (anon ro), `home` (alice rw, bob ro).
+
+`alice` and `bob` use the password in `SMB_PASSWORD`. Without it, the example generates one and logs it at startup.
 
 ## Embed
 
@@ -70,6 +72,20 @@ server.serve().await?;
 ```
 
 Removing a user revokes that user's active sessions. Removing a share or revoking share access closes matching active tree connections and open handles.
+
+## Limitations
+
+Not supported:
+
+- SMB3 encryption
+- Kerberos; authentication is NTLM only
+- oplocks, leases and durable handles
+- change notifications
+- named pipes and RPC, so clients can't list a server's shares
+- DFS
+- multichannel and compression
+- alternate data streams and extended attributes
+- network discovery (mDNS, NetBIOS, WS-Discovery): clients connect by name or address
 
 ## License
 

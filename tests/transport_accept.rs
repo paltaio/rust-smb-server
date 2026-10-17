@@ -24,7 +24,7 @@ fn cpu_time() -> Duration {
     tv(usage.ru_utime) + tv(usage.ru_stime)
 }
 
-fn set_fd_limit(soft: u64) -> u64 {
+fn set_fd_limit(soft: libc::rlim_t) -> libc::rlim_t {
     // SAFETY: `limit` is a valid pointer for getrlimit and setrlimit.
     unsafe {
         let mut limit = std::mem::zeroed::<libc::rlimit>();
@@ -40,7 +40,7 @@ fn set_fd_limit(soft: u64) -> u64 {
 async fn accept_errors_back_off_and_recover() {
     let (addr, handle) = start(SmbServer::builder()).await;
 
-    let open = std::fs::read_dir("/proc/self/fd").expect("fd dir").count() as u64;
+    let open = std::fs::read_dir("/proc/self/fd").expect("fd dir").count() as libc::rlim_t;
     let old_limit = set_fd_limit(open + 16);
     let mut hogs = Vec::new();
     while let Ok(f) = File::open("/dev/null") {

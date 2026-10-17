@@ -1,0 +1,60 @@
+[package]
+name = "smb-server-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+smb-server = { path = ".." }
+tokio = { version = "1.40", features = ["rt"] }
+
+[workspace]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "frame"
+path = "fuzz_targets/frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "header"
+path = "fuzz_targets/header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "spnego"
+path = "fuzz_targets/spnego.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ntlm"
+path = "fuzz_targets/ntlm.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "smb1_negotiate"
+path = "fuzz_targets/smb1_negotiate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dispatch"
+path = "fuzz_targets/dispatch.rs"
+test = false
+doc = false
+bench = false
