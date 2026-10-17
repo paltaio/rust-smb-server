@@ -228,6 +228,13 @@ pub trait ShareBackend: Send + Sync + 'static {
     /// Static capabilities. TREE_CONNECT clamps access to read-only when
     /// `is_read_only` is set.
     fn capabilities(&self) -> BackendCapabilities;
+
+    /// Size, free space and identity of the volume behind the share, for the
+    /// filesystem QUERY_INFO classes. The default returns
+    /// [`VolumeInfo::default`].
+    async fn volume_info(&self) -> SmbResult<VolumeInfo> {
+        Ok(VolumeInfo::default())
+    }
 }
 
 /// A live open file or directory handle.
@@ -293,11 +300,26 @@ pub trait Handle: Send + Sync {
     /// uses the wildcards of MS-FSA 2.1.4.4: `*` and `?`, and the DOS forms
     /// `<` (DOS_STAR), `>` (DOS_QM) and `"` (DOS_DOT).
     /// QUERY_DIRECTORY returns the result as is, so the backend applies the
-    /// pattern.
+    /// pattern. The `.` and `..` entries are left out; QUERY_DIRECTORY adds
+    /// them.
     async fn list_dir(&self, pattern: Option<&str>) -> SmbResult<Vec<DirEntry>>;
 
     /// Close the handle. Boxed self lets implementors consume internal state.
     async fn close(self: Box<Self>) -> SmbResult<()>;
+
+    /// Number of hard links to the file, reported as NumberOfLinks by
+    /// FileStandardInformation. `0` means the file has been deleted while
+    /// open. The default reports `1`.
+    async fn link_count(&self) -> SmbResult<u32> {
+        Ok(1)
+    }
+
+    /// True if this directory has no entries other than `.` and `..`,
+    /// counting entries that [`Handle::list_dir`] leaves out. The default
+    /// lists the directory.
+    async fn dir_is_empty(&self) -> SmbResult<bool> {
+        Ok(self.list_dir(None).await?.is_empty())
+    }
 }
 
 /// Backend for the synthetic IPC$ share. `open`, `unlink` and `rename`
@@ -323,6 +345,53 @@ impl ShareBackend for NotSupportedBackend {
         BackendCapabilities {
             is_read_only: true,
             case_sensitive: false,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// VolumeInfo
+// ---------------------------------------------------------------------------
+
+/// Volume behind a share, as reported by FileFsVolumeInformation,
+/// FileFsSizeInformation, FileFsFullSizeInformation,
+/// FileFsAttributeInformation and FileFsSectorSizeInformation (MS-FSCC 2.5).
+///
+/// Sizes count allocation units of `sectors_per_allocation_unit *
+/// bytes_per_sector` bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VolumeInfo {
+    /// Total allocation units on the volume.
+    pub total_allocation_units: u64,
+    /// Free allocation units available to the share's users, after quotas
+    /// and reserved space.
+    pub caller_available_allocation_units: u64,
+    /// Free allocation units on the volume.
+    pub actual_available_allocation_units: u64,
+    /// Sectors in one allocation unit.
+    pub sectors_per_allocation_unit: u32,
+    /// Bytes in one sector.
+    pub bytes_per_sector: u32,
+    /// Volume serial number.
+    pub serial_number: u32,
+    /// Volume label. `None` reports the share name.
+    pub label: Option<String>,
+    /// Longest file name the volume stores, in characters.
+    pub max_name_length: u32,
+}
+
+impl Default for VolumeInfo {
+    /// A 4 PiB volume with 2 PiB free, in 4 KiB allocation units.
+    fn default() -> Self {
+        Self {
+            total_allocation_units: 1 << 40,
+            caller_available_allocation_units: 1 << 39,
+            actual_available_allocation_units: 1 << 39,
+            sectors_per_allocation_unit: 1,
+            bytes_per_sector: 4096,
+            serial_number: crate::info_class::VOLUME_SERIAL_NUMBER,
+            label: None,
+            max_name_length: 255,
         }
     }
 }

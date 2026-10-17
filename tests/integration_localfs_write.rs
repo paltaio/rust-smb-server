@@ -888,7 +888,7 @@ async fn directory_renames_while_it_is_open() {
         STATUS_SUCCESS
     );
     c.close(dir).await;
-    assert_eq!(c.list(listing, "*").await.unwrap(), ["sub"]);
+    assert_eq!(c.list(listing, "*").await.unwrap(), [".", "..", "sub"]);
     c.close(listing).await;
     assert!(root.join("e").join("sub").is_dir());
     assert!(!root.join("d").exists());

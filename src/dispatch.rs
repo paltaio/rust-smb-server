@@ -792,7 +792,7 @@ mod tests {
     }
 
     /// CREATE f.txt, then related QUERY_INFO and CLOSE on the new FileId.
-    /// The QUERY_INFO response, 86 bytes, is padded in the compound.
+    /// The QUERY_INFO response, 76 bytes, is padded in the compound.
     fn create_query_close() -> Vec<u8> {
         let name = crate::utils::utf16le("f.txt");
         let mut create = Vec::new();
@@ -821,7 +821,7 @@ mod tests {
         QueryInfoRequest {
             structure_size: 41,
             info_type: 1,
-            file_information_class: crate::info_class::FILE_NAME_INFORMATION,
+            file_information_class: crate::info_class::FILE_EA_INFORMATION,
             output_buffer_length: 4096,
             input_buffer_offset: 0,
             reserved: 0,

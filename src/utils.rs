@@ -32,6 +32,7 @@ pub fn utf16le(s: &str) -> Vec<u8> {
 /// Decode a UTF-16LE byte slice. Returns an empty string if the buffer is not
 /// 2-byte aligned (caller decides what to do); replacement characters on
 /// invalid surrogates.
+#[allow(dead_code, reason = "no wire decoder uses lossy decoding")]
 pub fn utf16le_to_string(bytes: &[u8]) -> String {
     if !bytes.len().is_multiple_of(2) {
         return String::new();

@@ -38,6 +38,10 @@ pub enum SmbError {
     NotSameDevice,
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    #[error("disk full")]
+    DiskFull,
+    #[error("disk quota exceeded")]
+    QuotaExceeded,
 }
 
 impl SmbError {
@@ -56,6 +60,8 @@ impl SmbError {
             SmbError::NotSupported => ntstatus::STATUS_NOT_SUPPORTED,
             SmbError::NotSameDevice => ntstatus::STATUS_NOT_SAME_DEVICE,
             SmbError::Io(_) => ntstatus::STATUS_UNEXPECTED_IO_ERROR,
+            SmbError::DiskFull => ntstatus::STATUS_DISK_FULL,
+            SmbError::QuotaExceeded => ntstatus::STATUS_DISK_QUOTA_EXCEEDED,
         }
     }
 }

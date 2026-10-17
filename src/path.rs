@@ -11,6 +11,13 @@ use crate::error::{SmbError, SmbResult};
 /// A validated, component-list path. No `..`, no Windows-forbidden chars, no
 /// alternate streams. Always relative to the share root; the empty path is
 /// the root.
+///
+/// Each component is a filename as MS-FSCC 2.1.5.2 defines it: 1 to 255
+/// UTF-16 code units, with no control characters and none of
+/// `" * / : < > ? \ |`. The whole path is at most 32,760 UTF-16 code units.
+/// On Windows hosts the reserved device names (`CON`, `PRN`, `AUX`, `NUL`,
+/// `COM1`-`COM9` and `LPT1`-`LPT9`, with or without an extension) are
+/// rejected too.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SmbPath {
     components: Vec<String>,
@@ -37,6 +44,9 @@ impl SmbPath {
             .unwrap_or(s);
         if trimmed.is_empty() {
             return Ok(Self::root());
+        }
+        if trimmed.encode_utf16().count() > MAX_PATH_UNITS {
+            return Err(SmbError::NameInvalid);
         }
 
         // 2. Reject forbidden characters anywhere in the path.
@@ -65,8 +75,8 @@ impl SmbPath {
             if raw == ".." {
                 return Err(SmbError::NameInvalid);
             }
-            // 4. Reject reserved DOS device names.
-            if is_reserved_dos_name(raw) {
+            // 4. Length and, on Windows hosts, reserved device names.
+            if raw.encode_utf16().count() > MAX_COMPONENT_UNITS || host_reserved_name(raw) {
                 return Err(SmbError::NameInvalid);
             }
             components.push(raw.to_string());
@@ -169,6 +179,58 @@ impl std::fmt::Display for SmbPath {
             f.write_str(&self.display_backslash())
         }
     }
+}
+
+/// Longest filename component, in UTF-16 code units (MS-FSCC 2.1.5.2).
+const MAX_COMPONENT_UNITS: usize = 255;
+
+/// Longest pathname, in UTF-16 code units (MS-FSCC 2.1.5).
+const MAX_PATH_UNITS: usize = 32_760;
+
+/// True if `name` is one filename component that `SmbPath` accepts, so a
+/// client that sees it in a listing can open it.
+#[cfg_attr(
+    not(feature = "localfs"),
+    allow(dead_code, reason = "used by LocalFsBackend")
+)]
+pub(crate) fn is_valid_component(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && name.encode_utf16().count() <= MAX_COMPONENT_UNITS
+        && !name
+            .chars()
+            .any(|c| is_control(c) || is_forbidden(c) || matches!(c, '\\' | '/'))
+        && !host_reserved_name(name)
+}
+
+/// True if `pattern` is a valid QUERY_DIRECTORY search pattern (MS-FSA
+/// 2.1.5.6.3): a filename component in which the wildcards `* ? < > "` may
+/// appear, or `.` or `..`.
+pub(crate) fn is_valid_pattern(pattern: &str) -> bool {
+    !pattern.is_empty()
+        && pattern.encode_utf16().count() <= MAX_COMPONENT_UNITS
+        && !pattern
+            .chars()
+            .any(|c| is_control(c) || matches!(c, ':' | '|' | '\\' | '/'))
+}
+
+fn is_control(c: char) -> bool {
+    ('\u{0000}'..='\u{001F}').contains(&c)
+}
+
+#[cfg_attr(
+    not(feature = "localfs"),
+    allow(dead_code, reason = "used by LocalFsBackend")
+)]
+fn is_forbidden(c: char) -> bool {
+    matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*')
+}
+
+/// True if `name` is a reserved DOS device name on this host. Only Windows
+/// resolves these names to devices.
+fn host_reserved_name(name: &str) -> bool {
+    cfg!(windows) && is_reserved_dos_name(name)
 }
 
 fn is_reserved_dos_name(s: &str) -> bool {
@@ -286,13 +348,65 @@ mod tests {
         assert!(s.parse::<SmbPath>().is_err());
     }
 
+    #[cfg(windows)]
     #[test]
     fn rejects_reserved_dos_names() {
         for bad in [
             "CON", "con", "PRN", "AUX", "NUL", "COM1", "LPT9", "Con.txt", "NUL.dat",
         ] {
             assert!(bad.parse::<SmbPath>().is_err(), "{bad}");
+            assert!(!is_valid_component(bad), "{bad}");
         }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn accepts_reserved_dos_names_where_the_host_does() {
+        for name in ["CON", "aux.c", "dir\\nul", "LPT9.log"] {
+            assert!(name.parse::<SmbPath>().is_ok(), "{name}");
+        }
+        assert!(is_valid_component("aux.c"));
+    }
+
+    #[test]
+    fn limits_component_and_path_length() {
+        let longest = "x".repeat(255);
+        assert!(longest.parse::<SmbPath>().is_ok());
+        assert!(format!("{longest}y").parse::<SmbPath>().is_err());
+        // Length counts UTF-16 code units: U+1F600 takes two.
+        assert!("\u{1F600}".repeat(127).parse::<SmbPath>().is_ok());
+        assert!("\u{1F600}".repeat(128).parse::<SmbPath>().is_err());
+
+        let component = "x".repeat(254);
+        let path = vec![component.as_str(); 129].join("\\");
+        assert_eq!(path.len(), 32_894);
+        assert!(path.parse::<SmbPath>().is_err());
+        let path = vec![component.as_str(); 128].join("\\");
+        assert_eq!(path.len(), 32_639);
+        assert!(path.parse::<SmbPath>().is_ok());
+    }
+
+    #[test]
+    fn component_validation_matches_path_parsing() {
+        for name in ["a.txt", " lead", "\u{F021}"] {
+            assert!(is_valid_component(name), "{name}");
+            assert!(name.parse::<SmbPath>().is_ok(), "{name}");
+        }
+        for name in ["", ".", "..", "a:b", "a*b", "a\\b", "a/b", "a\u{1}b"] {
+            assert!(!is_valid_component(name), "{name:?}");
+        }
+        assert!(!is_valid_component(&"x".repeat(256)));
+    }
+
+    #[test]
+    fn pattern_validation_allows_wildcards_and_dots() {
+        for pattern in ["*", "*.txt", "a?b", "<.\"", ">", ".", ".."] {
+            assert!(is_valid_pattern(pattern), "{pattern}");
+        }
+        for pattern in ["", "a|b", "a:b", "a\\b", "a/b", "a\u{0}"] {
+            assert!(!is_valid_pattern(pattern), "{pattern:?}");
+        }
+        assert!(!is_valid_pattern(&"*".repeat(256)));
     }
 
     #[test]

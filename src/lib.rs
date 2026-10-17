@@ -60,3 +60,6 @@ mod tests {
 }
 
 mod auth_policy;
+mod wildcard;
+
+pub use backend::VolumeInfo;

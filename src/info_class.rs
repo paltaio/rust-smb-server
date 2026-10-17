@@ -55,12 +55,18 @@ pub fn encode_file_basic_information(info: &FileInfo) -> Vec<u8> {
 // FileStandardInformation (MS-FSCC §2.4.41) - 24 bytes
 // ---------------------------------------------------------------------------
 
-pub fn encode_file_standard_information(info: &FileInfo) -> Vec<u8> {
+/// `links` is NumberOfLinks. DeletePending is set when `delete_pending` is
+/// or no link is left (MS-FSA 2.1.5.12.27).
+pub fn encode_file_standard_information(
+    info: &FileInfo,
+    links: u32,
+    delete_pending: bool,
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(24);
     out.extend_from_slice(&info.allocation_size.to_le_bytes());
     out.extend_from_slice(&info.end_of_file.to_le_bytes());
-    out.extend_from_slice(&1u32.to_le_bytes()); // NumberOfLinks = 1
-    out.push(0); // DeletePending
+    out.extend_from_slice(&links.to_le_bytes());
+    out.push(u8::from(delete_pending || links == 0));
     out.push(if info.is_directory { 1 } else { 0 }); // Directory
     out.extend_from_slice(&0u16.to_le_bytes()); // Reserved
     out
@@ -116,39 +122,34 @@ pub fn encode_file_alignment_information() -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
-// FileNameInformation (MS-FSCC §2.4.27) - 4 bytes + UTF-16LE name
-// ---------------------------------------------------------------------------
-
-pub fn encode_file_name_information(name: &str) -> Vec<u8> {
-    let n = utf16le(name);
-    let mut out = Vec::with_capacity(4 + n.len());
-    out.extend_from_slice(&(n.len() as u32).to_le_bytes());
-    out.extend_from_slice(&n);
-    out
-}
-
-// ---------------------------------------------------------------------------
 // FileAllInformation (MS-FSCC §2.4.2) - concatenation of basic, standard,
 // internal, EA, access, position, mode, alignment, name.
 // ---------------------------------------------------------------------------
 
-pub fn encode_file_all_information(info: &FileInfo, access_mask: u32) -> Vec<u8> {
+/// The name part is empty, as MS-SMB2 3.3.5.20.1 asks of servers.
+pub fn encode_file_all_information(
+    info: &FileInfo,
+    access_mask: u32,
+    links: u32,
+    delete_pending: bool,
+) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&encode_file_basic_information(info));
-    out.extend_from_slice(&encode_file_standard_information(info));
+    out.extend_from_slice(&encode_file_standard_information(
+        info,
+        links,
+        delete_pending,
+    ));
     out.extend_from_slice(&encode_file_internal_information(info.file_index));
     out.extend_from_slice(&encode_file_ea_information());
     out.extend_from_slice(&encode_file_access_information(access_mask));
     out.extend_from_slice(&encode_file_position_information());
     out.extend_from_slice(&encode_file_mode_information(0));
     out.extend_from_slice(&encode_file_alignment_information());
-    out.extend_from_slice(&encode_file_name_information(&info.name));
+    out.extend_from_slice(&0u32.to_le_bytes()); // FileNameLength
     // Linux cifs checks FileAllInformation against its struct with
-    // FileName[1], so the empty-name root case must still be at least 101
-    // bytes.
-    if out.len() < 101 {
-        out.push(0);
-    }
+    // FileName[1], so the empty name still takes one byte.
+    out.push(0);
     out
 }
 
@@ -198,8 +199,9 @@ pub const FS_SIZE_INFORMATION: u8 = 0x03;
 pub const FS_DEVICE_INFORMATION: u8 = 0x04;
 pub const FS_ATTRIBUTE_INFORMATION: u8 = 0x05;
 pub const FS_FULL_SIZE_INFORMATION: u8 = 0x07;
+pub const FS_SECTOR_SIZE_INFORMATION: u8 = 0x0B;
 
-/// Serial number of the volume behind every share.
+/// Volume serial number of a backend that reports none of its own.
 pub const VOLUME_SERIAL_NUMBER: u32 = 0xCAFE_BABE;
 
 /// FileFsVolumeInformation (MS-FSCC §2.5.9). Volume creation time, serial,
@@ -271,64 +273,21 @@ pub fn encode_fs_full_size_information(
     out
 }
 
-// ---------------------------------------------------------------------------
-// Minimal SECURITY_DESCRIPTOR with owner=Everyone, DACL=Everyone allowed.
-// ---------------------------------------------------------------------------
-
-/// Self-relative SECURITY_DESCRIPTOR (MS-DTYP §2.4.6): owner Everyone
-/// (S-1-1-0), no group, DACL with one Allow ACE granting `0x001F_01FF`
-/// (FILE_ALL_ACCESS) to Everyone.
-pub fn encode_minimal_security_descriptor() -> Vec<u8> {
-    // SID Everyone (S-1-1-0): 1, 1, [0,0,0,0,0,1], [0,0,0,0]
-    // Total length: 1 (Revision) + 1 (SubAuthorityCount=1) + 6 (Identifier) + 4 (subauth) = 12
-    let everyone: Vec<u8> = vec![
-        0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
-    ];
-
-    // Build ACE: AccessAllowedAce
-    //   Header: 4 bytes (Type=0, Flags=0, Size)
-    //   Mask: 4 bytes
-    //   Sid: variable
-    let mut ace = Vec::new();
-    ace.push(0x00); // ACCESS_ALLOWED_ACE_TYPE
-    ace.push(0x00); // AceFlags
-    let ace_size: u16 = (4 + 4 + everyone.len()) as u16;
-    ace.extend_from_slice(&ace_size.to_le_bytes());
-    ace.extend_from_slice(&0x001F_01FFu32.to_le_bytes()); // FILE_ALL_ACCESS
-    ace.extend_from_slice(&everyone);
-
-    // ACL: Revision (1), Sbz1 (1), AclSize (2), AceCount (2), Sbz2 (2), then ACEs.
-    let acl_size: u16 = (8 + ace.len()) as u16;
-    let mut dacl = Vec::new();
-    dacl.push(0x02); // Revision = ACL_REVISION
-    dacl.push(0x00); // Sbz1
-    dacl.extend_from_slice(&acl_size.to_le_bytes());
-    dacl.extend_from_slice(&1u16.to_le_bytes()); // AceCount
-    dacl.extend_from_slice(&0u16.to_le_bytes()); // Sbz2
-    dacl.extend_from_slice(&ace);
-
-    // SECURITY_DESCRIPTOR (self-relative):
-    //   Revision (1), Sbz1 (1), Control (2),
-    //   OwnerOffset (4), GroupOffset (4), SaclOffset (4), DaclOffset (4)
-    //   Then concatenated entities.
-    const SE_DACL_PRESENT: u16 = 0x0004;
-    const SE_SELF_RELATIVE: u16 = 0x8000;
-    let mut sd = Vec::new();
-    sd.push(0x01); // Revision = SECURITY_DESCRIPTOR_REVISION
-    sd.push(0x00); // Sbz1
-    sd.extend_from_slice(&(SE_DACL_PRESENT | SE_SELF_RELATIVE).to_le_bytes());
-    let header_len: u32 = 20;
-    let owner_off = header_len;
-    let group_off = 0u32;
-    let sacl_off = 0u32;
-    let dacl_off = owner_off + everyone.len() as u32;
-    sd.extend_from_slice(&owner_off.to_le_bytes());
-    sd.extend_from_slice(&group_off.to_le_bytes());
-    sd.extend_from_slice(&sacl_off.to_le_bytes());
-    sd.extend_from_slice(&dacl_off.to_le_bytes());
-    sd.extend_from_slice(&everyone);
-    sd.extend_from_slice(&dacl);
-    sd
+/// FileFsSectorSizeInformation (MS-FSCC §2.5.8) - 28 bytes. Every sector
+/// size is `bytes_per_sector`, and the device and partition are reported
+/// aligned.
+pub fn encode_fs_sector_size_information(bytes_per_sector: u32) -> Vec<u8> {
+    const SSINFO_FLAGS_ALIGNED_DEVICE: u32 = 0x0000_0001;
+    const SSINFO_FLAGS_PARTITION_ALIGNED_ON_DEVICE: u32 = 0x0000_0002;
+    let mut out = Vec::with_capacity(28);
+    for _ in 0..4 {
+        out.extend_from_slice(&bytes_per_sector.to_le_bytes());
+    }
+    let flags = SSINFO_FLAGS_ALIGNED_DEVICE | SSINFO_FLAGS_PARTITION_ALIGNED_ON_DEVICE;
+    out.extend_from_slice(&flags.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes()); // ByteOffsetForSectorAlignment
+    out.extend_from_slice(&0u32.to_le_bytes()); // ByteOffsetForPartitionAlignment
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -412,6 +371,20 @@ fn write_dir_entry_prefix(out: &mut Vec<u8>, info: &FileInfo, name_len: usize) {
     out.extend_from_slice(&(name_len as u32).to_le_bytes());
 }
 
+/// Offset of FileName in a directory entry of info class `class`: the size
+/// of its fixed part. `None` for classes `encode_dir_entry` does not encode.
+pub fn dir_entry_name_offset(class: u8) -> Option<usize> {
+    Some(match class {
+        FILE_DIRECTORY_INFORMATION => 64,
+        FILE_FULL_DIRECTORY_INFORMATION => 68,
+        FILE_BOTH_DIRECTORY_INFORMATION => 94,
+        FILE_NAMES_INFORMATION => 12,
+        FILE_ID_BOTH_DIRECTORY_INFORMATION => 104,
+        FILE_ID_FULL_DIRECTORY_INFORMATION => 80,
+        _ => return None,
+    })
+}
+
 /// Round up `n` to the next multiple of 8.
 pub fn align8(n: usize) -> usize {
     (n + 7) & !7
@@ -444,8 +417,24 @@ mod tests {
 
     #[test]
     fn standard_information_is_24_bytes() {
-        let bytes = encode_file_standard_information(&fake_info());
+        let bytes = encode_file_standard_information(&fake_info(), 1, false);
         assert_eq!(bytes.len(), 24);
+    }
+
+    #[test]
+    fn standard_information_reports_links_and_delete_pending() {
+        let bytes = encode_file_standard_information(&fake_info(), 3, false);
+        assert_eq!(bytes[16..20], 3u32.to_le_bytes());
+        assert_eq!(bytes[20], 0);
+        assert_eq!(
+            encode_file_standard_information(&fake_info(), 1, true)[20],
+            1
+        );
+        // No link left: the file is being deleted.
+        assert_eq!(
+            encode_file_standard_information(&fake_info(), 0, false)[20],
+            1
+        );
     }
 
     #[test]
@@ -456,18 +445,34 @@ mod tests {
 
     #[test]
     fn file_all_information_empty_name_keeps_linux_minimum_size() {
-        let mut info = fake_info();
-        info.name.clear();
-        let bytes = encode_file_all_information(&info, 0x001F_01FF);
+        let bytes = encode_file_all_information(&fake_info(), 0x001F_01FF, 1, false);
         assert_eq!(bytes.len(), 101);
+        // FileNameLength
+        assert_eq!(bytes[96..100], [0; 4]);
     }
 
     #[test]
-    fn security_descriptor_is_self_relative() {
-        let sd = encode_minimal_security_descriptor();
-        // Revision=1, then Control bits 8000 set => self-relative.
-        assert_eq!(sd[0], 0x01);
-        let control = u16::from_le_bytes([sd[2], sd[3]]);
-        assert!(control & 0x8000 != 0);
+    fn dir_entry_name_offsets_match_the_encoders() {
+        let entry = DirEntry { info: fake_info() };
+        let name_len = utf16le(&entry.info.name).len();
+        for class in [
+            FILE_DIRECTORY_INFORMATION,
+            FILE_FULL_DIRECTORY_INFORMATION,
+            FILE_BOTH_DIRECTORY_INFORMATION,
+            FILE_NAMES_INFORMATION,
+            FILE_ID_BOTH_DIRECTORY_INFORMATION,
+            FILE_ID_FULL_DIRECTORY_INFORMATION,
+        ] {
+            let offset = dir_entry_name_offset(class).unwrap();
+            assert_eq!(encode_dir_entry(class, &entry).len(), offset + name_len);
+        }
+        assert_eq!(dir_entry_name_offset(0x3C), None);
+    }
+
+    #[test]
+    fn sector_size_information_is_28_bytes() {
+        let bytes = encode_fs_sector_size_information(4096);
+        assert_eq!(bytes.len(), 28);
+        assert_eq!(bytes[0..4], 4096u32.to_le_bytes());
     }
 }

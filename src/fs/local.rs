@@ -10,8 +10,13 @@
 //! - `read_only()` flips a flag that makes write-class opens reject early
 //!   with `SmbError::AccessDenied`.
 //! - `list_dir` applies the MS-FSA 2.1.4.4 wildcards (`*`, `?`, `<`, `>`,
-//!   `"`) itself, folding ASCII case only, since cap-std only provides raw
-//!   `entries()`. `"*.*"` matches every name, as `"*"` does.
+//!   `"`) itself, since cap-std only provides raw `entries()`. Matching
+//!   ignores case only where the host looks names up case-insensitively.
+//!   `"*.*"` matches every name, as `"*"` does.
+//! - Listings leave out names a client could not open again: names that are
+//!   not valid UTF-8 or not valid `SmbPath` components.
+//! - Name lookups are case-sensitive or not as the host filesystem reports
+//!   for the share root.
 //! - On Windows, directory handles share delete access, so a client can
 //!   rename or delete a directory it or another client has open.
 
@@ -25,6 +30,7 @@ use bytes::Bytes;
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, Metadata, OpenOptions as CapOpenOptions};
 use tokio::task::spawn_blocking;
+use tracing::debug;
 
 use crate::backend::{
     BackendCapabilities, DirEntry as SmbDirEntry, FILE_ATTRIBUTE_ARCHIVE, FILE_ATTRIBUTE_READONLY,
@@ -33,6 +39,11 @@ use crate::backend::{
 use crate::error::{SmbError, SmbResult};
 use crate::path::{SmbPath, same_path};
 use crate::utils::{FILETIME_OFFSET, system_time_to_filetime};
+
+use super::volume;
+use crate::backend::VolumeInfo;
+use crate::path::is_valid_component;
+use crate::wildcard::Pattern;
 
 // ---------------------------------------------------------------------------
 // Backend
@@ -49,6 +60,8 @@ pub struct LocalFsBackend {
     /// Device of the share root; see `file_index`.
     root_dev: Option<u64>,
     read_only: bool,
+    /// Case rule of name lookups in the share root.
+    case_sensitive: bool,
 }
 
 impl LocalFsBackend {
@@ -57,10 +70,12 @@ impl LocalFsBackend {
     pub fn new(path: impl AsRef<Path>) -> io::Result<Self> {
         let dir = Dir::open_ambient_dir(path, ambient_authority())?;
         let root_dev = file_key(&dir.dir_metadata()?).map(|(dev, _)| dev);
+        let case_sensitive = volume::is_case_sensitive(&dir);
         Ok(Self {
             root: Arc::new(dir),
             root_dev,
             read_only: false,
+            case_sensitive,
         })
     }
 
@@ -116,6 +131,8 @@ fn io_to_smb(err: io::Error) -> SmbError {
         NotADirectory => SmbError::NotADirectory,
         InvalidInput | InvalidFilename => SmbError::NameInvalid,
         CrossesDevices => SmbError::NotSameDevice,
+        StorageFull => SmbError::DiskFull,
+        QuotaExceeded => SmbError::QuotaExceeded,
         _ => SmbError::Io(err),
     }
 }
@@ -385,46 +402,66 @@ fn file_info_from_metadata(name: String, md: &Metadata, root_dev: Option<u64>) -
 }
 
 // ---------------------------------------------------------------------------
-// DOS glob matching
+// Directory listing
 // ---------------------------------------------------------------------------
 
-/// Match `name` against a pattern with the wildcards of MS-FSA 2.1.4.4.
-/// Comparison folds ASCII case only.
-///
-/// - `*` matches any sequence, `?` any single character.
-/// - `<` (DOS_STAR) matches any sequence that does not contain the last `.`
-///   of the name.
-/// - `>` (DOS_QM) matches any single character other than `.`, and matches
-///   nothing at a `.` or at the end of the name.
-/// - `"` (DOS_DOT) matches a `.`, or nothing at the end of the name.
-fn glob_match(pattern: &str, name: &str) -> bool {
-    let p: Vec<char> = pattern.chars().collect();
-    let n: Vec<char> = name.chars().collect();
-    let last_dot = n.iter().rposition(|&c| c == '.');
-
-    // matches[j]: the pattern consumed so far matches the first j characters
-    // of the name. One row per pattern character.
-    let mut matches = vec![false; n.len() + 1];
-    matches[0] = true;
-    for &pc in &p {
-        let mut next = vec![false; n.len() + 1];
-        for j in 0..=n.len() {
-            let here = j < n.len();
-            next[j] = match pc {
-                '*' => matches[j] || (j > 0 && next[j - 1]),
-                '<' => matches[j] || (j > 0 && next[j - 1] && Some(j - 1) != last_dot),
-                '?' => j > 0 && matches[j - 1],
-                '>' => {
-                    (j > 0 && matches[j - 1] && n[j - 1] != '.')
-                        || (matches[j] && (!here || n[j] == '.'))
-                }
-                '"' => (j > 0 && matches[j - 1] && n[j - 1] == '.') || (matches[j] && !here),
-                c => j > 0 && matches[j - 1] && c.eq_ignore_ascii_case(&n[j - 1]),
-            };
+/// Entries of `dir` whose names match `pattern`, every entry for `None`.
+/// Names a client could not open again are left out.
+fn list_entries(
+    dir: &Dir,
+    pattern: Option<&str>,
+    root_dev: Option<u64>,
+) -> io::Result<Vec<SmbDirEntry>> {
+    let pattern = pattern
+        .filter(|p| !matches!(*p, "" | "*" | "*.*"))
+        .map(|p| Pattern::new(p, !volume::is_case_sensitive(dir)));
+    let mut out = Vec::new();
+    for entry in dir.entries()? {
+        let entry = entry?;
+        let os_name = entry.file_name();
+        if os_name == "." || os_name == ".." {
+            continue;
         }
-        matches = next;
+        let Some(name) = os_name.to_str().filter(|n| is_valid_component(n)) else {
+            debug!(name = ?os_name, "listing leaves out a name clients cannot open");
+            continue;
+        };
+        if pattern.as_ref().is_some_and(|p| !p.matches(name)) {
+            continue;
+        }
+        let md = match listed_metadata(dir, &entry) {
+            Ok(md) => md,
+            // Removed since the directory was read.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        let info = file_info_from_metadata(name.to_owned(), &md, root_dev);
+        out.push(SmbDirEntry { info });
     }
-    matches[n.len()]
+    Ok(out)
+}
+
+/// Metadata of a listed entry as an open of its name sees it: a symlink
+/// reports its target, or itself when the target cannot be reached inside
+/// the share.
+fn listed_metadata(dir: &Dir, entry: &cap_std::fs::DirEntry) -> io::Result<Metadata> {
+    if entry.file_type()?.is_symlink()
+        && let Ok(md) = dir.metadata(entry.file_name())
+    {
+        return Ok(md);
+    }
+    entry_metadata(dir, entry)
+}
+
+/// True if `dir` has no entries besides `.` and `..`.
+fn dir_is_empty(dir: &Dir) -> io::Result<bool> {
+    for entry in dir.entries()? {
+        let name = entry?.file_name();
+        if name != "." && name != ".." {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 // ---------------------------------------------------------------------------
@@ -748,9 +785,18 @@ impl ShareBackend for LocalFsBackend {
     fn capabilities(&self) -> BackendCapabilities {
         BackendCapabilities {
             is_read_only: self.read_only,
-            // Case rule of the platform's usual filesystem; lookups go to the host.
-            case_sensitive: cfg!(any(target_os = "linux", target_os = "freebsd")),
+            case_sensitive: self.case_sensitive,
         }
+    }
+
+    async fn volume_info(&self) -> SmbResult<VolumeInfo> {
+        let root = Arc::clone(&self.root);
+        let root_dev = self.root_dev;
+        spawn_blocking(move || volume::volume_info(&root, root_dev))
+            .await
+            .map_err(join_to_io)
+            .map_err(io_to_smb)?
+            .map_err(io_to_smb)
     }
 }
 
@@ -966,33 +1012,11 @@ impl Handle for LocalHandle {
                 let dir_handle = Arc::clone(dir_handle);
                 let root_dev = *root_dev;
                 let pat = pattern.map(|s| s.to_owned());
-                spawn_blocking(move || -> io::Result<Vec<SmbDirEntry>> {
-                    let mut out = Vec::new();
-                    for entry in dir_handle.entries()? {
-                        let entry = entry?;
-                        let os_name = entry.file_name();
-                        let Some(name) = os_name.to_str().map(str::to_owned) else {
-                            // Skip non-UTF-8 names; SMB wire format is UTF-16
-                            // and we never want to emit invalid Unicode here.
-                            continue;
-                        };
-                        if let Some(p) = pat.as_deref() {
-                            // Empty / "*" / "*.*" all mean "match everything"
-                            // in DOS-speak.
-                            if !(p.is_empty() || p == "*" || p == "*.*" || glob_match(p, &name)) {
-                                continue;
-                            }
-                        }
-                        let md = entry_metadata(&dir_handle, &entry)?;
-                        let info = file_info_from_metadata(name, &md, root_dev);
-                        out.push(SmbDirEntry { info });
-                    }
-                    Ok(out)
-                })
-                .await
-                .map_err(join_to_io)
-                .map_err(io_to_smb)?
-                .map_err(io_to_smb)
+                spawn_blocking(move || list_entries(&dir_handle, pat.as_deref(), root_dev))
+                    .await
+                    .map_err(join_to_io)
+                    .map_err(io_to_smb)?
+                    .map_err(io_to_smb)
             }
         }
     }
@@ -1002,6 +1026,40 @@ impl Handle for LocalHandle {
         // does when the last `Arc` ref goes away. No flush here: SMB CLOSE
         // does not imply fsync.
         Ok(())
+    }
+
+    /// The host link count of a file. A directory reports one link, as it
+    /// has one name, or none once it has been removed.
+    async fn link_count(&self) -> SmbResult<u32> {
+        let md = match self {
+            LocalHandle::File { file, .. } => {
+                let file = Arc::clone(file);
+                spawn_blocking(move || Metadata::from_file(&file)).await
+            }
+            LocalHandle::Dir { dir_handle, .. } => {
+                let dir_handle = Arc::clone(dir_handle);
+                spawn_blocking(move || dir_handle.dir_metadata()).await
+            }
+        }
+        .map_err(join_to_io)
+        .map_err(io_to_smb)?
+        .map_err(io_to_smb)?;
+        let links = link_count(&md).map_or(1, |n| u32::try_from(n).unwrap_or(u32::MAX));
+        Ok(if md.is_dir() { links.min(1) } else { links })
+    }
+
+    async fn dir_is_empty(&self) -> SmbResult<bool> {
+        match self {
+            LocalHandle::File { .. } => Err(SmbError::NotADirectory),
+            LocalHandle::Dir { dir_handle, .. } => {
+                let dir_handle = Arc::clone(dir_handle);
+                spawn_blocking(move || dir_is_empty(&dir_handle))
+                    .await
+                    .map_err(join_to_io)
+                    .map_err(io_to_smb)?
+                    .map_err(io_to_smb)
+            }
+        }
     }
 }
 
@@ -1421,15 +1479,24 @@ mod tests {
         let names: Vec<_> = one.iter().map(|e| e.info.name.as_str()).collect();
         assert_eq!(names, vec!["c.log"]);
 
-        // Case-insensitive.
+        // Case follows the host's lookup rule.
         let any_txt = dir_h.list_dir(Some("*.TXT")).await.unwrap();
-        assert_eq!(any_txt.len(), 2);
+        let expected = if backend.capabilities().case_sensitive {
+            0
+        } else {
+            2
+        };
+        assert_eq!(any_txt.len(), expected);
 
         // "*" matches everything.
         let all = dir_h.list_dir(Some("*")).await.unwrap();
         assert_eq!(all.len(), 4);
 
         dir_h.close().await.unwrap();
+    }
+
+    fn glob_match(pattern: &str, name: &str) -> bool {
+        Pattern::new(pattern, true).matches(name)
     }
 
     #[test]
@@ -1575,5 +1642,167 @@ mod tests {
             .unwrap();
         // 100ns granularity: round-trip should be sub-microsecond.
         assert!(delta < Duration::from_micros(1), "delta = {delta:?}");
+    }
+
+    #[test]
+    fn full_disk_and_quota_map_to_their_statuses() {
+        let full = io_to_smb(io::ErrorKind::StorageFull.into());
+        assert_eq!(full.to_nt_status(), crate::ntstatus::STATUS_DISK_FULL);
+        let quota = io_to_smb(io::ErrorKind::QuotaExceeded.into());
+        assert_eq!(
+            quota.to_nt_status(),
+            crate::ntstatus::STATUS_DISK_QUOTA_EXCEEDED
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn volume_info_reports_the_host_volume() {
+        let td = tempdir().unwrap();
+        let backend = LocalFsBackend::new(td.path()).unwrap();
+        let info = backend.volume_info().await.unwrap();
+        let st = rustix::fs::statvfs(td.path()).unwrap();
+        assert_eq!(info.total_allocation_units, st.f_blocks);
+        let unit = u64::from(info.sectors_per_allocation_unit) * u64::from(info.bytes_per_sector);
+        assert_eq!(unit, st.f_frsize);
+        // Free space moves with other activity on the volume.
+        let free_bytes = info.actual_available_allocation_units * unit;
+        let host_free = st.f_bfree * st.f_frsize;
+        assert!(
+            free_bytes.abs_diff(host_free) <= 64 << 20,
+            "{free_bytes} vs {host_free}"
+        );
+        assert!(info.caller_available_allocation_units <= info.actual_available_allocation_units);
+        assert_ne!(info, VolumeInfo::default());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn listing_leaves_out_names_clients_cannot_open() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let td = tempdir().unwrap();
+        for name in [
+            OsStr::new("ok.txt"),
+            OsStr::new("a:b"),
+            OsStr::new("star*"),
+            OsStr::from_bytes(b"bad\xffutf8"),
+        ] {
+            std::fs::write(td.path().join(name), b"x").unwrap();
+        }
+        let long = "x".repeat(200) + "\u{e9}"; // 202 bytes, 201 UTF-16 units
+        std::fs::write(td.path().join(&long), b"x").unwrap();
+
+        let backend = LocalFsBackend::new(td.path()).unwrap();
+        let dir = backend
+            .open(&SmbPath::root(), opts_open_dir())
+            .await
+            .unwrap()
+            .0;
+        let mut names: Vec<String> = dir
+            .list_dir(None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.info.name)
+            .collect();
+        names.sort();
+        let mut expected = vec!["ok.txt".to_string(), long];
+        expected.sort();
+        assert_eq!(names, expected);
+        // Every listed name opens again.
+        for name in &names {
+            backend
+                .open(&p(name), opts_open_ro())
+                .await
+                .unwrap()
+                .0
+                .close()
+                .await
+                .unwrap();
+        }
+        dir.close().await.unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn dir_is_empty_counts_unlisted_names() {
+        let td = tempdir().unwrap();
+        std::fs::create_dir(td.path().join("d")).unwrap();
+        let backend = LocalFsBackend::new(td.path()).unwrap();
+        let dir = backend.open(&p("d"), opts_open_dir()).await.unwrap().0;
+        assert!(dir.dir_is_empty().await.unwrap());
+        std::fs::write(td.path().join("d").join("a:b"), b"x").unwrap();
+        assert!(dir.list_dir(None).await.unwrap().is_empty());
+        assert!(!dir.dir_is_empty().await.unwrap());
+        dir.close().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn link_count_reports_hard_links() {
+        let td = tempdir().unwrap();
+        std::fs::write(td.path().join("a"), b"x").unwrap();
+        std::fs::hard_link(td.path().join("a"), td.path().join("b")).unwrap();
+        std::fs::create_dir_all(td.path().join("d").join("sub")).unwrap();
+        let backend = LocalFsBackend::new(td.path()).unwrap();
+
+        let file = backend.open(&p("a"), opts_open_ro()).await.unwrap().0;
+        assert_eq!(file.link_count().await.unwrap(), 2);
+        std::fs::remove_file(td.path().join("a")).unwrap();
+        std::fs::remove_file(td.path().join("b")).unwrap();
+        assert_eq!(file.link_count().await.unwrap(), 0);
+        file.close().await.unwrap();
+
+        let dir = backend.open(&p("d"), opts_open_dir()).await.unwrap().0;
+        assert_eq!(dir.link_count().await.unwrap(), 1);
+        dir.close().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn listing_reports_symlinks_as_their_targets() {
+        let td = tempdir().unwrap();
+        std::fs::create_dir(td.path().join("real")).unwrap();
+        std::os::unix::fs::symlink("real", td.path().join("link")).unwrap();
+        std::os::unix::fs::symlink("missing", td.path().join("dangling")).unwrap();
+        let backend = LocalFsBackend::new(td.path()).unwrap();
+
+        let root = backend
+            .open(&SmbPath::root(), opts_open_dir())
+            .await
+            .unwrap()
+            .0;
+        let entries = root.list_dir(None).await.unwrap();
+        let get = |name: &str| {
+            entries
+                .iter()
+                .find(|e| e.info.name == name)
+                .unwrap_or_else(|| panic!("{name} listed"))
+                .info
+                .clone()
+        };
+        let link = get("link");
+        let opened = backend.open(&p("link"), opts_open_ro()).await.unwrap().0;
+        let stat = opened.stat().await.unwrap();
+        assert!(link.is_directory);
+        assert_eq!(link.is_directory, stat.is_directory);
+        assert_eq!(link.file_index, stat.file_index);
+        assert!(!get("dangling").is_directory);
+        opened.close().await.unwrap();
+        root.close().await.unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn case_rule_comes_from_the_filesystem() {
+        let td = tempdir().unwrap();
+        let backend = LocalFsBackend::new(td.path()).unwrap();
+        // The test directory is on a case-sensitive Linux filesystem: a name
+        // in another case is a different file.
+        std::fs::write(td.path().join("a.txt"), b"x").unwrap();
+        assert!(!td.path().join("A.TXT").exists());
+        assert!(backend.capabilities().case_sensitive);
     }
 }

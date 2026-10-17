@@ -64,6 +64,11 @@ socket2 = "0.6"
 
 [target.'cfg(windows)'.dependencies]
 cap-primitives = { workspace = true, optional = true }
+windows-sys = { version = "0.61", features = ["Wdk_Storage_FileSystem", "Win32_Storage_FileSystem", "Win32_System_IO"] }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs"] }
+libc = "0.2"
 
 [features]
 default = ["localfs"]
@@ -96,6 +101,3 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
-
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"

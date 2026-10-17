@@ -3,3 +3,5 @@
 mod local;
 
 pub use local::LocalFsBackend;
+
+mod volume;
