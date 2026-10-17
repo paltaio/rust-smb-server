@@ -125,12 +125,6 @@ fn info_length_mismatch(smb311: bool) -> HandlerResponse {
     response
 }
 
-/// Whether the open behind a FileStandardInformation query is being
-/// deleted.
-fn delete_pending(_open: &Open) -> bool {
-    false
-}
-
 /// A reply and how to cut it down when it is longer than OutputBufferLength.
 type Reply = Result<(Vec<u8>, Overflow), u32>;
 
@@ -169,13 +163,13 @@ async fn query_file(open: &Open, class: u8, cap: usize) -> Reply {
         ic::FILE_STANDARD_INFORMATION | ic::FILE_ALL_INFORMATION => {
             let links = handle.link_count().await.map_err(|e| e.to_nt_status())?;
             if class == ic::FILE_STANDARD_INFORMATION {
-                ic::encode_file_standard_information(&info, links, delete_pending(open))
+                ic::encode_file_standard_information(&info, links, open.delete_pending())
             } else {
                 ic::encode_file_all_information(
                     &info,
                     open.granted_access,
                     links,
-                    delete_pending(open),
+                    open.delete_pending(),
                 )
             }
         }

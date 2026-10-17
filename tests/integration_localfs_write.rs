@@ -1295,6 +1295,7 @@ fn context_data<'a>(contexts: &'a [CreateContext], name: &[u8; 4]) -> &'a [u8] {
 async fn create_answers_maximal_access_and_on_disk_id() {
     let td = tempdir().expect("tempdir");
     let backend = LocalFsBackend::new(td.path()).expect("open root");
+    let volume = backend.volume_info().await.expect("volume info");
     let (mut c, handle) = Client::connect(Share::new("share", backend).public()).await;
 
     let queries = context_chain(&[
@@ -1320,6 +1321,7 @@ async fn create_answers_maximal_access_and_on_disk_id() {
         .await;
     assert_eq!(qfid[0..8], id[0..8]);
     assert_ne!(qfid[0..8], [0; 8]);
+    assert_eq!(qfid[8..16], u64::from(volume.serial_number).to_le_bytes());
     assert_eq!(qfid[16..32], [0; 16]);
     c.close(resp.file_id).await;
 

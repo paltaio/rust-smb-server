@@ -38,7 +38,7 @@ async fn register_session(
     ));
     state.active_connections.register(&conn).await;
 
-    let session = Session::new(1, identity, [0; 16], [0; 16], false, None);
+    let session = Session::new(identity, [0; 16], [0; 16], false, None);
     let session = Arc::new(tokio::sync::RwLock::new(session));
     let share = state.find_share(share_name).await.expect("share");
     let tree = Arc::new(tokio::sync::RwLock::new(TreeConnect::new(
@@ -83,6 +83,28 @@ async fn config_handle_adds_users_and_shares() {
     let state = server.state();
     assert!(state.lookup_user("bob").await.is_some());
     assert!(state.find_share("media").await.is_some());
+}
+
+#[tokio::test]
+async fn config_handle_rejects_the_share_names_build_rejects() {
+    let server = public_server();
+    let config = server.config_handle();
+    let add = |name: &str| config.add_share(Share::new(name, MemFsBackend::new()).public());
+
+    for name in ["IPC$", "ipc$"] {
+        assert_eq!(
+            add(name).await,
+            Err(ConfigError::ReservedShareName(name.to_string()))
+        );
+    }
+    for name in ["", "a\\b", "a/b", "\\share"] {
+        assert_eq!(
+            add(name).await,
+            Err(ConfigError::InvalidShareName(name.to_string()))
+        );
+        assert!(server.state().find_share(name).await.is_none());
+    }
+    assert_eq!(add("share$").await, Ok(()));
 }
 
 #[tokio::test]

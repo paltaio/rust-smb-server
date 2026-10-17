@@ -14,8 +14,9 @@ use std::time::Duration;
 use smb_server::wire::header::Command;
 use smb_server::wire::messages::{
     CloseRequest, CloseResponse, CreateRequest, CreateResponse, FileId, FlushRequest, LockElement,
-    LockRequest, LogoffRequest, NegotiateRequest, NegotiateResponse, ReadRequest, ReadResponse,
-    SetInfoRequest, TreeDisconnectRequest, WriteRequest, WriteResponse,
+    LockRequest, LogoffRequest, NegotiateRequest, NegotiateResponse, QueryInfoRequest,
+    QueryInfoResponse, ReadRequest, ReadResponse, SetInfoRequest, TreeDisconnectRequest,
+    WriteRequest, WriteResponse,
 };
 use smb_server::{
     BackendCapabilities, Bytes, ConfigHandle, DirEntry, FileInfo, FileTimes, Handle,
@@ -392,6 +393,29 @@ impl Client {
         let mut body = Vec::new();
         LogoffRequest::default().write_to(&mut body).expect("write");
         self.send(Command::Logoff, &body).await.0
+    }
+
+    /// SMB2_0_INFO_FILE QUERY_INFO for `class`; returns the output buffer.
+    pub async fn query_file_info(&mut self, file_id: FileId, class: u8) -> Result<Vec<u8>, u32> {
+        let req = QueryInfoRequest {
+            structure_size: 41,
+            info_type: 1,
+            file_information_class: class,
+            output_buffer_length: 4096,
+            input_buffer_offset: 0,
+            reserved: 0,
+            input_buffer_length: 0,
+            additional_information: 0,
+            flags: 0,
+            file_id,
+            input_buffer: vec![],
+        };
+        let mut body = Vec::new();
+        req.write_to(&mut body).expect("write");
+        match self.send(Command::QueryInfo, &body).await {
+            (0, rb) => Ok(QueryInfoResponse::parse(&rb).expect("parse").buffer),
+            (status, _) => Err(status),
+        }
     }
 }
 

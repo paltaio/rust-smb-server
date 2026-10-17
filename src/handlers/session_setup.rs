@@ -304,18 +304,20 @@ async fn continue_exchange(
     // A session that already exists is being reauthenticated.
     let existing = conn.sessions.read().await.get(&sid).cloned();
 
-    // The failed-logon throttle counts by the user name the client sent.
+    // The failed-logon throttle counts by the user name the client sent and
+    // by the client's address.
     let claimed_user = NtlmAuthenticate::parse(&ntlm)
         .map(|a| a.user)
         .unwrap_or_default();
-    if !claimed_user.is_empty() && server.auth.is_locked_out(&claimed_user) {
-        info!("logon refused: too many failed logons for this user name");
+    let peer = conn.peer_addr.map(|a| a.ip());
+    if server.auth.is_locked_out(&claimed_user, peer) {
+        info!("logon refused: too many failed logons for this user name or address");
         return logon_failed(
             server,
             conn,
             sid,
             existing.is_some(),
-            "",
+            None,
             ntstatus::STATUS_ACCOUNT_LOCKED_OUT,
         )
         .await;
@@ -356,8 +358,15 @@ async fn continue_exchange(
     let (outcome, raw_form, server_mic, nt_hash) = match result {
         Ok(r) => r,
         Err(status) => {
-            return logon_failed(server, conn, sid, existing.is_some(), &claimed_user, status)
-                .await;
+            return logon_failed(
+                server,
+                conn,
+                sid,
+                existing.is_some(),
+                Some(&claimed_user),
+                status,
+            )
+            .await;
         }
     };
     if !claimed_user.is_empty() {
@@ -416,7 +425,6 @@ async fn continue_exchange(
     let signing_key = signing_key(dialect, &session_base_key);
     let signing_required = signing_required(server, conn, req, &outcome.identity);
     let session = Session::new(
-        sid,
         outcome.identity.clone(),
         session_base_key,
         signing_key,
@@ -461,19 +469,22 @@ fn session_limit_reached<T>(server: &ServerState, sessions: &HashMap<u64, T>) ->
     sessions.len() >= server.auth.settings.max_sessions_per_connection
 }
 
-/// Ends a logon that failed with `status`: counts it against `user` and the
-/// connection, closes the connection once it has failed too often, and
-/// removes a session that was being reauthenticated (MS-SMB2 3.3.5.5.3).
+/// Ends a logon that failed with `status`: counts it against the connection
+/// and, with `user` set, against that name and the client's address. Closes
+/// the connection once it has failed too often, and removes a session that
+/// was being reauthenticated (MS-SMB2 3.3.5.5.3).
 async fn logon_failed(
     server: &ServerState,
     conn: &Connection,
     sid: u64,
     reauth: bool,
-    user: &str,
+    user: Option<&str>,
     status: u32,
 ) -> HandlerResponse {
-    if !user.is_empty() {
-        server.auth.record_failure(user);
+    if let Some(user) = user {
+        server
+            .auth
+            .record_failure(user, conn.peer_addr.map(|a| a.ip()));
     }
     let failures = conn.logon_failures.fetch_add(1, Ordering::Relaxed) + 1;
     if server.auth.connection_exhausted(failures) {

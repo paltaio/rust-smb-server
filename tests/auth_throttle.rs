@@ -53,3 +53,26 @@ async fn repeated_failures_lock_the_user_name_for_a_while() {
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(logon(addr, "alice", "password").await, 0);
 }
+
+#[tokio::test]
+async fn failures_from_one_address_lock_it_out() {
+    let td = tempfile::tempdir().expect("tempdir");
+    let backend = LocalFsBackend::new(td.path()).expect("open root");
+    let (addr, _handle) = start_server(
+        SmbServer::builder()
+            .user("alice", "password")
+            .share(Share::new("home", backend).user("alice", Access::Read))
+            .logon_throttle(2, Duration::from_secs(60)),
+    )
+    .await;
+
+    // Ten times the per-user limit, one guess per name.
+    for i in 0..20 {
+        let user = format!("guess{i}");
+        assert_eq!(logon(addr, &user, "wrong").await, STATUS_LOGON_FAILURE);
+    }
+    assert_eq!(
+        logon(addr, "alice", "password").await,
+        STATUS_ACCOUNT_LOCKED_OUT
+    );
+}

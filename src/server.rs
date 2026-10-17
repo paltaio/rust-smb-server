@@ -16,13 +16,12 @@ use tracing::{Instrument, debug, error, info, info_span, warn};
 use uuid::Uuid;
 
 use crate::backend::ShareBackend;
-use crate::builder::{Access, Share, SmbServerBuilder};
+use crate::builder::{Access, Share, ShareNameError, SmbServerBuilder, check_share_name};
 use crate::conn::connection_loop;
 use crate::conn::limits::Limits;
 use crate::conn::listener::{AcceptBackoff, configure_socket};
 use crate::conn::state::Connection;
 use crate::files::close_opens;
-use crate::utils::now_filetime;
 
 // ---------------------------------------------------------------------------
 // ShareMode / ShareBindings
@@ -196,7 +195,6 @@ pub struct ServerState {
     pub users: ServerUsers,
     pub shares: ServerShares,
     pub active_connections: ActiveConnections,
-    pub server_start_filetime: u64,
     /// Notified by `shutdown()`. The accept loop stops; each connection
     /// closes once it has answered the frame it is receiving, if any.
     pub shutdown: Arc<Notify>,
@@ -216,7 +214,6 @@ impl ServerState {
             users,
             shares: ServerShares::new(shares),
             active_connections: ActiveConnections::new(),
-            server_start_filetime: now_filetime(),
             shutdown: Arc::new(Notify::new()),
             shutting_down: Arc::new(AtomicBool::new(false)),
             auth: crate::auth_policy::AuthPolicy::default(),
@@ -264,6 +261,8 @@ pub enum ConfigError {
     EmptyUserName,
     #[error("share name `{0}` is reserved")]
     ReservedShareName(String),
+    #[error("share name `{0}` must be non-empty and contain no `\\` or `/`")]
+    InvalidShareName(String),
 }
 
 #[derive(Clone)]
@@ -457,10 +456,11 @@ fn validate_user_name(name: &str) -> Result<(), ConfigError> {
 }
 
 fn validate_share_name(name: &str) -> Result<(), ConfigError> {
-    if name.eq_ignore_ascii_case("IPC$") {
-        return Err(ConfigError::ReservedShareName(name.to_string()));
+    match check_share_name(name) {
+        Ok(()) => Ok(()),
+        Err(ShareNameError::Reserved) => Err(ConfigError::ReservedShareName(name.to_string())),
+        Err(ShareNameError::Invalid) => Err(ConfigError::InvalidShareName(name.to_string())),
     }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -613,7 +613,7 @@ impl SmbServer {
                                 let span = info_span!("conn", peer = %peer);
                                 connections.spawn(async move {
                                     let _slot = slot;
-                                    if let Err(e) = connection_loop(stream, server_state).await {
+                                    if let Err(e) = connection_loop(stream, peer, server_state).await {
                                         error!(error = %e, "connection loop exited with error");
                                     }
                                 }.instrument(span));
@@ -651,9 +651,8 @@ impl SmbServer {
         .await
     }
 
-    /// Access shared state for in-crate tests/integrations.
-    #[doc(hidden)]
-    pub fn state(&self) -> Arc<ServerState> {
+    #[cfg(any(test, fuzzing))]
+    pub(crate) fn state(&self) -> Arc<ServerState> {
         self.state.clone()
     }
 }

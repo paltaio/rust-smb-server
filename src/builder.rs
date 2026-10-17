@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use thiserror::Error;
@@ -110,6 +111,26 @@ pub enum BuildError {
     },
 }
 
+/// Why a share name cannot be configured.
+pub(crate) enum ShareNameError {
+    /// IPC$, which the server provides itself.
+    Reserved,
+    /// Empty, or contains `\` or `/`, so no UNC path reaches it.
+    Invalid,
+}
+
+/// Checks a share name for [`SmbServerBuilder::build`] and
+/// `ConfigHandle`.
+pub(crate) fn check_share_name(name: &str) -> Result<(), ShareNameError> {
+    if name.eq_ignore_ascii_case("IPC$") {
+        return Err(ShareNameError::Reserved);
+    }
+    if name.is_empty() || name.contains(['\\', '/']) {
+        return Err(ShareNameError::Invalid);
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // SmbServerBuilder
 // ---------------------------------------------------------------------------
@@ -126,6 +147,7 @@ pub struct SmbServerBuilder {
     server_guid: Option<Uuid>,
     limits: Limits,
     auth: crate::auth_policy::AuthSettings,
+    max_opens_per_connection: usize,
 }
 
 impl Default for SmbServerBuilder {
@@ -147,6 +169,7 @@ impl SmbServerBuilder {
             server_guid: None,
             limits: Limits::default(),
             auth: crate::auth_policy::AuthSettings::default(),
+            max_opens_per_connection: crate::files::DEFAULT_MAX_OPENS_PER_CONNECTION,
         }
     }
 
@@ -200,10 +223,12 @@ impl SmbServerBuilder {
     /// Failed-logon throttle. After `max_failures` failed logons for one
     /// user name, each within `lockout` of the one before, logons with that
     /// name fail with STATUS_ACCOUNT_LOCKED_OUT until `lockout` has passed
-    /// since the last failure. A connection is closed after `max_failures`
-    /// failed logons. Unknown names are tracked the same way as configured
-    /// ones. `max_failures` 0 turns the throttle off. Default 10 failures
-    /// and 60 seconds.
+    /// since the last failure. One client address is locked out the same
+    /// way after ten times `max_failures` failed logons, whatever names they
+    /// used. A connection is closed after `max_failures` failed logons.
+    /// Unknown names are tracked the same way as configured ones.
+    /// `max_failures` 0 turns the throttle off. Default 10 failures and 60
+    /// seconds.
     pub fn logon_throttle(mut self, max_failures: u32, lockout: std::time::Duration) -> Self {
         self.auth.max_logon_failures = max_failures;
         self.auth.lockout = lockout;
@@ -264,6 +289,15 @@ impl SmbServerBuilder {
         self
     }
 
+    /// Most files one connection may hold open at once. A CREATE past the
+    /// limit fails with STATUS_INSUFFICIENT_RESOURCES. Defaults to 16384.
+    /// [`ConfigHandle::set_max_opens_per_connection`](crate::ConfigHandle::set_max_opens_per_connection)
+    /// changes it at run time.
+    pub fn max_opens_per_connection(mut self, opens: usize) -> Self {
+        self.max_opens_per_connection = opens;
+        self
+    }
+
     pub fn build(self) -> Result<SmbServer, BuildError> {
         let limits = &self.limits;
         if limits.max_connections == 0 {
@@ -308,11 +342,14 @@ impl SmbServerBuilder {
 
         let mut seen_names = std::collections::HashSet::new();
         for share in &self.shares {
-            if share.name.eq_ignore_ascii_case("IPC$") {
-                return Err(BuildError::ReservedShareName(share.name.clone()));
-            }
-            if share.name.is_empty() || share.name.contains(['\\', '/']) {
-                return Err(BuildError::InvalidShareName(share.name.clone()));
+            match check_share_name(&share.name) {
+                Err(ShareNameError::Reserved) => {
+                    return Err(BuildError::ReservedShareName(share.name.clone()));
+                }
+                Err(ShareNameError::Invalid) => {
+                    return Err(BuildError::InvalidShareName(share.name.clone()));
+                }
+                Ok(()) => {}
             }
             if !seen_names.insert(share.name.to_ascii_lowercase()) {
                 return Err(BuildError::DuplicateShare(share.name.clone()));
@@ -367,6 +404,9 @@ impl SmbServerBuilder {
 
         let state = ServerState::new(cfg, users, share_bindings);
         let state = state.with_auth(self.auth);
+        state
+            .max_opens_per_connection
+            .store(self.max_opens_per_connection, Ordering::Relaxed);
         Ok(SmbServer::from_state(state))
     }
 }

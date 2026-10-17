@@ -58,3 +58,22 @@ async fn failed_creates_release_their_slot() {
     std::fs::write(td.path().join("f.txt"), b"data").unwrap();
     assert!(a.open("f.txt", FILE_READ_DATA, SHARE_ALL).await.is_ok());
 }
+
+#[tokio::test]
+async fn the_builder_sets_the_open_limit() {
+    let td = tempdir().unwrap();
+    std::fs::write(td.path().join("f.txt"), b"data").unwrap();
+    let server = Server::start(
+        smb_server::SmbServer::builder()
+            .max_opens_per_connection(1)
+            .share(smb_server::Share::new("share", local(td.path())).public()),
+    )
+    .await;
+    let mut c = server.client().await;
+    let first = c.open("f.txt", FILE_READ_DATA, SHARE_ALL).await.unwrap();
+    assert_eq!(
+        c.open("f.txt", FILE_READ_DATA, SHARE_ALL).await,
+        Err(ntstatus::STATUS_INSUFFICIENT_RESOURCES)
+    );
+    c.close(first).await;
+}

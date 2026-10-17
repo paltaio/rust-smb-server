@@ -241,7 +241,7 @@ mod tests {
             guid: GUID,
             dialects: DIALECTS.to_vec(),
         });
-        let session = Session::new(7, Identity::Anonymous, [0; 16], [0; 16], false, None);
+        let session = Session::new(Identity::Anonymous, [0; 16], [0; 16], false, None);
         let tree = TreeConnect::new(1, ShareBindings::ipc(), Access::Read);
         session
             .trees

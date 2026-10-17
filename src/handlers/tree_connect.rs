@@ -203,7 +203,7 @@ mod tests {
             .state();
         let conn = Arc::new(Connection::new(server.config.server_guid, 65536, 65536));
         *conn.dialect.write().await = Some(dialect);
-        let session = Session::new(7, identity, [0; 16], [0; 16], false, None);
+        let session = Session::new(identity, [0; 16], [0; 16], false, None);
         conn.sessions
             .write()
             .await
@@ -298,7 +298,6 @@ mod tests {
         state.active_connections.register(&conn).await;
         *conn.dialect.write().await = Some(Dialect::Smb302);
         let session = Arc::new(RwLock::new(Session::new(
-            7,
             Identity::Anonymous,
             [0; 16],
             [0; 16],

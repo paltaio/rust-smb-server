@@ -233,8 +233,6 @@ fn check_signature(buf: &[u8], expected_msg: u32) -> ProtoResult<()> {
 #[derive(Debug, Clone, Default)]
 pub struct NtlmNegotiate {
     pub flags: u32,
-    pub domain: Vec<u8>,
-    pub workstation: Vec<u8>,
     /// Raw bytes of the original message - needed for MIC computation later.
     pub raw: Vec<u8>,
 }
@@ -260,22 +258,16 @@ impl NtlmNegotiate {
         let domain_field = read_field(buf, 16)?;
         let ws_field = read_field(buf, 24)?;
 
-        // Fields may be empty (offset/len = 0) when supplied flags don't set them.
-        let domain = if domain_field.len == 0 {
-            Vec::new()
-        } else {
-            slice_field(buf, domain_field)?.to_vec()
-        };
-        let workstation = if ws_field.len == 0 {
-            Vec::new()
-        } else {
-            slice_field(buf, ws_field)?.to_vec()
-        };
+        // Fields may be empty (offset/len = 0) when supplied flags don't set
+        // them. Non-empty ones must lie inside the message.
+        for field in [domain_field, ws_field] {
+            if field.len != 0 {
+                slice_field(buf, field)?;
+            }
+        }
 
         Ok(Self {
             flags,
-            domain,
-            workstation,
             raw: buf.to_vec(),
         })
     }
@@ -643,11 +635,6 @@ impl UserCreds {
             nt_hash: nt_hash(password),
         }
     }
-
-    /// Construct from a precomputed NT hash.
-    pub fn from_nt_hash(nt_hash: [u8; 16]) -> Self {
-        Self { nt_hash }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -929,8 +916,6 @@ mod tests {
 
         let n = NtlmNegotiate::parse(&buf).unwrap();
         assert_eq!(n.flags, flags);
-        assert!(n.domain.is_empty());
-        assert!(n.workstation.is_empty());
     }
 
     #[test]
@@ -1157,7 +1142,9 @@ mod tests {
 
     #[test]
     fn debug_output_hides_keys() {
-        let creds = UserCreds::from_nt_hash([0xAB; 16]);
+        let creds = UserCreds {
+            nt_hash: [0xAB; 16],
+        };
         assert_eq!(format!("{creds:?}"), "UserCreds { .. }");
         let outcome = AuthOutcome {
             identity: Identity::Anonymous,

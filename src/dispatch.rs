@@ -742,7 +742,7 @@ mod tests {
             user: "alice".to_string(),
             domain: String::new(),
         };
-        let session = Session::new(1, identity, [0; 16], KEY, true, None);
+        let session = Session::new(identity, [0; 16], KEY, true, None);
         let share = state.find_share("home").await.expect("share");
         let tree = TreeConnect::new(1, share, Access::ReadWrite);
         session

@@ -57,11 +57,7 @@ pub(crate) async fn close_open(open_arc: &Arc<RwLock<Open>>, want_attrs: bool) -
     };
     // MS-FSA 2.1.5.5 phase 1: a directory that is not empty is not deleted.
     let delete_on_close = open.delete_on_close
-        && (!open.is_directory
-            || handle
-                .list_dir(None)
-                .await
-                .is_ok_and(|entries| entries.is_empty()));
+        && (!open.is_directory || handle.dir_is_empty().await.unwrap_or(false));
     if let Err(e) = handle.close().await {
         debug!(error = %e, path = %open.last_path, "backend close failed");
     }
@@ -128,7 +124,7 @@ mod tests {
         let removed = share();
         let added = share();
         let conn = Connection::new(uuid::Uuid::nil(), 1 << 16, 1 << 16);
-        let session = Session::new(1, Identity::Anonymous, [0; 16], [0; 16], false, None);
+        let session = Session::new(Identity::Anonymous, [0; 16], [0; 16], false, None);
         let tree = TreeConnect::new(1, Arc::clone(&added), Access::ReadWrite);
         session
             .trees

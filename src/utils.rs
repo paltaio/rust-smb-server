@@ -29,21 +29,6 @@ pub fn utf16le(s: &str) -> Vec<u8> {
     out
 }
 
-/// Decode a UTF-16LE byte slice. Returns an empty string if the buffer is not
-/// 2-byte aligned (caller decides what to do); replacement characters on
-/// invalid surrogates.
-#[allow(dead_code, reason = "no wire decoder uses lossy decoding")]
-pub fn utf16le_to_string(bytes: &[u8]) -> String {
-    if !bytes.len().is_multiple_of(2) {
-        return String::new();
-    }
-    let units: Vec<u16> = bytes
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
-        .collect();
-    String::from_utf16_lossy(&units)
-}
-
 /// Decode a UTF-16LE byte slice into a `Vec<u16>`, returning `None` on a
 /// non-aligned buffer.
 pub fn utf16le_to_units(bytes: &[u8]) -> Option<Vec<u16>> {

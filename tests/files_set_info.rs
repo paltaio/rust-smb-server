@@ -73,3 +73,29 @@ async fn rename_with_a_root_directory_is_refused() {
     );
     assert!(td.path().join("f.txt").exists());
 }
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn disposition_counts_names_the_listing_hides() {
+    let td = tempdir().unwrap();
+    std::fs::create_dir(td.path().join("d")).unwrap();
+    std::fs::write(td.path().join("d").join("a:b"), b"x").unwrap();
+    let server = Server::public(local(td.path())).await;
+    let mut c = server.client().await;
+    let dir = c
+        .create(Create {
+            name: "d",
+            access: RW | DELETE,
+            options: FILE_DIRECTORY_FILE,
+            ..Create::default()
+        })
+        .await
+        .unwrap()
+        .file_id;
+    assert_eq!(
+        c.set_delete(dir, true).await,
+        ntstatus::STATUS_DIRECTORY_NOT_EMPTY
+    );
+    c.close(dir).await;
+    assert!(td.path().join("d").join("a:b").exists());
+}

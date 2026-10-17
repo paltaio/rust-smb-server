@@ -10,6 +10,7 @@ pub mod state;
 pub mod writer;
 
 use std::io;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use tokio::net::TcpStream;
@@ -18,15 +19,21 @@ use tracing::{debug, info};
 use crate::server::ServerState;
 use state::Connection;
 
-/// Runs the reader and writer tasks for a single accepted connection until
-/// either side hangs up. Returns once both halves are done.
-pub async fn connection_loop(stream: TcpStream, server: Arc<ServerState>) -> io::Result<()> {
+/// Runs the reader and writer tasks for a single connection accepted from
+/// `peer` until either side hangs up. Returns once both halves are done.
+pub async fn connection_loop(
+    stream: TcpStream,
+    peer: SocketAddr,
+    server: Arc<ServerState>,
+) -> io::Result<()> {
     let (read_half, write_half) = tokio::io::split(stream);
-    let conn = Arc::new(Connection::new(
+    let mut conn = Connection::new(
         server.config.server_guid,
         server.config.max_read_size,
         server.config.max_write_size,
-    ));
+    );
+    conn.peer_addr = Some(peer);
+    let conn = Arc::new(conn);
     let conn_id = server.active_connections.register(&conn).await;
     let (tx, rx) = writer::response_queue();
 

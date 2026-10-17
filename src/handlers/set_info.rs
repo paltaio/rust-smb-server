@@ -259,11 +259,8 @@ async fn set_disposition(open: &Open, delete: bool) -> Result<(), u32> {
         if info.read_only {
             return Err(ntstatus::STATUS_CANNOT_DELETE);
         }
-        if open.is_directory {
-            let entries = handle.list_dir(None).await.map_err(|e| e.to_nt_status())?;
-            if !entries.is_empty() {
-                return Err(ntstatus::STATUS_DIRECTORY_NOT_EMPTY);
-            }
+        if open.is_directory && !handle.dir_is_empty().await.map_err(|e| e.to_nt_status())? {
+            return Err(ntstatus::STATUS_DIRECTORY_NOT_EMPTY);
         }
     }
     let file = open.file.as_ref().ok_or(ntstatus::STATUS_FILE_CLOSED)?;

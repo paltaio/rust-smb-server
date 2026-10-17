@@ -57,9 +57,6 @@ pub struct Connection {
     /// multi-leg SESSION_SETUP.
     pub session_preauth: RwLock<HashMap<u64, PreauthIntegrity>>,
 
-    /// Monotonic SessionId allocator.
-    next_session_id: AtomicU64,
-
     /// Set when the connection must close without sending a reply.
     disconnect: std::sync::atomic::AtomicBool,
 
@@ -77,6 +74,9 @@ pub struct Connection {
 
     /// Opens held on this connection, across its sessions and trees.
     pub open_count: Arc<std::sync::atomic::AtomicUsize>,
+
+    /// The client's address, set when the connection is accepted.
+    pub peer_addr: Option<std::net::SocketAddr>,
 }
 
 impl Connection {
@@ -92,13 +92,13 @@ impl Connection {
             sessions: RwLock::new(HashMap::new()),
             pending_auths: RwLock::new(HashMap::new()),
             session_preauth: RwLock::new(HashMap::new()),
-            next_session_id: AtomicU64::new(1),
             disconnect: std::sync::atomic::AtomicBool::new(false),
             credits: Mutex::new(crate::conn::credits::CreditWindow::new()),
             pending_auth_started: Mutex::new(HashMap::new()),
             client_negotiate: Mutex::new(None),
             logon_failures: AtomicU32::new(0),
             open_count: Arc::default(),
+            peer_addr: None,
         }
     }
 
@@ -111,10 +111,6 @@ impl Connection {
     /// True once a handler has asked to close the connection.
     pub fn disconnect_requested(&self) -> bool {
         self.disconnect.load(std::sync::atomic::Ordering::Acquire)
-    }
-
-    pub fn alloc_session_id(&self) -> u64 {
-        self.next_session_id.fetch_add(1, Ordering::Relaxed)
     }
 
     pub async fn close_session(&self, session_id: u64) -> bool {
@@ -267,7 +263,6 @@ async fn detach_tree(tree_arc: &Arc<RwLock<TreeConnect>>) -> Vec<Arc<RwLock<Open
 // ---------------------------------------------------------------------------
 
 pub struct Session {
-    pub id: u64,
     pub identity: Identity,
     pub session_base_key: [u8; 16],
     pub signing_key: [u8; 16],
@@ -283,7 +278,6 @@ pub struct Session {
 
 impl Session {
     pub fn new(
-        id: u64,
         identity: Identity,
         session_base_key: [u8; 16],
         signing_key: [u8; 16],
@@ -291,7 +285,6 @@ impl Session {
         preauth_snapshot: Option<[u8; 64]>,
     ) -> Self {
         Self {
-            id,
             identity,
             session_base_key,
             signing_key,

@@ -119,8 +119,9 @@ impl ContextQueries {
     }
 
     /// Response contexts for an open of a file with `info` on a tree whose
-    /// MaximalAccess is `maximal`.
-    fn answer(&self, info: &FileInfo, maximal: u32) -> Vec<CreateContext> {
+    /// MaximalAccess is `maximal`, on the volume with serial number
+    /// `volume_serial`.
+    fn answer(&self, info: &FileInfo, maximal: u32, volume_serial: u32) -> Vec<CreateContext> {
         let mut out = Vec::new();
         if let Some(timestamp) = self.maximal_access {
             let (status, access) = if timestamp == Some(info.change_time) {
@@ -139,7 +140,7 @@ impl ContextQueries {
             // DiskFileId, VolumeId, 16 reserved bytes.
             let mut data = vec![0; 32];
             data[..8].copy_from_slice(&info.file_index.to_le_bytes());
-            data[8..16].copy_from_slice(&u64::from(VOLUME_SERIAL_NUMBER).to_le_bytes());
+            data[8..16].copy_from_slice(&u64::from(volume_serial).to_le_bytes());
             out.push(CreateContext {
                 name: CreateContext::NAME_QFID.to_vec(),
                 data,
@@ -332,6 +333,17 @@ pub async fn handle(
         }
     }
 
+    // The on-disk id carries the serial number FileFsVolumeInformation
+    // reports.
+    let volume_serial = if queries.query_on_disk_id {
+        backend
+            .volume_info()
+            .await
+            .map_or(VOLUME_SERIAL_NUMBER, |v| v.serial_number)
+    } else {
+        VOLUME_SERIAL_NUMBER
+    };
+
     // Allocate FileId, register Open. A tree disconnected or revoked while
     // the backend worked takes no new opens.
     let mut tree = tree_arc.write().await;
@@ -368,7 +380,11 @@ pub async fn handle(
         OpenAction::Overwritten => FILE_OVERWRITTEN,
     };
     let mut contexts = Vec::new();
-    CreateContext::encode_chain(&queries.answer(&info, maximal), &mut contexts).expect("encode");
+    CreateContext::encode_chain(
+        &queries.answer(&info, maximal, volume_serial),
+        &mut contexts,
+    )
+    .expect("encode");
     let resp = CreateResponse {
         structure_size: 89,
         oplock_level: 0,

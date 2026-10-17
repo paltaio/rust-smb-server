@@ -18,9 +18,11 @@
 //! # Writing a backend
 //!
 //! A share serves any [`ShareBackend`]. Each CREATE calls
-//! [`ShareBackend::open`], and the returned [`Handle`] serves READ, WRITE,
-//! FLUSH, QUERY_INFO, QUERY_DIRECTORY and SET_INFO on that open until CLOSE.
-//! `LocalFsBackend` (feature `localfs`) is the reference implementation.
+//! [`ShareBackend::open`], which returns a [`Handle`] and the
+//! [`OpenAction`] it took; CREATE reports the action to the client. The
+//! handle serves READ, WRITE, FLUSH, QUERY_INFO, QUERY_DIRECTORY and
+//! SET_INFO on that open until the open is closed. `LocalFsBackend`
+//! (feature `localfs`) is the reference implementation.
 //!
 //! What the protocol layer does around the backend calls:
 //!
@@ -28,6 +30,10 @@
 //!   are dropped; `..`, empty components, `<>:"|?*`, control characters and
 //!   stream names are rejected before the backend sees them. The empty path
 //!   is the share root.
+//! - `open` fails with [`SmbError::PathNotFound`] when a directory on the
+//!   way to the path is missing, and with [`SmbError::NotFound`] when only
+//!   the last component is. Clients see STATUS_OBJECT_PATH_NOT_FOUND and
+//!   STATUS_OBJECT_NAME_NOT_FOUND.
 //! - Share permissions and the access the client asked for are checked
 //!   before `open`. [`OpenOptions`] carries the result: `read`, `write` and
 //!   `write_attributes` reflect the access granted to the open. READ and
@@ -35,33 +41,61 @@
 //!   is called. When [`BackendCapabilities::is_read_only`] is set, trees on
 //!   the share get read access only, so opens that ask for write access,
 //!   and dispositions that create or truncate, fail before `open`.
+//! - Share modes, byte-range locks and the delete-pending flag are kept by
+//!   the protocol layer for every connection, per file: by
+//!   [`FileInfo::file_index`], or by path when it is 0. A CREATE refused by
+//!   the share-mode check has already called `open` and closes the new
+//!   handle again. A CREATE that would truncate first opens the file
+//!   without write access to run the checks.
+//! - [`Handle::close`] runs on every path that ends an open: CLOSE,
+//!   TREE_DISCONNECT, LOGOFF, the end of a session or connection, and
+//!   [`ConfigHandle`] changes that end sessions or trees. Before it,
+//!   [`Handle::set_times`] puts back access and write times the client
+//!   fixed on that open.
 //! - Delete-on-close: [`OpenOptions::delete_on_close`] and
-//!   FileDispositionInformation are recorded on the open. At CLOSE the
-//!   protocol layer calls [`Handle::close`] and then
-//!   [`ShareBackend::unlink`] on the open's current path. `open` doesn't
-//!   delete anything itself. Read-only files and, for SET_INFO, non-empty
-//!   directories are refused before that point; `unlink` returns
-//!   [`SmbError::NotEmpty`] for a directory that has entries.
+//!   FileDispositionInformation make the file delete-pending. When its last
+//!   open ends, on any of the paths above, the protocol layer calls
+//!   [`Handle::close`] and then [`ShareBackend::unlink`] on the file's
+//!   current path. `open` doesn't delete anything itself. Read-only files
+//!   are refused before that point, and so, for SET_INFO, are directories
+//!   that [`Handle::dir_is_empty`] reports as not empty. `unlink` returns
+//!   [`SmbError::NotEmpty`] for a directory that has entries; the directory
+//!   then stays.
 //! - A rename through SET_INFO calls [`ShareBackend::rename`] and then moves
 //!   the path of every open at or below the old name. The backend keeps
 //!   those handles working on the renamed file.
+//! - A CREATE that makes or overwrites a file passes the attributes it asks
+//!   for to [`Handle::set_attributes`] when they differ from what
+//!   [`Handle::stat`] reports. If that returns [`SmbError::NotSupported`],
+//!   it retries with READONLY alone when that was asked for; the CREATE
+//!   succeeds either way.
 //! - FileBasicInformation passes [`Handle::set_attributes`] and
 //!   [`Handle::set_times`] only the values that differ from what
-//!   [`Handle::stat`] reports. After a write or truncate and at CLOSE,
-//!   `set_times` also puts back access and write times the client fixed on
-//!   that open. [`Handle::truncate`] is never called on a directory.
-//! - QUERY_DIRECTORY calls [`Handle::list_dir`] on the first query and on a
-//!   restart, then pages through the returned entries itself.
+//!   [`Handle::stat`] reports. After a write or truncate, `set_times` also
+//!   puts back the times the client fixed. [`Handle::truncate`] is never
+//!   called on a directory.
+//! - QUERY_DIRECTORY calls [`Handle::list_dir`] with the search pattern on
+//!   the first query and on a restart, then pages through the returned
+//!   entries itself. Below the share root it adds `.` and `..`, and opens
+//!   the parent directory to describe `..`.
+//! - FileStandardInformation and FileAllInformation report
+//!   [`Handle::link_count`] as NumberOfLinks, and DeletePending when the
+//!   file is delete-pending or has no links left. The filesystem
+//!   QUERY_INFO classes, and the VolumeId of the on-disk id CREATE context,
+//!   come from [`ShareBackend::volume_info`].
 //! - READ and WRITE lengths are bounded by the negotiated maximum sizes.
 //! - Each [`SmbError`] maps to one NTSTATUS for the client; see
 //!   [`SmbError::to_nt_status`].
 //!
-//! A handle can be dropped without [`Handle::close`], for example when its
-//! connection ends, so release resources in `Drop` as well.
+//! A handle is dropped without [`Handle::close`] only when the task serving
+//! its connection is cancelled, so release resources in `Drop` as well.
 //!
-//! Later releases may add trait methods with default bodies next to the
-//! existing ones, as [`Handle::write_owned`] sits next to [`Handle::write`].
-//! A backend that implements the required methods keeps compiling.
+//! Some methods have default bodies: [`Handle::write_owned`] calls
+//! [`Handle::write`], [`Handle::link_count`] reports 1,
+//! [`Handle::dir_is_empty`] lists the directory, and
+//! [`ShareBackend::volume_info`] returns [`VolumeInfo::default`]. Later
+//! releases may add more methods with default bodies; a backend that
+//! implements the required methods keeps compiling.
 
 mod access_mask;
 mod backend;
