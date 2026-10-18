@@ -7,8 +7,11 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use tracing::{debug, warn};
+
 use crate::access_mask::{DELETE, FILE_APPEND_DATA, FILE_EXECUTE, FILE_READ_DATA, FILE_WRITE_DATA};
 use crate::backend::FileInfo;
+use crate::error::SmbError;
 use crate::ntstatus;
 use crate::path::{SmbPath, rebase, same_path};
 use crate::server::ShareBindings;
@@ -79,6 +82,7 @@ impl Sharing {
 pub(crate) struct FileTable {
     files: Mutex<HashMap<FileKey, Arc<FileNode>>>,
     next_open: AtomicU64,
+    renames: tokio::sync::Mutex<()>,
 }
 
 struct FileNode {
@@ -182,20 +186,10 @@ impl FileTable {
         lock(&self.files)
     }
 
-    /// Checks whether an open with `sharing` of the file `info` describes,
-    /// reached through `path`, may be added, without adding it.
-    pub(crate) fn check(
-        &self,
-        info: &FileInfo,
-        path: &SmbPath,
-        case_sensitive: bool,
-        sharing: Sharing,
-    ) -> Result<(), u32> {
-        let key = FileKey::new(info.file_index, path, case_sensitive);
-        match self.files().get(&key) {
-            Some(node) => node.state().admit(sharing),
-            None => Ok(()),
-        }
+    /// Serializes renames on the share: a rename holds this while it checks
+    /// the target, renames in the backend and moves the open names.
+    pub(crate) async fn rename_lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.renames.lock().await
     }
 
     /// True if an open on the share currently has `path` as its name.
@@ -262,12 +256,14 @@ impl FileTable {
     }
 }
 
-/// One open's entry in its share's [`FileTable`]. Dropping it without
-/// [`FileRef::release`] leaves the entry in place.
+/// One open's entry in its share's [`FileTable`]. Dropping it removes the
+/// entry and its locks; [`FileRef::release`] does the same and hands back a
+/// delete still to be done.
 pub(crate) struct FileRef {
     share: Arc<ShareBindings>,
     node: Arc<FileNode>,
     id: u64,
+    released: bool,
 }
 
 impl FileRef {
@@ -311,7 +307,24 @@ impl FileRef {
             share: Arc::clone(share),
             node,
             id,
+            released: false,
         })
+    }
+
+    /// The open's current name.
+    pub(crate) fn path(&self) -> SmbPath {
+        self.node
+            .state()
+            .entry(self.id)
+            .map(|e| e.path.clone())
+            .unwrap_or_default()
+    }
+
+    /// True if this is an entry for the file `info` describes, reached
+    /// through `path`.
+    pub(crate) fn is_for(&self, info: &FileInfo, path: &SmbPath) -> bool {
+        let case_sensitive = self.share.backend.capabilities().case_sensitive;
+        FileKey::new(info.file_index, path, case_sensitive) == self.node.state().key
     }
 
     /// Whether the file is delete-pending (MS-FSA Link.IsDeleted).
@@ -332,13 +345,24 @@ impl FileRef {
     }
 
     /// Takes a byte-range lock for this open (MS-FSA 2.1.5.8). Fails with
-    /// STATUS_INVALID_LOCK_RANGE when the range passes the largest offset and
-    /// STATUS_LOCK_NOT_GRANTED when it conflicts with a lock already held.
-    pub(crate) fn lock_range(&self, offset: u64, length: u64, exclusive: bool) -> Result<(), u32> {
+    /// STATUS_INVALID_LOCK_RANGE when the range passes the largest offset,
+    /// STATUS_INSUFFICIENT_RESOURCES when the open already holds `limit`
+    /// locks, and STATUS_LOCK_NOT_GRANTED when it conflicts with a lock
+    /// already held.
+    pub(crate) fn lock_range(
+        &self,
+        offset: u64,
+        length: u64,
+        exclusive: bool,
+        limit: usize,
+    ) -> Result<(), u32> {
         if length != 0 && offset.checked_add(length - 1).is_none() {
             return Err(ntstatus::STATUS_INVALID_LOCK_RANGE);
         }
         let mut state = self.node.state();
+        if state.locks.iter().filter(|l| l.owner == self.id).count() >= limit {
+            return Err(ntstatus::STATUS_INSUFFICIENT_RESOURCES);
+        }
         if state.range_conflicts(self.id, offset, length, exclusive, true) {
             return Err(ntstatus::STATUS_LOCK_NOT_GRANTED);
         }
@@ -403,9 +427,16 @@ impl FileRef {
     /// Removes the open and its byte-range locks from the table (MS-FSA
     /// 2.1.5.5). With `delete_on_close` the file becomes delete-pending.
     /// When that leaves a delete-pending file with no opens, returns the
-    /// removal still to be done; until it is done, the file opens for
+    /// removal still to be done; until that is dropped, the file opens for
     /// nobody.
-    pub(crate) fn release(self, delete_on_close: bool) -> Option<PendingDelete> {
+    pub(crate) fn release(mut self, delete_on_close: bool) -> Option<PendingDelete> {
+        self.detach(delete_on_close)
+    }
+
+    fn detach(&mut self, delete_on_close: bool) -> Option<PendingDelete> {
+        if std::mem::replace(&mut self.released, true) {
+            return None;
+        }
         let mut files = self.share.files.files();
         let mut state = self.node.state();
         let entry = state
@@ -424,8 +455,8 @@ impl FileRef {
             drop(state);
             drop(files);
             return Some(PendingDelete {
-                share: self.share,
-                node: self.node,
+                share: Arc::clone(&self.share),
+                node: Arc::clone(&self.node),
                 path,
             });
         }
@@ -436,13 +467,28 @@ impl FileRef {
     }
 }
 
+impl Drop for FileRef {
+    /// An entry dropped without a release still leaves the table. When it
+    /// was the last open of a delete-pending file, the removal runs on the
+    /// current runtime; without one, the name is freed and the file stays.
+    fn drop(&mut self) {
+        let Some(pending) = self.detach(false) else {
+            return;
+        };
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(pending.run());
+        }
+    }
+}
+
 fn remove_node(files: &mut HashMap<FileKey, Arc<FileNode>>, key: &FileKey, node: &Arc<FileNode>) {
     if files.get(key).is_some_and(|n| Arc::ptr_eq(n, node)) {
         files.remove(key);
     }
 }
 
-/// A delete-pending file whose last open has closed.
+/// A delete-pending file whose last open has closed. Dropping it frees the
+/// name in the table, whether or not the removal ran.
 pub(crate) struct PendingDelete {
     share: Arc<ShareBindings>,
     node: Arc<FileNode>,
@@ -450,19 +496,22 @@ pub(crate) struct PendingDelete {
 }
 
 impl PendingDelete {
-    /// The share the file is on.
-    pub(crate) fn share(&self) -> &Arc<ShareBindings> {
-        &self.share
+    /// Removes the file from the share, then frees its name in the table. A
+    /// failed delete does not fail the close (MS-SMB2 3.3.4.17); a
+    /// directory that gained entries stays (MS-FSA 2.1.5.5).
+    pub(crate) async fn run(self) {
+        match self.share.backend.unlink(&self.path).await {
+            Ok(()) => {}
+            Err(SmbError::NotEmpty) => {
+                debug!(path = %self.path, "delete-on-close skipped a non-empty directory");
+            }
+            Err(e) => warn!(error = %e, path = %self.path, "delete-on-close failed"),
+        }
     }
+}
 
-    /// The name to remove.
-    pub(crate) fn path(&self) -> &SmbPath {
-        &self.path
-    }
-
-    /// Drops the file from the table once the removal has been attempted,
-    /// so the name opens again.
-    pub(crate) fn finish(self) {
+impl Drop for PendingDelete {
+    fn drop(&mut self) {
         let mut files = self.share.files.files();
         let key = self.node.state().key.clone();
         remove_node(&mut files, &key, &self.node);
@@ -472,16 +521,22 @@ impl PendingDelete {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::OpenOptions;
     use crate::server::{ShareBindings, ShareMode};
     use crate::tests::memfs::MemFsBackend;
 
     const RW: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE;
     const ALL: u32 = RW | FILE_SHARE_DELETE;
+    const CAP: usize = super::super::DEFAULT_MAX_LOCKS_PER_OPEN;
 
     fn share() -> Arc<ShareBindings> {
+        share_on(MemFsBackend::new())
+    }
+
+    fn share_on(backend: MemFsBackend) -> Arc<ShareBindings> {
         ShareBindings::new(
             "s".to_string(),
-            Arc::new(MemFsBackend::new()),
+            Arc::new(backend),
             ShareMode::Public,
             HashMap::new(),
             false,
@@ -489,18 +544,9 @@ mod tests {
     }
 
     fn info(file_index: u64) -> FileInfo {
-        FileInfo {
-            name: String::new(),
-            end_of_file: 0,
-            allocation_size: 0,
-            creation_time: 0,
-            last_access_time: 0,
-            last_write_time: 0,
-            change_time: 0,
-            is_directory: false,
-            read_only: false,
-            file_index,
-        }
+        let mut info = FileInfo::new("");
+        info.file_index = file_index;
+        info
     }
 
     fn p(s: &str) -> SmbPath {
@@ -574,24 +620,52 @@ mod tests {
         );
         assert!(a.release(false).is_none());
         let pending = b.release(false).expect("last close removes the file");
-        assert_eq!(pending.path(), &p("f"));
+        assert_eq!(pending.path, p("f"));
         assert_eq!(
             open(&s, "f", FILE_READ_DATA, ALL).err(),
             Some(ntstatus::STATUS_DELETE_PENDING)
         );
-        pending.finish();
+        drop(pending);
         assert!(open(&s, "f", FILE_READ_DATA, ALL).is_ok());
     }
 
     #[test]
-    fn clearing_the_disposition_keeps_the_file() {
+    fn a_pending_delete_dropped_before_it_runs_frees_the_name() {
         let s = share();
         let a = open(&s, "f", DELETE, ALL).unwrap();
-        let b = open(&s, "f", DELETE, ALL).unwrap();
         a.set_delete_pending(true);
-        b.set_delete_pending(false);
-        assert!(a.release(false).is_none());
-        assert!(b.release(false).is_none());
+        let pending = a.release(false).expect("last close removes the file");
+        drop(pending.run());
+        assert!(s.files.files().is_empty());
+        assert!(open(&s, "f", FILE_READ_DATA, ALL).is_ok());
+    }
+
+    #[test]
+    fn a_dropped_open_leaves_the_table() {
+        let s = share();
+        let a = open(&s, "f", FILE_READ_DATA | FILE_WRITE_DATA, 0).unwrap();
+        a.lock_range(0, 10, true, CAP).unwrap();
+        drop(a);
+        assert!(s.files.files().is_empty());
+        let b = open(&s, "f", FILE_READ_DATA, ALL).unwrap();
+        b.lock_range(0, 10, true, CAP).unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropping_the_last_open_of_a_delete_pending_file_removes_it() {
+        let s = share_on(MemFsBackend::new().with_file("f", b"x"));
+        let a = open(&s, "f", DELETE, ALL).unwrap();
+        a.set_delete_pending(true);
+        drop(a);
+        for _ in 0..100 {
+            if s.files.files().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(s.files.files().is_empty());
+        let missing = s.backend.open(&p("f"), OpenOptions::default()).await;
+        assert!(matches!(missing, Err(SmbError::NotFound)));
     }
 
     #[test]
@@ -599,17 +673,17 @@ mod tests {
         let s = share();
         let a = open(&s, "f", FILE_READ_DATA | FILE_WRITE_DATA, ALL).unwrap();
         let b = open(&s, "f", FILE_READ_DATA | FILE_WRITE_DATA, ALL).unwrap();
-        a.lock_range(0, 50, true).unwrap();
+        a.lock_range(0, 50, true, CAP).unwrap();
         assert_eq!(
-            b.lock_range(10, 5, true),
+            b.lock_range(10, 5, true, CAP),
             Err(ntstatus::STATUS_LOCK_NOT_GRANTED)
         );
         assert_eq!(
-            b.lock_range(49, 1, false),
+            b.lock_range(49, 1, false, CAP),
             Err(ntstatus::STATUS_LOCK_NOT_GRANTED)
         );
         assert_eq!(
-            a.lock_range(0, 50, true),
+            a.lock_range(0, 50, true, CAP),
             Err(ntstatus::STATUS_LOCK_NOT_GRANTED)
         );
         // The owner reads and writes its own exclusive range.
@@ -620,8 +694,8 @@ mod tests {
         );
         assert_eq!(b.check_io(50, 10, true), Ok(()));
 
-        b.lock_range(100, 10, false).unwrap();
-        a.lock_range(105, 10, false).unwrap();
+        b.lock_range(100, 10, false, CAP).unwrap();
+        a.lock_range(105, 10, false, CAP).unwrap();
         assert_eq!(a.check_io(100, 1, false), Ok(()));
         // A shared lock blocks writes from every open, its owner included.
         assert_eq!(
@@ -641,14 +715,31 @@ mod tests {
         assert_eq!(b.check_io(0, 10, false), Ok(()));
 
         assert_eq!(
-            a.lock_range(u64::MAX, 2, true),
+            a.lock_range(u64::MAX, 2, true, CAP),
             Err(ntstatus::STATUS_INVALID_LOCK_RANGE)
         );
-        a.lock_range(u64::MAX, 1, true).unwrap();
+        a.lock_range(u64::MAX, 1, true, CAP).unwrap();
         // Closing an open drops its locks.
         assert!(a.release(false).is_none());
-        b.lock_range(105, 10, true).unwrap_err();
-        b.lock_range(0, 100, true).unwrap();
+        b.lock_range(105, 10, true, CAP).unwrap_err();
+        b.lock_range(0, 100, true, CAP).unwrap();
+    }
+
+    #[test]
+    fn locks_per_open_stop_at_the_limit() {
+        let s = share();
+        let a = open(&s, "f", FILE_WRITE_DATA, ALL).unwrap();
+        let b = open(&s, "f", FILE_WRITE_DATA, ALL).unwrap();
+        a.lock_range(0, 10, true, 2).unwrap();
+        a.lock_range(10, 10, true, 2).unwrap();
+        assert_eq!(
+            a.lock_range(20, 10, true, 2),
+            Err(ntstatus::STATUS_INSUFFICIENT_RESOURCES)
+        );
+        // The limit counts this open's locks only.
+        b.lock_range(20, 10, true, 2).unwrap();
+        a.unlock_range(0, 10).unwrap();
+        a.lock_range(30, 10, true, 2).unwrap();
     }
 
     #[test]
@@ -656,10 +747,10 @@ mod tests {
         let s = share();
         let a = open(&s, "f", FILE_WRITE_DATA, ALL).unwrap();
         let b = open(&s, "f", FILE_WRITE_DATA, ALL).unwrap();
-        a.lock_range(0, 0, true).unwrap();
-        b.lock_range(0, 0, true).unwrap();
+        a.lock_range(0, 0, true, CAP).unwrap();
+        b.lock_range(0, 0, true, CAP).unwrap();
         assert_eq!(b.check_io(0, 10, true), Ok(()));
-        a.lock_range(10, 0, true).unwrap();
+        a.lock_range(10, 0, true, CAP).unwrap();
         assert_eq!(b.check_io(10, 0, true), Ok(()));
         assert_eq!(
             b.check_io(5, 10, true),
@@ -696,8 +787,8 @@ mod tests {
         a.set_delete_pending(true);
         assert!(s.files.delete_pending_at(&p("e\\f"), false));
         let pending = a.release(false).expect("pending removal");
-        assert_eq!(pending.path(), &p("e\\f"));
-        pending.finish();
+        assert_eq!(pending.path, p("e\\f"));
+        drop(pending);
         assert!(s.files.files().is_empty());
     }
 }

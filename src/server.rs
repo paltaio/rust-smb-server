@@ -205,6 +205,9 @@ pub struct ServerState {
     /// Opens one connection may hold at once. CREATE past it fails with
     /// STATUS_INSUFFICIENT_RESOURCES.
     pub max_opens_per_connection: std::sync::atomic::AtomicUsize,
+    /// Byte-range locks one open may hold at once. LOCK past it fails with
+    /// STATUS_INSUFFICIENT_RESOURCES.
+    pub max_locks_per_open: std::sync::atomic::AtomicUsize,
 }
 
 impl ServerState {
@@ -219,6 +222,9 @@ impl ServerState {
             auth: crate::auth_policy::AuthPolicy::default(),
             max_opens_per_connection: std::sync::atomic::AtomicUsize::new(
                 crate::files::DEFAULT_MAX_OPENS_PER_CONNECTION,
+            ),
+            max_locks_per_open: std::sync::atomic::AtomicUsize::new(
+                crate::files::DEFAULT_MAX_LOCKS_PER_OPEN,
             ),
         }
     }
@@ -413,7 +419,8 @@ impl ConfigHandle {
 
     /// Set how many files one connection may hold open at once. A CREATE
     /// past the limit fails with STATUS_INSUFFICIENT_RESOURCES; opens already
-    /// held stay open. The default is 16384.
+    /// held stay open. The default is
+    /// [`DEFAULT_MAX_OPENS_PER_CONNECTION`](crate::DEFAULT_MAX_OPENS_PER_CONNECTION).
     pub fn set_max_opens_per_connection(&self, limit: usize) {
         self.state
             .max_opens_per_connection

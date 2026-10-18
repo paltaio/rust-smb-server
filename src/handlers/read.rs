@@ -8,8 +8,7 @@ use crate::proto::messages::{ReadRequest, ReadResponse};
 use crate::access_mask::FILE_READ_DATA;
 use crate::conn::state::Connection;
 use crate::dispatch::HandlerResponse;
-use crate::handlers::shared::{lookup_open, lookup_session_tree};
-use crate::handlers::write::is_smb3;
+use crate::handlers::shared::{channel_is_valid, lookup_open, lookup_session_tree};
 use crate::ntstatus;
 use crate::server::ServerState;
 
@@ -40,8 +39,7 @@ pub async fn handle(
         if open.granted_access & FILE_READ_DATA == 0 {
             return HandlerResponse::err(ntstatus::STATUS_ACCESS_DENIED);
         }
-        // Every connection is TCP, so an RDMA channel is never valid.
-        if is_smb3(*conn.dialect.read().await) && req.channel != 0 {
+        if !channel_is_valid(*conn.dialect.read().await, req.channel) {
             return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
         }
         if req.length > 0

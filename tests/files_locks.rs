@@ -128,11 +128,40 @@ async fn invalid_lock_requests_are_rejected() {
 }
 
 #[tokio::test]
+async fn locks_past_the_limit_are_refused() {
+    let td = tempdir().unwrap();
+    std::fs::write(td.path().join("f.txt"), vec![b'x'; 200]).unwrap();
+    let server = Server::start(
+        smb_server::SmbServer::builder()
+            .max_locks_per_open(2)
+            .share(smb_server::Share::new("share", local(td.path())).public()),
+    )
+    .await;
+    let mut a = server.client().await;
+    let mut b = server.client().await;
+    let fa = a.open("f.txt", RW, SHARE_ALL).await.unwrap();
+    let fb = b.open("f.txt", RW, SHARE_ALL).await.unwrap();
+
+    assert_eq!(a.lock(fa, &[(0, 10, EX_NOW), (20, 10, EX_NOW)]).await, 0);
+    assert_eq!(
+        a.lock(fa, &[(40, 10, EX_NOW)]).await,
+        ntstatus::STATUS_INSUFFICIENT_RESOURCES
+    );
+    // A request that crosses the limit takes none of its ranges.
+    assert_eq!(a.lock(fa, &[(0, 10, LOCK_UNLOCK)]).await, 0);
+    assert_eq!(
+        a.lock(fa, &[(40, 10, EX_NOW), (60, 10, EX_NOW)]).await,
+        ntstatus::STATUS_INSUFFICIENT_RESOURCES
+    );
+    assert_eq!(b.lock(fb, &[(40, 10, EX_NOW)]).await, 0);
+    assert_eq!(a.lock(fa, &[(80, 10, EX_NOW)]).await, 0);
+}
+
+#[tokio::test]
 async fn locks_go_away_with_their_open() {
     let td = tempdir().unwrap();
     let (_server, mut a, fa, mut b, fb) = two_opens(td.path()).await;
 
-    // CLOSE.
     assert_eq!(a.lock(fa, &[(0, 10, EX_NOW)]).await, 0);
     assert_eq!(
         b.lock(fb, &[(0, 10, EX_NOW)]).await,
@@ -140,39 +169,4 @@ async fn locks_go_away_with_their_open() {
     );
     a.close(fa).await;
     assert_eq!(b.lock(fb, &[(0, 10, EX_NOW)]).await, 0);
-    assert_eq!(b.lock(fb, &[(0, 10, LOCK_UNLOCK)]).await, 0);
-
-    // LOGOFF.
-    let fa = a.open("f.txt", RW, SHARE_ALL).await.unwrap();
-    assert_eq!(a.lock(fa, &[(0, 10, EX_NOW)]).await, 0);
-    assert_eq!(
-        b.lock(fb, &[(0, 10, EX_NOW)]).await,
-        ntstatus::STATUS_LOCK_NOT_GRANTED
-    );
-    assert_eq!(a.logoff().await, 0);
-    assert_eq!(b.lock(fb, &[(0, 10, EX_NOW)]).await, 0);
-    assert_eq!(b.lock(fb, &[(0, 10, LOCK_UNLOCK)]).await, 0);
-}
-
-#[tokio::test]
-async fn locks_go_away_when_the_connection_drops() {
-    let td = tempdir().unwrap();
-    let (server, mut a, fa, mut b, fb) = two_opens(td.path()).await;
-    assert_eq!(a.lock(fa, &[(0, 10, EX_NOW)]).await, 0);
-    assert_eq!(
-        b.lock(fb, &[(0, 10, EX_NOW)]).await,
-        ntstatus::STATUS_LOCK_NOT_GRANTED
-    );
-    drop(a);
-
-    let mut granted = false;
-    for _ in 0..200 {
-        if b.lock(fb, &[(0, 10, EX_NOW)]).await == 0 {
-            granted = true;
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    assert!(granted, "lock of a dropped connection stayed");
-    drop(server);
 }

@@ -33,14 +33,10 @@ pub struct WriteRequest {
     #[br(parse_with = super::read_buf_at, args(
         data_offset.into(),
         length as usize,
-        WRITE_BUFFER_OFFSET,
+        u64::from(WriteRequest::STANDARD_DATA_OFFSET),
     ))]
     pub data: Vec<u8>,
 }
-
-/// Offset of the first byte after the fixed WRITE request fields, counted
-/// from the start of the SMB2 header: 64 + 48.
-const WRITE_BUFFER_OFFSET: u64 = 0x70;
 
 impl WriteRequest {
     /// Canonical `DataOffset` placing the data buffer immediately after the

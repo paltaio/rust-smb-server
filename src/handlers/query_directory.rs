@@ -174,7 +174,7 @@ async fn start_scan(
         .map_err(|e| e.to_nt_status())?;
 
     let mut entries = Vec::with_capacity(listed.len() + 2);
-    if !open.last_path.is_root() {
+    if open.path().is_some_and(|path| !path.is_root()) {
         let matcher = pattern.as_deref().map(|p| Pattern::new(p, true));
         let matches = |name: &str| matcher.as_ref().is_none_or(|m| m.matches(name));
         if matches(".") || matches("..") {
@@ -211,7 +211,7 @@ async fn start_scan(
 /// File info of the parent directory of `open`, or `None` if it cannot be
 /// opened.
 async fn parent_info(backend: &dyn ShareBackend, open: &Open) -> Option<FileInfo> {
-    let parent = open.last_path.parent()?;
+    let parent = open.path()?.parent()?;
     let opts = OpenOptions {
         read: true,
         write: false,

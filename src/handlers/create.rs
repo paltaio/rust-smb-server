@@ -281,13 +281,17 @@ pub async fn handle(
         share: req.share_access,
     };
 
-    // An open that truncates checks the file first, so a refused open
-    // leaves the file as it was.
-    if matches!(intent, OpenIntent::Truncate | OpenIntent::OverwriteOrCreate)
-        && let Err(status) = check_existing(&share, &path, opts, sharing).await
-    {
-        return HandlerResponse::err(status);
-    }
+    // An open that truncates checks the file and takes its place in the
+    // table first, so a refused open leaves the file as it was and no other
+    // open slips in while the backend truncates.
+    let reserved = if matches!(intent, OpenIntent::Truncate | OpenIntent::OverwriteOrCreate) {
+        match reserve_existing(&share, &path, opts, sharing).await {
+            Ok(reserved) => reserved,
+            Err(status) => return HandlerResponse::err(status),
+        }
+    } else {
+        None
+    };
 
     let (handle, action) = match backend.open(&path, opts).await {
         Ok(opened) => opened,
@@ -315,11 +319,18 @@ pub async fn handle(
         let _ = handle.close().await;
         return HandlerResponse::err(ntstatus::STATUS_CANNOT_DELETE);
     }
-    let file = match FileRef::register(&share, &info, &path, sharing) {
-        Ok(f) => f,
-        Err(status) => {
-            let _ = handle.close().await;
-            return HandlerResponse::err(status);
+    let file = match reserved {
+        Some(file) if file.is_for(&info, &path) => file,
+        // The file was replaced between the two opens, or did not exist.
+        reserved => {
+            drop(reserved);
+            match FileRef::register(&share, &info, &path, sharing) {
+                Ok(f) => f,
+                Err(status) => {
+                    let _ = handle.close().await;
+                    return HandlerResponse::err(status);
+                }
+            }
         }
     };
 
@@ -350,9 +361,6 @@ pub async fn handle(
     if tree.closed {
         drop(tree);
         let _ = handle.close().await;
-        if let Some(pending) = file.release(false) {
-            pending.finish();
-        }
         return HandlerResponse::err(ntstatus::STATUS_NETWORK_NAME_DELETED);
     }
     let file_id = tree.alloc_file_id();
@@ -360,7 +368,6 @@ pub async fn handle(
         file_id,
         handle: Some(handle),
         granted_access: open_access,
-        last_path: path,
         is_directory: info.is_directory,
         delete_on_close,
         search_state: None,
@@ -384,7 +391,7 @@ pub async fn handle(
         &queries.answer(&info, maximal, volume_serial),
         &mut contexts,
     )
-    .expect("encode");
+    .expect("encoding into a Vec cannot fail");
     let resp = CreateResponse {
         structure_size: 89,
         oplock_level: 0,
@@ -412,16 +419,17 @@ pub async fn handle(
     HandlerResponse::ok(buf)
 }
 
-/// Checks an existing file at `path` against the opens already on it, and
-/// against delete-on-close, before a CREATE that truncates it. A file that
-/// is missing or cannot be opened for reading passes; the real open reports
-/// those.
-async fn check_existing(
+/// Before a CREATE that truncates the file at `path`, checks the existing
+/// file against the opens already on it and against delete-on-close, and
+/// enters the new open in the share's table so the file keeps this sharing
+/// mode while the backend truncates it. A file that is missing or cannot be
+/// opened for reading passes without an entry; the real open reports those.
+async fn reserve_existing(
     share: &Arc<ShareBindings>,
     path: &SmbPath,
     opts: OpenOptions,
     sharing: Sharing,
-) -> Result<(), u32> {
+) -> Result<Option<FileRef>, u32> {
     let probe = OpenOptions {
         read: true,
         write: false,
@@ -431,15 +439,12 @@ async fn check_existing(
         ..opts
     };
     let Ok((handle, _)) = share.backend.open(path, probe).await else {
-        return Ok(());
+        return Ok(None);
     };
     let result = match handle.stat().await {
         Ok(info) if opts.delete_on_close && info.read_only => Err(ntstatus::STATUS_CANNOT_DELETE),
-        Ok(info) => {
-            let case_sensitive = share.backend.capabilities().case_sensitive;
-            share.files.check(&info, path, case_sensitive, sharing)
-        }
-        Err(_) => Ok(()),
+        Ok(info) => FileRef::register(share, &info, path, sharing).map(Some),
+        Err(_) => Ok(None),
     };
     let _ = handle.close().await;
     result
@@ -458,5 +463,156 @@ async fn apply_attributes(handle: &dyn Handle, attributes: u32, path: &SmbPath) 
     }
     if let Err(e) = result {
         debug!(error = %e, path = %path, attributes, "create attributes not applied");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use async_trait::async_trait;
+    use tokio::sync::{Notify, RwLock, Semaphore};
+
+    use super::*;
+    use crate::backend::{BackendCapabilities, ShareBackend};
+    use crate::builder::Access;
+    use crate::conn::state::{Session, TreeConnect};
+    use crate::error::SmbResult;
+    use crate::proto::auth::ntlm::Identity;
+    use crate::proto::header::{Command, HeaderTail};
+    use crate::tests::memfs::MemFsBackend;
+    use crate::{Share, SmbServer};
+
+    /// Memory backend whose truncating opens tell `waiting` they have
+    /// arrived and then wait for a permit from `go`.
+    struct HoldTruncate {
+        inner: MemFsBackend,
+        waiting: Arc<Notify>,
+        go: Arc<Semaphore>,
+    }
+
+    #[async_trait]
+    impl ShareBackend for HoldTruncate {
+        async fn open(
+            &self,
+            path: &SmbPath,
+            opts: OpenOptions,
+        ) -> SmbResult<(Box<dyn Handle>, OpenAction)> {
+            if opts.intent == OpenIntent::Truncate {
+                self.waiting.notify_one();
+                self.go.acquire().await.expect("gate").forget();
+            }
+            self.inner.open(path, opts).await
+        }
+
+        async fn unlink(&self, path: &SmbPath) -> SmbResult<()> {
+            self.inner.unlink(path).await
+        }
+
+        async fn rename(&self, from: &SmbPath, to: &SmbPath, replace: bool) -> SmbResult<()> {
+            self.inner.rename(from, to, replace).await
+        }
+
+        fn capabilities(&self) -> BackendCapabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    fn create_body(name: &str, disposition: u32) -> Vec<u8> {
+        let name: Vec<u8> = name.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let req = CreateRequest {
+            structure_size: 57,
+            security_flags: 0,
+            requested_oplock_level: 0,
+            impersonation_level: 2,
+            smb_create_flags: 0,
+            reserved: 0,
+            desired_access: FILE_READ_DATA | FILE_WRITE_DATA,
+            file_attributes: 0,
+            share_access: 7,
+            create_disposition: disposition,
+            create_options: 0,
+            name_offset: 0x78,
+            name_length: name.len() as u16,
+            create_contexts_offset: 0,
+            create_contexts_length: 0,
+            name,
+            create_contexts: Vec::new(),
+        };
+        let mut body = Vec::new();
+        req.write_to(&mut body)
+            .expect("encoding into a Vec cannot fail");
+        body
+    }
+
+    #[tokio::test]
+    async fn a_truncating_create_holds_the_file_while_the_backend_truncates() {
+        let waiting = Arc::new(Notify::new());
+        let go = Arc::new(Semaphore::new(0));
+        let backend = HoldTruncate {
+            inner: MemFsBackend::new().with_file("f.txt", b"precious"),
+            waiting: Arc::clone(&waiting),
+            go: Arc::clone(&go),
+        };
+        let server = SmbServer::builder()
+            .listen("127.0.0.1:0".parse().unwrap())
+            .share(Share::new("s", backend).public())
+            .build()
+            .unwrap();
+        let state = server.state();
+        let share = state.find_share("s").await.unwrap();
+        let conn = Arc::new(Connection::new(
+            state.config.server_guid,
+            state.config.max_read_size,
+            state.config.max_write_size,
+        ));
+        let session = Session::new(Identity::Anonymous, [0; 16], [0; 16], false, None);
+        let tree = TreeConnect::new(1, Arc::clone(&share), Access::ReadWrite);
+        session
+            .trees
+            .write()
+            .await
+            .insert(1, Arc::new(RwLock::new(tree)));
+        conn.sessions
+            .write()
+            .await
+            .insert(1, Arc::new(RwLock::new(session)));
+
+        let hdr = Smb2Header {
+            command: Command::Create,
+            tail: HeaderTail::sync(1),
+            session_id: 1,
+            ..Smb2Header::default()
+        };
+        let body = create_body("f.txt", FILE_OVERWRITE);
+        let truncating = tokio::spawn({
+            let state = Arc::clone(&state);
+            let conn = Arc::clone(&conn);
+            async move { handle(&state, &conn, &hdr, &body).await }
+        });
+        waiting.notified().await;
+
+        // Another connection's exclusive open arrives while the backend
+        // truncates.
+        let path: SmbPath = "f.txt".parse().unwrap();
+        let (probe, _) = share
+            .backend
+            .open(&path, OpenOptions::default())
+            .await
+            .unwrap();
+        let info = probe.stat().await.unwrap();
+        let exclusive = FileRef::register(
+            &share,
+            &info,
+            &path,
+            Sharing {
+                access: FILE_READ_DATA,
+                share: 0,
+            },
+        );
+        assert_eq!(exclusive.err(), Some(ntstatus::STATUS_SHARING_VIOLATION));
+
+        go.add_permits(1);
+        let response = truncating.await.unwrap();
+        assert_eq!(response.status, ntstatus::STATUS_SUCCESS);
+        assert_eq!(probe.stat().await.unwrap().end_of_file, 0);
     }
 }

@@ -11,9 +11,7 @@ use crate::backend::{
 };
 use crate::conn::state::{Connection, Open};
 use crate::dispatch::HandlerResponse;
-use crate::handlers::shared::{
-    lookup_open, lookup_session_tree, rename_open_paths, restore_fixed_times,
-};
+use crate::handlers::shared::{lookup_open, lookup_session_tree, restore_fixed_times};
 use crate::info_class as ic;
 use crate::ntstatus;
 use crate::path::{SmbPath, same_path};
@@ -35,7 +33,7 @@ enum Class {
 }
 
 pub async fn handle(
-    server: &Arc<ServerState>,
+    _server: &Arc<ServerState>,
     conn: &Arc<Connection>,
     hdr: &Smb2Header,
     body: &[u8],
@@ -126,7 +124,11 @@ pub async fn handle(
             if buffer[8..16] != [0; 8] {
                 return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
             }
-            let name_len = u32::from_le_bytes(buffer[16..20].try_into().unwrap());
+            let name_len = u32::from_le_bytes(
+                buffer[16..20]
+                    .try_into()
+                    .expect("the length check above covers these bytes"),
+            );
             let Some(name_bytes) = usize::try_from(name_len)
                 .ok()
                 .and_then(|len| buffer.get(20..)?.get(..len))
@@ -142,10 +144,13 @@ pub async fn handle(
                 Err(_) => return HandlerResponse::err(ntstatus::STATUS_OBJECT_NAME_INVALID),
             };
             let replace_if_exists = buffer[0] != 0;
-            let from = open_arc.read().await.last_path.clone();
+            let case_sensitive = share.backend.capabilities().case_sensitive;
+            let _renames = share.files.rename_lock().await;
+            let Some(from) = open_arc.read().await.path() else {
+                return HandlerResponse::err(ntstatus::STATUS_FILE_CLOSED);
+            };
             // MS-FSA 2.1.5.15.12: an open target is not replaced. A target
             // that names the source itself is the same file and skips this.
-            let case_sensitive = share.backend.capabilities().case_sensitive;
             if replace_if_exists
                 && !same_path(&from, &new_path, case_sensitive)
                 && share.files.path_is_open(&new_path, case_sensitive)
@@ -159,7 +164,6 @@ pub async fn handle(
             {
                 Ok(()) => {
                     share.files.rename_paths(&from, &new_path, case_sensitive);
-                    rename_open_paths(server, &share, &from, &new_path).await;
                     Ok(())
                 }
                 Err(e) => Err(e.to_nt_status()),
@@ -266,4 +270,186 @@ async fn set_disposition(open: &Open, delete: bool) -> Result<(), u32> {
     let file = open.file.as_ref().ok_or(ntstatus::STATUS_FILE_CLOSED)?;
     file.set_delete_pending(delete);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use async_trait::async_trait;
+    use tokio::sync::{Notify, RwLock, Semaphore};
+
+    use super::*;
+    use crate::backend::{
+        BackendCapabilities, Handle, OpenAction, OpenIntent, OpenOptions, ShareBackend,
+    };
+    use crate::builder::Access;
+    use crate::conn::state::{Session, TreeConnect};
+    use crate::error::SmbResult;
+    use crate::files::{FileRef, Sharing};
+    use crate::proto::auth::ntlm::Identity;
+    use crate::proto::header::{Command, HeaderTail};
+    use crate::proto::messages::FileId;
+    use crate::tests::memfs::MemFsBackend;
+    use crate::{Share, SmbServer};
+
+    /// Memory backend that counts renames and, once the first has run in
+    /// the backend, tells `waiting` and waits for a permit from `go` before
+    /// returning it.
+    struct HoldRename {
+        inner: MemFsBackend,
+        renames: Arc<AtomicUsize>,
+        waiting: Arc<Notify>,
+        go: Arc<Semaphore>,
+    }
+
+    #[async_trait]
+    impl ShareBackend for HoldRename {
+        async fn open(
+            &self,
+            path: &SmbPath,
+            opts: OpenOptions,
+        ) -> SmbResult<(Box<dyn Handle>, OpenAction)> {
+            self.inner.open(path, opts).await
+        }
+
+        async fn unlink(&self, path: &SmbPath) -> SmbResult<()> {
+            self.inner.unlink(path).await
+        }
+
+        async fn rename(&self, from: &SmbPath, to: &SmbPath, replace: bool) -> SmbResult<()> {
+            let result = self.inner.rename(from, to, replace).await;
+            if self.renames.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.waiting.notify_one();
+                self.go.acquire().await.expect("gate").forget();
+            }
+            result
+        }
+
+        fn capabilities(&self) -> BackendCapabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    fn rename_body(file_id: FileId, to: &str) -> Vec<u8> {
+        let name: Vec<u8> = to.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let mut buffer = vec![1];
+        buffer.resize(16, 0);
+        buffer.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        buffer.extend_from_slice(&name);
+        let req = SetInfoRequest {
+            structure_size: 33,
+            info_type: 1,
+            file_information_class: ic::FILE_RENAME_INFORMATION,
+            buffer_length: buffer.len() as u32,
+            buffer_offset: 0x60,
+            reserved: 0,
+            additional_information: 0,
+            file_id,
+            buffer,
+        };
+        let mut body = Vec::new();
+        req.write_to(&mut body)
+            .expect("encoding into a Vec cannot fail");
+        body
+    }
+
+    #[tokio::test]
+    async fn renames_on_a_share_run_one_at_a_time() {
+        let renames = Arc::new(AtomicUsize::new(0));
+        let waiting = Arc::new(Notify::new());
+        let go = Arc::new(Semaphore::new(0));
+        let backend = HoldRename {
+            inner: MemFsBackend::new().with_file("d\\f", b"x"),
+            renames: Arc::clone(&renames),
+            waiting: Arc::clone(&waiting),
+            go: Arc::clone(&go),
+        };
+        let server = SmbServer::builder()
+            .listen("127.0.0.1:0".parse().unwrap())
+            .share(Share::new("s", backend).public())
+            .build()
+            .unwrap();
+        let state = server.state();
+        let share = state.find_share("s").await.unwrap();
+        let conn = Arc::new(Connection::new(
+            state.config.server_guid,
+            state.config.max_read_size,
+            state.config.max_write_size,
+        ));
+        let session = Session::new(Identity::Anonymous, [0; 16], [0; 16], false, None);
+        let tree = TreeConnect::new(1, Arc::clone(&share), Access::ReadWrite);
+        let mut file_ids = Vec::new();
+        for (path, directory) in [("d\\f", false), ("d", true)] {
+            let path: SmbPath = path.parse().unwrap();
+            let opts = OpenOptions {
+                directory,
+                intent: OpenIntent::OpenOrCreate,
+                ..OpenOptions::default()
+            };
+            let (handle, _) = share.backend.open(&path, opts).await.unwrap();
+            let info = handle.stat().await.unwrap();
+            let sharing = Sharing {
+                access: DELETE,
+                share: 7,
+            };
+            let file = FileRef::register(&share, &info, &path, sharing).unwrap();
+            let file_id = tree.alloc_file_id();
+            let open = Open {
+                file_id,
+                handle: Some(handle),
+                granted_access: DELETE,
+                is_directory: directory,
+                delete_on_close: false,
+                search_state: None,
+                fixed_times: FileTimes::default(),
+                create_options: 0,
+                file: Some(file),
+                slot: None,
+            };
+            tree.opens
+                .write()
+                .await
+                .insert(file_id, Arc::new(RwLock::new(open)));
+            file_ids.push(file_id);
+        }
+        session
+            .trees
+            .write()
+            .await
+            .insert(1, Arc::new(RwLock::new(tree)));
+        conn.sessions
+            .write()
+            .await
+            .insert(1, Arc::new(RwLock::new(session)));
+
+        let hdr = Smb2Header {
+            command: Command::SetInfo,
+            tail: HeaderTail::sync(1),
+            session_id: 1,
+            ..Smb2Header::default()
+        };
+        let rename = |file_id, to: &str| {
+            let state = Arc::clone(&state);
+            let conn = Arc::clone(&conn);
+            let body = rename_body(file_id, to);
+            tokio::spawn(async move { handle(&state, &conn, &hdr, &body).await })
+        };
+        let file = rename(file_ids[0], "d\\g");
+        waiting.notified().await;
+        let parent = rename(file_ids[1], "e");
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            renames.load(Ordering::SeqCst),
+            1,
+            "a rename ran during another"
+        );
+
+        go.add_permits(1);
+        assert_eq!(file.await.unwrap().status, ntstatus::STATUS_SUCCESS);
+        assert_eq!(parent.await.unwrap().status, ntstatus::STATUS_SUCCESS);
+        assert!(share.files.path_is_open(&"e\\g".parse().unwrap(), false));
+    }
 }

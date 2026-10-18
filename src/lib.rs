@@ -42,16 +42,18 @@
 //!   the share get read access only, so opens that ask for write access,
 //!   and dispositions that create or truncate, fail before `open`.
 //! - Share modes, byte-range locks and the delete-pending flag are kept by
-//!   the protocol layer for every connection, per file: by
-//!   [`FileInfo::file_index`], or by path when it is 0. A CREATE refused by
-//!   the share-mode check has already called `open` and closes the new
-//!   handle again. A CREATE that would truncate first opens the file
-//!   without write access to run the checks.
+//!   the protocol layer per share, across every connection, keyed by
+//!   [`FileInfo::file_index`], or by path when it is 0. Two shares over
+//!   the same directory do not see each other's opens. A CREATE that would
+//!   truncate first opens the file without write access, runs the checks
+//!   and enters the open in the table, so the sharing mode holds while
+//!   `open` truncates. Any other CREATE refused by the share-mode check has
+//!   already called `open` and closes the new handle again.
 //! - [`Handle::close`] runs on every path that ends an open: CLOSE,
 //!   TREE_DISCONNECT, LOGOFF, the end of a session or connection, and
 //!   [`ConfigHandle`] changes that end sessions or trees. Before it,
-//!   [`Handle::set_times`] puts back access and write times the client
-//!   fixed on that open.
+//!   [`Handle::set_times`] puts back access and write times that
+//!   FileBasicInformation froze or set through that open.
 //! - Delete-on-close: [`OpenOptions::delete_on_close`] and
 //!   FileDispositionInformation make the file delete-pending. When its last
 //!   open ends, on any of the paths above, the protocol layer calls
@@ -62,8 +64,9 @@
 //!   [`SmbError::NotEmpty`] for a directory that has entries; the directory
 //!   then stays.
 //! - A rename through SET_INFO calls [`ShareBackend::rename`] and then moves
-//!   the path of every open at or below the old name. The backend keeps
-//!   those handles working on the renamed file.
+//!   the path of every open at or below the old name. Renames on one share
+//!   run one at a time. The backend keeps those handles working on the
+//!   renamed file.
 //! - A CREATE that makes or overwrites a file passes the attributes it asks
 //!   for to [`Handle::set_attributes`] when they differ from what
 //!   [`Handle::stat`] reports. If that returns [`SmbError::NotSupported`],
@@ -72,8 +75,8 @@
 //! - FileBasicInformation passes [`Handle::set_attributes`] and
 //!   [`Handle::set_times`] only the values that differ from what
 //!   [`Handle::stat`] reports. After a write or truncate, `set_times` also
-//!   puts back the times the client fixed. [`Handle::truncate`] is never
-//!   called on a directory.
+//!   puts back the times FileBasicInformation froze or set.
+//!   [`Handle::truncate`] is never called on a directory.
 //! - QUERY_DIRECTORY calls [`Handle::list_dir`] with the search pattern on
 //!   the first query and on a restart, then pages through the returned
 //!   entries itself. Below the share root it adds `.` and `..`, and opens
@@ -87,22 +90,25 @@
 //! - Each [`SmbError`] maps to one NTSTATUS for the client; see
 //!   [`SmbError::to_nt_status`].
 //!
-//! A handle is dropped without [`Handle::close`] only when the task serving
-//! its connection is cancelled, so release resources in `Drop` as well.
+//! A handle is dropped without [`Handle::close`] when the task serving its
+//! connection panics or is cancelled, and when a [`ConfigHandle`] call that
+//! ends its session or tree is cancelled, so release resources in `Drop` as
+//! well.
 //!
-//! Some methods have default bodies: [`Handle::write_owned`] calls
-//! [`Handle::write`], [`Handle::link_count`] reports 1,
-//! [`Handle::dir_is_empty`] lists the directory, and
-//! [`ShareBackend::volume_info`] returns [`VolumeInfo::default`]. Later
-//! releases may add more methods with default bodies; a backend that
-//! implements the required methods keeps compiling.
+//! Later releases may add methods with default bodies, fields to
+//! [`FileInfo`], [`BackendCapabilities`] and [`VolumeInfo`], and variants
+//! to [`OpenIntent`]. A backend that implements the required methods,
+//! builds those types through [`FileInfo::new`] and the `Default` impls, and
+//! matches `OpenIntent` with a wildcard arm keeps compiling.
 
 mod access_mask;
+mod auth_policy;
 mod backend;
 mod builder;
 pub(crate) mod conn;
 mod dispatch;
 mod error;
+mod files;
 #[cfg(feature = "localfs")]
 mod fs;
 mod handlers;
@@ -111,15 +117,22 @@ pub mod ntstatus;
 mod path;
 mod proto;
 mod server;
+#[cfg(test)]
+mod tests {
+    mod dynamic_config;
+    pub(crate) mod memfs;
+}
 mod utils;
+mod wildcard;
 
 pub use backend::{
-    BackendCapabilities, DirEntry, FileInfo, FileTimes, Handle, OpenIntent, OpenOptions,
-    ShareBackend,
+    BackendCapabilities, DirEntry, FileInfo, FileTimes, Handle, OpenAction, OpenIntent,
+    OpenOptions, ShareBackend, VolumeInfo,
 };
 pub use builder::{Access, BuildError, Share, SmbServerBuilder};
 pub use bytes::Bytes;
 pub use error::{SmbError, SmbResult};
+pub use files::{DEFAULT_MAX_LOCKS_PER_OPEN, DEFAULT_MAX_OPENS_PER_CONNECTION};
 #[cfg(feature = "localfs")]
 pub use fs::LocalFsBackend;
 pub use path::SmbPath;
@@ -130,21 +143,6 @@ pub mod wire {
     pub use crate::proto::header;
     pub use crate::proto::messages;
 }
-
-pub use backend::OpenAction;
-
-mod files;
-
-#[cfg(test)]
-mod tests {
-    mod dynamic_config;
-    pub(crate) mod memfs;
-}
-
-mod auth_policy;
-mod wildcard;
-
-pub use backend::VolumeInfo;
 
 /// Entry points for the cargo-fuzz targets in `fuzz/`. Built only with
 /// `--cfg fuzzing`, which `cargo fuzz` sets.

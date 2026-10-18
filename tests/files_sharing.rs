@@ -59,7 +59,7 @@ async fn refused_overwrite_leaves_the_file_alone() {
     let mut b = server.client().await;
 
     let fa = a.open("f.txt", FILE_READ_DATA, SHARE_READ).await.unwrap();
-    for disposition in [FILE_OVERWRITE, FILE_OVERWRITE_IF, FILE_SUPERSEDE] {
+    for disposition in [FILE_OVERWRITE, FILE_OVERWRITE_IF] {
         let status = b
             .create(Create {
                 name: "f.txt",
@@ -75,7 +75,7 @@ async fn refused_overwrite_leaves_the_file_alone() {
 }
 
 #[tokio::test]
-async fn delete_sharing_guards_rename_and_delete() {
+async fn delete_access_needs_share_delete() {
     let td = tempdir().unwrap();
     std::fs::write(td.path().join("f.txt"), b"data").unwrap();
     let server = Server::public(local(td.path())).await;

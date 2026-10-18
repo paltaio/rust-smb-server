@@ -47,10 +47,9 @@ impl ShareBackend for CaseRule {
     }
 
     fn capabilities(&self) -> BackendCapabilities {
-        BackendCapabilities {
-            case_sensitive: self.1,
-            ..self.0.capabilities()
-        }
+        let mut capabilities = self.0.capabilities();
+        capabilities.case_sensitive = self.1;
+        capabilities
     }
 }
 

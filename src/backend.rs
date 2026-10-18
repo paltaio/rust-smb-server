@@ -16,6 +16,7 @@ use crate::path::SmbPath;
 
 /// SMB CREATE disposition as seen by a backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum OpenIntent {
     /// `FILE_OPEN`: open existing only; fail if missing.
     Open,
@@ -80,8 +81,10 @@ pub enum OpenAction {
 // FileInfo / DirEntry / FileTimes
 // ---------------------------------------------------------------------------
 
-/// Filesystem-style metadata for a single file or directory.
+/// Filesystem-style metadata for a single file or directory. Built with
+/// [`FileInfo::new`]; every field is public.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct FileInfo {
     /// Display name (last component). For QUERY_INFO at the share root this
     /// is the share name.
@@ -129,6 +132,23 @@ pub(crate) const VALID_SET_ATTRIBUTES: u32 = FILE_ATTRIBUTE_READONLY
     | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED;
 
 impl FileInfo {
+    /// A zero-length, writable file named `name` with no times and no file
+    /// id. Set the fields the backend knows.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            end_of_file: 0,
+            allocation_size: 0,
+            creation_time: 0,
+            last_access_time: 0,
+            last_write_time: 0,
+            change_time: 0,
+            is_directory: false,
+            read_only: false,
+            file_index: 0,
+        }
+    }
+
     /// SMB2 file attributes (MS-FSCC 2.6) for this file:
     /// `FILE_ATTRIBUTE_DIRECTORY` for directories and
     /// `FILE_ATTRIBUTE_READONLY` for read-only files.
@@ -181,8 +201,10 @@ impl FileTimes {
 // BackendCapabilities
 // ---------------------------------------------------------------------------
 
-/// Static, advertised capabilities of a backend.
+/// Static, advertised capabilities of a backend. Built from
+/// [`BackendCapabilities::default`]; every field is public.
 #[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
 pub struct BackendCapabilities {
     /// If true, all write-class operations are denied at the protocol layer
     /// before reaching the backend (matches `LocalFsBackend::read_only()`).
@@ -315,8 +337,9 @@ pub trait Handle: Send + Sync {
     }
 
     /// True if this directory has no entries other than `.` and `..`,
-    /// counting entries that [`Handle::list_dir`] leaves out. The default
-    /// lists the directory.
+    /// including entries [`Handle::list_dir`] leaves out. The default checks
+    /// `list_dir(None)`, so a backend whose listing hides entries overrides
+    /// it.
     async fn dir_is_empty(&self) -> SmbResult<bool> {
         Ok(self.list_dir(None).await?.is_empty())
     }
@@ -358,8 +381,10 @@ impl ShareBackend for NotSupportedBackend {
 /// FileFsAttributeInformation and FileFsSectorSizeInformation (MS-FSCC 2.5).
 ///
 /// Sizes count allocation units of `sectors_per_allocation_unit *
-/// bytes_per_sector` bytes.
+/// bytes_per_sector` bytes. Built from [`VolumeInfo::default`]; every
+/// field is public.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct VolumeInfo {
     /// Total allocation units on the volume.
     pub total_allocation_units: u64,

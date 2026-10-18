@@ -3,14 +3,12 @@
 use std::sync::Arc;
 
 use crate::proto::header::Smb2Header;
-use crate::proto::messages::FileId;
+use crate::proto::messages::{Dialect, FileId};
 use tokio::sync::RwLock;
 use tracing::warn;
 
 use crate::conn::state::{Connection, Open, Session, TreeConnect};
 use crate::ntstatus;
-use crate::path::{SmbPath, rebase};
-use crate::server::{ServerState, ShareBindings};
 
 /// Look up the session and tree referenced by `hdr`, returning the tree
 /// inside the session. Returns the appropriate NTSTATUS on miss.
@@ -48,6 +46,17 @@ pub async fn lookup_open(
     opens.get(&file_id).cloned()
 }
 
+/// True if a READ or WRITE on `dialect` may carry `channel`. Every
+/// connection is TCP, so on SMB 3.x an RDMA channel is never valid; on
+/// earlier dialects the field is reserved and ignored.
+pub fn channel_is_valid(dialect: Option<Dialect>, channel: u32) -> bool {
+    channel == 0
+        || !matches!(
+            dialect,
+            Some(Dialect::Smb300 | Dialect::Smb302 | Dialect::Smb311)
+        )
+}
+
 /// Puts back the times `open` keeps fixed, after a change made through it.
 pub async fn restore_fixed_times(open: &Open) {
     let fixed = open.fixed_times;
@@ -57,45 +66,6 @@ pub async fn restore_fixed_times(open: &Open) {
     if let Some(handle) = open.handle.as_ref()
         && let Err(e) = handle.set_times(fixed).await
     {
-        warn!(error = %e, path = %open.last_path, "restoring fixed times failed");
-    }
-}
-
-/// Every open on `share`, on any connection.
-async fn share_opens(server: &ServerState, share: &Arc<ShareBindings>) -> Vec<Arc<RwLock<Open>>> {
-    let mut out = Vec::new();
-    for conn in server.active_connections.live().await {
-        let sessions: Vec<_> = conn.sessions.read().await.values().cloned().collect();
-        for sess_arc in sessions {
-            let trees: Vec<_> = {
-                let sess = sess_arc.read().await;
-                let trees = sess.trees.read().await;
-                trees.values().cloned().collect()
-            };
-            for tree_arc in trees {
-                let tree = tree_arc.read().await;
-                if Arc::ptr_eq(&tree.share, share) {
-                    out.extend(tree.opens.read().await.values().cloned());
-                }
-            }
-        }
-    }
-    out
-}
-
-/// Moves every open on `share` whose path is `from`, or lies below it, to
-/// the matching path under `to`.
-pub async fn rename_open_paths(
-    server: &ServerState,
-    share: &Arc<ShareBindings>,
-    from: &SmbPath,
-    to: &SmbPath,
-) {
-    let case_sensitive = share.backend.capabilities().case_sensitive;
-    for open_arc in share_opens(server, share).await {
-        let mut open = open_arc.write().await;
-        if let Some(path) = rebase(&open.last_path, from, to, case_sensitive) {
-            open.last_path = path;
-        }
+        warn!(error = %e, path = %open.path().unwrap_or_default(), "restoring fixed times failed");
     }
 }

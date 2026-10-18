@@ -148,6 +148,7 @@ pub struct SmbServerBuilder {
     limits: Limits,
     auth: crate::auth_policy::AuthSettings,
     max_opens_per_connection: usize,
+    max_locks_per_open: usize,
 }
 
 impl Default for SmbServerBuilder {
@@ -170,6 +171,7 @@ impl SmbServerBuilder {
             limits: Limits::default(),
             auth: crate::auth_policy::AuthSettings::default(),
             max_opens_per_connection: crate::files::DEFAULT_MAX_OPENS_PER_CONNECTION,
+            max_locks_per_open: crate::files::DEFAULT_MAX_LOCKS_PER_OPEN,
         }
     }
 
@@ -229,7 +231,7 @@ impl SmbServerBuilder {
     /// Unknown names are tracked the same way as configured ones.
     /// `max_failures` 0 turns the throttle off. Default 10 failures and 60
     /// seconds.
-    pub fn logon_throttle(mut self, max_failures: u32, lockout: std::time::Duration) -> Self {
+    pub fn logon_throttle(mut self, max_failures: u32, lockout: Duration) -> Self {
         self.auth.max_logon_failures = max_failures;
         self.auth.lockout = lockout;
         self
@@ -251,8 +253,9 @@ impl SmbServerBuilder {
         self
     }
 
-    /// Most connections served at once. A connection accepted beyond the
-    /// limit is closed straight away. Defaults to 1024.
+    /// Most connections served at once, counting every client together;
+    /// per-host limits belong in the firewall. A connection accepted beyond
+    /// the limit is closed straight away. Defaults to 1024.
     pub fn max_connections(mut self, connections: usize) -> Self {
         self.limits.max_connections = connections;
         self
@@ -290,11 +293,20 @@ impl SmbServerBuilder {
     }
 
     /// Most files one connection may hold open at once. A CREATE past the
-    /// limit fails with STATUS_INSUFFICIENT_RESOURCES. Defaults to 16384.
+    /// limit fails with STATUS_INSUFFICIENT_RESOURCES. Defaults to
+    /// [`DEFAULT_MAX_OPENS_PER_CONNECTION`](crate::DEFAULT_MAX_OPENS_PER_CONNECTION).
     /// [`ConfigHandle::set_max_opens_per_connection`](crate::ConfigHandle::set_max_opens_per_connection)
     /// changes it at run time.
     pub fn max_opens_per_connection(mut self, opens: usize) -> Self {
         self.max_opens_per_connection = opens;
+        self
+    }
+
+    /// Most byte-range locks one open may hold at once. A LOCK past the
+    /// limit fails with STATUS_INSUFFICIENT_RESOURCES. Defaults to
+    /// [`DEFAULT_MAX_LOCKS_PER_OPEN`](crate::DEFAULT_MAX_LOCKS_PER_OPEN).
+    pub fn max_locks_per_open(mut self, locks: usize) -> Self {
+        self.max_locks_per_open = locks;
         self
     }
 
@@ -407,6 +419,9 @@ impl SmbServerBuilder {
         state
             .max_opens_per_connection
             .store(self.max_opens_per_connection, Ordering::Relaxed);
+        state
+            .max_locks_per_open
+            .store(self.max_locks_per_open, Ordering::Relaxed);
         Ok(SmbServer::from_state(state))
     }
 }

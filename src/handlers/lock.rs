@@ -8,6 +8,7 @@
 //! set, as MS-SMB2 3.3.5.14.2 lets a server do in place of waiting.
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use crate::proto::header::Smb2Header;
 use crate::proto::messages::{LockElement, LockRequest, LockResponse};
@@ -24,7 +25,7 @@ const UNLOCK: u32 = LockElement::FLAG_UNLOCK;
 const FAIL_IMMEDIATELY: u32 = LockElement::FLAG_FAIL_IMMEDIATELY;
 
 pub async fn handle(
-    _server: &Arc<ServerState>,
+    server: &Arc<ServerState>,
     conn: &Arc<Connection>,
     hdr: &Smb2Header,
     body: &[u8],
@@ -70,10 +71,11 @@ pub async fn handle(
         }
         // MS-SMB2 3.3.5.14.2: a failed lock releases the ranges this request
         // locked before it.
+        let limit = server.max_locks_per_open.load(Ordering::Relaxed);
         let mut taken = Vec::new();
         let mut result = Ok(());
         for l in &req.locks {
-            match file.lock_range(l.offset, l.length, l.flags & EXCLUSIVE != 0) {
+            match file.lock_range(l.offset, l.length, l.flags & EXCLUSIVE != 0, limit) {
                 Ok(()) => taken.push(l),
                 Err(status) => {
                     for t in &taken {

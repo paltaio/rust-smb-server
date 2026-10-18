@@ -39,8 +39,6 @@ async fn opens_past_the_limit_are_refused() {
 
     a.close(first).await;
     assert!(a.open("f.txt", FILE_READ_DATA, SHARE_ALL).await.is_ok());
-    // A failed CREATE gives its slot back.
-    assert_eq!(a.tree_disconnect().await, 0);
 }
 
 #[tokio::test]

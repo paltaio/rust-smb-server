@@ -3,7 +3,6 @@
 #[path = "support_files.rs"]
 mod support;
 
-use smb_server::{Share, SmbServer};
 use support::*;
 use tempfile::tempdir;
 
@@ -57,8 +56,7 @@ async fn tree_disconnect_and_logoff_close_their_opens() {
 async fn revoked_share_closes_its_opens() {
     let td = tempdir().unwrap();
     let (backend, counters) = Probe::new(td.path(), Counters::default());
-    let server =
-        Server::start(SmbServer::builder().share(Share::new("share", backend).public())).await;
+    let server = Server::public(backend).await;
     let mut c = server.client().await;
     delete_on_close(&mut c, "gone.txt").await;
 

@@ -9,7 +9,9 @@ use crate::access_mask::{FILE_APPEND_DATA, FILE_WRITE_DATA};
 use crate::conn::state::Connection;
 use crate::dispatch::HandlerResponse;
 use crate::handlers::create::{FILE_NO_INTERMEDIATE_BUFFERING, WRITE_THROUGH_OPTIONS};
-use crate::handlers::shared::{lookup_open, lookup_session_tree, restore_fixed_times};
+use crate::handlers::shared::{
+    channel_is_valid, lookup_open, lookup_session_tree, restore_fixed_times,
+};
 use crate::ntstatus;
 use crate::server::ServerState;
 
@@ -40,8 +42,7 @@ pub async fn handle(
         None => return HandlerResponse::err(ntstatus::STATUS_FILE_CLOSED),
     };
     let dialect = *conn.dialect.read().await;
-    // Every connection is TCP, so an RDMA channel is never valid.
-    if is_smb3(dialect) && req.channel != 0 {
+    if !channel_is_valid(dialect, req.channel) {
         return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
     }
     if req.data_offset > MAX_DATA_OFFSET {
@@ -90,7 +91,9 @@ pub async fn handle(
 
     if req.length == 0 {
         let mut buf = Vec::new();
-        WriteResponse::new(0).write_to(&mut buf).expect("encode");
+        WriteResponse::new(0)
+            .write_to(&mut buf)
+            .expect("encoding into a Vec cannot fail");
         return HandlerResponse::ok(buf);
     }
     if let Some(file) = open.file.as_ref()
@@ -116,12 +119,4 @@ pub async fn handle(
         .write_to(&mut buf)
         .expect("encode");
     HandlerResponse::ok(buf)
-}
-
-/// True for the SMB 3.x dialects.
-pub(crate) fn is_smb3(dialect: Option<Dialect>) -> bool {
-    matches!(
-        dialect,
-        Some(Dialect::Smb300 | Dialect::Smb302 | Dialect::Smb311)
-    )
 }

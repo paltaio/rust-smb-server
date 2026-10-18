@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::backend::{FileTimes, Handle};
 use crate::builder::Access;
-use crate::files::{FileRef, OpenSlot, close_opens};
+use crate::files::{FileRef, OpenSlot, close_opens, finish_close};
 use crate::path::SmbPath;
 use crate::server::ShareBindings;
 
@@ -347,7 +347,6 @@ pub struct Open {
     pub handle: Option<Box<dyn Handle>>,
     /// Open.GrantedAccess: access mask bits, generic rights already mapped.
     pub granted_access: u32,
-    pub last_path: SmbPath,
     pub is_directory: bool,
     /// FILE_DELETE_ON_CLOSE was set on CREATE (MS-FSA Open.Mode): the file
     /// becomes delete-pending when this open closes.
@@ -359,18 +358,44 @@ pub struct Open {
     pub fixed_times: FileTimes,
     /// CreateOptions of the CREATE request.
     pub create_options: u32,
-    /// The open's entry in its share's table of open files. `None` once the
-    /// open is closed.
+    /// The open's entry in its share's table of open files, which holds its
+    /// current name. `None` once the open is closed.
     pub(crate) file: Option<FileRef>,
     /// Counts the open against its connection's limit.
     pub(crate) slot: Option<OpenSlot>,
 }
 
 impl Open {
+    /// The open's current name on the share, `None` once the open is closed.
+    pub fn path(&self) -> Option<SmbPath> {
+        self.file.as_ref().map(FileRef::path)
+    }
+
     /// Whether the file is delete-pending (MS-FSA Link.IsDeleted), as
     /// FileStandardInformation reports it.
     pub fn delete_pending(&self) -> bool {
         self.file.as_ref().is_some_and(FileRef::delete_pending)
+    }
+}
+
+impl Drop for Open {
+    /// An open dropped without a CLOSE closes on the current runtime as a
+    /// CLOSE would, delete-on-close included. Without a runtime the handle
+    /// and the table entry are dropped and the file stays.
+    fn drop(&mut self) {
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let file = self.file.take();
+        runtime.spawn(finish_close(
+            handle,
+            file,
+            self.delete_on_close,
+            self.is_directory,
+        ));
     }
 }
 
