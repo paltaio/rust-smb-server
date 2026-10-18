@@ -1,9 +1,8 @@
 //! Every way an open ends closes it the way CLOSE does.
 
-#[path = "support_files.rs"]
-mod support;
+mod common;
 
-use support::*;
+use common::client::*;
 use tempfile::tempdir;
 
 async fn delete_on_close(c: &mut Client, name: &str) {

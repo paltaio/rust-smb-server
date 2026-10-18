@@ -3,15 +3,16 @@
 
 mod common;
 
+use common::client::*;
 use common::{
-    STATUS_SUCCESS, anonymous_session_setup, build_header, decode_file_id_both_directory_info,
-    negotiate, parse_response_header, read_frame, start_server, tree_connect, utf16le, write_frame,
+    anonymous_session_setup, build_header, id_both_entries, negotiate, parse_response_header,
+    read_frame, start_server, tree_connect, utf16le, write_frame,
 };
+use smb_server::ntstatus::STATUS_SUCCESS;
 use smb_server::wire::header::Command;
 use smb_server::wire::messages::{
-    CloseRequest, CloseResponse, CreateContext, CreateRequest, CreateResponse, FileId, InfoType,
-    QueryDirectoryRequest, QueryDirectoryResponse, QueryInfoRequest, QueryInfoResponse,
-    ReadRequest, ReadResponse, SetInfoRequest, WriteRequest, WriteResponse,
+    CloseRequest, CloseResponse, CreateContext, CreateRequest, CreateResponse,
+    QueryDirectoryRequest, ReadRequest, ReadResponse, WriteRequest, WriteResponse,
 };
 use smb_server::{
     BackendCapabilities, Handle, LocalFsBackend, OpenAction, OpenOptions, ShareBackend, SmbError,
@@ -151,280 +152,6 @@ async fn end_to_end_anon_write_then_read_localfs() {
     handle.abort();
 }
 
-const FILE_READ_DATA: u32 = 0x0000_0001;
-const FILE_WRITE_DATA: u32 = 0x0000_0002;
-const FILE_APPEND_DATA: u32 = 0x0000_0004;
-const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
-const SYNCHRONIZE: u32 = 0x0010_0000;
-const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
-const FILE_GENERIC_READ: u32 = 0x0012_0089;
-const FILE_GENERIC_EXECUTE: u32 = 0x0012_00A0;
-const FILE_WRITE_ATTRIBUTES: u32 = 0x0000_0100;
-const DELETE: u32 = 0x0001_0000;
-const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
-const FILE_OPEN: u32 = 0x0000_0001;
-const FILE_CREATE: u32 = 0x0000_0002;
-const FILE_DELETE_ON_CLOSE: u32 = 0x0000_1000;
-const FILE_BASIC_INFORMATION: u8 = 0x04;
-const FILE_INTERNAL_INFORMATION: u8 = 0x06;
-const FILE_ACCESS_INFORMATION: u8 = 0x08;
-const FILE_ALL_INFORMATION: u8 = 0x12;
-const FILE_ID_BOTH_DIRECTORY_INFORMATION: u8 = 0x25;
-const FILE_RENAME_INFORMATION: u8 = 0x0A;
-const FILE_DISPOSITION_INFORMATION: u8 = 0x0D;
-const FILE_SHORT_NAME_INFORMATION: u8 = 0x28;
-
-/// Connected client on one tree of a server serving `share`.
-struct Client {
-    s: TcpStream,
-    session_id: u64,
-    tree_id: u32,
-    next_mid: u64,
-}
-
-impl Client {
-    async fn connect(share: Share) -> (Self, tokio::task::JoinHandle<()>) {
-        let (addr, handle) = start_server(SmbServer::builder().share(share)).await;
-        let mut s = TcpStream::connect(addr).await.expect("connect");
-        let _ = negotiate(&mut s).await;
-        let session_id = anonymous_session_setup(&mut s).await;
-        let tree_id = tree_connect(&mut s, "\\\\127.0.0.1\\share", session_id, 3).await;
-        let client = Self {
-            s,
-            session_id,
-            tree_id,
-            next_mid: 4,
-        };
-        (client, handle)
-    }
-
-    async fn send(&mut self, command: Command, body: &[u8]) -> (u32, Vec<u8>) {
-        let hdr = build_header(command, self.next_mid, self.session_id, self.tree_id);
-        self.next_mid += 1;
-        write_frame(&mut self.s, &hdr, body).await;
-        let resp = read_frame(&mut self.s).await;
-        let (rh, rb) = parse_response_header(&resp);
-        assert_eq!(rh.command, command);
-        (rh.channel_sequence_status, rb.to_vec())
-    }
-
-    /// Opens an existing file; returns its FileId, or the status on failure.
-    async fn open(&mut self, name: &str, access: u32, options: u32) -> Result<FileId, u32> {
-        let (status, rb) = self.create(name, access, FILE_OPEN, options, &[]).await;
-        if status != STATUS_SUCCESS {
-            return Err(status);
-        }
-        Ok(CreateResponse::parse(&rb)
-            .expect("parse create resp")
-            .file_id)
-    }
-
-    /// CREATE with the create context chain `contexts`, placed 8-aligned
-    /// after the name. Returns the status and the response body.
-    async fn create(
-        &mut self,
-        name: &str,
-        access: u32,
-        disposition: u32,
-        options: u32,
-        contexts: &[u8],
-    ) -> (u32, Vec<u8>) {
-        let mut name = utf16le(name);
-        let name_length = name.len() as u16;
-        name.resize(name.len().next_multiple_of(8), 0);
-        let contexts_offset = if contexts.is_empty() {
-            0
-        } else {
-            0x78 + name.len() as u32
-        };
-        let req = CreateRequest {
-            structure_size: 57,
-            security_flags: 0,
-            requested_oplock_level: 0,
-            impersonation_level: 2,
-            smb_create_flags: 0,
-            reserved: 0,
-            desired_access: access,
-            file_attributes: 0,
-            share_access: 0x0000_0007,
-            create_disposition: disposition,
-            create_options: options,
-            name_offset: 0x78,
-            name_length,
-            create_contexts_offset: contexts_offset,
-            create_contexts_length: contexts.len() as u32,
-            name,
-            create_contexts: contexts.to_vec(),
-        };
-        let mut body = Vec::new();
-        req.write_to(&mut body).expect("write");
-        self.send(Command::Create, &body).await
-    }
-
-    async fn set_info(&mut self, file_id: FileId, class: u8, buffer: Vec<u8>) -> u32 {
-        let req = SetInfoRequest {
-            structure_size: 33,
-            info_type: InfoType::File as u8,
-            file_information_class: class,
-            buffer_length: buffer.len() as u32,
-            buffer_offset: 0x60,
-            reserved: 0,
-            additional_information: 0,
-            file_id,
-            buffer,
-        };
-        let mut body = Vec::new();
-        req.write_to(&mut body).expect("write");
-        self.send(Command::SetInfo, &body).await.0
-    }
-
-    /// QUERY_INFO for a file information class; returns the output buffer.
-    async fn query_file_info(&mut self, file_id: FileId, class: u8) -> Vec<u8> {
-        let req = QueryInfoRequest {
-            structure_size: 41,
-            info_type: InfoType::File as u8,
-            file_information_class: class,
-            output_buffer_length: 4096,
-            input_buffer_offset: 0,
-            reserved: 0,
-            input_buffer_length: 0,
-            additional_information: 0,
-            flags: 0,
-            file_id,
-            input_buffer: vec![],
-        };
-        let mut body = Vec::new();
-        req.write_to(&mut body).expect("write");
-        let (status, rb) = self.send(Command::QueryInfo, &body).await;
-        assert_eq!(status, STATUS_SUCCESS);
-        QueryInfoResponse::parse(&rb).expect("parse").buffer
-    }
-
-    /// QUERY_DIRECTORY for every entry in a file information class; returns
-    /// the output buffer.
-    async fn query_directory(&mut self, dir_id: FileId, class: u8) -> Vec<u8> {
-        let pattern = utf16le("*");
-        let req = QueryDirectoryRequest {
-            structure_size: 33,
-            file_information_class: class,
-            flags: QueryDirectoryRequest::FLAG_RESTART_SCANS,
-            file_index: 0,
-            file_id: dir_id,
-            file_name_offset: 64 + 32,
-            file_name_length: pattern.len() as u16,
-            output_buffer_length: 4096,
-            file_name: pattern,
-        };
-        let mut body = Vec::new();
-        req.write_to(&mut body).expect("write");
-        let (status, rb) = self.send(Command::QueryDirectory, &body).await;
-        assert_eq!(status, STATUS_SUCCESS);
-        QueryDirectoryResponse::parse(&rb).expect("parse").buffer
-    }
-
-    /// QUERY_INFO for a file information class; returns the status.
-    async fn query_file_info_status(&mut self, file_id: FileId, class: u8) -> u32 {
-        let req = QueryInfoRequest {
-            structure_size: 41,
-            info_type: InfoType::File as u8,
-            file_information_class: class,
-            output_buffer_length: 4096,
-            input_buffer_offset: 0,
-            reserved: 0,
-            input_buffer_length: 0,
-            additional_information: 0,
-            flags: 0,
-            file_id,
-            input_buffer: vec![],
-        };
-        let mut body = Vec::new();
-        req.write_to(&mut body).expect("write");
-        self.send(Command::QueryInfo, &body).await.0
-    }
-
-    /// Names QUERY_DIRECTORY returns for `pattern`, or the status.
-    async fn list(&mut self, dir_id: FileId, pattern: &str) -> Result<Vec<String>, u32> {
-        let pattern = utf16le(pattern);
-        let req = QueryDirectoryRequest {
-            structure_size: 33,
-            file_information_class: FILE_ID_BOTH_DIRECTORY_INFORMATION,
-            flags: QueryDirectoryRequest::FLAG_RESTART_SCANS,
-            file_index: 0,
-            file_id: dir_id,
-            file_name_offset: 64 + 32,
-            file_name_length: pattern.len() as u16,
-            output_buffer_length: 4096,
-            file_name: pattern,
-        };
-        let mut body = Vec::new();
-        req.write_to(&mut body).expect("write");
-        let (status, rb) = self.send(Command::QueryDirectory, &body).await;
-        if status != STATUS_SUCCESS {
-            return Err(status);
-        }
-        let buf = QueryDirectoryResponse::parse(&rb).expect("parse").buffer;
-        let mut names: Vec<String> = decode_file_id_both_directory_info(&buf)
-            .into_iter()
-            .map(|(name, _)| name)
-            .collect();
-        names.sort();
-        Ok(names)
-    }
-
-    /// READ of up to 64 bytes at offset 0; returns the status.
-    async fn read(&mut self, file_id: FileId) -> u32 {
-        let req = ReadRequest {
-            structure_size: 49,
-            padding: ReadResponse::STANDARD_DATA_OFFSET,
-            flags: 0,
-            length: 64,
-            offset: 0,
-            file_id,
-            minimum_count: 0,
-            channel: 0,
-            remaining_bytes: 0,
-            read_channel_info_offset: 0,
-            read_channel_info_length: 0,
-            buffer: vec![0],
-        };
-        let mut body = Vec::new();
-        req.write_to(&mut body).expect("write");
-        self.send(Command::Read, &body).await.0
-    }
-
-    /// WRITE of `data` at `offset`; returns the status.
-    async fn write(&mut self, file_id: FileId, offset: u64, data: &[u8]) -> u32 {
-        let req = WriteRequest {
-            structure_size: 49,
-            data_offset: WriteRequest::STANDARD_DATA_OFFSET,
-            length: data.len() as u32,
-            offset,
-            file_id,
-            channel: 0,
-            remaining_bytes: 0,
-            write_channel_info_offset: 0,
-            write_channel_info_length: 0,
-            flags: 0,
-            data: data.to_vec(),
-        };
-        let mut body = Vec::new();
-        req.write_to(&mut body).expect("write");
-        self.send(Command::Write, &body).await.0
-    }
-
-    async fn close(&mut self, file_id: FileId) {
-        let req = CloseRequest {
-            structure_size: 24,
-            flags: 0,
-            reserved: 0,
-            file_id,
-        };
-        let mut body = Vec::new();
-        req.write_to(&mut body).expect("write");
-        assert_eq!(self.send(Command::Close, &body).await.0, STATUS_SUCCESS);
-    }
-}
-
 fn rename_info(new_name: &str, replace: bool) -> Vec<u8> {
     let name = utf16le(new_name);
     let mut buf = vec![0u8; 16];
@@ -445,11 +172,14 @@ async fn read_only_share_denies_delete_and_write_opens() {
     let td = tempdir().expect("tempdir");
     std::fs::write(td.path().join("keep.txt"), b"keep").expect("write keep.txt");
     let backend = LocalFsBackend::new(td.path()).expect("open root");
-    let (mut c, handle) = Client::connect(Share::new("share", backend).public_read_only()).await;
+    let server =
+        Server::start(SmbServer::builder().share(Share::new("share", backend).public_read_only()))
+            .await;
+    let mut c = server.client().await;
 
     for access in [DELETE, FILE_WRITE_ATTRIBUTES] {
         assert_eq!(
-            c.open("keep.txt", FILE_GENERIC_READ | access, 0)
+            c.open("keep.txt", FILE_GENERIC_READ | access, SHARE_ALL)
                 .await
                 .unwrap_err(),
             ntstatus::STATUS_ACCESS_DENIED,
@@ -457,14 +187,12 @@ async fn read_only_share_denies_delete_and_write_opens() {
         );
     }
     assert_eq!(
-        c.open("keep.txt", FILE_GENERIC_READ, FILE_DELETE_ON_CLOSE)
+        c.open_with_options("keep.txt", FILE_GENERIC_READ, FILE_DELETE_ON_CLOSE)
             .await
             .unwrap_err(),
         ntstatus::STATUS_ACCESS_DENIED
     );
     assert!(td.path().join("keep.txt").exists());
-
-    handle.abort();
 }
 
 #[tokio::test]
@@ -474,11 +202,12 @@ async fn read_write_share_checks_open_access() {
         std::fs::write(td.path().join(name), b"x").expect("write file");
     }
     let backend = LocalFsBackend::new(td.path()).expect("open root");
-    let (mut c, handle) = Client::connect(Share::new("share", backend).public()).await;
+    let server = Server::public(backend).await;
+    let mut c = server.client().await;
 
     // Delete-on-close with DELETE access removes the file on CLOSE.
     let file_id = c
-        .open("doc.txt", FILE_GENERIC_READ | DELETE, FILE_DELETE_ON_CLOSE)
+        .open_with_options("doc.txt", FILE_GENERIC_READ | DELETE, FILE_DELETE_ON_CLOSE)
         .await
         .unwrap();
     c.close(file_id).await;
@@ -486,14 +215,14 @@ async fn read_write_share_checks_open_access() {
 
     // Delete-on-close without DELETE access is rejected.
     assert_eq!(
-        c.open("ro.txt", FILE_GENERIC_READ, FILE_DELETE_ON_CLOSE)
+        c.open_with_options("ro.txt", FILE_GENERIC_READ, FILE_DELETE_ON_CLOSE)
             .await
             .unwrap_err(),
         ntstatus::STATUS_INVALID_PARAMETER
     );
 
     // FileDispositionInformation on an open with DELETE access.
-    let file_id = c.open("disp.txt", DELETE, 0).await.unwrap();
+    let file_id = c.open("disp.txt", DELETE, SHARE_ALL).await.unwrap();
     assert_eq!(
         c.set_info(file_id, FILE_DISPOSITION_INFORMATION, vec![1])
             .await,
@@ -507,7 +236,7 @@ async fn read_write_share_checks_open_access() {
         .open(
             "ren.txt",
             FILE_GENERIC_READ | DELETE | FILE_WRITE_ATTRIBUTES,
-            0,
+            SHARE_ALL,
         )
         .await
         .unwrap();
@@ -533,7 +262,10 @@ async fn read_write_share_checks_open_access() {
     assert!(td.path().join("renamed.txt").exists());
 
     // A read-only open on a writable share lacks DELETE and FILE_WRITE_ATTRIBUTES.
-    let file_id = c.open("ro.txt", FILE_GENERIC_READ, 0).await.unwrap();
+    let file_id = c
+        .open("ro.txt", FILE_GENERIC_READ, SHARE_ALL)
+        .await
+        .unwrap();
     for (class, buffer) in [
         (FILE_DISPOSITION_INFORMATION, vec![1]),
         (FILE_RENAME_INFORMATION, rename_info("ro-moved.txt", false)),
@@ -554,8 +286,6 @@ async fn read_write_share_checks_open_access() {
     c.close(file_id).await;
     assert!(td.path().join("ro.txt").exists());
     assert!(!td.path().join("ro-moved.txt").exists());
-
-    handle.abort();
 }
 
 #[tokio::test]
@@ -567,9 +297,10 @@ async fn rename_with_replace_if_exists() {
     }
     std::fs::create_dir(root.join("dir")).expect("mkdir");
     let backend = LocalFsBackend::new(root).expect("open root");
-    let (mut c, handle) = Client::connect(Share::new("share", backend).public()).await;
+    let server = Server::public(backend).await;
+    let mut c = server.client().await;
 
-    let tmp = c.open("tmp.txt", DELETE, 0).await.unwrap();
+    let tmp = c.open("tmp.txt", DELETE, SHARE_ALL).await.unwrap();
     assert_eq!(
         c.set_info(tmp, FILE_RENAME_INFORMATION, rename_info("doc.txt", false))
             .await,
@@ -580,7 +311,10 @@ async fn rename_with_replace_if_exists() {
             .await,
         ntstatus::STATUS_ACCESS_DENIED
     );
-    let busy = c.open("busy.txt", FILE_GENERIC_READ, 0).await.unwrap();
+    let busy = c
+        .open("busy.txt", FILE_GENERIC_READ, SHARE_ALL)
+        .await
+        .unwrap();
     assert_eq!(
         c.set_info(tmp, FILE_RENAME_INFORMATION, rename_info("busy.txt", true))
             .await,
@@ -598,8 +332,6 @@ async fn rename_with_replace_if_exists() {
     assert!(!root.join("tmp.txt").exists());
     assert_eq!(std::fs::read(root.join("busy.txt")).unwrap(), b"busy");
     assert!(root.join("dir").is_dir());
-
-    handle.abort();
 }
 
 #[tokio::test]
@@ -607,33 +339,47 @@ async fn file_id_is_stable_across_opens_and_matches_listing() {
     let td = tempdir().expect("tempdir");
     std::fs::write(td.path().join("f.txt"), b"x").expect("write file");
     let backend = LocalFsBackend::new(td.path()).expect("open root");
-    let (mut c, handle) = Client::connect(Share::new("share", backend).public()).await;
+    let server = Server::public(backend).await;
+    let mut c = server.client().await;
 
-    let first = c.open("f.txt", FILE_GENERIC_READ, 0).await.unwrap();
-    let second = c.open("f.txt", FILE_GENERIC_READ, 0).await.unwrap();
-    let id = c.query_file_info(first, FILE_INTERNAL_INFORMATION).await;
-    let id = u64::from_le_bytes(id[..8].try_into().unwrap());
-    assert_ne!(id, 0);
-    let second_id = c.query_file_info(second, FILE_INTERNAL_INFORMATION).await;
-    assert_eq!(second_id, id.to_le_bytes());
-    // FileAllInformation: Basic (40) and Standard (24) come before Internal.
-    let all = c.query_file_info(second, FILE_ALL_INFORMATION).await;
-    assert_eq!(all[64..72], id.to_le_bytes());
-
-    let root = c
-        .open("", FILE_GENERIC_READ, FILE_DIRECTORY_FILE)
+    let first = c.open("f.txt", FILE_GENERIC_READ, SHARE_ALL).await.unwrap();
+    let second = c.open("f.txt", FILE_GENERIC_READ, SHARE_ALL).await.unwrap();
+    let id = c
+        .query_file_info(first, FILE_INTERNAL_INFORMATION)
         .await
         .unwrap();
-    let buf = c
-        .query_directory(root, FILE_ID_BOTH_DIRECTORY_INFORMATION)
+    let id = u64::from_le_bytes(id[..8].try_into().unwrap());
+    assert_ne!(id, 0);
+    let second_id = c
+        .query_file_info(second, FILE_INTERNAL_INFORMATION)
+        .await
+        .unwrap();
+    assert_eq!(second_id, id.to_le_bytes());
+    // FileAllInformation: Basic (40) and Standard (24) come before Internal.
+    let all = c
+        .query_file_info(second, FILE_ALL_INFORMATION)
+        .await
+        .unwrap();
+    assert_eq!(all[64..72], id.to_le_bytes());
+
+    let root = c.open_dir("").await;
+    let (status, buf) = c
+        .query_directory(
+            root,
+            FILE_ID_BOTH_DIRECTORY_INFORMATION,
+            QueryDirectoryRequest::FLAG_RESTART_SCANS,
+            "*",
+            4096,
+        )
         .await;
-    let listed = decode_file_id_both_directory_info(&buf);
+    assert_eq!(status, STATUS_SUCCESS);
+    let listed = id_both_entries(&buf);
     assert!(
-        listed.contains(&("f.txt".to_string(), id)),
+        listed
+            .iter()
+            .any(|(name, file_id, _)| name == "f.txt" && *file_id == id),
         "id {id:#x}, listed {listed:?}"
     );
-
-    handle.abort();
 }
 
 /// AccessFlags of a FileAllInformation buffer: after Basic (40), Standard
@@ -648,30 +394,33 @@ async fn read_and_write_check_the_open_access() {
     let path = td.path().join("f.txt");
     std::fs::write(&path, b"data").expect("write file");
     let backend = LocalFsBackend::new(td.path()).expect("open root");
-    let (mut c, handle) = Client::connect(Share::new("share", backend).public()).await;
+    let server = Server::public(backend).await;
+    let mut c = server.client().await;
 
     let attrs = c
-        .open("f.txt", FILE_READ_DATA | FILE_WRITE_ATTRIBUTES, 0)
+        .open("f.txt", FILE_READ_DATA | FILE_WRITE_ATTRIBUTES, SHARE_ALL)
         .await
         .unwrap();
     assert_eq!(
-        c.write(attrs, 0, b"XXXX").await,
+        c.write(attrs, 0, b"XXXX").await.unwrap_err(),
         ntstatus::STATUS_ACCESS_DENIED
     );
-    assert_eq!(c.read(attrs).await, STATUS_SUCCESS);
+    c.read(attrs, 0, 64).await.unwrap();
     c.close(attrs).await;
 
-    let write_only = c.open("f.txt", FILE_WRITE_DATA, 0).await.unwrap();
-    assert_eq!(c.read(write_only).await, ntstatus::STATUS_ACCESS_DENIED);
-    assert_eq!(c.write(write_only, 0, b"D").await, STATUS_SUCCESS);
+    let write_only = c.open("f.txt", FILE_WRITE_DATA, SHARE_ALL).await.unwrap();
+    assert_eq!(
+        c.read(write_only, 0, 64).await.unwrap_err(),
+        ntstatus::STATUS_ACCESS_DENIED
+    );
+    c.write(write_only, 0, b"D").await.unwrap();
     c.close(write_only).await;
 
-    let append = c.open("f.txt", FILE_APPEND_DATA, 0).await.unwrap();
-    assert_eq!(c.write(append, 4, b"!").await, STATUS_SUCCESS);
+    let append = c.open("f.txt", FILE_APPEND_DATA, SHARE_ALL).await.unwrap();
+    c.write(append, 4, b"!").await.unwrap();
     c.close(append).await;
 
     assert_eq!(std::fs::read(&path).unwrap(), b"Data!");
-    handle.abort();
 }
 
 #[tokio::test]
@@ -679,17 +428,22 @@ async fn query_info_reports_the_open_access() {
     let td = tempdir().expect("tempdir");
     std::fs::write(td.path().join("f.txt"), b"x").expect("write file");
     let backend = LocalFsBackend::new(td.path()).expect("open root");
-    let (mut c, handle) = Client::connect(Share::new("share", backend).public()).await;
+    let server = Server::public(backend).await;
+    let mut c = server.client().await;
 
     let access = FILE_READ_ATTRIBUTES | DELETE | SYNCHRONIZE;
-    let file_id = c.open("f.txt", access, 0).await.unwrap();
-    let info = c.query_file_info(file_id, FILE_ACCESS_INFORMATION).await;
+    let file_id = c.open("f.txt", access, SHARE_ALL).await.unwrap();
+    let info = c
+        .query_file_info(file_id, FILE_ACCESS_INFORMATION)
+        .await
+        .unwrap();
     assert_eq!(info, access.to_le_bytes());
-    let all = c.query_file_info(file_id, FILE_ALL_INFORMATION).await;
+    let all = c
+        .query_file_info(file_id, FILE_ALL_INFORMATION)
+        .await
+        .unwrap();
     assert_eq!(all_info_access(&all), access);
     c.close(file_id).await;
-
-    handle.abort();
 }
 
 #[tokio::test]
@@ -697,23 +451,28 @@ async fn maximum_allowed_on_read_only_share_grants_read_access() {
     let td = tempdir().expect("tempdir");
     std::fs::write(td.path().join("f.txt"), b"data").expect("write file");
     let backend = LocalFsBackend::new(td.path()).expect("open root");
-    let (mut c, handle) = Client::connect(Share::new("share", backend).public_read_only()).await;
+    let server =
+        Server::start(SmbServer::builder().share(Share::new("share", backend).public_read_only()))
+            .await;
+    let mut c = server.client().await;
 
-    let file_id = c.open("f.txt", MAXIMUM_ALLOWED, 0).await.unwrap();
-    let info = c.query_file_info(file_id, FILE_ACCESS_INFORMATION).await;
+    let file_id = c.open("f.txt", MAXIMUM_ALLOWED, SHARE_ALL).await.unwrap();
+    let info = c
+        .query_file_info(file_id, FILE_ACCESS_INFORMATION)
+        .await
+        .unwrap();
     assert_eq!(
         info,
         (FILE_GENERIC_READ | FILE_GENERIC_EXECUTE).to_le_bytes()
     );
-    assert_eq!(c.read(file_id).await, STATUS_SUCCESS);
+    c.read(file_id, 0, 64).await.unwrap();
     assert_eq!(
-        c.write(file_id, 0, b"X").await,
+        c.write(file_id, 0, b"X").await.unwrap_err(),
         ntstatus::STATUS_ACCESS_DENIED
     );
     c.close(file_id).await;
 
     assert_eq!(std::fs::read(td.path().join("f.txt")).unwrap(), b"data");
-    handle.abort();
 }
 
 /// `LocalFsBackend` whose host refuses to open files for writing, as for a
@@ -753,17 +512,18 @@ async fn delete_style_open_needs_no_host_write_access() {
         std::fs::write(td.path().join(name), b"x").expect("write file");
     }
     let backend = NoWriteOpens(LocalFsBackend::new(td.path()).expect("open root"));
-    let (mut c, handle) = Client::connect(Share::new("share", backend).public()).await;
+    let server = Server::public(backend).await;
+    let mut c = server.client().await;
 
     let delete_access = DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
     let file_id = c
-        .open("doc.txt", delete_access, FILE_DELETE_ON_CLOSE)
+        .open_with_options("doc.txt", delete_access, FILE_DELETE_ON_CLOSE)
         .await
         .unwrap();
     c.close(file_id).await;
     assert!(!td.path().join("doc.txt").exists());
 
-    let file_id = c.open("disp.txt", delete_access, 0).await.unwrap();
+    let file_id = c.open("disp.txt", delete_access, SHARE_ALL).await.unwrap();
     assert_eq!(
         c.set_info(file_id, FILE_DISPOSITION_INFORMATION, vec![1])
             .await,
@@ -771,8 +531,6 @@ async fn delete_style_open_needs_no_host_write_access() {
     );
     c.close(file_id).await;
     assert!(!td.path().join("disp.txt").exists());
-
-    handle.abort();
 }
 
 #[tokio::test]
@@ -783,11 +541,12 @@ async fn rename_moves_other_opens_of_the_file() {
         std::fs::write(root.join(name), data).expect("write file");
     }
     let backend = LocalFsBackend::new(root).expect("open root");
-    let (mut c, handle) = Client::connect(Share::new("share", backend).public()).await;
+    let server = Server::public(backend).await;
+    let mut c = server.client().await;
 
-    let a = c.open("x.txt", DELETE, 0).await.unwrap();
+    let a = c.open("x.txt", DELETE, SHARE_ALL).await.unwrap();
     let b = c
-        .open("x.txt", FILE_GENERIC_READ | DELETE, 0)
+        .open("x.txt", FILE_GENERIC_READ | DELETE, SHARE_ALL)
         .await
         .unwrap();
     assert_eq!(
@@ -798,7 +557,7 @@ async fn rename_moves_other_opens_of_the_file() {
     c.close(a).await;
 
     // `b` has y.txt open after the rename, so y.txt is not replaced.
-    let z = c.open("z.txt", DELETE, 0).await.unwrap();
+    let z = c.open("z.txt", DELETE, SHARE_ALL).await.unwrap();
     assert_eq!(
         c.set_info(z, FILE_RENAME_INFORMATION, rename_info("y.txt", true))
             .await,
@@ -816,8 +575,6 @@ async fn rename_moves_other_opens_of_the_file() {
     assert!(!root.join("y.txt").exists());
     assert_eq!(std::fs::read(root.join("x.txt")).unwrap(), b"new");
     assert_eq!(std::fs::read(root.join("z.txt")).unwrap(), b"z");
-
-    handle.abort();
 }
 
 #[tokio::test]
@@ -827,17 +584,21 @@ async fn rename_of_a_directory_moves_opens_below_it() {
     std::fs::create_dir_all(root.join("d").join("sub")).expect("mkdir");
     std::fs::write(root.join("d").join("sub").join("f.txt"), b"f").expect("write file");
     let backend = LocalFsBackend::new(root).expect("open root");
-    let (mut c, handle) = Client::connect(Share::new("share", backend).public()).await;
+    let server = Server::public(backend).await;
+    let mut c = server.client().await;
 
     let child = c
-        .open(
+        .open_with_options(
             "d\\sub\\f.txt",
             FILE_GENERIC_READ | DELETE,
             FILE_DELETE_ON_CLOSE,
         )
         .await
         .unwrap();
-    let dir = c.open("d", DELETE, FILE_DIRECTORY_FILE).await.unwrap();
+    let dir = c
+        .open_with_options("d", DELETE, FILE_DIRECTORY_FILE)
+        .await
+        .unwrap();
     let status = c
         .set_info(dir, FILE_RENAME_INFORMATION, rename_info("e", false))
         .await;
@@ -851,7 +612,6 @@ async fn rename_of_a_directory_moves_opens_below_it() {
         c.close(child).await;
         assert!(!root.join("d").join("sub").join("f.txt").exists());
         assert!(!root.join("e").exists());
-        handle.abort();
         return;
     }
     assert_eq!(status, STATUS_SUCCESS);
@@ -865,8 +625,6 @@ async fn rename_of_a_directory_moves_opens_below_it() {
         std::fs::read(root.join("d").join("sub").join("f.txt")).unwrap(),
         b"new"
     );
-
-    handle.abort();
 }
 
 #[tokio::test]
@@ -875,35 +633,30 @@ async fn directory_renames_while_it_is_open() {
     let root = td.path();
     std::fs::create_dir_all(root.join("d").join("sub")).expect("mkdir");
     let backend = LocalFsBackend::new(root).expect("open root");
-    let (mut c, handle) = Client::connect(Share::new("share", backend).public()).await;
+    let server = Server::public(backend).await;
+    let mut c = server.client().await;
 
-    let listing = c
-        .open("d", FILE_GENERIC_READ, FILE_DIRECTORY_FILE)
+    let listing = c.open_dir("d").await;
+    let dir = c
+        .open_with_options("d", DELETE, FILE_DIRECTORY_FILE)
         .await
         .unwrap();
-    let dir = c.open("d", DELETE, FILE_DIRECTORY_FILE).await.unwrap();
     assert_eq!(
         c.set_info(dir, FILE_RENAME_INFORMATION, rename_info("e", false))
             .await,
         STATUS_SUCCESS
     );
     c.close(dir).await;
-    assert_eq!(c.list(listing, "*").await.unwrap(), [".", "..", "sub"]);
+    assert_eq!(
+        c.list(listing, QueryDirectoryRequest::FLAG_RESTART_SCANS, "*")
+            .await
+            .unwrap(),
+        [".", "..", "sub"]
+    );
     c.close(listing).await;
     assert!(root.join("e").join("sub").is_dir());
     assert!(!root.join("d").exists());
-
-    handle.abort();
 }
-
-const FILE_GENERIC_WRITE: u32 = 0x0012_0116;
-const FILE_ALLOCATION_INFORMATION: u8 = 0x13;
-const FILE_ALTERNATE_NAME_INFORMATION: u8 = 0x15;
-const FILE_ATTRIBUTE_READONLY: u32 = 0x0000_0001;
-const FILE_ATTRIBUTE_HIDDEN: u32 = 0x0000_0002;
-const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
-const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x0000_0020;
-const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
 
 /// FileBasicInformation buffer: creation, access, write and change times,
 /// then attributes.
@@ -932,9 +685,13 @@ async fn allocation_below_end_of_file_truncates() {
     let path = td.path().join("f.txt");
     std::fs::write(&path, b"hello world").expect("write file");
     let backend = LocalFsBackend::new(td.path()).expect("open root");
-    let (mut c, handle) = Client::connect(Share::new("share", backend).public()).await;
+    let server = Server::public(backend).await;
+    let mut c = server.client().await;
 
-    let file_id = c.open("f.txt", FILE_GENERIC_WRITE, 0).await.unwrap();
+    let file_id = c
+        .open("f.txt", FILE_GENERIC_WRITE, SHARE_ALL)
+        .await
+        .unwrap();
     for (size, expected) in [(100u64, &b"hello world"[..]), (5, b"hello")] {
         assert_eq!(
             c.set_info(
@@ -948,8 +705,6 @@ async fn allocation_below_end_of_file_truncates() {
         assert_eq!(std::fs::read(&path).unwrap(), expected, "allocation {size}");
     }
     c.close(file_id).await;
-
-    handle.abort();
 }
 
 #[tokio::test]
@@ -957,10 +712,11 @@ async fn directory_attribute_is_accepted_on_a_directory() {
     let td = tempdir().expect("tempdir");
     std::fs::create_dir(td.path().join("d")).expect("mkdir");
     let backend = LocalFsBackend::new(td.path()).expect("open root");
-    let (mut c, handle) = Client::connect(Share::new("share", backend).public()).await;
+    let server = Server::public(backend).await;
+    let mut c = server.client().await;
 
     let dir = c
-        .open(
+        .open_with_options(
             "d",
             FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES,
             FILE_DIRECTORY_FILE,
@@ -977,8 +733,6 @@ async fn directory_attribute_is_accepted_on_a_directory() {
         STATUS_SUCCESS
     );
     c.close(dir).await;
-
-    handle.abort();
 }
 
 #[tokio::test]
@@ -998,9 +752,10 @@ async fn special_time_values_are_not_written_as_times() {
         (md.accessed().unwrap(), md.modified().unwrap())
     };
     let backend = LocalFsBackend::new(td.path()).expect("open root");
-    let (mut c, handle) = Client::connect(Share::new("share", backend).public()).await;
+    let server = Server::public(backend).await;
+    let mut c = server.client().await;
     let file_id = c
-        .open("f.txt", FILE_GENERIC_READ | FILE_GENERIC_WRITE, 0)
+        .open("f.txt", FILE_GENERIC_READ | FILE_GENERIC_WRITE, SHARE_ALL)
         .await
         .unwrap();
 
@@ -1014,7 +769,7 @@ async fn special_time_values_are_not_written_as_times() {
         assert_eq!(times(), (t0, t0), "time value {t}");
     }
     // After -1 a write through the open leaves the write time alone.
-    assert_eq!(c.write(file_id, 4, b"more").await, STATUS_SUCCESS);
+    c.write(file_id, 4, b"more").await.unwrap();
     assert_eq!(times().1, t0);
     // After -2 it updates it again. NTFS keeps a time fixed for a handle
     // once a time is set through it, so a Windows host keeps it.
@@ -1027,7 +782,7 @@ async fn special_time_values_are_not_written_as_times() {
         .await,
         STATUS_SUCCESS
     );
-    assert_eq!(c.write(file_id, 8, b"!").await, STATUS_SUCCESS);
+    c.write(file_id, 8, b"!").await.unwrap();
     if cfg!(windows) {
         assert_eq!(times().1, t0);
     } else {
@@ -1044,8 +799,6 @@ async fn special_time_values_are_not_written_as_times() {
     );
     c.close(file_id).await;
     assert_eq!(std::fs::read(&path).unwrap(), b"datamore!");
-
-    handle.abort();
 }
 
 #[tokio::test]
@@ -1056,9 +809,13 @@ async fn deleting_a_non_empty_directory_fails() {
     std::fs::write(root.join("full").join("f.txt"), b"f").expect("write file");
     std::fs::create_dir(root.join("empty")).expect("mkdir");
     let backend = LocalFsBackend::new(root).expect("open root");
-    let (mut c, handle) = Client::connect(Share::new("share", backend).public()).await;
+    let server = Server::public(backend).await;
+    let mut c = server.client().await;
 
-    let dir = c.open("full", DELETE, FILE_DIRECTORY_FILE).await.unwrap();
+    let dir = c
+        .open_with_options("full", DELETE, FILE_DIRECTORY_FILE)
+        .await
+        .unwrap();
     assert_eq!(
         c.set_info(dir, FILE_DISPOSITION_INFORMATION, vec![1]).await,
         ntstatus::STATUS_DIRECTORY_NOT_EMPTY
@@ -1069,21 +826,22 @@ async fn deleting_a_non_empty_directory_fails() {
     // MS-FSA 2.1.5.1 accepts delete-on-close on a non-empty directory and
     // 2.1.5.5 keeps the directory at close.
     let dir = c
-        .open("full", DELETE, FILE_DIRECTORY_FILE | FILE_DELETE_ON_CLOSE)
+        .open_with_options("full", DELETE, FILE_DIRECTORY_FILE | FILE_DELETE_ON_CLOSE)
         .await
         .unwrap();
     c.close(dir).await;
     assert!(root.join("full").join("f.txt").exists());
 
-    let dir = c.open("empty", DELETE, FILE_DIRECTORY_FILE).await.unwrap();
+    let dir = c
+        .open_with_options("empty", DELETE, FILE_DIRECTORY_FILE)
+        .await
+        .unwrap();
     assert_eq!(
         c.set_info(dir, FILE_DISPOSITION_INFORMATION, vec![1]).await,
         STATUS_SUCCESS
     );
     c.close(dir).await;
     assert!(!root.join("empty").exists());
-
-    handle.abort();
 }
 
 #[tokio::test]
@@ -1092,10 +850,11 @@ async fn read_only_attribute_is_applied_and_others_are_rejected() {
     let path = td.path().join("f.txt");
     std::fs::write(&path, b"x").expect("write file");
     let backend = LocalFsBackend::new(td.path()).expect("open root");
-    let (mut c, handle) = Client::connect(Share::new("share", backend).public()).await;
+    let server = Server::public(backend).await;
+    let mut c = server.client().await;
     let attrs_access = FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES;
 
-    let file_id = c.open("f.txt", attrs_access, 0).await.unwrap();
+    let file_id = c.open("f.txt", attrs_access, SHARE_ALL).await.unwrap();
     assert_eq!(
         c.set_info(
             file_id,
@@ -1105,13 +864,16 @@ async fn read_only_attribute_is_applied_and_others_are_rejected() {
         .await,
         STATUS_SUCCESS
     );
-    let basic = c.query_file_info(file_id, FILE_BASIC_INFORMATION).await;
+    let basic = c
+        .query_file_info(file_id, FILE_BASIC_INFORMATION)
+        .await
+        .unwrap();
     assert_eq!(attributes_of(&basic), FILE_ATTRIBUTE_READONLY);
     assert!(std::fs::metadata(&path).unwrap().permissions().readonly());
     c.close(file_id).await;
 
     // A read-only file cannot be deleted.
-    let file_id = c.open("f.txt", DELETE, 0).await.unwrap();
+    let file_id = c.open("f.txt", DELETE, SHARE_ALL).await.unwrap();
     assert_eq!(
         c.set_info(file_id, FILE_DISPOSITION_INFORMATION, vec![1])
             .await,
@@ -1119,14 +881,14 @@ async fn read_only_attribute_is_applied_and_others_are_rejected() {
     );
     c.close(file_id).await;
     assert_eq!(
-        c.open("f.txt", DELETE, FILE_DELETE_ON_CLOSE)
+        c.open_with_options("f.txt", DELETE, FILE_DELETE_ON_CLOSE)
             .await
             .unwrap_err(),
         ntstatus::STATUS_CANNOT_DELETE
     );
     assert!(path.exists());
 
-    let file_id = c.open("f.txt", attrs_access, 0).await.unwrap();
+    let file_id = c.open("f.txt", attrs_access, SHARE_ALL).await.unwrap();
     assert_eq!(
         c.set_info(
             file_id,
@@ -1148,7 +910,10 @@ async fn read_only_attribute_is_applied_and_others_are_rejected() {
             "attributes {attributes:#x}"
         );
     }
-    let basic = c.query_file_info(file_id, FILE_BASIC_INFORMATION).await;
+    let basic = c
+        .query_file_info(file_id, FILE_BASIC_INFORMATION)
+        .await
+        .unwrap();
     assert_eq!(attributes_of(&basic), FILE_ATTRIBUTE_NORMAL);
     assert_eq!(
         c.set_info(
@@ -1161,8 +926,6 @@ async fn read_only_attribute_is_applied_and_others_are_rejected() {
     );
     c.close(file_id).await;
     assert!(!std::fs::metadata(&path).unwrap().permissions().readonly());
-
-    handle.abort();
 }
 
 /// A creation time in the same FileBasicInformation does not stop the write
@@ -1173,12 +936,13 @@ async fn write_time_applies_with_a_creation_time() {
     std::fs::write(td.path().join("f.txt"), b"x").expect("write file");
     std::fs::create_dir(td.path().join("d")).expect("mkdir");
     let backend = LocalFsBackend::new(td.path()).expect("open root");
-    let (mut c, handle) = Client::connect(Share::new("share", backend).public()).await;
+    let server = Server::public(backend).await;
+    let mut c = server.client().await;
 
     let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_577_934_245);
     for (name, options) in [("f.txt", 0), ("d", FILE_DIRECTORY_FILE)] {
         let file_id = c
-            .open(name, FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES, options)
+            .open_with_options(name, FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES, options)
             .await
             .unwrap();
         assert_eq!(
@@ -1198,8 +962,6 @@ async fn write_time_applies_with_a_creation_time() {
             assert_eq!(md.created().unwrap(), t, "{name}");
         }
     }
-
-    handle.abort();
 }
 
 #[tokio::test]
@@ -1207,20 +969,20 @@ async fn alternate_name_query_reports_no_short_name() {
     let td = tempdir().expect("tempdir");
     std::fs::write(td.path().join("a long name.txt"), b"x").expect("write file");
     let backend = LocalFsBackend::new(td.path()).expect("open root");
-    let (mut c, handle) = Client::connect(Share::new("share", backend).public()).await;
+    let server = Server::public(backend).await;
+    let mut c = server.client().await;
 
     let file_id = c
-        .open("a long name.txt", FILE_READ_ATTRIBUTES, 0)
+        .open("a long name.txt", FILE_READ_ATTRIBUTES, SHARE_ALL)
         .await
         .unwrap();
     assert_eq!(
-        c.query_file_info_status(file_id, FILE_ALTERNATE_NAME_INFORMATION)
-            .await,
+        c.query_file_info(file_id, FILE_ALTERNATE_NAME_INFORMATION)
+            .await
+            .unwrap_err(),
         ntstatus::STATUS_OBJECT_NAME_NOT_FOUND
     );
     c.close(file_id).await;
-
-    handle.abort();
 }
 
 #[tokio::test]
@@ -1230,19 +992,18 @@ async fn query_directory_applies_dos_wildcards() {
         std::fs::write(td.path().join(name), b"x").expect("write file");
     }
     let backend = LocalFsBackend::new(td.path()).expect("open root");
-    let (mut c, handle) = Client::connect(Share::new("share", backend).public()).await;
+    let server = Server::public(backend).await;
+    let mut c = server.client().await;
 
-    let root = c
-        .open("", FILE_GENERIC_READ, FILE_DIRECTORY_FILE)
-        .await
-        .unwrap();
-    assert_eq!(c.list(root, ">w.txt").await.unwrap(), ["ow.txt", "sw.txt"]);
+    let root = c.open_dir("").await;
+    assert_eq!(
+        c.list(root, QueryDirectoryRequest::FLAG_RESTART_SCANS, ">w.txt")
+            .await
+            .unwrap(),
+        ["ow.txt", "sw.txt"]
+    );
     c.close(root).await;
-
-    handle.abort();
 }
-
-const FILE_ALL_ACCESS: u32 = 0x001F_01FF;
 
 fn context_chain(contexts: &[(&[u8], &[u8])]) -> Vec<u8> {
     let list: Vec<CreateContext> = contexts
@@ -1296,14 +1057,21 @@ async fn create_answers_maximal_access_and_on_disk_id() {
     let td = tempdir().expect("tempdir");
     let backend = LocalFsBackend::new(td.path()).expect("open root");
     let volume = backend.volume_info().await.expect("volume info");
-    let (mut c, handle) = Client::connect(Share::new("share", backend).public()).await;
+    let server = Server::public(backend).await;
+    let mut c = server.client().await;
 
     let queries = context_chain(&[
         (CreateContext::NAME_MXAC, &[]),
         (CreateContext::NAME_QFID, &[]),
     ]);
     let (status, rb) = c
-        .create("new.txt", FILE_GENERIC_READ, FILE_CREATE, 0, &queries)
+        .create_raw(Create {
+            name: "new.txt",
+            access: FILE_GENERIC_READ,
+            disposition: FILE_CREATE,
+            contexts: queries,
+            ..Create::default()
+        })
         .await;
     assert_eq!(status, STATUS_SUCCESS);
     let resp = CreateResponse::parse(&rb).unwrap();
@@ -1318,7 +1086,8 @@ async fn create_answers_maximal_access_and_on_disk_id() {
     assert_eq!(qfid.len(), 32);
     let id = c
         .query_file_info(resp.file_id, FILE_INTERNAL_INFORMATION)
-        .await;
+        .await
+        .unwrap();
     assert_eq!(qfid[0..8], id[0..8]);
     assert_ne!(qfid[0..8], [0; 8]);
     assert_eq!(qfid[8..16], u64::from(volume.serial_number).to_le_bytes());
@@ -1336,7 +1105,13 @@ async fn create_answers_maximal_access_and_on_disk_id() {
         (changed, STATUS_SUCCESS, FILE_ALL_ACCESS),
     ] {
         let (open_status, rb) = c
-            .create("new.txt", FILE_READ_ATTRIBUTES, FILE_OPEN, 0, &chain)
+            .create_raw(Create {
+                name: "new.txt",
+                access: FILE_READ_ATTRIBUTES,
+                disposition: FILE_OPEN,
+                contexts: chain,
+                ..Create::default()
+            })
             .await;
         assert_eq!(open_status, STATUS_SUCCESS);
         let contexts = response_contexts(&rb);
@@ -1345,8 +1120,6 @@ async fn create_answers_maximal_access_and_on_disk_id() {
         assert_eq!(mxac[4..8], access.to_le_bytes());
         c.close(CreateResponse::parse(&rb).unwrap().file_id).await;
     }
-
-    handle.abort();
 }
 
 #[tokio::test]
@@ -1354,11 +1127,20 @@ async fn maximal_access_on_a_read_only_share_is_read_access() {
     let td = tempdir().expect("tempdir");
     std::fs::write(td.path().join("f.txt"), b"x").expect("write file");
     let backend = LocalFsBackend::new(td.path()).expect("open root");
-    let (mut c, handle) = Client::connect(Share::new("share", backend).public_read_only()).await;
+    let server =
+        Server::start(SmbServer::builder().share(Share::new("share", backend).public_read_only()))
+            .await;
+    let mut c = server.client().await;
 
     let queries = context_chain(&[(CreateContext::NAME_MXAC, &[])]);
     let (status, rb) = c
-        .create("f.txt", FILE_READ_ATTRIBUTES, FILE_OPEN, 0, &queries)
+        .create_raw(Create {
+            name: "f.txt",
+            access: FILE_READ_ATTRIBUTES,
+            disposition: FILE_OPEN,
+            contexts: queries,
+            ..Create::default()
+        })
         .await;
     assert_eq!(status, STATUS_SUCCESS);
     let contexts = response_contexts(&rb);
@@ -1369,15 +1151,14 @@ async fn maximal_access_on_a_read_only_share_is_read_access() {
         (FILE_GENERIC_READ | FILE_GENERIC_EXECUTE).to_le_bytes()
     );
     c.close(CreateResponse::parse(&rb).unwrap().file_id).await;
-
-    handle.abort();
 }
 
 #[tokio::test]
 async fn create_ignores_other_contexts_and_rejects_malformed_ones() {
     let td = tempdir().expect("tempdir");
     let backend = LocalFsBackend::new(td.path()).expect("open root");
-    let (mut c, handle) = Client::connect(Share::new("share", backend).public()).await;
+    let server = Server::public(backend).await;
+    let mut c = server.client().await;
 
     let others = context_chain(&[
         (CreateContext::NAME_RQLS, &[0; 32]),
@@ -1385,7 +1166,13 @@ async fn create_ignores_other_contexts_and_rejects_malformed_ones() {
         (b"XXXX", &[1, 2, 3]),
     ]);
     let (status, rb) = c
-        .create("a.txt", FILE_GENERIC_READ, FILE_CREATE, 0, &others)
+        .create_raw(Create {
+            name: "a.txt",
+            access: FILE_GENERIC_READ,
+            disposition: FILE_CREATE,
+            contexts: others,
+            ..Create::default()
+        })
         .await;
     assert_eq!(status, STATUS_SUCCESS);
     assert!(response_contexts(&rb).is_empty());
@@ -1399,11 +1186,15 @@ async fn create_ignores_other_contexts_and_rejects_malformed_ones() {
         ),
     ] {
         let (status, _) = c
-            .create("b.txt", FILE_GENERIC_READ, FILE_CREATE, 0, &chain)
+            .create_raw(Create {
+                name: "b.txt",
+                access: FILE_GENERIC_READ,
+                disposition: FILE_CREATE,
+                contexts: chain,
+                ..Create::default()
+            })
             .await;
         assert_eq!(status, ntstatus::STATUS_INVALID_PARAMETER, "{case}");
         assert!(!td.path().join("b.txt").exists(), "{case}");
     }
-
-    handle.abort();
 }

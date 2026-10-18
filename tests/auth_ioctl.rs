@@ -2,16 +2,18 @@
 
 #![cfg(feature = "localfs")]
 
-#[allow(dead_code, reason = "this crate uses part of the shared helpers")]
 mod common;
-#[path = "support_auth.rs"]
-mod support;
 
-use common::{anonymous_session_setup, start_server, tree_connect};
+use common::auth::*;
+use common::client::{Create, FILE_GENERIC_READ};
+use common::{anonymous_session_setup, negotiate_body, start_server, tree_connect};
+use smb_server::ntstatus::{
+    STATUS_FILE_CLOSED, STATUS_INVALID_PARAMETER, STATUS_NETWORK_NAME_DELETED,
+    STATUS_NOT_SUPPORTED, STATUS_USER_SESSION_DELETED,
+};
 use smb_server::wire::header::Command;
 use smb_server::wire::messages::{FileId, Fsctl, IoctlRequest, IoctlResponse, NegotiateResponse};
 use smb_server::{LocalFsBackend, Share, SmbServer};
-use support::*;
 use tokio::net::TcpStream;
 
 const FSCTL_GET_COMPRESSION: u32 = 0x0009_003C;
@@ -133,6 +135,11 @@ async fn enumerate_snapshots_returns_an_empty_array() {
 }
 
 async fn open_file(c: &mut Conn, name: &str) -> FileId {
-    let body = create_body(name, 0x0012_0089, 0);
+    let body = Create {
+        name,
+        access: FILE_GENERIC_READ,
+        ..Create::default()
+    }
+    .body();
     created_file_id(&request(&mut c.s, Command::Create, 30, c.sid, c.tid, &body).await)
 }

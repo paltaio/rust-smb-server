@@ -5,12 +5,12 @@
 
 mod common;
 
-use common::encode_frame;
 use common::{
-    STATUS_SUCCESS, anonymous_session_setup, build_header, decode_file_id_both_directory_info,
-    negotiate, parse_response_header, read_frame, start_server, tree_connect, utf16le, write_frame,
+    anonymous_session_setup, build_header, framed, id_both_entries, negotiate,
+    parse_response_header, read_frame, start_server, tree_connect, utf16le, write_frame,
 };
 use smb_server::LocalFsBackend;
+use smb_server::ntstatus::STATUS_SUCCESS;
 use smb_server::wire::header::{Command, SMB2_FLAGS_RELATED_OPERATIONS, Smb2Header};
 use smb_server::wire::messages::{
     CloseRequest, CloseResponse, CreateRequest, CreateResponse, FileId, InfoType, LogoffRequest,
@@ -131,9 +131,9 @@ async fn end_to_end_anon_read_localfs() {
     append_compound_part(&mut compound, &mut create_hdr, &create_body, true);
     append_compound_part(&mut compound, &mut qi_hdr, &qi_body, true);
     append_compound_part(&mut compound, &mut close_hdr, &close_body, false);
-    let mut framed = Vec::new();
-    encode_frame(&compound, &mut framed);
-    s.write_all(&framed).await.expect("write compound");
+    s.write_all(&framed(&compound))
+        .await
+        .expect("write compound");
 
     let resp = read_frame(&mut s).await;
     let (create_resp_hdr, create_resp_body) = parse_response_header(&resp);
@@ -271,13 +271,13 @@ async fn end_to_end_anon_read_localfs() {
     assert_eq!(rh.channel_sequence_status, STATUS_SUCCESS);
     let qd_resp = QueryDirectoryResponse::parse(rb).expect("parse query directory resp");
     assert!(qd_resp.output_buffer_length >= 104);
-    let entries = decode_file_id_both_directory_info(&qd_resp.buffer);
+    let entries = id_both_entries(&qd_resp.buffer);
     assert!(
-        entries.iter().any(|(n, _)| n == "hello.txt"),
+        entries.iter().any(|(n, _, _)| n == "hello.txt"),
         "entries={entries:?}"
     );
     assert!(
-        entries.iter().any(|(n, _)| n == "sub"),
+        entries.iter().any(|(n, _, _)| n == "sub"),
         "entries={entries:?}"
     );
 

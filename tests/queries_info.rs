@@ -1,35 +1,19 @@
 //! QUERY_INFO against `LocalFsBackend` over TCP loopback.
 #![cfg(feature = "localfs")]
 
-#[path = "support_queries.rs"]
-mod support;
+mod common;
 
-use smb_server::{LocalFsBackend, Share, ShareBackend, ntstatus};
-use support::{
-    Client, FILE_GENERIC_READ, INFO_FILE, INFO_FILESYSTEM, INFO_SECURITY, u32_at, u64_at,
-};
+use common::client::*;
+use smb_server::{LocalFsBackend, ShareBackend, ntstatus};
 use tempfile::tempdir;
-
-const FILE_BASIC_INFORMATION: u8 = 0x04;
-const FILE_STANDARD_INFORMATION: u8 = 0x05;
-const FILE_NAME_INFORMATION: u8 = 0x09;
-const FILE_ALL_INFORMATION: u8 = 0x12;
-const FILE_STREAM_INFORMATION: u8 = 0x16;
-const FILE_ATTRIBUTE_TAG_INFORMATION: u8 = 0x23;
-const FS_VOLUME_INFORMATION: u8 = 0x01;
-const FS_SIZE_INFORMATION: u8 = 0x03;
-const FS_ATTRIBUTE_INFORMATION: u8 = 0x05;
-const FS_CONTROL_INFORMATION: u8 = 0x06;
-const FS_FULL_SIZE_INFORMATION: u8 = 0x07;
-const FS_SECTOR_SIZE_INFORMATION: u8 = 0x0B;
-const SYNCHRONIZE: u32 = 0x0010_0000;
 
 #[tokio::test]
 async fn volume_size_and_identity_come_from_the_backend() {
     let td = tempdir().expect("tempdir");
     let backend = LocalFsBackend::new(td.path()).expect("open root");
     let volume = backend.volume_info().await.expect("volume info");
-    let (mut c, handle) = Client::connect(Share::new("share", backend).public()).await;
+    let server = Server::public(backend).await;
+    let mut c = server.client().await;
     let root = c.open_dir("").await;
 
     let (status, full) = c
@@ -67,7 +51,6 @@ async fn volume_size_and_identity_come_from_the_backend() {
     assert_eq!(u32_at(&sector, 0), volume.bytes_per_sector);
 
     c.close(root).await;
-    handle.abort();
 }
 
 #[tokio::test]
@@ -75,9 +58,10 @@ async fn short_buffers_get_partial_data_or_a_length_error() {
     let td = tempdir().expect("tempdir");
     std::fs::write(td.path().join("f.txt"), b"data").expect("write");
     let backend = LocalFsBackend::new(td.path()).expect("open root");
-    let (mut c, handle) = Client::connect(Share::new("share", backend).public()).await;
+    let server = Server::public(backend).await;
+    let mut c = server.client().await;
     let root = c.open_dir("").await;
-    let file = c.open("f.txt", FILE_GENERIC_READ, 0).await.unwrap();
+    let file = c.open("f.txt", FILE_GENERIC_READ, SHARE_ALL).await.unwrap();
 
     // FileFsAttributeInformation: 12 fixed bytes, then "NTFS".
     let (status, buf) = c
@@ -125,7 +109,6 @@ async fn short_buffers_get_partial_data_or_a_length_error() {
 
     c.close(file).await;
     c.close(root).await;
-    handle.abort();
 }
 
 #[tokio::test]
@@ -134,8 +117,12 @@ async fn names_follow_the_rules_for_remote_queries() {
     std::fs::create_dir(td.path().join("d")).expect("mkdir");
     std::fs::write(td.path().join("d").join("f.txt"), b"x").expect("write");
     let backend = LocalFsBackend::new(td.path()).expect("open root");
-    let (mut c, handle) = Client::connect(Share::new("share", backend).public()).await;
-    let file = c.open("d\\f.txt", FILE_GENERIC_READ, 0).await.unwrap();
+    let server = Server::public(backend).await;
+    let mut c = server.client().await;
+    let file = c
+        .open("d\\f.txt", FILE_GENERIC_READ, SHARE_ALL)
+        .await
+        .unwrap();
 
     let (status, _) = c
         .query_info(file, INFO_FILE, FILE_NAME_INFORMATION, 4096)
@@ -150,14 +137,14 @@ async fn names_follow_the_rules_for_remote_queries() {
     assert_eq!(u32_at(&all, 96), 0);
 
     c.close(file).await;
-    handle.abort();
 }
 
 #[tokio::test]
 async fn unimplemented_classes_get_the_spec_statuses() {
     let td = tempdir().expect("tempdir");
     let backend = LocalFsBackend::new(td.path()).expect("open root");
-    let (mut c, handle) = Client::connect(Share::new("share", backend).public()).await;
+    let server = Server::public(backend).await;
+    let mut c = server.client().await;
     let root = c.open_dir("").await;
 
     for (info_type, class, expected) in [
@@ -184,7 +171,6 @@ async fn unimplemented_classes_get_the_spec_statuses() {
     }
 
     c.close(root).await;
-    handle.abort();
 }
 
 #[tokio::test]
@@ -192,8 +178,9 @@ async fn attribute_classes_require_read_attributes_access() {
     let td = tempdir().expect("tempdir");
     std::fs::write(td.path().join("f.txt"), b"x").expect("write");
     let backend = LocalFsBackend::new(td.path()).expect("open root");
-    let (mut c, handle) = Client::connect(Share::new("share", backend).public()).await;
-    let file = c.open("f.txt", SYNCHRONIZE, 0).await.unwrap();
+    let server = Server::public(backend).await;
+    let mut c = server.client().await;
+    let file = c.open("f.txt", SYNCHRONIZE, SHARE_ALL).await.unwrap();
 
     for class in [FILE_BASIC_INFORMATION, FILE_ALL_INFORMATION, 0x22] {
         let (status, _) = c.query_info(file, INFO_FILE, class, 4096).await;
@@ -205,21 +192,20 @@ async fn attribute_classes_require_read_attributes_access() {
     assert_eq!(status, ntstatus::STATUS_SUCCESS);
 
     c.close(file).await;
-    handle.abort();
 }
 
 #[tokio::test]
 async fn output_buffer_is_capped_at_max_transact_size() {
     let td = tempdir().expect("tempdir");
     let backend = LocalFsBackend::new(td.path()).expect("open root");
-    let (mut c, handle) = Client::connect(Share::new("share", backend).public()).await;
+    let server = Server::public(backend).await;
+    let mut c = server.client().await;
     let root = c.open_dir("").await;
     let (status, _) = c
         .query_info(root, INFO_FILE, FILE_BASIC_INFORMATION, 0x7FFF_FFFF)
         .await;
     assert_eq!(status, ntstatus::STATUS_INVALID_PARAMETER);
     c.close(root).await;
-    handle.abort();
 }
 
 #[cfg(unix)]
@@ -229,8 +215,9 @@ async fn standard_information_reports_the_link_count() {
     std::fs::write(td.path().join("a"), b"x").expect("write");
     std::fs::hard_link(td.path().join("a"), td.path().join("b")).expect("link");
     let backend = LocalFsBackend::new(td.path()).expect("open root");
-    let (mut c, handle) = Client::connect(Share::new("share", backend).public()).await;
-    let file = c.open("a", FILE_GENERIC_READ, 0).await.unwrap();
+    let server = Server::public(backend).await;
+    let mut c = server.client().await;
+    let file = c.open("a", FILE_GENERIC_READ, SHARE_ALL).await.unwrap();
 
     let (status, standard) = c
         .query_info(file, INFO_FILE, FILE_STANDARD_INFORMATION, 4096)
@@ -240,5 +227,4 @@ async fn standard_information_reports_the_link_count() {
     assert_eq!(standard[20], 0, "DeletePending");
 
     c.close(file).await;
-    handle.abort();
 }

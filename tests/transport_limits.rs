@@ -1,44 +1,22 @@
 //! Connection limits, timeouts and keepalive.
 
-#[allow(dead_code, reason = "only the session helpers are used here")]
 mod common;
-#[path = "support_transport.rs"]
-mod support;
 
 use std::time::{Duration, Instant};
 
-use smb_server::ntstatus::STATUS_INSUFFICIENT_RESOURCES;
-use smb_server::wire::header::Command;
-use smb_server::{LocalFsBackend, Share, SmbServer, SmbServerBuilder};
-use support::{
-    WAIT, assert_closed, assert_open, connect, connect_negotiated, framed, header, message,
-    negotiate_request, open_file, read_body, start, try_read_frame,
+use common::transport::{
+    WAIT, anonymous_session, anonymous_tree, assert_closed, assert_open, connect,
+    connect_negotiated, negotiate_request, open_file, read_body, with_share,
 };
-use tempfile::TempDir;
+use common::{build_header, framed, message, start_server, try_read_frame};
+use smb_server::SmbServer;
+use smb_server::ntstatus::{STATUS_INSUFFICIENT_RESOURCES, STATUS_MORE_PROCESSING_REQUIRED};
+use smb_server::wire::header::Command;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
-
-/// Builder with a public share holding `f.txt` of `size` bytes.
-fn with_share(size: usize) -> (SmbServerBuilder, TempDir) {
-    let td = tempfile::tempdir().expect("tempdir");
-    std::fs::write(td.path().join("f.txt"), vec![0x5A; size]).expect("file");
-    let backend = LocalFsBackend::new(td.path()).expect("backend");
-    let builder = SmbServer::builder().share(Share::new("share", backend).public());
-    (builder, td)
-}
-
-/// Anonymous session and tree on `share`; the next free MessageId is 4.
-async fn anonymous_tree(addr: std::net::SocketAddr) -> (TcpStream, u64, u32) {
-    let mut s = connect(addr).await;
-    common::negotiate(&mut s).await;
-    let session_id = common::anonymous_session_setup(&mut s).await;
-    let tree_id = common::tree_connect(&mut s, "\\\\server\\share", session_id, 3).await;
-    (s, session_id, tree_id)
-}
 
 #[tokio::test]
 async fn connections_beyond_the_limit_are_closed() {
-    let (addr, handle) = start(SmbServer::builder().max_connections(2)).await;
+    let (addr, handle) = start_server(SmbServer::builder().max_connections(2)).await;
     let first = connect_negotiated(addr).await;
     let _second = connect_negotiated(addr).await;
     let mut third = connect(addr).await;
@@ -64,7 +42,7 @@ async fn connections_beyond_the_limit_are_closed() {
 #[tokio::test]
 async fn connections_without_a_session_close_after_the_handshake_timeout() {
     let builder = SmbServer::builder().handshake_timeout(Duration::from_millis(300));
-    let (addr, handle) = start(builder).await;
+    let (addr, handle) = start_server(builder).await;
     let mut silent = connect(addr).await;
     let mut negotiated = connect_negotiated(addr).await;
     assert_closed(&mut silent, WAIT).await;
@@ -75,7 +53,7 @@ async fn connections_without_a_session_close_after_the_handshake_timeout() {
 #[tokio::test]
 async fn partial_frames_close_after_the_io_timeout() {
     let builder = SmbServer::builder().io_timeout(Duration::from_millis(300));
-    let (addr, handle) = start(builder).await;
+    let (addr, handle) = start_server(builder).await;
     let mut short_prefix = connect_negotiated(addr).await;
     short_prefix.write_all(&[0, 0]).await.expect("write");
     let mut short_payload = connect_negotiated(addr).await;
@@ -89,8 +67,8 @@ async fn partial_frames_close_after_the_io_timeout() {
 
 #[tokio::test]
 async fn idle_connections_close_unless_a_file_is_open() {
-    let (builder, _td) = with_share(16);
-    let (addr, handle) = start(builder.idle_timeout(Duration::from_millis(500))).await;
+    let (builder, _td) = with_share(&[("f.txt", &[0x5A; 16])]);
+    let (addr, handle) = start_server(builder.idle_timeout(Duration::from_millis(500))).await;
     let (mut idle, _, _) = anonymous_tree(addr).await;
     let (mut busy, session_id, tree_id) = anonymous_tree(addr).await;
     open_file(&mut busy, 4, session_id, tree_id, "f.txt").await;
@@ -103,14 +81,14 @@ async fn idle_connections_close_unless_a_file_is_open() {
 #[tokio::test]
 async fn a_peer_that_stops_reading_is_dropped_after_the_io_timeout() {
     const MIB: u32 = 1024 * 1024;
-    let (builder, _td) = with_share(MIB as usize);
-    let (addr, handle) = start(builder.io_timeout(Duration::from_millis(500))).await;
+    let (builder, _td) = with_share(&[("f.txt", &vec![0x5A; MIB as usize])]);
+    let (addr, handle) = start_server(builder.io_timeout(Duration::from_millis(500))).await;
     let (mut s, session_id, tree_id) = anonymous_tree(addr).await;
     let file_id = open_file(&mut s, 4, session_id, tree_id, "f.txt").await;
 
     let mut requests = Vec::new();
     for i in 0..64 {
-        let mut hdr = header(Command::Read, 5 + 16 * i, session_id, tree_id);
+        let mut hdr = build_header(Command::Read, 5 + 16 * i, session_id, tree_id);
         hdr.credit_charge = 16;
         hdr.credit_request_response = 16;
         requests.extend_from_slice(&framed(&message(&hdr, &read_body(file_id, MIB))));
@@ -140,7 +118,7 @@ async fn a_peer_that_stops_reading_is_dropped_after_the_io_timeout() {
 #[tokio::test]
 async fn accepted_connections_use_tcp_keepalive() {
     let builder = SmbServer::builder().tcp_keepalive(Some(Duration::from_secs(30)));
-    let (addr, handle) = start(builder).await;
+    let (addr, handle) = start_server(builder).await;
     let s = connect_negotiated(addr).await;
     let client_port = s.local_addr().expect("local addr").port();
 
@@ -164,16 +142,14 @@ async fn accepted_connections_use_tcp_keepalive() {
 
 #[tokio::test]
 async fn abandoned_authentication_exchanges_expire() {
-    let (builder, _td) = with_share(0);
-    let (addr, handle) = start(builder.handshake_timeout(Duration::from_millis(500))).await;
-    let mut s = connect(addr).await;
-    common::negotiate(&mut s).await;
-    common::anonymous_session_setup(&mut s).await;
+    let (builder, _td) = with_share(&[]);
+    let (addr, handle) = start_server(builder.handshake_timeout(Duration::from_millis(500))).await;
+    let (mut s, _) = anonymous_session(addr).await;
 
     let mut message_id = 3;
     for _ in 0..16 {
         let (status, _) = common::start_ntlm_session_setup(&mut s, message_id).await;
-        assert_eq!(status, common::STATUS_MORE_PROCESSING_REQUIRED);
+        assert_eq!(status, STATUS_MORE_PROCESSING_REQUIRED);
         message_id += 1;
     }
     let (status, _) = common::start_ntlm_session_setup(&mut s, message_id).await;
@@ -181,6 +157,6 @@ async fn abandoned_authentication_exchanges_expire() {
 
     tokio::time::sleep(Duration::from_millis(600)).await;
     let (status, _) = common::start_ntlm_session_setup(&mut s, message_id + 1).await;
-    assert_eq!(status, common::STATUS_MORE_PROCESSING_REQUIRED);
+    assert_eq!(status, STATUS_MORE_PROCESSING_REQUIRED);
     handle.abort();
 }

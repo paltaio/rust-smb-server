@@ -1,9 +1,4 @@
-//! SMB2 client and backends for the open, lock, write and teardown tests.
-
-#![allow(dead_code, reason = "each test crate uses part of the helpers")]
-
-#[path = "common/mod.rs"]
-pub mod common;
+//! SMB2 client and backends for the file and query tests.
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -11,12 +6,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use smb_server::ntstatus::STATUS_SUCCESS;
 use smb_server::wire::header::Command;
 use smb_server::wire::messages::{
-    CloseRequest, CloseResponse, CreateRequest, CreateResponse, FileId, FlushRequest, LockElement,
-    LockRequest, LogoffRequest, NegotiateRequest, NegotiateResponse, QueryInfoRequest,
-    QueryInfoResponse, ReadRequest, ReadResponse, SetInfoRequest, TreeDisconnectRequest,
-    WriteRequest, WriteResponse,
+    CloseRequest, CloseResponse, CreateRequest, CreateResponse, FileId, FileInfoClass,
+    FlushRequest, InfoType, LockElement, LockRequest, LogoffRequest, QueryDirectoryRequest,
+    QueryDirectoryResponse, QueryInfoRequest, QueryInfoResponse, ReadRequest, ReadResponse,
+    SetInfoRequest, TreeDisconnectRequest, WriteRequest, WriteResponse,
 };
 use smb_server::{
     BackendCapabilities, Bytes, ConfigHandle, DirEntry, FileInfo, FileTimes, Handle,
@@ -27,19 +23,23 @@ use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
-use self::common::{
-    STATUS_SUCCESS, anonymous_session_setup, build_header, negotiate, parse_response_header,
-    read_frame, tree_connect, utf16le, write_frame,
+use super::{
+    anonymous_session_setup, build_header, id_both_entries, negotiate, negotiate_dialects,
+    parse_response_header, read_frame, tree_connect, utf16le, write_frame,
 };
 
 pub const FILE_READ_DATA: u32 = 0x0000_0001;
 pub const FILE_WRITE_DATA: u32 = 0x0000_0002;
 pub const FILE_APPEND_DATA: u32 = 0x0000_0004;
 pub const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
+pub const FILE_WRITE_ATTRIBUTES: u32 = 0x0000_0100;
 pub const DELETE: u32 = 0x0001_0000;
 pub const SYNCHRONIZE: u32 = 0x0010_0000;
+pub const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
 pub const FILE_GENERIC_READ: u32 = 0x0012_0089;
 pub const FILE_GENERIC_WRITE: u32 = 0x0012_0116;
+pub const FILE_GENERIC_EXECUTE: u32 = 0x0012_00A0;
+pub const FILE_ALL_ACCESS: u32 = 0x001F_01FF;
 pub const RW: u32 = FILE_GENERIC_READ | FILE_GENERIC_WRITE;
 
 pub const SHARE_READ: u32 = 0x1;
@@ -62,11 +62,40 @@ pub const FILE_DELETE_ON_CLOSE: u32 = 0x0000_1000;
 pub const FILE_OPEN_BY_FILE_ID: u32 = 0x0000_2000;
 pub const FILE_RESERVE_OPFILTER: u32 = 0x0010_0000;
 
-pub const FILE_ATTRIBUTE_READONLY: u32 = 0x1;
+pub const FILE_ATTRIBUTE_READONLY: u32 = 0x0000_0001;
+pub const FILE_ATTRIBUTE_HIDDEN: u32 = 0x0000_0002;
+pub const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
+pub const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x0000_0020;
+pub const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
 
-pub const FILE_DISPOSITION_INFORMATION: u8 = 0x0D;
+pub const FILE_BASIC_INFORMATION: u8 = 0x04;
+pub const FILE_STANDARD_INFORMATION: u8 = 0x05;
+pub const FILE_INTERNAL_INFORMATION: u8 = 0x06;
+pub const FILE_ACCESS_INFORMATION: u8 = 0x08;
+pub const FILE_NAME_INFORMATION: u8 = 0x09;
 pub const FILE_RENAME_INFORMATION: u8 = 0x0A;
+pub const FILE_LINK_INFORMATION: u8 = 0x0B;
+pub const FILE_DISPOSITION_INFORMATION: u8 = 0x0D;
+pub const FILE_ALL_INFORMATION: u8 = 0x12;
+pub const FILE_ALLOCATION_INFORMATION: u8 = 0x13;
 pub const FILE_END_OF_FILE_INFORMATION: u8 = 0x14;
+pub const FILE_ALTERNATE_NAME_INFORMATION: u8 = 0x15;
+pub const FILE_STREAM_INFORMATION: u8 = 0x16;
+pub const FILE_ATTRIBUTE_TAG_INFORMATION: u8 = 0x23;
+pub const FILE_ID_BOTH_DIRECTORY_INFORMATION: u8 =
+    FileInfoClass::FileIdBothDirectoryInformation as u8;
+pub const FILE_SHORT_NAME_INFORMATION: u8 = 0x28;
+
+pub const FS_VOLUME_INFORMATION: u8 = 0x01;
+pub const FS_SIZE_INFORMATION: u8 = 0x03;
+pub const FS_ATTRIBUTE_INFORMATION: u8 = 0x05;
+pub const FS_CONTROL_INFORMATION: u8 = 0x06;
+pub const FS_FULL_SIZE_INFORMATION: u8 = 0x07;
+pub const FS_SECTOR_SIZE_INFORMATION: u8 = 0x0B;
+
+pub const INFO_FILE: u8 = InfoType::File as u8;
+pub const INFO_FILESYSTEM: u8 = InfoType::FileSystem as u8;
+pub const INFO_SECURITY: u8 = InfoType::Security as u8;
 
 pub const LOCK_SHARED: u32 = LockElement::FLAG_SHARED_LOCK;
 pub const LOCK_EXCLUSIVE: u32 = LockElement::FLAG_EXCLUSIVE_LOCK;
@@ -82,15 +111,7 @@ pub struct Server {
 
 impl Server {
     pub async fn start(builder: SmbServerBuilder) -> Self {
-        let server = builder
-            .listen("127.0.0.1:0".parse().unwrap())
-            .build()
-            .expect("build");
-        let config = server.config_handle();
-        let addr = server.bind().await.expect("bind");
-        let task = tokio::spawn(async move {
-            let _ = server.serve().await;
-        });
+        let (addr, config, _, task) = super::spawn_server(builder).await;
         Self { addr, config, task }
     }
 
@@ -154,6 +175,43 @@ impl Default for Create<'_> {
     }
 }
 
+impl Create<'_> {
+    /// The request body, with the name padded to 8 bytes and the contexts
+    /// after it.
+    pub fn body(&self) -> Vec<u8> {
+        let mut name = utf16le(self.name);
+        let name_length = name.len() as u16;
+        name.resize(name.len().next_multiple_of(8), 0);
+        let contexts_offset = if self.contexts.is_empty() {
+            0
+        } else {
+            0x78 + name.len() as u32
+        };
+        let req = CreateRequest {
+            structure_size: 57,
+            security_flags: 0,
+            requested_oplock_level: 0,
+            impersonation_level: 2,
+            smb_create_flags: 0,
+            reserved: 0,
+            desired_access: self.access,
+            file_attributes: self.attributes,
+            share_access: self.share,
+            create_disposition: self.disposition,
+            create_options: self.options,
+            name_offset: 0x78,
+            name_length,
+            create_contexts_offset: contexts_offset,
+            create_contexts_length: self.contexts.len() as u32,
+            name,
+            create_contexts: self.contexts.clone(),
+        };
+        let mut body = Vec::new();
+        req.write_to(&mut body).expect("write");
+        body
+    }
+}
+
 impl Client {
     pub async fn connect(addr: SocketAddr, dialect: Option<u16>) -> Self {
         let mut s = TcpStream::connect(addr).await.expect("connect");
@@ -161,7 +219,9 @@ impl Client {
             None => {
                 let _ = negotiate(&mut s).await;
             }
-            Some(d) => negotiate_dialect(&mut s, d).await,
+            Some(d) => {
+                negotiate_dialects(&mut s, &[d]).await;
+            }
         }
         let session_id = anonymous_session_setup(&mut s).await;
         let tree_id = tree_connect(&mut s, "\\\\127.0.0.1\\share", session_id, 3).await;
@@ -194,37 +254,13 @@ impl Client {
         (rh.channel_sequence_status, rb.to_vec())
     }
 
+    /// CREATE; returns the status and the raw response body.
+    pub async fn create_raw(&mut self, c: Create<'_>) -> Reply {
+        self.send(Command::Create, &c.body()).await
+    }
+
     pub async fn create(&mut self, c: Create<'_>) -> Result<CreateResponse, u32> {
-        let mut name = utf16le(c.name);
-        let name_length = name.len() as u16;
-        name.resize(name.len().next_multiple_of(8), 0);
-        let contexts_offset = if c.contexts.is_empty() {
-            0
-        } else {
-            0x78 + name.len() as u32
-        };
-        let req = CreateRequest {
-            structure_size: 57,
-            security_flags: 0,
-            requested_oplock_level: 0,
-            impersonation_level: 2,
-            smb_create_flags: 0,
-            reserved: 0,
-            desired_access: c.access,
-            file_attributes: c.attributes,
-            share_access: c.share,
-            create_disposition: c.disposition,
-            create_options: c.options,
-            name_offset: 0x78,
-            name_length,
-            create_contexts_offset: contexts_offset,
-            create_contexts_length: c.contexts.len() as u32,
-            name,
-            create_contexts: c.contexts,
-        };
-        let mut body = Vec::new();
-        req.write_to(&mut body).expect("write");
-        let (status, rb) = self.send(Command::Create, &body).await;
+        let (status, rb) = self.create_raw(c).await;
         if status != STATUS_SUCCESS {
             return Err(status);
         }
@@ -241,6 +277,31 @@ impl Client {
         })
         .await
         .map(|r| r.file_id)
+    }
+
+    /// Opens an existing file or directory with `access` and `options`,
+    /// sharing everything; returns its FileId.
+    pub async fn open_with_options(
+        &mut self,
+        name: &str,
+        access: u32,
+        options: u32,
+    ) -> Result<FileId, u32> {
+        self.create(Create {
+            name,
+            access,
+            options,
+            ..Create::default()
+        })
+        .await
+        .map(|r| r.file_id)
+    }
+
+    /// Opens a directory for listing.
+    pub async fn open_dir(&mut self, name: &str) -> FileId {
+        self.open_with_options(name, FILE_GENERIC_READ, FILE_DIRECTORY_FILE)
+            .await
+            .expect("open directory")
     }
 
     pub async fn close_with(
@@ -417,6 +478,116 @@ impl Client {
             (status, _) => Err(status),
         }
     }
+
+    /// QUERY_DIRECTORY; returns the status and the output buffer, empty
+    /// for an error.
+    pub async fn query_directory(
+        &mut self,
+        dir: FileId,
+        class: u8,
+        flags: u8,
+        pattern: &str,
+        output_buffer_length: u32,
+    ) -> Reply {
+        let pattern = utf16le(pattern);
+        let req = QueryDirectoryRequest {
+            structure_size: 33,
+            file_information_class: class,
+            flags,
+            file_index: 0,
+            file_id: dir,
+            file_name_offset: 64 + 32,
+            file_name_length: pattern.len() as u16,
+            output_buffer_length,
+            file_name: pattern,
+        };
+        let mut body = Vec::new();
+        req.write_to(&mut body).expect("write");
+        let (status, rb) = self.send(Command::QueryDirectory, &body).await;
+        if status & 0xC000_0000 == 0xC000_0000 {
+            return (status, Vec::new());
+        }
+        let resp = QueryDirectoryResponse::parse(&rb).expect("parse");
+        (status, resp.buffer)
+    }
+
+    /// Sorted names QUERY_DIRECTORY returns for `pattern` in
+    /// FileIdBothDirectoryInformation, or the status.
+    pub async fn list(
+        &mut self,
+        dir: FileId,
+        flags: u8,
+        pattern: &str,
+    ) -> Result<Vec<String>, u32> {
+        let (status, buf) = self
+            .query_directory(
+                dir,
+                FILE_ID_BOTH_DIRECTORY_INFORMATION,
+                flags,
+                pattern,
+                65536,
+            )
+            .await;
+        if status != STATUS_SUCCESS {
+            return Err(status);
+        }
+        let mut names: Vec<String> = id_both_entries(&buf).into_iter().map(|e| e.0).collect();
+        names.sort();
+        Ok(names)
+    }
+
+    /// QUERY_INFO; returns the status and the response body after the
+    /// header.
+    pub async fn query_info_raw(
+        &mut self,
+        file_id: FileId,
+        info_type: u8,
+        class: u8,
+        output_buffer_length: u32,
+    ) -> Reply {
+        let req = QueryInfoRequest {
+            structure_size: 41,
+            info_type,
+            file_information_class: class,
+            output_buffer_length,
+            input_buffer_offset: 0,
+            reserved: 0,
+            input_buffer_length: 0,
+            additional_information: 0x7,
+            flags: 0,
+            file_id,
+            input_buffer: vec![],
+        };
+        let mut body = Vec::new();
+        req.write_to(&mut body).expect("write");
+        self.send(Command::QueryInfo, &body).await
+    }
+
+    /// QUERY_INFO; returns the status and the output buffer, empty for an
+    /// error.
+    pub async fn query_info(
+        &mut self,
+        file_id: FileId,
+        info_type: u8,
+        class: u8,
+        output_buffer_length: u32,
+    ) -> Reply {
+        let (status, rb) = self
+            .query_info_raw(file_id, info_type, class, output_buffer_length)
+            .await;
+        if status & 0xC000_0000 == 0xC000_0000 {
+            return (status, Vec::new());
+        }
+        (status, QueryInfoResponse::parse(&rb).expect("parse").buffer)
+    }
+}
+
+pub fn u32_at(buf: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap())
+}
+
+pub fn u64_at(buf: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap())
 }
 
 /// A WRITE of `data` at `offset` with the data right after the fixed part.
@@ -434,28 +605,6 @@ pub fn write_request(file_id: FileId, offset: u64, data: &[u8]) -> WriteRequest 
         flags: 0,
         data: data.to_vec(),
     }
-}
-
-/// NEGOTIATE offering only `dialect` (2.x or 3.0 to 3.0.2).
-pub async fn negotiate_dialect(s: &mut TcpStream, dialect: u16) {
-    let req = NegotiateRequest {
-        structure_size: 36,
-        dialect_count: 1,
-        security_mode: 0x0001,
-        reserved: 0,
-        capabilities: 0,
-        client_guid: [0xCD; 16],
-        negotiate_context_offset_or_client_start_time: 0,
-        dialects: vec![dialect],
-    };
-    let mut body = Vec::new();
-    req.write_to(&mut body).expect("write negotiate");
-    write_frame(s, &build_header(Command::Negotiate, 0, 0, 0), &body).await;
-    let resp = read_frame(s).await;
-    let (rh, rb) = parse_response_header(&resp);
-    assert_eq!(rh.channel_sequence_status, STATUS_SUCCESS);
-    let resp = NegotiateResponse::parse(rb).expect("parse negotiate");
-    assert_eq!(resp.dialect_revision, dialect);
 }
 
 /// Waits up to two seconds for `done` to hold.

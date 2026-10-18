@@ -2,15 +2,15 @@
 //! RLIMIT_NOFILE for the whole process, so it lives in its own test binary.
 #![cfg(target_os = "linux")]
 
-#[path = "support_transport.rs"]
-mod support;
+mod common;
 
 use std::fs::File;
 use std::time::Duration;
 
+use common::start_server;
+use common::transport::{negotiate_request, read_response};
 use smb_server::SmbServer;
 use smb_server::wire::header::Command;
-use support::{negotiate_request, read_response, start};
 use tokio::io::AsyncWriteExt;
 
 fn cpu_time() -> Duration {
@@ -38,7 +38,7 @@ fn set_fd_limit(soft: libc::rlim_t) -> libc::rlim_t {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn accept_errors_back_off_and_recover() {
-    let (addr, handle) = start(SmbServer::builder()).await;
+    let (addr, handle) = start_server(SmbServer::builder()).await;
 
     let open = std::fs::read_dir("/proc/self/fd").expect("fd dir").count() as libc::rlim_t;
     let old_limit = set_fd_limit(open + 16);

@@ -1,10 +1,9 @@
 //! ShareAccess between opens of one file, on one or several connections.
 
-#[path = "support_files.rs"]
-mod support;
+mod common;
 
+use common::client::*;
 use smb_server::ntstatus;
-use support::*;
 use tempfile::tempdir;
 
 #[tokio::test]

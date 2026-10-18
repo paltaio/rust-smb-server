@@ -1,13 +1,14 @@
 //! Configuration changes reach live connections.
 
-#[path = "support_files.rs"]
-mod support;
+mod common;
 
 use std::time::Duration;
 
+use common::auth::{Login, spnego_login};
+use common::client::*;
+use common::{negotiate, tree_connect};
+use smb_server::ntstatus::STATUS_SUCCESS;
 use smb_server::{Access, Share, SmbServer, ntstatus};
-use support::common::{STATUS_SUCCESS, negotiate, tree_connect, user_session_setup};
-use support::*;
 use tempfile::tempdir;
 use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
@@ -16,7 +17,9 @@ use tokio::sync::Semaphore;
 async fn user_client(server: &Server, user: &str, password: &str) -> Client {
     let mut s = TcpStream::connect(server.addr).await.unwrap();
     let _ = negotiate(&mut s).await;
-    let (status, session_id, _, _) = user_session_setup(&mut s, user, password).await;
+    let Login {
+        status, session_id, ..
+    } = spnego_login(&mut s, 1, 0, user, password).await;
     assert_eq!(status, STATUS_SUCCESS);
     let tree_id = tree_connect(&mut s, "\\\\127.0.0.1\\share", session_id, 3).await;
     Client::from_parts(s, session_id, tree_id)

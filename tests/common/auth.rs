@@ -1,23 +1,18 @@
 //! Client-side NTLM, SPNEGO and SMB2 pieces for the authentication tests.
 
-#![allow(dead_code, reason = "each test crate uses part of the helpers")]
-
 use hmac::Mac as _;
 use md4::Digest as _;
 use rc4::{KeyInit as _, StreamCipher as _};
-use smb_server::wire::header::{
-    Command, HeaderTail, SMB2_FLAGS_SERVER_TO_REDIR, SMB2_FLAGS_SIGNED, Smb2Header,
-};
-use smb_server::wire::messages::{
-    FileId, IoctlRequest, NegotiateRequest, SessionSetupRequest, SessionSetupResponse,
-    TreeConnectRequest,
-};
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use smb_server::ntstatus::STATUS_MORE_PROCESSING_REQUIRED;
+use smb_server::wire::header::{Command, SMB2_FLAGS_SIGNED, Smb2Header};
+use smb_server::wire::messages::{FileId, IoctlRequest, NegotiateRequest, SessionSetupResponse};
+use tokio::io::AsyncWriteExt as _;
 use tokio::net::TcpStream;
 
-pub const NTLMSSP_SIGNATURE: &[u8] = b"NTLMSSP\0";
-pub const OID_SPNEGO: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x02];
-pub const OID_NTLMSSP: &[u8] = &[0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x02, 0x0a];
+use super::{
+    NTLMSSP_SIGNATURE, OID_NTLMSSP, OID_SPNEGO, build_header, framed, parse_response_header,
+    read_frame, session_setup_body, smb2_signature, try_read_frame, utf16le,
+};
 
 pub const OID_KRB5: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x02];
 
@@ -45,18 +40,6 @@ pub const CLIENT_FLAGS: u32 = NTLM_UNICODE
     | NTLM_128
     | NTLM_KEY_EXCH
     | NTLM_56;
-
-pub const STATUS_LOGON_FAILURE: u32 = 0xC000_006D;
-pub const STATUS_USER_SESSION_DELETED: u32 = 0xC000_0203;
-pub const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
-pub const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
-pub const STATUS_NOT_SUPPORTED: u32 = 0xC000_00BB;
-pub const STATUS_FILE_CLOSED: u32 = 0xC000_0128;
-pub const STATUS_REQUEST_NOT_ACCEPTED: u32 = 0xC000_00D0;
-pub const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
-pub const STATUS_ACCOUNT_LOCKED_OUT: u32 = 0xC000_0234;
-pub const STATUS_NETWORK_NAME_DELETED: u32 = 0xC000_00C9;
-pub const STATUS_BAD_NETWORK_NAME: u32 = 0xC000_00CC;
 
 // --- DER --------------------------------------------------------------------
 
@@ -304,61 +287,6 @@ pub fn ntlm_mac(exported: &[u8; 16], client_to_server: bool, message: &[u8]) -> 
 
 // --- SMB2 -------------------------------------------------------------------
 
-pub fn utf16le(s: &str) -> Vec<u8> {
-    s.encode_utf16().flat_map(u16::to_le_bytes).collect()
-}
-
-pub fn build_header(
-    command: Command,
-    message_id: u64,
-    session_id: u64,
-    tree_id: u32,
-) -> Smb2Header {
-    Smb2Header {
-        credit_charge: 1,
-        channel_sequence_status: 0,
-        command,
-        credit_request_response: 64,
-        flags: 0,
-        next_command: 0,
-        message_id,
-        tail: HeaderTail::sync(tree_id),
-        session_id,
-        signature: [0u8; 16],
-    }
-}
-
-pub fn encode_frame(payload: &[u8], out: &mut Vec<u8>) {
-    out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-    out.extend_from_slice(payload);
-}
-
-pub async fn read_frame(s: &mut TcpStream) -> Vec<u8> {
-    let mut hdr = [0u8; 4];
-    s.read_exact(&mut hdr).await.expect("frame header");
-    let len = u32::from_be_bytes(hdr) as usize & 0x00FF_FFFF;
-    let mut body = vec![0u8; len];
-    s.read_exact(&mut body).await.expect("frame body");
-    body
-}
-
-pub fn parse_response_header(frame: &[u8]) -> (Smb2Header, &[u8]) {
-    let (h, rest) = Smb2Header::parse(frame).expect("response header");
-    assert_ne!(h.flags & SMB2_FLAGS_SERVER_TO_REDIR, 0, "not a response");
-    (h, rest)
-}
-
-/// SMB 2.x signature (HMAC-SHA256) of `msg` with its signature field zeroed.
-pub fn smb2_signature(msg: &[u8], key: &[u8; 16]) -> [u8; 16] {
-    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(key).expect("hmac key");
-    mac.update(&msg[..48]);
-    mac.update(&[0; 16]);
-    mac.update(&msg[64..]);
-    mac.finalize().into_bytes()[..16]
-        .try_into()
-        .expect("16 bytes")
-}
-
 /// Sends `body` as `command` and returns the response frame.
 pub async fn request(
     s: &mut TcpStream,
@@ -390,9 +318,7 @@ pub async fn send(
         let sig = smb2_signature(&msg, key);
         msg[48..64].copy_from_slice(&sig);
     }
-    let mut framed = Vec::new();
-    encode_frame(&msg, &mut framed);
-    s.write_all(&framed).await.expect("write");
+    s.write_all(&framed(&msg)).await.expect("write");
     read_frame(s).await
 }
 
@@ -402,23 +328,6 @@ pub fn status(frame: &[u8]) -> u32 {
 
 pub fn response_session_id(frame: &[u8]) -> u64 {
     parse_response_header(frame).0.session_id
-}
-
-/// NEGOTIATE request body.
-pub fn negotiate_body(dialects: &[u16], security_mode: u16, capabilities: u32) -> Vec<u8> {
-    let req = NegotiateRequest {
-        structure_size: 36,
-        dialect_count: dialects.len() as u16,
-        security_mode,
-        reserved: 0,
-        capabilities,
-        client_guid: [0xCD; 16],
-        negotiate_context_offset_or_client_start_time: 0,
-        dialects: dialects.to_vec(),
-    };
-    let mut body = Vec::new();
-    req.write_to(&mut body).expect("negotiate");
-    body
 }
 
 pub const CTX_PREAUTH: u16 = 0x0001;
@@ -493,24 +402,6 @@ pub fn response_contexts(frame: &[u8]) -> Vec<(u16, Vec<u8>)> {
     out
 }
 
-/// SESSION_SETUP request body.
-pub fn session_setup_body(blob: &[u8], flags: u8, security_mode: u8, previous: u64) -> Vec<u8> {
-    let req = SessionSetupRequest {
-        structure_size: 25,
-        flags,
-        security_mode,
-        capabilities: 0,
-        channel: 0,
-        security_buffer_offset: 88,
-        security_buffer_length: blob.len() as u16,
-        previous_session_id: previous,
-        security_buffer: blob.to_vec(),
-    };
-    let mut body = Vec::new();
-    req.write_to(&mut body).expect("session setup");
-    body
-}
-
 /// Security buffer of a SESSION_SETUP response.
 pub fn session_setup_token(frame: &[u8]) -> Vec<u8> {
     let (_, body) = parse_response_header(frame);
@@ -580,7 +471,7 @@ pub async fn login_with(
     let body = session_setup_body(&first, opts.flags, opts.security_mode, 0);
     let frame = request(s, Command::SessionSetup, mid, session_id, 0, &body).await;
     let st = status(&frame);
-    if st != 0xC000_0016 {
+    if st != STATUS_MORE_PROCESSING_REQUIRED {
         return Login {
             status: st,
             session_id: response_session_id(&frame),
@@ -615,49 +506,6 @@ pub async fn login_with(
         key,
         frame,
     }
-}
-
-/// TREE_CONNECT request body for `path`.
-pub fn tree_connect_body(path: &str) -> Vec<u8> {
-    let path = utf16le(path);
-    let mut body = Vec::new();
-    TreeConnectRequest {
-        structure_size: 9,
-        flags: 0,
-        path_offset: 64 + 8,
-        path_length: path.len() as u16,
-        path,
-    }
-    .write_to(&mut body)
-    .expect("tree connect");
-    body
-}
-
-/// CREATE request body opening `name` (FILE_OPEN) with `access`.
-pub fn create_body(name: &str, access: u32, options: u32) -> Vec<u8> {
-    let name = utf16le(name);
-    let req = smb_server::wire::messages::CreateRequest {
-        structure_size: 57,
-        security_flags: 0,
-        requested_oplock_level: 0,
-        impersonation_level: 2,
-        smb_create_flags: 0,
-        reserved: 0,
-        desired_access: access,
-        file_attributes: 0,
-        share_access: 7,
-        create_disposition: 1,
-        create_options: options,
-        name_offset: 0x78,
-        name_length: name.len() as u16,
-        create_contexts_offset: 0,
-        create_contexts_length: 0,
-        name,
-        create_contexts: Vec::new(),
-    };
-    let mut body = Vec::new();
-    req.write_to(&mut body).expect("create");
-    body
 }
 
 /// FileId of a successful CREATE response frame.
@@ -716,14 +564,8 @@ pub fn validate_negotiate_input(
 
 /// Reads a frame, or returns `None` once the server closes the connection.
 pub async fn read_or_closed(s: &mut TcpStream) -> Option<Vec<u8>> {
-    let mut hdr = [0u8; 4];
-    match tokio::time::timeout(std::time::Duration::from_secs(5), s.read_exact(&mut hdr)).await {
-        Ok(Ok(_)) => {}
-        Ok(Err(_)) => return None,
+    match tokio::time::timeout(std::time::Duration::from_secs(5), try_read_frame(s)).await {
+        Ok(frame) => frame.ok(),
         Err(_) => panic!("server neither replied nor closed the connection"),
     }
-    let len = ((hdr[1] as usize) << 16) | ((hdr[2] as usize) << 8) | hdr[3] as usize;
-    let mut body = vec![0u8; len];
-    s.read_exact(&mut body).await.ok()?;
-    Some(body)
 }

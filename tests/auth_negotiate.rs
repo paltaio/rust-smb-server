@@ -2,22 +2,21 @@
 
 #![cfg(feature = "localfs")]
 
-#[allow(dead_code, reason = "this crate uses part of the shared helpers")]
 mod common;
-#[path = "support_auth.rs"]
-mod support;
 
-use common::start_server;
+use common::auth::*;
+use common::{negotiate_body, start_server};
+use smb_server::ntstatus::{
+    STATUS_INVALID_PARAMETER, STATUS_NOT_SUPPORTED, STATUS_SMB_NO_PREAUTH_INTEGRITY_HASH_OVERLAP,
+};
 use smb_server::wire::header::Command;
 use smb_server::wire::messages::NegotiateResponse;
 use smb_server::{LocalFsBackend, Share, SmbServer};
-use support::*;
 use tokio::net::TcpStream;
 
 const SHA512: u16 = 0x0001;
 const AES_CMAC: u16 = 0x0001;
 const AES_GMAC: u16 = 0x0002;
-const NO_PREAUTH_HASH_OVERLAP: u32 = 0xC05D_0000;
 
 async fn connect() -> (TcpStream, tokio::task::JoinHandle<()>, tempfile::TempDir) {
     let td = tempfile::tempdir().expect("tempdir");
@@ -72,7 +71,10 @@ async fn smb311_contexts_are_checked() {
             vec![preauth.clone(), preauth.clone()],
             STATUS_INVALID_PARAMETER,
         ),
-        (vec![preauth_context(&[0x0002])], NO_PREAUTH_HASH_OVERLAP),
+        (
+            vec![preauth_context(&[0x0002])],
+            STATUS_SMB_NO_PREAUTH_INTEGRITY_HASH_OVERLAP,
+        ),
         (vec![(CTX_PREAUTH, vec![1, 0])], STATUS_INVALID_PARAMETER),
         (
             vec![preauth.clone(), signing.clone(), signing.clone()],

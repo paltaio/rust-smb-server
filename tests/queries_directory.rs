@@ -1,25 +1,21 @@
 //! QUERY_DIRECTORY against `LocalFsBackend` over TCP loopback.
 #![cfg(feature = "localfs")]
 
-#[path = "support_queries.rs"]
-mod support;
+mod common;
 
+use common::client::*;
+use common::id_both_entries;
 use smb_server::wire::messages::QueryDirectoryRequest;
-use smb_server::{LocalFsBackend, Share, ntstatus};
-use support::{
-    Client, FILE_DIRECTORY_FILE, FILE_ID_BOTH_DIRECTORY_INFORMATION, INFO_FILE, id_both_entries,
-    u64_at,
-};
+use smb_server::{LocalFsBackend, ntstatus};
 use tempfile::tempdir;
 
 const RESTART: u8 = QueryDirectoryRequest::FLAG_RESTART_SCANS;
 const REOPEN: u8 = QueryDirectoryRequest::FLAG_REOPEN;
-const FILE_INTERNAL_INFORMATION: u8 = 0x06;
-const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
 
-async fn client(root: &std::path::Path) -> (Client, tokio::task::JoinHandle<()>) {
-    let backend = LocalFsBackend::new(root).expect("open root");
-    Client::connect(Share::new("share", backend).public()).await
+async fn client(root: &std::path::Path) -> (Server, Client) {
+    let server = Server::public(LocalFsBackend::new(root).expect("open root")).await;
+    let c = server.client().await;
+    (server, c)
 }
 
 #[tokio::test]
@@ -27,7 +23,7 @@ async fn first_query_with_no_match_returns_no_such_file() {
     let td = tempdir().expect("tempdir");
     std::fs::write(td.path().join("a.txt"), b"x").expect("write");
     std::fs::create_dir(td.path().join("empty")).expect("mkdir");
-    let (mut c, handle) = client(td.path()).await;
+    let (_server, mut c) = client(td.path()).await;
 
     let root = c.open_dir("").await;
     assert_eq!(
@@ -51,8 +47,6 @@ async fn first_query_with_no_match_returns_no_such_file() {
         Err(ntstatus::STATUS_NO_SUCH_FILE)
     );
     c.close(empty).await;
-
-    handle.abort();
 }
 
 #[tokio::test]
@@ -60,7 +54,7 @@ async fn dot_entries_lead_listings_below_the_root() {
     let td = tempdir().expect("tempdir");
     std::fs::create_dir(td.path().join("d")).expect("mkdir");
     std::fs::write(td.path().join("d").join("f.txt"), b"x").expect("write");
-    let (mut c, handle) = client(td.path()).await;
+    let (_server, mut c) = client(td.path()).await;
 
     let root = c.open_dir("").await;
     assert_eq!(c.list(root, 0, "*").await.unwrap(), ["d"]);
@@ -91,7 +85,6 @@ async fn dot_entries_lead_listings_below_the_root() {
 
     c.close(dir).await;
     c.close(root).await;
-    handle.abort();
 }
 
 #[tokio::test]
@@ -99,7 +92,7 @@ async fn an_entry_larger_than_the_buffer_returns_a_partial_name() {
     let td = tempdir().expect("tempdir");
     let name = "n".repeat(40);
     std::fs::write(td.path().join(&name), b"x").expect("write");
-    let (mut c, handle) = client(td.path()).await;
+    let (_server, mut c) = client(td.path()).await;
     let root = c.open_dir("").await;
 
     // FileIdBothDirectoryInformation has 104 fixed bytes.
@@ -128,7 +121,6 @@ async fn an_entry_larger_than_the_buffer_returns_a_partial_name() {
     assert_eq!(buf.len(), 104 + 80);
 
     c.close(root).await;
-    handle.abort();
 }
 
 #[tokio::test]
@@ -137,7 +129,7 @@ async fn entries_that_do_not_fit_wait_for_the_next_query() {
     for name in ["a", "b", "c"] {
         std::fs::write(td.path().join(name), b"x").expect("write");
     }
-    let (mut c, handle) = client(td.path()).await;
+    let (_server, mut c) = client(td.path()).await;
     let root = c.open_dir("").await;
 
     // Room for one 106-byte entry, then 112 bytes to the next one.
@@ -161,15 +153,14 @@ async fn entries_that_do_not_fit_wait_for_the_next_query() {
     assert_eq!(seen, ["a", "b", "c"]);
 
     c.close(root).await;
-    handle.abort();
 }
 
 #[tokio::test]
 async fn listing_requires_list_directory_access() {
     let td = tempdir().expect("tempdir");
-    let (mut c, handle) = client(td.path()).await;
+    let (_server, mut c) = client(td.path()).await;
     let dir = c
-        .open("", FILE_READ_ATTRIBUTES, FILE_DIRECTORY_FILE)
+        .open_with_options("", FILE_READ_ATTRIBUTES, FILE_DIRECTORY_FILE)
         .await
         .unwrap();
     assert_eq!(
@@ -177,13 +168,12 @@ async fn listing_requires_list_directory_access() {
         Err(ntstatus::STATUS_ACCESS_DENIED)
     );
     c.close(dir).await;
-    handle.abort();
 }
 
 #[tokio::test]
 async fn information_classes_get_the_spec_statuses() {
     let td = tempdir().expect("tempdir");
-    let (mut c, handle) = client(td.path()).await;
+    let (_server, mut c) = client(td.path()).await;
     let root = c.open_dir("").await;
     // FileIdExtdDirectoryInformation and FileIdAllExtdBothDirectoryInformation.
     for class in [0x3C, 0x51] {
@@ -200,7 +190,6 @@ async fn information_classes_get_the_spec_statuses() {
         );
     }
     c.close(root).await;
-    handle.abort();
 }
 
 #[tokio::test]
@@ -209,7 +198,7 @@ async fn patterns_are_validated_and_kept_across_restarts() {
     for name in ["a1", "a2", "b1"] {
         std::fs::write(td.path().join(name), b"x").expect("write");
     }
-    let (mut c, handle) = client(td.path()).await;
+    let (_server, mut c) = client(td.path()).await;
     let root = c.open_dir("").await;
 
     assert_eq!(
@@ -227,13 +216,12 @@ async fn patterns_are_validated_and_kept_across_restarts() {
     assert_eq!(c.list(root, RESTART, "b*").await.unwrap(), ["b1"]);
 
     c.close(root).await;
-    handle.abort();
 }
 
 #[tokio::test]
 async fn output_buffer_is_capped_at_max_transact_size() {
     let td = tempdir().expect("tempdir");
-    let (mut c, handle) = client(td.path()).await;
+    let (_server, mut c) = client(td.path()).await;
     let root = c.open_dir("").await;
     let (status, _) = c
         .query_directory(
@@ -246,7 +234,6 @@ async fn output_buffer_is_capped_at_max_transact_size() {
         .await;
     assert_eq!(status, ntstatus::STATUS_INVALID_PARAMETER);
     c.close(root).await;
-    handle.abort();
 }
 
 /// Every listed name opens, and names that cannot be opened are not listed.
@@ -261,18 +248,19 @@ async fn listing_and_open_agree_on_names() {
     }
     let backend = LocalFsBackend::new(td.path()).expect("open root");
     assert!(backend.capabilities().case_sensitive);
-    let (mut c, handle) = Client::connect(Share::new("share", backend).public()).await;
+    let server = Server::public(backend).await;
+    let mut c = server.client().await;
     let root = c.open_dir("").await;
 
     let names = c.list(root, RESTART, "*").await.unwrap();
     assert_eq!(names, ["aux.c", "lower.txt"]);
     for name in &names {
-        let id = c.open(name, support::FILE_GENERIC_READ, 0).await.unwrap();
+        let id = c.open(name, FILE_GENERIC_READ, SHARE_ALL).await.unwrap();
         c.close(id).await;
     }
     // Lookups are case-sensitive here, and so is matching.
     assert!(
-        c.open("LOWER.TXT", support::FILE_GENERIC_READ, 0)
+        c.open("LOWER.TXT", FILE_GENERIC_READ, SHARE_ALL)
             .await
             .is_err()
     );
@@ -286,5 +274,4 @@ async fn listing_and_open_agree_on_names() {
     );
 
     c.close(root).await;
-    handle.abort();
 }

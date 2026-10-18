@@ -2,17 +2,15 @@
 
 #![cfg(feature = "localfs")]
 
-#[allow(dead_code, reason = "this crate uses part of the shared helpers")]
 mod common;
-#[path = "support_auth.rs"]
-mod support;
 
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use common::auth::*;
 use common::{negotiate, start_server};
+use smb_server::ntstatus::{STATUS_ACCOUNT_LOCKED_OUT, STATUS_LOGON_FAILURE};
 use smb_server::{Access, LocalFsBackend, Share, SmbServer};
-use support::*;
 use tokio::net::TcpStream;
 
 async fn logon(addr: SocketAddr, user: &str, password: &str) -> u32 {

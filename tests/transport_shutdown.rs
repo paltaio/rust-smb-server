@@ -1,16 +1,15 @@
 //! Graceful shutdown.
 
-#[path = "support_transport.rs"]
-mod support;
+mod common;
 
 use std::time::Duration;
 
+use common::start_with_shutdown;
+use common::transport::{
+    WAIT, assert_closed, connect_in_session_setup, connect_negotiated, echo, read_response,
+};
 use smb_server::SmbServer;
 use smb_server::wire::header::Command;
-use support::{
-    WAIT, assert_closed, connect_in_session_setup, connect_negotiated, echo, read_response,
-    start_with_shutdown,
-};
 use tokio::io::AsyncWriteExt;
 
 #[tokio::test]

@@ -1,11 +1,10 @@
 //! CREATE reports what the open did, and a missing directory on the way to
 //! the name is reported as such.
 
-#[path = "support_files.rs"]
-mod support;
+mod common;
 
+use common::client::*;
 use smb_server::{LocalFsBackend, OpenAction, OpenIntent, OpenOptions, ShareBackend, ntstatus};
-use support::*;
 use tempfile::tempdir;
 
 const SUPERSEDED: u32 = 0;

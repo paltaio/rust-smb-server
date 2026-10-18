@@ -1,11 +1,10 @@
 //! READ, WRITE and FLUSH request rules.
 
-#[path = "support_files.rs"]
-mod support;
+mod common;
 
+use common::client::*;
 use smb_server::ntstatus;
 use smb_server::wire::messages::WriteRequest;
-use support::*;
 use tempfile::tempdir;
 
 const SMB21: u16 = 0x0210;

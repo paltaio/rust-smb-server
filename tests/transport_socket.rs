@@ -1,18 +1,18 @@
 //! Socket options on accepted connections.
 
-#[path = "support_transport.rs"]
-mod support;
+mod common;
 
 use std::time::{Duration, Instant};
 
+use common::start_server;
+use common::transport::{connect_in_session_setup, echo, read_response};
 use smb_server::SmbServer;
 use smb_server::wire::header::Command;
-use support::{connect_in_session_setup, echo, read_response, start};
 use tokio::io::AsyncWriteExt;
 
 #[tokio::test]
 async fn pipelined_responses_are_not_delayed() {
-    let (addr, handle) = start(SmbServer::builder()).await;
+    let (addr, handle) = start_server(SmbServer::builder()).await;
     let mut s = connect_in_session_setup(addr).await;
 
     const ROUNDS: u64 = 10;

@@ -2,21 +2,20 @@
 
 #![cfg(feature = "localfs")]
 
-#[allow(dead_code, reason = "this crate uses part of the shared helpers")]
 mod common;
-#[path = "support_auth.rs"]
-mod support;
 
+use common::auth::*;
+use common::client::{Create, FILE_DIRECTORY_FILE, FILE_READ_ATTRIBUTES};
 use common::{anonymous_session_setup, negotiate, start_server, tree_connect};
+use smb_server::ntstatus::{
+    STATUS_ACCESS_DENIED, STATUS_FILE_CLOSED, STATUS_INVALID_DEVICE_STATE,
+    STATUS_INVALID_PARAMETER, STATUS_NETWORK_NAME_DELETED, STATUS_NOT_SUPPORTED,
+    STATUS_USER_SESSION_DELETED,
+};
 use smb_server::wire::header::Command;
 use smb_server::wire::messages::FileId;
 use smb_server::{LocalFsBackend, Share, SmbServer};
-use support::*;
 use tokio::net::TcpStream;
-
-const STATUS_INVALID_DEVICE_STATE: u32 = 0xC000_0184;
-const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
-const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
 
 struct Conn {
     s: TcpStream,
@@ -56,7 +55,13 @@ impl Conn {
 
     async fn open(&mut self, name: &str, access: u32, options: u32) -> FileId {
         self.mid += 1;
-        let body = create_body(name, access, options);
+        let body = Create {
+            name,
+            access,
+            options,
+            ..Create::default()
+        }
+        .body();
         let frame = request(
             &mut self.s,
             Command::Create,

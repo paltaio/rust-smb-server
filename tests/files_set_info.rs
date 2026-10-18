@@ -1,16 +1,11 @@
 //! SET_INFO request validation.
 
-#[path = "support_files.rs"]
-mod support;
+mod common;
 
+use common::client::*;
 use smb_server::ntstatus;
 use smb_server::wire::messages::FileId;
-use support::*;
 use tempfile::tempdir;
-
-const FILE_STANDARD_INFORMATION: u8 = 5;
-const FILE_LINK_INFORMATION: u8 = 11;
-const SECURITY: u8 = 3;
 
 #[tokio::test]
 async fn set_info_checks_the_open_first_then_the_request() {
@@ -22,7 +17,7 @@ async fn set_info_checks_the_open_first_then_the_request() {
     let bogus = FileId::new(0xBAD, 0xBAD);
 
     assert_eq!(
-        c.set_info_raw(bogus, SECURITY, 0, vec![0; 20]).await,
+        c.set_info_raw(bogus, INFO_SECURITY, 0, vec![0; 20]).await,
         ntstatus::STATUS_FILE_CLOSED
     );
     assert_eq!(
@@ -55,7 +50,7 @@ async fn rename_with_a_root_directory_is_refused() {
     let mut c = server.client().await;
     let f = c.open("f.txt", RW | DELETE, SHARE_ALL).await.unwrap();
 
-    let name = support::common::utf16le("g.txt");
+    let name = common::utf16le("g.txt");
     let mut buf = vec![0u8; 20];
     buf[8] = 5; // RootDirectory
     buf[16..20].copy_from_slice(&(name.len() as u32).to_le_bytes());

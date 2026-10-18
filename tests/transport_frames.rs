@@ -1,21 +1,19 @@
 //! Request frame size limits and queued response memory.
 
-#[allow(dead_code, reason = "only the session helpers are used here")]
 mod common;
-#[path = "support_transport.rs"]
-mod support;
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
 use std::time::Duration;
 
+use common::transport::{
+    ECHO_BODY, WAIT, anonymous_tree, assert_closed, assert_open, compound, connect,
+    connect_in_session_setup, connect_negotiated, open_file, read_body, read_response, with_share,
+};
+use common::{build_header, framed, message, start_server};
+use smb_server::SmbServer;
 use smb_server::ntstatus::STATUS_INVALID_PARAMETER;
 use smb_server::wire::header::{Command, Smb2Header};
-use smb_server::{LocalFsBackend, Share, SmbServer};
-use support::{
-    ECHO_BODY, WAIT, assert_closed, assert_open, connect, connect_in_session_setup,
-    connect_negotiated, framed, header, message, open_file, read_body, read_response, start,
-};
 use tokio::io::AsyncWriteExt;
 
 /// Records the largest single allocation and the bytes in use.
@@ -60,7 +58,7 @@ static MEASURING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[tokio::test]
 async fn frames_longer_than_the_negotiated_limit_close_the_connection() {
-    let (addr, handle) = start(SmbServer::builder()).await;
+    let (addr, handle) = start_server(SmbServer::builder()).await;
     let mut before_negotiate = connect(addr).await;
     before_negotiate
         .write_all(&[0, 0x01, 0x20, 0x00])
@@ -78,12 +76,12 @@ async fn frames_longer_than_the_negotiated_limit_close_the_connection() {
 
 #[tokio::test]
 async fn small_commands_over_68_kib_close_the_connection() {
-    let (addr, handle) = start(SmbServer::builder()).await;
+    let (addr, handle) = start_server(SmbServer::builder()).await;
     let mut s = connect_in_session_setup(addr).await;
 
     let mut body = ECHO_BODY.to_vec();
     body.resize(64 * 1024, 0);
-    let hdr = header(Command::Echo, 2, 0, 0);
+    let hdr = build_header(Command::Echo, 2, 0, 0);
     s.write_all(&framed(&message(&hdr, &body)))
         .await
         .expect("write");
@@ -91,7 +89,7 @@ async fn small_commands_over_68_kib_close_the_connection() {
     assert_eq!(hdr.command, Command::Echo);
 
     body.resize(68 * 1024 + 1, 0);
-    let hdr = header(Command::Echo, 3, 0, 0);
+    let hdr = build_header(Command::Echo, 3, 0, 0);
     s.write_all(&framed(&message(&hdr, &body)))
         .await
         .expect("write");
@@ -102,7 +100,7 @@ async fn small_commands_over_68_kib_close_the_connection() {
 #[tokio::test]
 async fn frame_buffers_grow_with_the_bytes_received() {
     let _measuring = MEASURING.lock().await;
-    let (addr, handle) = start(SmbServer::builder()).await;
+    let (addr, handle) = start_server(SmbServer::builder()).await;
     let mut s = connect_negotiated(addr).await;
 
     LARGEST.store(0, Ordering::Relaxed);
@@ -123,21 +121,14 @@ async fn frame_buffers_grow_with_the_bytes_received() {
 async fn responses_a_peer_does_not_read_stay_bounded() {
     let _measuring = MEASURING.lock().await;
     const MIB: u32 = 1024 * 1024;
-    let td = tempfile::tempdir().expect("tempdir");
-    std::fs::write(td.path().join("f.txt"), vec![0x5A; MIB as usize]).expect("file");
-    let backend = LocalFsBackend::new(td.path()).expect("backend");
-    let builder = SmbServer::builder().share(Share::new("share", backend).public());
-    let (addr, handle) = start(builder).await;
-
-    let mut s = connect(addr).await;
-    common::negotiate(&mut s).await;
-    let session_id = common::anonymous_session_setup(&mut s).await;
-    let tree_id = common::tree_connect(&mut s, "\\\\server\\share", session_id, 3).await;
+    let (builder, _td) = with_share(&[("f.txt", &vec![0x5A; MIB as usize])]);
+    let (addr, handle) = start_server(builder).await;
+    let (mut s, session_id, tree_id) = anonymous_tree(addr).await;
     let file_id = open_file(&mut s, 4, session_id, tree_id, "f.txt").await;
 
     let mut requests = Vec::new();
     for i in 0..64 {
-        let mut hdr = header(Command::Read, 5 + 16 * i, session_id, tree_id);
+        let mut hdr = build_header(Command::Read, 5 + 16 * i, session_id, tree_id);
         hdr.credit_charge = 16;
         hdr.credit_request_response = 16;
         requests.extend_from_slice(&framed(&message(&hdr, &read_body(file_id, MIB))));
@@ -154,39 +145,15 @@ async fn responses_a_peer_does_not_read_stay_bounded() {
     handle.abort();
 }
 
-/// Requests chained into one compound frame, each 8-byte aligned.
-fn compound(messages: &[Vec<u8>]) -> Vec<u8> {
-    let mut out = Vec::new();
-    for (index, msg) in messages.iter().enumerate() {
-        let mut msg = msg.clone();
-        if index + 1 < messages.len() {
-            msg.resize(msg.len().next_multiple_of(8), 0);
-            let next = msg.len() as u32;
-            msg[0x14..0x18].copy_from_slice(&next.to_le_bytes());
-        }
-        out.extend_from_slice(&msg);
-    }
-    framed(&out)
-}
-
 #[tokio::test]
 async fn responses_too_large_for_a_frame_fail_instead_of_wrapping() {
     let _measuring = MEASURING.lock().await;
     const MIB: u32 = 1024 * 1024;
-    let td = tempfile::tempdir().expect("tempdir");
-    std::fs::write(td.path().join("f.txt"), vec![0x5A; 8 * MIB as usize]).expect("file");
-    let backend = LocalFsBackend::new(td.path()).expect("backend");
-    let builder = SmbServer::builder()
-        .max_read_size(8 * MIB)
-        .share(Share::new("share", backend).public());
-    let (addr, handle) = start(builder).await;
-
-    let mut s = connect(addr).await;
-    common::negotiate(&mut s).await;
-    let session_id = common::anonymous_session_setup(&mut s).await;
-    let tree_id = common::tree_connect(&mut s, "\\\\server\\share", session_id, 3).await;
+    let (builder, _td) = with_share(&[("f.txt", &vec![0x5A; 8 * MIB as usize])]);
+    let (addr, handle) = start_server(builder.max_read_size(8 * MIB)).await;
+    let (mut s, session_id, tree_id) = anonymous_tree(addr).await;
     let file_id = open_file(&mut s, 4, session_id, tree_id, "f.txt").await;
-    let mut hdr = header(Command::Echo, 5, 0, 0);
+    let mut hdr = build_header(Command::Echo, 5, 0, 0);
     hdr.credit_request_response = 1024;
     s.write_all(&framed(&message(&hdr, &ECHO_BODY)))
         .await
@@ -195,7 +162,7 @@ async fn responses_too_large_for_a_frame_fail_instead_of_wrapping() {
 
     // Two 8 MiB READs: their responses together exceed 16 MiB - 1.
     let read = |message_id| {
-        let mut hdr = header(Command::Read, message_id, session_id, tree_id);
+        let mut hdr = build_header(Command::Read, message_id, session_id, tree_id);
         hdr.credit_charge = 128;
         message(&hdr, &read_body(file_id, 8 * MIB))
     };
@@ -210,7 +177,7 @@ async fn responses_too_large_for_a_frame_fail_instead_of_wrapping() {
     assert_eq!(second.channel_sequence_status, STATUS_INVALID_PARAMETER);
 
     // The stream is still framed correctly.
-    let echo = header(Command::Echo, 262, 0, 0);
+    let echo = build_header(Command::Echo, 262, 0, 0);
     s.write_all(&framed(&message(&echo, &ECHO_BODY)))
         .await
         .expect("write");

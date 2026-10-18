@@ -2,15 +2,16 @@
 
 mod common;
 
+use common::auth::{Login, spnego_login};
 use common::{
-    STATUS_MORE_PROCESSING_REQUIRED, STATUS_SUCCESS, anonymous_session_setup, build_header,
-    encode_frame, finish_anonymous_session_setup, negotiate, parse_response_header, read_frame,
-    smb2_signature, start_ntlm_session_setup, start_server, tree_connect, user_session_setup,
-    utf16le, write_frame,
+    anonymous_session_setup, build_header, finish_anonymous_session_setup, framed, negotiate,
+    parse_response_header, read_frame, smb2_signature, start_ntlm_session_setup, start_server,
+    tree_connect, tree_connect_body, write_frame,
 };
+use smb_server::ntstatus::{STATUS_MORE_PROCESSING_REQUIRED, STATUS_SUCCESS};
 
 use smb_server::wire::header::{Command, SMB2_FLAGS_SIGNED};
-use smb_server::wire::messages::{FileId, Fsctl, IoctlRequest, IoctlResponse, TreeConnectRequest};
+use smb_server::wire::messages::{FileId, Fsctl, IoctlRequest, IoctlResponse};
 use smb_server::{Access, LocalFsBackend, Share, SmbServer, ntstatus};
 use tempfile::tempdir;
 use tokio::io::AsyncWriteExt;
@@ -136,23 +137,18 @@ async fn smb2_sessions_sign_with_the_session_key() {
     let mut s = TcpStream::connect(addr).await.expect("connect");
     assert_eq!(negotiate(&mut s).await.dialect_revision, 0x0210);
 
-    let (status, session_id, key, resp) = user_session_setup(&mut s, "alice", "password").await;
+    let Login {
+        status,
+        session_id,
+        key,
+        frame: resp,
+    } = spnego_login(&mut s, 1, 0, "alice", "password").await;
     assert_eq!(status, STATUS_SUCCESS);
     assert_ne!(read_u32(&resp, 0x10) & SMB2_FLAGS_SIGNED, 0);
     assert_eq!(resp[48..64], smb2_signature(&resp, &key));
 
     // A TREE_CONNECT signed with the session key is accepted.
-    let path = utf16le("\\\\127.0.0.1\\home");
-    let mut body = Vec::new();
-    TreeConnectRequest {
-        structure_size: 9,
-        flags: 0,
-        path_offset: 64 + 8,
-        path_length: path.len() as u16,
-        path,
-    }
-    .write_to(&mut body)
-    .expect("write tree connect");
+    let body = tree_connect_body("\\\\127.0.0.1\\home");
     let mut hdr = build_header(Command::TreeConnect, 3, session_id, 0);
     hdr.flags |= SMB2_FLAGS_SIGNED;
     let mut msg = Vec::new();
@@ -160,9 +156,7 @@ async fn smb2_sessions_sign_with_the_session_key() {
     msg.extend_from_slice(&body);
     let signature = smb2_signature(&msg, &key);
     msg[48..64].copy_from_slice(&signature);
-    let mut framed = Vec::new();
-    encode_frame(&msg, &mut framed);
-    s.write_all(&framed).await.expect("write");
+    s.write_all(&framed(&msg)).await.expect("write");
     let resp = read_frame(&mut s).await;
     let (rh, _) = parse_response_header(&resp);
     assert_eq!(rh.channel_sequence_status, STATUS_SUCCESS);
@@ -190,7 +184,9 @@ async fn user_names_match_configured_users_ignoring_case() {
     ] {
         let mut s = TcpStream::connect(addr).await.expect("connect");
         negotiate(&mut s).await;
-        let (status, session_id, _, _) = user_session_setup(&mut s, user, "").await;
+        let Login {
+            status, session_id, ..
+        } = spnego_login(&mut s, 1, 0, user, "").await;
         assert_eq!(status, expected, "user {user}");
         if status == STATUS_SUCCESS {
             tree_connect(&mut s, "\\\\127.0.0.1\\g", session_id, 3).await;

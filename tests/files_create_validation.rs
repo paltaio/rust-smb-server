@@ -1,12 +1,11 @@
 //! CREATE request validation.
 
-#[path = "support_files.rs"]
-mod support;
+mod common;
 
+use common::client::*;
 use smb_server::ntstatus;
 use smb_server::wire::header::Command;
 use smb_server::wire::messages::{CreateContext, CreateRequest};
-use support::*;
 use tempfile::tempdir;
 
 fn context(name: &[u8; 4], data: &[u8]) -> Vec<u8> {
@@ -186,8 +185,7 @@ async fn file_ids_are_unique_within_a_session() {
     let mut c = server.client().await;
     let first_tree = c.tree_id;
     let a = c.open("f.txt", FILE_READ_DATA, SHARE_ALL).await.unwrap();
-    c.tree_id =
-        support::common::tree_connect(&mut c.s, "\\\\127.0.0.1\\share", c.session_id, 100).await;
+    c.tree_id = common::tree_connect(&mut c.s, "\\\\127.0.0.1\\share", c.session_id, 100).await;
     assert_ne!(c.tree_id, first_tree);
     let b = c.open("f.txt", FILE_READ_DATA, SHARE_ALL).await.unwrap();
     assert_ne!(a, b);

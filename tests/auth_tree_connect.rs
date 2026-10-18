@@ -2,15 +2,13 @@
 
 #![cfg(feature = "localfs")]
 
-#[allow(dead_code, reason = "this crate uses part of the shared helpers")]
 mod common;
-#[path = "support_auth.rs"]
-mod support;
 
-use common::{anonymous_session_setup, negotiate, start_server};
+use common::auth::*;
+use common::{anonymous_session_setup, negotiate, start_server, tree_connect_body, utf16le};
+use smb_server::ntstatus::{STATUS_BAD_NETWORK_NAME, STATUS_INVALID_PARAMETER};
 use smb_server::wire::header::Command;
 use smb_server::{LocalFsBackend, Share, SmbServer};
-use support::*;
 use tokio::net::TcpStream;
 
 async fn connect() -> (

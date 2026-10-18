@@ -2,15 +2,14 @@
 
 #![cfg(feature = "localfs")]
 
-#[allow(dead_code, reason = "this crate uses part of the shared helpers")]
 mod common;
-#[path = "support_auth.rs"]
-mod support;
 
-use common::{STATUS_MORE_PROCESSING_REQUIRED, negotiate, start_server};
+use common::auth::*;
+use common::{OID_NTLMSSP, negotiate, session_setup_body, smb2_signature, start_server};
+use smb_server::ntstatus::{STATUS_LOGON_FAILURE, STATUS_MORE_PROCESSING_REQUIRED};
+
 use smb_server::wire::header::Command;
 use smb_server::{Access, LocalFsBackend, Share, SmbServer};
-use support::*;
 use tokio::net::TcpStream;
 
 const ACCEPT_COMPLETED: u8 = 0;

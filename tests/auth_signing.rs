@@ -3,16 +3,16 @@
 
 #![cfg(feature = "localfs")]
 
-#[allow(dead_code, reason = "this crate uses part of the shared helpers")]
 mod common;
-#[path = "support_auth.rs"]
-mod support;
 
-use common::{anonymous_session_setup, start_server};
+use common::auth::*;
+use common::{
+    anonymous_session_setup, build_header, negotiate_body, start_server, tree_connect_body,
+};
+use smb_server::ntstatus::STATUS_ACCESS_DENIED;
 use smb_server::wire::header::Command;
 use smb_server::wire::messages::NegotiateResponse;
 use smb_server::{Access, LocalFsBackend, Share, SmbServer, SmbServerBuilder};
-use support::*;
 use tokio::net::TcpStream;
 
 fn builder(td: &tempfile::TempDir) -> SmbServerBuilder {

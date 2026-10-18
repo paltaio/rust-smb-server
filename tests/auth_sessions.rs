@@ -2,17 +2,19 @@
 
 #![cfg(feature = "localfs")]
 
-#[allow(dead_code, reason = "this crate uses part of the shared helpers")]
 mod common;
-#[path = "support_auth.rs"]
-mod support;
 
 use std::net::SocketAddr;
 
-use common::{STATUS_MORE_PROCESSING_REQUIRED, negotiate, start_server};
+use common::auth::*;
+use common::{negotiate, session_setup_body, start_server, tree_connect_body};
+use smb_server::ntstatus::{
+    STATUS_ACCESS_DENIED, STATUS_LOGON_FAILURE, STATUS_MORE_PROCESSING_REQUIRED,
+    STATUS_REQUEST_NOT_ACCEPTED, STATUS_USER_SESSION_DELETED,
+};
+
 use smb_server::wire::header::Command;
 use smb_server::{Access, LocalFsBackend, Share, SmbServer};
-use support::*;
 use tokio::net::TcpStream;
 
 async fn server() -> (SocketAddr, tokio::task::JoinHandle<()>, tempfile::TempDir) {

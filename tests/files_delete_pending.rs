@@ -1,11 +1,10 @@
 //! Delete-pending belongs to the file: it holds until the last open closes.
 
-#[path = "support_files.rs"]
-mod support;
+mod common;
 
+use common::client::*;
 use smb_server::ntstatus;
 use smb_server::wire::messages::FileId;
-use support::*;
 use tempfile::tempdir;
 
 const ACCESS: u32 = RW | DELETE;
@@ -130,8 +129,6 @@ async fn delete_on_close_of_a_read_only_file_leaves_it_whole() {
 
 /// DeletePending as FileStandardInformation and FileAllInformation report it.
 async fn reported_delete_pending(c: &mut Client, file_id: FileId) -> (bool, bool) {
-    const FILE_STANDARD_INFORMATION: u8 = 0x05;
-    const FILE_ALL_INFORMATION: u8 = 0x12;
     let standard = c
         .query_file_info(file_id, FILE_STANDARD_INFORMATION)
         .await

@@ -1,10 +1,9 @@
 //! The per-connection open limit.
 
-#[path = "support_files.rs"]
-mod support;
+mod common;
 
+use common::client::*;
 use smb_server::ntstatus;
-use support::*;
 use tempfile::tempdir;
 
 #[tokio::test]

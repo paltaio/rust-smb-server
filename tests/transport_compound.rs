@@ -1,17 +1,16 @@
 //! Related compounded requests.
 
-#[allow(dead_code, reason = "only the session helpers are used here")]
 mod common;
-#[path = "support_transport.rs"]
-mod support;
 
+use common::transport::{
+    ECHO_BODY, anonymous_session, compound, create_body, read_response, with_share,
+};
+use common::{build_header, message, start_server, tree_connect_body};
 use smb_server::ntstatus::{
     STATUS_INVALID_HANDLE, STATUS_INVALID_PARAMETER, STATUS_OBJECT_NAME_NOT_FOUND,
 };
 use smb_server::wire::header::{Command, SMB2_FLAGS_RELATED_OPERATIONS, Smb2Header};
-use smb_server::wire::messages::{CloseRequest, FileId, QueryInfoRequest, TreeConnectRequest};
-use smb_server::{LocalFsBackend, Share, SmbServer};
-use support::{ECHO_BODY, connect, create_body, framed, header, message, read_response, start};
+use smb_server::wire::messages::{CloseRequest, FileId, QueryInfoRequest};
 use tempfile::TempDir;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
@@ -21,19 +20,14 @@ const RELATED_FILE_ID: FileId = FileId::new(u64::MAX, u64::MAX);
 /// Server with a public share holding `f.txt`, and an anonymous session
 /// on it; the next free MessageId is 3.
 async fn session() -> (TcpStream, u64, TempDir, tokio::task::JoinHandle<()>) {
-    let td = tempfile::tempdir().expect("tempdir");
-    std::fs::write(td.path().join("f.txt"), b"data").expect("file");
-    let backend = LocalFsBackend::new(td.path()).expect("backend");
-    let (addr, handle) =
-        start(SmbServer::builder().share(Share::new("share", backend).public())).await;
-    let mut s = connect(addr).await;
-    common::negotiate(&mut s).await;
-    let session_id = common::anonymous_session_setup(&mut s).await;
+    let (builder, td) = with_share(&[("f.txt", b"data")]);
+    let (addr, handle) = start_server(builder).await;
+    let (s, session_id) = anonymous_session(addr).await;
     (s, session_id, td, handle)
 }
 
 fn related(command: Command, message_id: u64, body: &[u8]) -> Vec<u8> {
-    let mut hdr = header(command, message_id, u64::MAX, u32::MAX);
+    let mut hdr = build_header(command, message_id, u64::MAX, u32::MAX);
     hdr.flags |= SMB2_FLAGS_RELATED_OPERATIONS;
     message(&hdr, body)
 }
@@ -71,21 +65,6 @@ fn close_body() -> Vec<u8> {
     body
 }
 
-/// Requests chained into one compound frame, each 8-byte aligned.
-fn compound(messages: &[Vec<u8>]) -> Vec<u8> {
-    let mut out = Vec::new();
-    for (index, msg) in messages.iter().enumerate() {
-        let mut msg = msg.clone();
-        if index + 1 < messages.len() {
-            msg.resize(msg.len().next_multiple_of(8), 0);
-            let next = msg.len() as u32;
-            msg[0x14..0x18].copy_from_slice(&next.to_le_bytes());
-        }
-        out.extend_from_slice(&msg);
-    }
-    framed(&out)
-}
-
 /// Header of each response in a compound response.
 async fn responses(s: &mut TcpStream) -> Vec<Smb2Header> {
     let (_, frame) = read_response(s).await;
@@ -114,7 +93,10 @@ async fn a_failed_create_fails_the_requests_that_use_its_file() {
     let mut create = create_body("missing.txt");
     // FILE_OPEN
     create[36..40].copy_from_slice(&1u32.to_le_bytes());
-    let first = message(&header(Command::Create, 4, session_id, tree_id), &create);
+    let first = message(
+        &build_header(Command::Create, 4, session_id, tree_id),
+        &create,
+    );
     s.write_all(&compound(&[
         first,
         related(Command::QueryInfo, 5, &query_info_body()),
@@ -133,22 +115,9 @@ async fn a_failed_create_fails_the_requests_that_use_its_file() {
 async fn a_related_request_uses_the_tree_a_tree_connect_created() {
     let (mut s, session_id, _td, handle) = session().await;
 
-    let path: Vec<u8> = "\\\\server\\share"
-        .encode_utf16()
-        .flat_map(u16::to_le_bytes)
-        .collect();
-    let mut tree_connect = Vec::new();
-    TreeConnectRequest {
-        structure_size: 9,
-        flags: 0,
-        path_offset: 64 + 8,
-        path_length: path.len() as u16,
-        path,
-    }
-    .write_to(&mut tree_connect)
-    .expect("tree connect");
+    let tree_connect = tree_connect_body("\\\\server\\share");
     let first = message(
-        &header(Command::TreeConnect, 3, session_id, 0),
+        &build_header(Command::TreeConnect, 3, session_id, 0),
         &tree_connect,
     );
     s.write_all(&compound(&[
@@ -186,7 +155,10 @@ async fn a_chain_that_starts_related_fails() {
 async fn a_related_request_needs_a_file_from_the_one_before() {
     let (mut s, session_id, _td, handle) = session().await;
     let tree_id = common::tree_connect(&mut s, "\\\\server\\share", session_id, 3).await;
-    let first = message(&header(Command::Echo, 4, session_id, tree_id), &ECHO_BODY);
+    let first = message(
+        &build_header(Command::Echo, 4, session_id, tree_id),
+        &ECHO_BODY,
+    );
     s.write_all(&compound(&[
         first,
         related(Command::QueryInfo, 5, &query_info_body()),

@@ -1,11 +1,10 @@
 //! Byte-range locks across opens and connections.
 
-#[path = "support_files.rs"]
-mod support;
+mod common;
 
+use common::client::*;
 use smb_server::ntstatus;
 use smb_server::wire::messages::FileId;
-use support::*;
 use tempfile::tempdir;
 
 const EX_NOW: u32 = LOCK_EXCLUSIVE | LOCK_FAIL_IMMEDIATELY;
