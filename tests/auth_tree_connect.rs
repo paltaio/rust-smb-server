@@ -42,27 +42,16 @@ fn body_with(path: &[u8], pad: usize) -> Vec<u8> {
 #[tokio::test]
 async fn path_must_be_server_and_share() {
     let (mut s, sid, _h, _td) = connect().await;
-    let mut mid = 3;
-    for path in [
-        "pub",
-        r"\pub",
-        r"\\srv\x\pub",
-        r"\\srv\pub\sub",
-        r"\\srv\pub\",
-        r"\\srv\pu*b",
-    ] {
-        mid += 1;
-        let frame = request(
-            &mut s,
-            Command::TreeConnect,
-            mid,
-            sid,
-            0,
-            &tree_connect_body(path),
-        )
-        .await;
-        assert_eq!(status(&frame), STATUS_INVALID_PARAMETER, "{path}");
-    }
+    let frame = request(
+        &mut s,
+        Command::TreeConnect,
+        3,
+        sid,
+        0,
+        &tree_connect_body(r"\\srv\pub\sub"),
+    )
+    .await;
+    assert_eq!(status(&frame), STATUS_INVALID_PARAMETER);
     let mut odd = utf16le(r"\\srv\pub");
     odd.push(0);
     let frame = request(

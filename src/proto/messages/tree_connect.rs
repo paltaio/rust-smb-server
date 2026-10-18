@@ -4,6 +4,8 @@ use binrw::{BinRead, BinWrite, binrw};
 use std::io::Cursor;
 
 use crate::proto::error::ProtoResult;
+use crate::proto::header::SMB2_HEADER_LEN;
+use crate::utils::utf16le_to_units;
 
 /// SMB2_TREE_CONNECT_REQUEST (MS-SMB2 §2.2.9).
 ///
@@ -36,15 +38,7 @@ impl TreeConnectRequest {
     /// Decode the UTF-16LE share path into a `String`. Returns `None` if the
     /// stored bytes are not an even length (malformed UTF-16LE).
     pub fn path_str(&self) -> Option<String> {
-        if !self.path.len().is_multiple_of(2) {
-            return None;
-        }
-        let units: Vec<u16> = self
-            .path
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
-            .collect();
-        Some(String::from_utf16_lossy(&units))
+        utf16le_to_units(&self.path).map(|units| String::from_utf16_lossy(&units))
     }
 
     /// The share path bytes in `body`, the request after the SMB2 header,
@@ -73,7 +67,6 @@ impl TreeConnectRequest {
 
 /// Size of the fixed part of a TREE_CONNECT request, before Buffer.
 const FIXED_LEN: usize = 8;
-const SMB2_HEADER_LEN: usize = 64;
 
 /// SMB2_TREE_CONNECT_RESPONSE (MS-SMB2 §2.2.10).
 #[binrw]

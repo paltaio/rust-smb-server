@@ -9,13 +9,11 @@ mod support;
 
 use std::net::SocketAddr;
 
-use common::{negotiate, start_server};
+use common::{STATUS_MORE_PROCESSING_REQUIRED, negotiate, start_server};
 use smb_server::wire::header::Command;
 use smb_server::{Access, LocalFsBackend, Share, SmbServer};
 use support::*;
 use tokio::net::TcpStream;
-
-const MORE_PROCESSING: u32 = 0xC000_0016;
 
 async fn server() -> (SocketAddr, tokio::task::JoinHandle<()>, tempfile::TempDir) {
     let td = tempfile::tempdir().expect("tempdir");
@@ -107,7 +105,7 @@ async fn reauthentication_keeps_the_session_and_its_trees() {
     let negotiate_msg = ntlm_negotiate(CLIENT_FLAGS);
     let body = session_setup_body(&negotiate_msg, 0, 1, 0);
     let frame = request(&mut s, Command::SessionSetup, 4, sid, 0, &body).await;
-    assert_eq!(status(&frame), MORE_PROCESSING);
+    assert_eq!(status(&frame), STATUS_MORE_PROCESSING_REQUIRED);
     assert_eq!(response_session_id(&frame), sid);
 
     let login = login_with(&mut s, 5, sid, "alice", "password", LoginOptions::default()).await;

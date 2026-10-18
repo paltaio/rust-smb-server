@@ -326,7 +326,14 @@ mod tests {
     #[tokio::test]
     async fn validate_negotiate_info_on_smb311_requests_a_disconnect() {
         let (server, conn) = connection(Dialect::Smb311).await;
-        let body = validate_body(0x44, GUID, 0x0001, &DIALECTS, 24);
+        let dialects = [0x0300, 0x0302, 0x0311];
+        conn.client_negotiate
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .dialects = dialects.to_vec();
+        let body = validate_body(0x44, GUID, 0x0001, &dialects, 24);
         handle(&server, &conn, &header(), &body).await;
         assert!(conn.disconnect_requested());
     }

@@ -198,12 +198,27 @@ mod tests {
         assert_eq!(payload_size(Command::Read, &body), 0x10_0000);
         assert_eq!(payload_size(Command::Write, &body), 0x10_0000);
         assert_eq!(payload_size(Command::QueryInfo, &body), 0x10_0000);
+        assert_eq!(payload_size(Command::ChangeNotify, &body), 0x10_0000);
+        assert_eq!(payload_size(Command::SetInfo, &body), 0x10_0000);
         assert_eq!(payload_size(Command::Echo, &body), 0);
+
+        let mut query_info = vec![0u8; 56];
+        query_info[12..16].copy_from_slice(&0x20_0000u32.to_le_bytes());
+        assert_eq!(payload_size(Command::QueryInfo, &query_info), 0x20_0000);
+
+        let mut query_directory = vec![0u8; 56];
+        query_directory[28..32].copy_from_slice(&0x30_0000u32.to_le_bytes());
+        assert_eq!(
+            payload_size(Command::QueryDirectory, &query_directory),
+            0x30_0000
+        );
 
         let mut ioctl = vec![0u8; 56];
         ioctl[28..32].copy_from_slice(&100u32.to_le_bytes());
         ioctl[44..48].copy_from_slice(&70_000u32.to_le_bytes());
         assert_eq!(payload_size(Command::Ioctl, &ioctl), 70_000);
+        ioctl[40..44].copy_from_slice(&80_000u32.to_le_bytes());
+        assert_eq!(payload_size(Command::Ioctl, &ioctl), 80_100);
         assert_eq!(payload_size(Command::Ioctl, &ioctl[..10]), 0);
     }
 

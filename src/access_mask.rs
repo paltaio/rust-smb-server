@@ -4,6 +4,8 @@
 use crate::builder::Access;
 
 pub const FILE_READ_DATA: u32 = 0x0000_0001;
+/// FILE_LIST_DIRECTORY shares its bit with FILE_READ_DATA.
+pub const FILE_LIST_DIRECTORY: u32 = FILE_READ_DATA;
 pub const FILE_WRITE_DATA: u32 = 0x0000_0002;
 pub const FILE_APPEND_DATA: u32 = 0x0000_0004;
 pub const FILE_EXECUTE: u32 = 0x0000_0020;

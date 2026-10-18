@@ -33,7 +33,7 @@ pub const NTLM_128: u32 = 0x2000_0000;
 pub const NTLM_KEY_EXCH: u32 = 0x4000_0000;
 pub const NTLM_56: u32 = 0x8000_0000;
 
-/// The flags a current Windows or Samba client sends.
+/// NTLMv2 client flags with signing, key exchange, 128-bit keys and TargetInfo.
 pub const CLIENT_FLAGS: u32 = NTLM_UNICODE
     | NTLM_REQUEST_TARGET
     | NTLM_SIGN

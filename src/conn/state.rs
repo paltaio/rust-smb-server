@@ -2,7 +2,7 @@
 //! connection's lifetime.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::proto::auth::ntlm::{Identity, NtlmServer};
@@ -58,7 +58,7 @@ pub struct Connection {
     pub session_preauth: RwLock<HashMap<u64, PreauthIntegrity>>,
 
     /// Set when the connection must close without sending a reply.
-    disconnect: std::sync::atomic::AtomicBool,
+    disconnect: AtomicBool,
 
     /// Connection.CommandSequenceWindow: the MessageIds the client may use.
     pub credits: Mutex<crate::conn::credits::CreditWindow>,
@@ -92,7 +92,7 @@ impl Connection {
             sessions: RwLock::new(HashMap::new()),
             pending_auths: RwLock::new(HashMap::new()),
             session_preauth: RwLock::new(HashMap::new()),
-            disconnect: std::sync::atomic::AtomicBool::new(false),
+            disconnect: AtomicBool::new(false),
             credits: Mutex::new(crate::conn::credits::CreditWindow::new()),
             pending_auth_started: Mutex::new(HashMap::new()),
             client_negotiate: Mutex::new(None),
@@ -104,13 +104,12 @@ impl Connection {
 
     /// Close the connection after the current request, without a reply.
     pub fn request_disconnect(&self) {
-        self.disconnect
-            .store(true, std::sync::atomic::Ordering::Release);
+        self.disconnect.store(true, Ordering::Release);
     }
 
     /// True once a handler has asked to close the connection.
     pub fn disconnect_requested(&self) -> bool {
-        self.disconnect.load(std::sync::atomic::Ordering::Acquire)
+        self.disconnect.load(Ordering::Acquire)
     }
 
     pub async fn close_session(&self, session_id: u64) -> bool {

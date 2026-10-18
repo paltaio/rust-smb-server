@@ -356,7 +356,6 @@ pub fn build_challenge(p: &ChallengeParams<'_>) -> Vec<u8> {
 #[derive(Debug, Clone)]
 pub struct NtlmAuthenticate {
     pub flags: u32,
-    #[allow(dead_code)]
     pub lm_response: Vec<u8>,
     pub nt_response: Vec<u8>,
     pub domain: String,
@@ -879,8 +878,99 @@ impl NtlmServer {
 // Tests
 // ===========================================================================
 
+/// Hand-built NTLM AUTHENTICATE_MESSAGEs for tests.
+#[cfg(test)]
+pub(crate) mod testing {
+    use super::*;
+
+    pub(crate) const CHALLENGE: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef];
+
+    pub(crate) fn hmac_md5(key: &[u8], parts: &[&[u8]]) -> [u8; 16] {
+        let mut mac = HmacMd5::new_from_slice(key).unwrap();
+        for part in parts {
+            mac.update(part);
+        }
+        mac.finalize().into_bytes().into()
+    }
+
+    /// Fields of a hand-built AUTHENTICATE_MESSAGE.
+    pub(crate) struct AuthMsg<'a> {
+        pub(crate) user: &'a str,
+        pub(crate) password: &'a str,
+        pub(crate) flags: u32,
+        /// `MsvAvFlags` value to put in the NTLMv2 response.
+        pub(crate) av_flags: Option<u32>,
+        /// Leave room for a MIC at offset 72.
+        pub(crate) mic_field: bool,
+        pub(crate) lm: &'a [u8],
+        pub(crate) nt: Option<&'a [u8]>,
+        pub(crate) encrypted_key: &'a [u8],
+        /// ServerChallenge the response answers.
+        pub(crate) challenge: [u8; 8],
+    }
+
+    impl Default for AuthMsg<'_> {
+        fn default() -> Self {
+            Self {
+                user: "User",
+                password: "Password",
+                flags: flags::NTLMSSP_NEGOTIATE_UNICODE,
+                av_flags: None,
+                mic_field: false,
+                lm: &[],
+                nt: None,
+                encrypted_key: &[],
+                challenge: CHALLENGE,
+            }
+        }
+    }
+
+    /// The message and the KeyExchangeKey the server derives from it.
+    pub(crate) fn build_auth(m: &AuthMsg<'_>) -> (Vec<u8>, [u8; 16]) {
+        let key_nt = ntowf_v2(&nt_hash(m.password), m.user, "");
+        let mut blob = vec![1, 1, 0, 0, 0, 0, 0, 0];
+        blob.extend_from_slice(&[0; 8]);
+        blob.extend_from_slice(&[0xAA; 8]);
+        blob.extend_from_slice(&[0; 4]);
+        if let Some(av) = m.av_flags {
+            blob.extend_from_slice(&encode_av_pairs(&[AvPair::new(
+                AvId::Flags,
+                av.to_le_bytes().to_vec(),
+            )]));
+        } else {
+            blob.extend_from_slice(&encode_av_pairs(&[]));
+        }
+        let proof = hmac_md5(&key_nt, &[&m.challenge, &blob]);
+        let key_exchange_key = hmac_md5(&key_nt, &[&proof]);
+        let nt =
+            m.nt.map_or_else(|| [&proof[..], &blob].concat(), <[u8]>::to_vec);
+
+        let user = utf16le(m.user);
+        let fields: [&[u8]; 6] = [m.lm, &nt, &[], &user, &[], m.encrypted_key];
+        let header_len = if m.mic_field { 88u32 } else { 72 };
+        let mut msg = NTLMSSP_SIGNATURE.to_vec();
+        msg.extend_from_slice(&MSG_AUTHENTICATE.to_le_bytes());
+        let mut payload = Vec::new();
+        for field in fields {
+            let offset = header_len + payload.len() as u32;
+            msg.extend_from_slice(&(field.len() as u16).to_le_bytes());
+            msg.extend_from_slice(&(field.len() as u16).to_le_bytes());
+            msg.extend_from_slice(&offset.to_le_bytes());
+            payload.extend_from_slice(field);
+        }
+        msg.extend_from_slice(&m.flags.to_le_bytes());
+        msg.extend_from_slice(&[0u8; 8]);
+        if m.mic_field {
+            msg.extend_from_slice(&[0u8; 16]);
+        }
+        msg.extend_from_slice(&payload);
+        (msg, key_exchange_key)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::testing::*;
     use super::*;
 
     #[test]
@@ -1186,45 +1276,6 @@ mod tests {
         assert_eq!(outcome.session_key, [0u8; 16]);
     }
 
-    fn hmac_md5(key: &[u8], parts: &[&[u8]]) -> [u8; 16] {
-        let mut mac = HmacMd5::new_from_slice(key).unwrap();
-        for part in parts {
-            mac.update(part);
-        }
-        mac.finalize().into_bytes().into()
-    }
-
-    /// Fields of a hand-built AUTHENTICATE_MESSAGE.
-    struct AuthMsg<'a> {
-        user: &'a str,
-        password: &'a str,
-        flags: u32,
-        /// `MsvAvFlags` value to put in the NTLMv2 response.
-        av_flags: Option<u32>,
-        /// Leave room for a MIC at offset 72.
-        mic_field: bool,
-        lm: &'a [u8],
-        nt: Option<&'a [u8]>,
-        encrypted_key: &'a [u8],
-    }
-
-    impl Default for AuthMsg<'_> {
-        fn default() -> Self {
-            Self {
-                user: "User",
-                password: "Password",
-                flags: flags::NTLMSSP_NEGOTIATE_UNICODE,
-                av_flags: None,
-                mic_field: false,
-                lm: &[],
-                nt: None,
-                encrypted_key: &[],
-            }
-        }
-    }
-
-    const CHALLENGE: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef];
-
     fn server() -> NtlmServer {
         let mut srv = NtlmServer::new(
             CHALLENGE,
@@ -1238,48 +1289,6 @@ mod tests {
         srv.step1_negotiate(&negotiate).unwrap();
         srv.challenge();
         srv
-    }
-
-    /// The message and the KeyExchangeKey the server derives from it.
-    fn build_auth(m: &AuthMsg<'_>) -> (Vec<u8>, [u8; 16]) {
-        let key_nt = ntowf_v2(&nt_hash(m.password), m.user, "");
-        let mut blob = vec![1, 1, 0, 0, 0, 0, 0, 0];
-        blob.extend_from_slice(&[0; 8]);
-        blob.extend_from_slice(&[0xAA; 8]);
-        blob.extend_from_slice(&[0; 4]);
-        if let Some(av) = m.av_flags {
-            blob.extend_from_slice(&encode_av_pairs(&[AvPair::new(
-                AvId::Flags,
-                av.to_le_bytes().to_vec(),
-            )]));
-        } else {
-            blob.extend_from_slice(&encode_av_pairs(&[]));
-        }
-        let proof = hmac_md5(&key_nt, &[&CHALLENGE, &blob]);
-        let key_exchange_key = hmac_md5(&key_nt, &[&proof]);
-        let nt =
-            m.nt.map_or_else(|| [&proof[..], &blob].concat(), <[u8]>::to_vec);
-
-        let user = utf16le(m.user);
-        let fields: [&[u8]; 6] = [m.lm, &nt, &[], &user, &[], m.encrypted_key];
-        let header_len = if m.mic_field { 88u32 } else { 72 };
-        let mut msg = NTLMSSP_SIGNATURE.to_vec();
-        msg.extend_from_slice(&MSG_AUTHENTICATE.to_le_bytes());
-        let mut payload = Vec::new();
-        for field in fields {
-            let offset = header_len + payload.len() as u32;
-            msg.extend_from_slice(&(field.len() as u16).to_le_bytes());
-            msg.extend_from_slice(&(field.len() as u16).to_le_bytes());
-            msg.extend_from_slice(&offset.to_le_bytes());
-            payload.extend_from_slice(field);
-        }
-        msg.extend_from_slice(&m.flags.to_le_bytes());
-        msg.extend_from_slice(&[0u8; 8]);
-        if m.mic_field {
-            msg.extend_from_slice(&[0u8; 16]);
-        }
-        msg.extend_from_slice(&payload);
-        (msg, key_exchange_key)
     }
 
     fn sign_mic(srv: &NtlmServer, msg: &mut [u8], key: &[u8; 16]) {

@@ -7,7 +7,9 @@ use tokio::net::TcpStream;
 use tracing::{debug, error, info};
 
 /// Sets TCP_NODELAY and, when `keepalive` is set, TCP keepalive with that
-/// idle time and probes 10 seconds apart on an accepted connection.
+/// idle time on an accepted connection. On Linux, Android, FreeBSD, NetBSD,
+/// macOS, iOS and Windows the probes are 10 seconds apart; elsewhere the
+/// system default applies.
 pub fn configure_socket(stream: &TcpStream, keepalive: Option<Duration>) {
     if let Err(e) = stream.set_nodelay(true) {
         debug!(error = %e, "set TCP_NODELAY failed");

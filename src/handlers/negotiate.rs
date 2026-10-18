@@ -19,9 +19,7 @@ use crate::ntstatus;
 use crate::server::ServerState;
 use crate::utils::{fill_random, now_filetime};
 
-// MS-SMB2 2.2.4 SecurityMode bits. SIGNING_REQUIRED is set only when the
-// server requires signing: anonymous Linux cifs mounts do not send enough
-// NTLM material for the server to derive matching SMB3 signing keys.
+// MS-SMB2 2.2.4 SecurityMode bits.
 const SIGNING_ENABLED: u16 = 0x0001;
 const SIGNING_REQUIRED: u16 = 0x0002;
 

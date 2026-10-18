@@ -5,6 +5,7 @@ use std::sync::Arc;
 use crate::proto::header::Smb2Header;
 use crate::proto::messages::{FileInfoClass, QueryDirectoryRequest, QueryDirectoryResponse};
 
+use crate::access_mask::FILE_LIST_DIRECTORY;
 use crate::backend::{DirEntry, FileInfo, OpenIntent, OpenOptions, ShareBackend};
 use crate::conn::state::{Connection, DirCursor, Open};
 use crate::dispatch::HandlerResponse;
@@ -15,8 +16,6 @@ use crate::path::is_valid_pattern;
 use crate::server::ServerState;
 use crate::utils::utf16le_to_units;
 use crate::wildcard::Pattern;
-
-const FILE_LIST_DIRECTORY: u32 = 0x0000_0001;
 
 /// Classes MS-SMB2 3.3.5.18 lists that this server does not encode:
 /// FileIdExtdDirectoryInformation, FileId64ExtdDirectoryInformation,

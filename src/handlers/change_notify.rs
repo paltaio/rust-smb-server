@@ -6,15 +6,12 @@ use std::sync::Arc;
 use crate::proto::header::Smb2Header;
 use crate::proto::messages::ChangeNotifyRequest;
 
-use crate::access_mask::FILE_READ_DATA;
+use crate::access_mask::FILE_LIST_DIRECTORY;
 use crate::conn::state::Connection;
 use crate::dispatch::HandlerResponse;
 use crate::handlers::shared::{lookup_open, lookup_session_tree};
 use crate::ntstatus;
 use crate::server::ServerState;
-
-/// FILE_LIST_DIRECTORY shares its bit with FILE_READ_DATA.
-const FILE_LIST_DIRECTORY: u32 = FILE_READ_DATA;
 
 pub async fn handle(
     _server: &Arc<ServerState>,

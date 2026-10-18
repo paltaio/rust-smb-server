@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use crate::proto::auth::ntlm::{
-    AuthOutcome, Direction, Identity, NtlmAuthenticate, NtlmMac, NtlmServer, NtlmTargetInfo,
-    UserCreds,
+    AuthOutcome, Direction, Identity, NTLMSSP_SIGNATURE, NtlmAuthenticate, NtlmMac, NtlmServer,
+    NtlmTargetInfo, UserCreds,
 };
 use crate::proto::auth::spnego::{
     NegState, NegTokenInit, OID_NTLMSSP, decode_init_token, decode_resp_token, encode_resp_token,
@@ -22,13 +22,10 @@ use crate::ntstatus;
 use crate::server::ServerState;
 use crate::utils::{fill_random, now_filetime};
 
-const NTLMSSP_MAGIC: &[u8] = b"NTLMSSP\0";
-
 /// A SESSION_SETUP security token, by form.
 enum Token {
     /// Raw NTLMSSP. RFC 4178 section 4.2.1 lets the client skip SPNEGO once
-    /// the mechanism is settled; Win11 reauth and Linux cifs.ko use this
-    /// form.
+    /// the mechanism is settled.
     Raw { msg_type: u32, ntlm: Vec<u8> },
     /// GSS-API NegTokenInit (starts with 0x60).
     Init(NegTokenInit),
@@ -41,7 +38,7 @@ enum Token {
 
 impl Token {
     fn decode(blob: &[u8]) -> Result<Self, u32> {
-        if blob.starts_with(NTLMSSP_MAGIC) {
+        if blob.starts_with(NTLMSSP_SIGNATURE) {
             let msg_type = blob
                 .get(8..12)
                 .map_or(0, |t| u32::from_le_bytes([t[0], t[1], t[2], t[3]]));
@@ -392,7 +389,6 @@ async fn continue_exchange(
     } else {
         0
     };
-    // Empty buffer for raw NTLMSSP path; SPNEGO accept-completed for SPNEGO.
     let success_buf: Vec<u8> = if raw_form {
         Vec::new()
     } else {
@@ -405,8 +401,7 @@ async fn continue_exchange(
         status: ntstatus::STATUS_SUCCESS,
         override_tree_id: None,
         override_session_id: Some(sid),
-        // Anonymous responses are not signed (no key). Signed responses for
-        // authenticated sessions get signed by the dispatcher's normal path.
+        // Anonymous sessions have no key; the dispatcher signs the rest.
         skip_signing: anonymous,
         take_preauth_snapshot_for_session: None,
     };
@@ -676,9 +671,8 @@ mod tests {
         assert!(configured_user(&users, "carol").is_none());
     }
 
-    use crate::proto::auth::ntlm::{nt_hash, ntowf_v2, utf16le};
+    use crate::proto::auth::ntlm::testing::{AuthMsg, build_auth};
     use crate::proto::header::{Command, HeaderTail};
-    use hmac::{Hmac, Mac};
     use std::time::Duration;
 
     fn header(session_id: u64) -> Smb2Header {
@@ -715,45 +709,23 @@ mod tests {
     }
 
     fn ntlm_negotiate() -> Vec<u8> {
-        let mut msg = b"NTLMSSP\0".to_vec();
+        let mut msg = NTLMSSP_SIGNATURE.to_vec();
         msg.extend_from_slice(&1u32.to_le_bytes());
         msg.extend_from_slice(&0x0008_0201u32.to_le_bytes());
         msg.extend_from_slice(&[0u8; 16]);
         msg
     }
 
-    /// NTLMv2 AUTHENTICATE_MESSAGE without a MIC or key exchange.
+    /// NTLMv2 AUTHENTICATE_MESSAGE answering the CHALLENGE_MESSAGE
+    /// `challenge`, without a MIC or key exchange.
     fn ntlm_authenticate(challenge: &[u8], user: &str, password: &str) -> Vec<u8> {
-        let hmac = |key: &[u8], parts: &[&[u8]]| -> [u8; 16] {
-            let mut mac = Hmac::<md5::Md5>::new_from_slice(key).unwrap();
-            for p in parts {
-                mac.update(p);
-            }
-            mac.finalize().into_bytes().into()
+        let m = AuthMsg {
+            user,
+            password,
+            challenge: challenge[24..32].try_into().unwrap(),
+            ..AuthMsg::default()
         };
-        let key = ntowf_v2(&nt_hash(password), user, "");
-        let mut blob = vec![1, 1, 0, 0, 0, 0, 0, 0];
-        blob.extend_from_slice(&[0; 8]);
-        blob.extend_from_slice(&[0xAA; 8]);
-        blob.extend_from_slice(&[0; 8]);
-        let proof = hmac(&key, &[&challenge[24..32], &blob]);
-        let nt = [&proof[..], &blob].concat();
-        let user = utf16le(user);
-        let fields: [&[u8]; 6] = [&[], &nt, &[], &user, &[], &[]];
-        let mut msg = b"NTLMSSP\0".to_vec();
-        msg.extend_from_slice(&3u32.to_le_bytes());
-        let mut payload = Vec::new();
-        for field in fields {
-            let offset = 72 + payload.len() as u32;
-            msg.extend_from_slice(&(field.len() as u16).to_le_bytes());
-            msg.extend_from_slice(&(field.len() as u16).to_le_bytes());
-            msg.extend_from_slice(&offset.to_le_bytes());
-            payload.extend_from_slice(field);
-        }
-        msg.extend_from_slice(&1u32.to_le_bytes());
-        msg.extend_from_slice(&[0u8; 8]);
-        msg.extend_from_slice(&payload);
-        msg
+        build_auth(&m).0
     }
 
     fn server(builder: crate::SmbServerBuilder) -> crate::SmbServer {

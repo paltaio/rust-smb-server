@@ -14,6 +14,7 @@ use crate::dispatch::HandlerResponse;
 use crate::handlers::shared::lookup_session;
 use crate::ntstatus;
 use crate::server::{ServerState, ShareMode};
+use crate::utils::utf16le_to_units;
 
 const SHARE_TYPE_DISK: u8 = 0x01;
 const SHARE_TYPE_PIPE: u8 = 0x02;
@@ -48,7 +49,11 @@ pub async fn handle(
         Ok(r) => r,
         Err(_) => return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER),
     };
-    let Some(path) = req.path_in(body).and_then(utf16_string) else {
+    let Some(path) = req
+        .path_in(body)
+        .and_then(utf16le_to_units)
+        .map(|units| String::from_utf16_lossy(&units))
+    else {
         return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
     };
     tracing::debug!(?path, "tree connect path");
@@ -127,17 +132,6 @@ pub async fn handle(
     let mut hr = HandlerResponse::ok(buf);
     hr.override_tree_id = Some(tree_id);
     hr
-}
-
-fn utf16_string(bytes: &[u8]) -> Option<String> {
-    if !bytes.len().is_multiple_of(2) {
-        return None;
-    }
-    let units: Vec<u16> = bytes
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
-        .collect();
-    Some(String::from_utf16_lossy(&units))
 }
 
 /// The share component of a `\\server\share` path (MS-SMB2 2.2.9), or

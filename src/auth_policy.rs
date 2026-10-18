@@ -1,5 +1,6 @@
-//! Server-wide logon policy: signing, per-connection session and tree
-//! limits, the failed-logon throttle, and SessionId allocation.
+//! Server-wide logon policy: signing, the per-connection session limit and
+//! per-session tree limit, the failed-logon throttle, and SessionId
+//! allocation.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -8,6 +9,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// Most user names and addresses the failed-logon throttle tracks at once.
+/// A new entry past this drops the oldest one that is not locked out; while
+/// every entry is locked out, new failures go uncounted.
 const THROTTLE_CAPACITY: usize = 4096;
 
 /// A source address is locked out after this many times
@@ -63,6 +66,14 @@ struct Failures {
     last: Instant,
 }
 
+impl Failures {
+    /// True while the count has reached `limit` and the last failure is
+    /// under `lockout` old.
+    fn locked_out(&self, limit: u32, lockout: Duration, now: Instant) -> bool {
+        self.count >= limit && now.duration_since(self.last) < lockout
+    }
+}
+
 impl AuthPolicy {
     pub fn new(settings: AuthSettings) -> Self {
         Self {
@@ -87,15 +98,23 @@ impl AuthPolicy {
             return false;
         }
         let failures = self.lock_failures();
-        let locked = |key: ThrottleKey, max: u32| {
+        let now = Instant::now();
+        let locked = |key: ThrottleKey| {
             failures
                 .get(&key)
-                .is_some_and(|f| f.count >= max && f.last.elapsed() < self.settings.lockout)
+                .is_some_and(|f| f.locked_out(self.limit(&key), self.settings.lockout, now))
         };
-        (!user.is_empty() && locked(user_key(user), max))
-            || addr.is_some_and(|addr| {
-                locked(addr_key(addr), max.saturating_mul(ADDRESS_FAILURE_FACTOR))
-            })
+        (!user.is_empty() && locked(user_key(user)))
+            || addr.is_some_and(|addr| locked(addr_key(addr)))
+    }
+
+    /// Failures that lock `key` out.
+    fn limit(&self, key: &ThrottleKey) -> u32 {
+        let max = self.settings.max_logon_failures;
+        match key {
+            ThrottleKey::User(_) => max,
+            ThrottleKey::Addr(_) => max.saturating_mul(ADDRESS_FAILURE_FACTOR),
+        }
     }
 
     /// Counts a failed logon for `user`, unless it is empty, and for `addr`.
@@ -119,12 +138,15 @@ impl AuthPolicy {
         let mut failures = self.lock_failures();
         if !failures.contains_key(&key) && failures.len() >= THROTTLE_CAPACITY {
             failures.retain(|_, f| now.duration_since(f.last) < lockout);
-            if failures.len() >= THROTTLE_CAPACITY
-                && let Some(oldest) = failures
+            if failures.len() >= THROTTLE_CAPACITY {
+                let Some(oldest) = failures
                     .iter()
+                    .filter(|(k, f)| !f.locked_out(self.limit(k), lockout, now))
                     .min_by_key(|(_, f)| f.last)
                     .map(|(k, _)| k.clone())
-            {
+                else {
+                    return;
+                };
                 failures.remove(&oldest);
             }
         }
@@ -242,14 +264,41 @@ mod tests {
     #[test]
     fn tracked_names_are_bounded() {
         let p = policy(3, Duration::from_secs(60));
-        for _ in 0..3 {
-            p.record_failure("victim", None);
-        }
         for i in 0..THROTTLE_CAPACITY + 10 {
             p.record_failure(&format!("user{i}"), None);
             assert!(p.tracked() <= THROTTLE_CAPACITY);
         }
         assert_eq!(p.tracked(), THROTTLE_CAPACITY);
+    }
+
+    #[test]
+    fn lockouts_survive_a_full_table() {
+        // The oldest entry that is not locked out makes room.
+        let p = policy(2, Duration::from_secs(60));
+        for _ in 0..2 {
+            p.record_failure("victim", None);
+        }
+        for i in 1..THROTTLE_CAPACITY {
+            p.record_failure(&format!("user{i}"), None);
+        }
+        p.record_failure("late", None);
+        assert_eq!(p.tracked(), THROTTLE_CAPACITY);
+        assert!(p.is_locked_out("victim", None));
+        p.record_failure("late", None);
+        assert!(p.is_locked_out("late", None));
+
+        // With every entry locked out, a new failure goes uncounted.
+        let p = policy(1, Duration::from_secs(60));
+        for i in 0..THROTTLE_CAPACITY {
+            p.record_failure(&format!("user{i}"), None);
+        }
+        for _ in 0..2 {
+            p.record_failure("late", None);
+        }
+        assert_eq!(p.tracked(), THROTTLE_CAPACITY);
+        assert!(!p.is_locked_out("late", None));
+        assert!(p.is_locked_out("user0", None));
+        assert!(p.is_locked_out(&format!("user{}", THROTTLE_CAPACITY - 1), None));
     }
 
     #[test]
@@ -271,14 +320,5 @@ mod tests {
         p.record_failure("", Some(other));
         assert!(!p.is_locked_out("bob", Some(other)));
         assert_eq!(p.tracked(), 21);
-    }
-
-    #[test]
-    fn session_ids_are_unique_and_never_zero() {
-        let p = AuthPolicy::default();
-        let a = p.alloc_session_id();
-        let b = p.alloc_session_id();
-        assert_ne!(a, 0);
-        assert_ne!(a, b);
     }
 }

@@ -66,6 +66,7 @@ async fn validate_negotiate_info_matches_negotiate() {
     assert_eq!(rh.command, Command::Ioctl);
     assert_eq!(rh.channel_sequence_status, STATUS_SUCCESS);
     let ioctl_resp = IoctlResponse::parse(rb).expect("parse ioctl resp");
+    assert_eq!(ioctl_resp.file_id, FileId::any());
     let mut expected = neg_resp.capabilities.to_le_bytes().to_vec();
     expected.extend_from_slice(&neg_resp.server_guid);
     expected.extend_from_slice(&neg_resp.security_mode.to_le_bytes());

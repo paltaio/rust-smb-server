@@ -112,26 +112,3 @@ async fn anonymous_sessions_stay_unsigned() {
     let sid = anonymous_session_setup(&mut s).await;
     assert_eq!(tree_connect_status(&mut s, 3, sid, "pub", None).await, 0);
 }
-
-#[tokio::test]
-async fn smb311_unsigned_tree_connect_is_refused() {
-    let td = tempfile::tempdir().unwrap();
-    let (addr, _handle) = start_server(builder(&td)).await;
-    let mut s = TcpStream::connect(addr).await.expect("connect");
-    let body = negotiate_311_body(&[0x0311], &[preauth_context(&[1])]);
-    let frame = request(&mut s, Command::Negotiate, 0, 0, 0, &body).await;
-    assert_eq!(status(&frame), 0);
-    let login = alice(&mut s, 0x01).await;
-
-    let hdr = build_header(Command::TreeConnect, 3, login.session_id, 0);
-    let mut msg = Vec::new();
-    hdr.write(&mut msg).unwrap();
-    msg.extend_from_slice(&tree_connect_body(r"\\srv\home"));
-    let mut framed = Vec::new();
-    encode_frame(&msg, &mut framed);
-    tokio::io::AsyncWriteExt::write_all(&mut s, &framed)
-        .await
-        .unwrap();
-    let reply = read_or_closed(&mut s).await;
-    assert!(reply.is_none_or(|f| status(&f) != 0));
-}

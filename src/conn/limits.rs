@@ -45,7 +45,8 @@ pub fn supports_multi_credit(dialect: Option<Dialect>) -> bool {
 /// Connection limits and timeouts, set through `SmbServerBuilder`.
 #[derive(Debug, Clone)]
 pub struct Limits {
-    /// Most connections served at once.
+    /// Most connections served at once, counting every client together.
+    /// Per-host limits belong in the firewall.
     pub max_connections: usize,
     /// Time a new connection has to establish its first session, and each
     /// SESSION_SETUP exchange has to finish.
@@ -66,7 +67,7 @@ impl Default for Limits {
         Self {
             max_connections: 1024,
             handshake_timeout: Duration::from_secs(30),
-            idle_timeout: Duration::from_secs(15 * 60),
+            idle_timeout: Duration::from_mins(15),
             io_timeout: Duration::from_secs(60),
             tcp_keepalive: Some(Duration::from_secs(60)),
         }

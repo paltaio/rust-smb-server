@@ -263,16 +263,12 @@ fn read_u16(buf: &[u8], offset: usize) -> u16 {
     u16::from_le_bytes([buf[offset], buf[offset + 1]])
 }
 
-fn read_u32(buf: &[u8], offset: usize) -> u32 {
-    let mut bytes = [0u8; 4];
-    bytes.copy_from_slice(&buf[offset..offset + 4]);
-    u32::from_le_bytes(bytes)
+pub(crate) fn read_u32(buf: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes(buf[offset..offset + 4].try_into().expect("4 bytes"))
 }
 
-fn read_u64(buf: &[u8], offset: usize) -> u64 {
-    let mut bytes = [0u8; 8];
-    bytes.copy_from_slice(&buf[offset..offset + 8]);
-    u64::from_le_bytes(bytes)
+pub(crate) fn read_u64(buf: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes(buf[offset..offset + 8].try_into().expect("8 bytes"))
 }
 
 /// Handles one request. `frame` is the request with related-operation ids

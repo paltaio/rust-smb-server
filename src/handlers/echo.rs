@@ -17,8 +17,8 @@ pub async fn handle(
     hdr: &Smb2Header,
     _body: &[u8],
 ) -> HandlerResponse {
-    // A connection with no session, established or in progress, has no
-    // business sending ECHO.
+    // ECHO on a connection with no session, established or in progress,
+    // closes the connection.
     let no_sessions =
         conn.sessions.read().await.is_empty() && conn.pending_auths.read().await.is_empty();
     if no_sessions {

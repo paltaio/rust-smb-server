@@ -7,13 +7,12 @@ mod common;
 #[path = "support_auth.rs"]
 mod support;
 
-use common::{negotiate, start_server};
+use common::{STATUS_MORE_PROCESSING_REQUIRED, negotiate, start_server};
 use smb_server::wire::header::Command;
 use smb_server::{Access, LocalFsBackend, Share, SmbServer};
 use support::*;
 use tokio::net::TcpStream;
 
-const MORE_PROCESSING: u32 = 0xC000_0016;
 const ACCEPT_COMPLETED: u8 = 0;
 const ACCEPT_INCOMPLETE: u8 = 1;
 const REQUEST_MIC: u8 = 3;
@@ -57,7 +56,7 @@ async fn wrong_client_mech_list_mic_fails_the_logon() {
     let mech_list = mech_type_list(&[OID_NTLMSSP]);
     let body = session_setup_body(&spnego_init(&mech_list, Some(&negotiate_msg)), 0, 1, 0);
     let frame = request(&mut s, Command::SessionSetup, 1, 0, 0, &body).await;
-    assert_eq!(status(&frame), MORE_PROCESSING);
+    assert_eq!(status(&frame), STATUS_MORE_PROCESSING_REQUIRED);
     let sid = response_session_id(&frame);
     let challenge = parse_neg_resp(&session_setup_token(&frame)).token.unwrap();
     let (auth, key) = ntlm_authenticate(
@@ -84,7 +83,7 @@ async fn ntlm_after_kerberos_gets_a_counter_proposal() {
         let mech_list = mech_type_list(&[OID_KRB5, OID_NTLMSSP]);
         let body = session_setup_body(&spnego_init(&mech_list, Some(b"krb5 ap-req")), 0, 1, 0);
         let frame = request(&mut s, Command::SessionSetup, 1, 0, 0, &body).await;
-        assert_eq!(status(&frame), MORE_PROCESSING);
+        assert_eq!(status(&frame), STATUS_MORE_PROCESSING_REQUIRED);
         let sid = response_session_id(&frame);
         let resp = parse_neg_resp(&session_setup_token(&frame));
         assert_eq!(resp.state, Some(REQUEST_MIC));
@@ -94,7 +93,7 @@ async fn ntlm_after_kerberos_gets_a_counter_proposal() {
         let negotiate_msg = ntlm_negotiate(CLIENT_FLAGS);
         let body = session_setup_body(&spnego_resp(Some(&negotiate_msg), None), 0, 1, 0);
         let frame = request(&mut s, Command::SessionSetup, 2, sid, 0, &body).await;
-        assert_eq!(status(&frame), MORE_PROCESSING);
+        assert_eq!(status(&frame), STATUS_MORE_PROCESSING_REQUIRED);
         assert_eq!(response_session_id(&frame), sid);
         let resp = parse_neg_resp(&session_setup_token(&frame));
         assert_eq!(resp.state, Some(ACCEPT_INCOMPLETE));
@@ -129,7 +128,7 @@ async fn negtokeninit_without_a_mech_token_selects_ntlm() {
     let mech_list = mech_type_list(&[OID_NTLMSSP]);
     let body = session_setup_body(&spnego_init(&mech_list, None), 0, 1, 0);
     let frame = request(&mut s, Command::SessionSetup, 1, 0, 0, &body).await;
-    assert_eq!(status(&frame), MORE_PROCESSING);
+    assert_eq!(status(&frame), STATUS_MORE_PROCESSING_REQUIRED);
     let sid = response_session_id(&frame);
     let resp = parse_neg_resp(&session_setup_token(&frame));
     assert_eq!(resp.state, Some(ACCEPT_INCOMPLETE));
@@ -139,7 +138,7 @@ async fn negtokeninit_without_a_mech_token_selects_ntlm() {
     let negotiate_msg = ntlm_negotiate(CLIENT_FLAGS);
     let body = session_setup_body(&spnego_resp(Some(&negotiate_msg), None), 0, 1, 0);
     let frame = request(&mut s, Command::SessionSetup, 2, sid, 0, &body).await;
-    assert_eq!(status(&frame), MORE_PROCESSING);
+    assert_eq!(status(&frame), STATUS_MORE_PROCESSING_REQUIRED);
     let challenge = parse_neg_resp(&session_setup_token(&frame)).token.unwrap();
     let (auth, key) = ntlm_authenticate(
         "alice",
