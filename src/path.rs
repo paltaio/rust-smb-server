@@ -49,17 +49,10 @@ impl SmbPath {
             return Err(SmbError::NameInvalid);
         }
 
-        // 2. Reject forbidden characters anywhere in the path.
-        for ch in trimmed.chars() {
-            if ch == '\0' || ('\u{0001}'..='\u{001F}').contains(&ch) {
-                return Err(SmbError::NameInvalid);
-            }
-            // Allow `\` and `/` as separators, reject the rest of the
-            // Windows-forbidden set anywhere.
-            match ch {
-                '<' | '>' | ':' | '"' | '|' | '?' | '*' => return Err(SmbError::NameInvalid),
-                _ => {}
-            }
+        // 2. Reject forbidden characters anywhere in the path. `\` and `/`
+        //    are separators here.
+        if trimmed.chars().any(|c| is_control(c) || is_forbidden(c)) {
+            return Err(SmbError::NameInvalid);
         }
 
         // 3. Split on `\` or `/`; reject `..` and empty components; skip `.`.
@@ -219,10 +212,6 @@ fn is_control(c: char) -> bool {
     ('\u{0000}'..='\u{001F}').contains(&c)
 }
 
-#[cfg_attr(
-    not(feature = "localfs"),
-    allow(dead_code, reason = "used by LocalFsBackend")
-)]
 fn is_forbidden(c: char) -> bool {
     matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*')
 }

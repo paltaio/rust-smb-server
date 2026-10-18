@@ -64,15 +64,15 @@ socket2 = "0.6"
 
 [target.'cfg(windows)'.dependencies]
 cap-primitives = { workspace = true, optional = true }
-windows-sys = { version = "0.61", features = ["Wdk_Storage_FileSystem", "Win32_Storage_FileSystem", "Win32_System_IO"] }
+windows-sys = { version = "0.61", features = ["Wdk_Storage_FileSystem", "Win32_Storage_FileSystem", "Win32_System_IO"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1", features = ["fs"] }
+rustix = { version = "1", features = ["fs"], optional = true }
 libc = "0.2"
 
 [features]
 default = ["localfs"]
-localfs = ["dep:cap-std", "dep:cap-primitives"]
+localfs = ["dep:cap-std", "dep:cap-primitives", "dep:rustix", "dep:windows-sys"]
 
 [dev-dependencies]
 tokio = { workspace = true }

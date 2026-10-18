@@ -8,8 +8,6 @@
 //!   random one logged at startup,
 //! - three shares: `public` (anonymous read+write), `media` (anonymous
 //!   read-only), `home` (alice = read+write, bob = read).
-//!
-//! Ctrl-C stops the server.
 
 use std::path::PathBuf;
 
@@ -65,16 +63,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .build()?;
 
-    let shutdown = server.shutdown_handle();
-    tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            tracing::info!("ctrl-c received, shutting down");
-            shutdown.shutdown();
-        }
-    });
-
     let addr = server.bind().await?;
     tracing::info!(%addr, "listening");
-    server.serve().await?;
+    let shutdown = server.shutdown_handle();
+    let mut serve = std::pin::pin!(server.serve());
+    tokio::select! {
+        res = &mut serve => res?,
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("ctrl-c received, shutting down");
+            shutdown.shutdown();
+            serve.await?;
+        }
+    }
     Ok(())
 }

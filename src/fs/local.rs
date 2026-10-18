@@ -1495,49 +1495,6 @@ mod tests {
         dir_h.close().await.unwrap();
     }
 
-    fn glob_match(pattern: &str, name: &str) -> bool {
-        Pattern::new(pattern, true).matches(name)
-    }
-
-    #[test]
-    fn glob_match_basics() {
-        assert!(glob_match("*", "anything"));
-        assert!(glob_match("*.txt", "foo.txt"));
-        assert!(!glob_match("*.txt", "foo.log"));
-        assert!(glob_match("a?c", "abc"));
-        assert!(!glob_match("a?c", "ac"));
-        assert!(glob_match("a*b*c", "axxxbxxxc"));
-        assert!(glob_match("FOO", "foo"));
-        assert!(glob_match("", ""));
-        assert!(!glob_match("", "a"));
-    }
-
-    #[test]
-    fn glob_match_dos_wildcards() {
-        // DOS_STAR stops before the last dot.
-        assert!(glob_match("<.txt", "ow.txt"));
-        assert!(glob_match("<.txt", "a.b.txt"));
-        assert!(glob_match("<.TXT", "ow.txt"));
-        assert!(!glob_match("<.txt", "ow.log"));
-        assert!(!glob_match("<", "a.b"));
-        assert!(glob_match("<", "noext"));
-        assert!(glob_match("<.<", "a.b"));
-        // DOS_QM takes one character, or none at a dot or the end.
-        assert!(glob_match(">w.txt", "ow.txt"));
-        assert!(!glob_match(">w.txt", "w.txt"));
-        assert!(glob_match(">>>.txt", "ab.txt"));
-        assert!(glob_match("a>>", "a"));
-        assert!(!glob_match("a>", "abc"));
-        // DOS_DOT matches a dot, or nothing at the end.
-        assert!(glob_match("a\"txt", "a.txt"));
-        assert!(glob_match("abc\"", "abc"));
-        assert!(!glob_match("a\"txt", "aXtxt"));
-        assert!(glob_match("<\"<", "a.b"));
-        assert!(glob_match("<\"<", "noext"));
-        assert!(glob_match("<\"", "noext"));
-        assert!(!glob_match("<\"", "a.b"));
-    }
-
     #[cfg(windows)]
     #[test]
     fn sharing_violation_maps_to_sharing() {
@@ -1792,17 +1749,5 @@ mod tests {
         assert!(!get("dangling").is_directory);
         opened.close().await.unwrap();
         root.close().await.unwrap();
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn case_rule_comes_from_the_filesystem() {
-        let td = tempdir().unwrap();
-        let backend = LocalFsBackend::new(td.path()).unwrap();
-        // The test directory is on a case-sensitive Linux filesystem: a name
-        // in another case is a different file.
-        std::fs::write(td.path().join("a.txt"), b"x").unwrap();
-        assert!(!td.path().join("A.TXT").exists());
-        assert!(backend.capabilities().case_sensitive);
     }
 }

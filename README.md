@@ -21,7 +21,7 @@ smb-server = "0.5"
 cargo run -p minimal-smb-example
 ```
 
-Listens on `127.0.0.1:4445` and serves directories under `smb-example` in the system temp directory. Override with `SMB_LISTEN` and `SMB_ROOT`. Ctrl-C stops it.
+Listens on `127.0.0.1:4445` and serves directories under `smb-example` in the system temp directory. Override with `SMB_LISTEN` and `SMB_ROOT`.
 
 Shares: `public` (anon rw), `media` (anon ro), `home` (alice rw, bob ro).
 

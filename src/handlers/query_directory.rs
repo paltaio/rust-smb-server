@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use crate::proto::header::Smb2Header;
-use crate::proto::messages::{FileInfoClass, QueryDirectoryRequest, QueryDirectoryResponse};
+use crate::proto::messages::{QueryDirectoryRequest, QueryDirectoryResponse};
 
 use crate::access_mask::FILE_LIST_DIRECTORY;
 use crate::backend::{DirEntry, FileInfo, OpenIntent, OpenOptions, ShareBackend};
@@ -56,15 +56,14 @@ pub async fn handle(
         return HandlerResponse::err(ntstatus::STATUS_ACCESS_DENIED);
     }
     let class = req.file_information_class;
-    if FileInfoClass::from_u8(class).is_none() {
+    let Some(name_offset) = dir_entry_name_offset(class) else {
         let status = if UNSUPPORTED_CLASSES.contains(&class) {
             ntstatus::STATUS_NOT_SUPPORTED
         } else {
             ntstatus::STATUS_INVALID_INFO_CLASS
         };
         return HandlerResponse::err(status);
-    }
-    let name_offset = dir_entry_name_offset(class).expect("supported class");
+    };
     let cap = req.output_buffer_length as usize;
     if cap < name_offset {
         return HandlerResponse::err(ntstatus::STATUS_INFO_LENGTH_MISMATCH);

@@ -1,8 +1,8 @@
-//! File / FileSystem / Security info-class encoders used by QUERY_INFO,
-//! SET_INFO, and QUERY_DIRECTORY.
+//! File and filesystem info-class encoders used by QUERY_INFO, SET_INFO and
+//! QUERY_DIRECTORY.
 //!
-//! These are byte-for-byte wire encodings per MS-FSCC §2.4 (file info) /
-//! §2.5 (filesystem info) / MS-DTYP §2.4 (security descriptor).
+//! Wire encodings per MS-FSCC 2.4 (file info) and MS-FSCC 2.5 (filesystem
+//! info).
 
 use crate::backend::{DirEntry, FileInfo};
 use crate::utils::utf16le;
