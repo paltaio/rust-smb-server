@@ -1,5 +1,5 @@
 //! Host queries about the volume and directory behind a share: size, free
-//! space, serial number, label and the case rule of name lookups.
+//! space, serial number and the case rule of name lookups.
 
 use std::io;
 
@@ -64,16 +64,15 @@ pub(super) fn volume_info(dir: &Dir, _root_dev: Option<u64>) -> io::Result<Volum
     }
 
     let handle = dir.as_handle().as_raw_handle();
-    let mut label = [0u16; 261];
     let mut serial = 0u32;
     let mut max_component = 0u32;
-    // SAFETY: `handle` stays open while `dir` is borrowed, and every pointer
-    // refers to a live local of the size passed with it.
+    // SAFETY: `handle` stays open while `dir` is borrowed, and every non-null
+    // pointer refers to a live local.
     let ok = unsafe {
         GetVolumeInformationByHandleW(
             handle,
-            label.as_mut_ptr(),
-            label.len() as u32,
+            std::ptr::null_mut(),
+            0,
             &mut serial,
             &mut max_component,
             std::ptr::null_mut(),
@@ -104,7 +103,6 @@ pub(super) fn volume_info(dir: &Dir, _root_dev: Option<u64>) -> io::Result<Volum
         )));
     }
 
-    let label_len = label.iter().position(|&c| c == 0).unwrap_or(label.len());
     Ok(VolumeInfo {
         total_allocation_units: u64::try_from(size.total).unwrap_or(0),
         caller_available_allocation_units: u64::try_from(size.caller_available).unwrap_or(0),
@@ -112,7 +110,7 @@ pub(super) fn volume_info(dir: &Dir, _root_dev: Option<u64>) -> io::Result<Volum
         sectors_per_allocation_unit: size.sectors_per_unit,
         bytes_per_sector: size.bytes_per_sector,
         serial_number: serial,
-        label: Some(String::from_utf16_lossy(&label[..label_len])),
+        label: None,
         max_name_length: max_component.clamp(1, MAX_NAME_LENGTH),
     })
 }
