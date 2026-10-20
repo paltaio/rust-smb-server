@@ -104,14 +104,14 @@ impl RelatedContext {
     }
 }
 
-fn needs_session(command: Command) -> bool {
+pub(crate) fn needs_session(command: Command) -> bool {
     !matches!(
         command,
         Command::Negotiate | Command::SessionSetup | Command::Echo | Command::Cancel
     )
 }
 
-fn needs_tree(command: Command) -> bool {
+pub(crate) fn needs_tree(command: Command) -> bool {
     command == Command::Create
         || command == Command::TreeDisconnect
         || file_id_body_offset(command).is_some()

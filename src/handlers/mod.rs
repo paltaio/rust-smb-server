@@ -33,18 +33,20 @@ mod tree_connect;
 mod tree_disconnect;
 mod write;
 
-/// Top-level command router.
+/// Top-level command router. `encrypted` tells whether the request arrived
+/// encrypted.
 pub async fn dispatch_command(
     server: &Arc<ServerState>,
     conn: &Arc<Connection>,
     hdr: &Smb2Header,
     body: &[u8],
+    encrypted: bool,
 ) -> HandlerResponse {
     match hdr.command {
         Command::Negotiate => negotiate::handle(server, conn, hdr, body).await,
         Command::SessionSetup => session_setup::handle(server, conn, hdr, body).await,
         Command::Logoff => logoff::handle(server, conn, hdr, body).await,
-        Command::TreeConnect => tree_connect::handle(server, conn, hdr, body).await,
+        Command::TreeConnect => tree_connect::handle(server, conn, hdr, body, encrypted).await,
         Command::TreeDisconnect => tree_disconnect::handle(server, conn, hdr, body).await,
         Command::Create => create::handle(server, conn, hdr, body).await,
         Command::Close => close::handle(server, conn, hdr, body).await,

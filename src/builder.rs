@@ -48,6 +48,7 @@ pub struct Share {
     pub(crate) backend: Arc<dyn ShareBackend>,
     pub(crate) mode: ShareMode,
     pub(crate) users: HashMap<String, Access>,
+    pub(crate) encrypt_data: bool,
 }
 
 impl Share {
@@ -58,6 +59,7 @@ impl Share {
             backend: Arc::new(backend),
             mode: ShareMode::AuthenticatedOnly,
             users: HashMap::new(),
+            encrypt_data: false,
         }
     }
 
@@ -77,6 +79,15 @@ impl Share {
     /// accumulate.
     pub fn user(mut self, name: impl Into<String>, access: Access) -> Self {
         self.users.insert(name.into(), access);
+        self
+    }
+
+    /// Encrypt all traffic to this share. SMB 3.x clients that cannot
+    /// encrypt, SMB 2.x clients and anonymous sessions are refused at
+    /// TREE_CONNECT unless `SmbServerBuilder::reject_unencrypted_access` is
+    /// turned off.
+    pub fn encrypt_data(mut self) -> Self {
+        self.encrypt_data = true;
         self
     }
 }
@@ -205,6 +216,29 @@ impl SmbServerBuilder {
     /// still require signing for its own sessions.
     pub fn require_signing(mut self, required: bool) -> Self {
         self.auth.require_signing = required;
+        self
+    }
+
+    /// Encrypt every authenticated session on a connection that negotiated
+    /// a cipher. While `reject_unencrypted_access` is on, clients that
+    /// cannot encrypt get no session, and anonymous sessions get no tree.
+    /// Off by default; with it off, a client that sends encrypted requests
+    /// gets encrypted replies, and `Share::encrypt_data` turns encryption
+    /// on for one share.
+    pub fn encrypt_data(mut self, encrypt: bool) -> Self {
+        self.auth.encrypt_data = encrypt;
+        self
+    }
+
+    /// Whether a session or share that must be encrypted refuses clients
+    /// that cannot encrypt: SMB 2.x, SMB 3.0 and 3.0.2 without the
+    /// encryption capability, SMB 3.1.1 without a common cipher, and
+    /// anonymous sessions. On SMB 3.0 and 3.0.2 it also refuses unencrypted
+    /// requests from clients that can encrypt; SMB 3.1.1 always refuses
+    /// them. On by default. Turned off, clients that cannot encrypt are
+    /// served unencrypted.
+    pub fn reject_unencrypted_access(mut self, reject: bool) -> Self {
+        self.auth.reject_unencrypted_access = reject;
         self
     }
 
@@ -387,9 +421,7 @@ impl SmbServerBuilder {
 
         let mut share_bindings: Vec<Arc<ShareBindings>> = Vec::with_capacity(self.shares.len());
         for s in self.shares {
-            share_bindings.push(ShareBindings::new(
-                s.name, s.backend, s.mode, s.users, false,
-            ));
+            share_bindings.push(ShareBindings::from_share(s));
         }
 
         // Store NT hashes only; plaintext passwords are dropped.

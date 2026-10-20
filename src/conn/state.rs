@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::proto::auth::ntlm::{Identity, NtlmServer};
-use crate::proto::crypto::{PreauthIntegrity, SigningAlgo};
+use crate::proto::crypto::{Cipher, PreauthIntegrity, SessionCipher, SigningAlgo};
 use crate::proto::messages::{Dialect, FileId};
 use tokio::sync::RwLock;
 use uuid::Uuid;
@@ -36,6 +36,9 @@ pub struct Connection {
     pub client_guid: tokio::sync::RwLock<Uuid>,
     pub dialect: tokio::sync::RwLock<Option<Dialect>>,
     pub signing_algo: tokio::sync::RwLock<SigningAlgo>,
+    /// Connection.CipherId: the cipher SMB 3.x sessions encrypt with, `None`
+    /// when the client cannot encrypt.
+    pub cipher: tokio::sync::RwLock<Option<Cipher>>,
     /// Connection.PreauthIntegrityHashValue after NEGOTIATE. SMB 3.1.1
     /// SESSION_SETUP exchanges fork this into `session_preauth`.
     pub preauth: Mutex<PreauthIntegrity>,
@@ -86,6 +89,7 @@ impl Connection {
             client_guid: tokio::sync::RwLock::new(Uuid::nil()),
             dialect: tokio::sync::RwLock::new(None),
             signing_algo: tokio::sync::RwLock::new(SigningAlgo::HmacSha256),
+            cipher: tokio::sync::RwLock::new(None),
             preauth: Mutex::new(PreauthIntegrity::new()),
             max_read_size: tokio::sync::RwLock::new(max_read_size),
             max_write_size: tokio::sync::RwLock::new(max_write_size),
@@ -267,6 +271,11 @@ pub struct Session {
     pub signing_key: [u8; 16],
     /// Whether signing is required for this session's traffic.
     pub signing_required: bool,
+    /// Session.EncryptData: every message of the session is encrypted.
+    pub encrypt_data: bool,
+    /// Encryption and decryption keys, set once the session is established
+    /// on a connection with a cipher. Anonymous sessions have none.
+    pub cipher: Option<Arc<SessionCipher>>,
     pub trees: RwLock<HashMap<u32, Arc<RwLock<TreeConnect>>>>,
     /// 3.1.1: snapshot taken at SESSION_SETUP completion (after the request
     /// hash but before the response is hashed). Used as KDF context.
@@ -288,6 +297,8 @@ impl Session {
             session_base_key,
             signing_key,
             signing_required,
+            encrypt_data: false,
+            cipher: None,
             trees: RwLock::new(HashMap::new()),
             preauth_snapshot,
             next_tree_id: AtomicU32::new(1),

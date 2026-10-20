@@ -42,6 +42,8 @@ md4   = "0.10"
 aes   = "0.8"
 cmac  = "0.7"
 rc4   = "0.2"
+aes-gcm = { version = "0.10", default-features = false, features = ["aes"] }
+ccm   = { version = "0.5", default-features = false }
 
 [dependencies]
 tokio = { workspace = true }
@@ -60,6 +62,8 @@ md4.workspace = true
 aes.workspace = true
 cmac.workspace = true
 rc4.workspace = true
+aes-gcm.workspace = true
+ccm.workspace = true
 socket2 = "0.6"
 
 [target.'cfg(windows)'.dependencies]

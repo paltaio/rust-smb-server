@@ -181,7 +181,7 @@ async fn validate_negotiate_info(
     }
 
     let mut out = Vec::with_capacity(VALIDATE_NEGOTIATE_RESPONSE_LEN as usize);
-    out.extend_from_slice(&server_capabilities(dialect).to_le_bytes());
+    out.extend_from_slice(&server_capabilities(dialect, client.capabilities).to_le_bytes());
     out.extend_from_slice(conn.server_guid.as_bytes());
     out.extend_from_slice(&server_security_mode(server).to_le_bytes());
     out.extend_from_slice(&dialect.as_u16().to_le_bytes());

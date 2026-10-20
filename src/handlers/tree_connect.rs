@@ -18,12 +18,14 @@ use crate::utils::utf16le_to_units;
 
 const SHARE_TYPE_DISK: u8 = 0x01;
 const SHARE_TYPE_PIPE: u8 = 0x02;
+const SHAREFLAG_ENCRYPT_DATA: u32 = 0x0000_8000;
 
 pub async fn handle(
     server: &Arc<ServerState>,
     conn: &Arc<Connection>,
     hdr: &Smb2Header,
     body: &[u8],
+    encrypted: bool,
 ) -> HandlerResponse {
     let sess_arc = match lookup_session(conn, hdr.session_id).await {
         Ok(s) => s,
@@ -32,12 +34,14 @@ pub async fn handle(
     let sess = sess_arc.read().await;
     let identity = sess.identity.clone();
     let anonymous = sess.is_anonymous();
+    let can_encrypt = sess.cipher.is_some();
     drop(sess);
 
     // MS-SMB2 3.3.5.7: on 3.1.1 an authenticated session's TREE_CONNECT
-    // must be signed, or the connection is dropped.
+    // must be signed or encrypted, or the connection is dropped.
     if *conn.dialect.read().await == Some(Dialect::Smb311)
         && !anonymous
+        && !encrypted
         && hdr.flags & SMB2_FLAGS_SIGNED == 0
     {
         warn!("unsigned SMB 3.1.1 TREE_CONNECT; closing the connection");
@@ -72,6 +76,16 @@ pub async fn handle(
             None => return HandlerResponse::err(ntstatus::STATUS_BAD_NETWORK_NAME),
         }
     };
+    // MS-SMB2 3.3.5.7: a session that cannot encrypt is refused a share
+    // whose traffic is encrypted.
+    let settings = &server.auth.settings;
+    if (settings.encrypt_data || share.encrypt_data)
+        && settings.reject_unencrypted_access
+        && !can_encrypt
+    {
+        warn!(share = %share.name, "TREE_CONNECT to an encrypted share without encryption");
+        return HandlerResponse::err(ntstatus::STATUS_ACCESS_DENIED);
+    }
 
     // The share and its ACL are checked with the session's tree table
     // locked. ConfigHandle changes them first and then sweeps the trees,
@@ -122,7 +136,11 @@ pub async fn handle(
             SHARE_TYPE_DISK
         },
         reserved: 0,
-        share_flags: 0,
+        share_flags: if share.encrypt_data && can_encrypt {
+            SHAREFLAG_ENCRYPT_DATA
+        } else {
+            0
+        },
         capabilities: 0,
         maximal_access,
     };
@@ -236,20 +254,20 @@ mod tests {
     async fn unsigned_smb311_tree_connect_requests_a_disconnect() {
         let (server, conn) = connection(Dialect::Smb311, alice()).await;
         let (hdr, body) = request(r"\\srv\home", 0);
-        let resp = handle(&server, &conn, &hdr, &body).await;
+        let resp = handle(&server, &conn, &hdr, &body, false).await;
         assert_ne!(resp.status, ntstatus::STATUS_SUCCESS);
         assert!(conn.disconnect_requested());
 
         // Signed, anonymous, or an older dialect: no disconnect.
         let (server, conn) = connection(Dialect::Smb311, alice()).await;
         let (hdr, body) = request(r"\\srv\home", SMB2_FLAGS_SIGNED);
-        assert_eq!(handle(&server, &conn, &hdr, &body).await.status, 0);
+        assert_eq!(handle(&server, &conn, &hdr, &body, false).await.status, 0);
         let (server, conn) = connection(Dialect::Smb311, Identity::Anonymous).await;
         let (hdr, body) = request(r"\\srv\home", 0);
-        assert_eq!(handle(&server, &conn, &hdr, &body).await.status, 0);
+        assert_eq!(handle(&server, &conn, &hdr, &body, false).await.status, 0);
         let (server, conn) = connection(Dialect::Smb302, alice()).await;
         let (hdr, body) = request(r"\\srv\home", 0);
-        assert_eq!(handle(&server, &conn, &hdr, &body).await.status, 0);
+        assert_eq!(handle(&server, &conn, &hdr, &body, false).await.status, 0);
         assert!(!conn.disconnect_requested());
     }
 
@@ -306,7 +324,7 @@ mod tests {
         let (hdr, body) = request(r"\\srv\home", 0);
         let tc = tokio::spawn({
             let (state, conn) = (state.clone(), conn.clone());
-            async move { handle(&state, &conn, &hdr, &body).await.status }
+            async move { handle(&state, &conn, &hdr, &body, false).await.status }
         });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let remove = tokio::spawn(async move { config.remove_share("home").await });
@@ -324,10 +342,10 @@ mod tests {
         let max = server.auth.settings.max_trees_per_session;
         let (hdr, body) = request(r"\\srv\home", 0);
         for _ in 0..max {
-            assert_eq!(handle(&server, &conn, &hdr, &body).await.status, 0);
+            assert_eq!(handle(&server, &conn, &hdr, &body, false).await.status, 0);
         }
         assert_eq!(
-            handle(&server, &conn, &hdr, &body).await.status,
+            handle(&server, &conn, &hdr, &body, false).await.status,
             ntstatus::STATUS_INSUFFICIENT_RESOURCES
         );
     }

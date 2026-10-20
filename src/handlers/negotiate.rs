@@ -3,11 +3,11 @@
 use std::sync::Arc;
 
 use crate::proto::auth::spnego::encode_init_response;
-use crate::proto::crypto::SigningAlgo;
+use crate::proto::crypto::{Cipher, SigningAlgo};
 use crate::proto::header::{SMB2_HEADER_LEN, Smb2Header};
 use crate::proto::messages::{
-    Dialect, NegotiateContext, NegotiateRequest, NegotiateResponse, PreauthIntegrityCapabilities,
-    SigningCapabilities,
+    Dialect, EncryptionCapabilities, NegotiateContext, NegotiateRequest, NegotiateResponse,
+    PreauthIntegrityCapabilities, SigningCapabilities,
 };
 use binrw::BinRead;
 use tracing::info;
@@ -24,6 +24,7 @@ const SIGNING_ENABLED: u16 = 0x0001;
 const SIGNING_REQUIRED: u16 = 0x0002;
 
 const CAP_LARGE_MTU: u32 = 0x0000_0004;
+const CAP_ENCRYPTION: u32 = 0x0000_0040;
 
 /// Size of the fixed part of a NEGOTIATE request, before Dialects.
 const NEGOTIATE_FIXED_LEN: usize = 36;
@@ -53,13 +54,32 @@ pub(crate) fn server_security_mode(server: &ServerState) -> u16 {
     }
 }
 
-/// Capabilities the server sends for `dialect` (Connection.ServerCapabilities).
-/// LARGE_MTU needs multi-credit support, which SMB 2.0.2 lacks.
-pub(crate) fn server_capabilities(dialect: Dialect) -> u32 {
-    match dialect {
+/// Capabilities the server sends for `dialect` to a client that sent
+/// `client_capabilities` (Connection.ServerCapabilities). LARGE_MTU needs
+/// multi-credit support, which SMB 2.0.2 lacks. ENCRYPTION goes to SMB 3.0
+/// and 3.0.2 clients that have it; 3.1.1 negotiates a cipher instead.
+pub(crate) fn server_capabilities(dialect: Dialect, client_capabilities: u32) -> u32 {
+    let mut caps = match dialect {
         Dialect::Smb202 => 0,
         _ => CAP_LARGE_MTU,
+    };
+    if matches!(dialect, Dialect::Smb300 | Dialect::Smb302)
+        && client_capabilities & CAP_ENCRYPTION != 0
+    {
+        caps |= CAP_ENCRYPTION;
     }
+    caps
+}
+
+/// Connection.CipherId for an SMB 3.0 or 3.0.2 connection: AES-128-CCM
+/// when the client has the ENCRYPTION capability.
+fn cipher_30(client_capabilities: u32) -> Option<Cipher> {
+    (client_capabilities & CAP_ENCRYPTION != 0).then_some(Cipher::Aes128Ccm)
+}
+
+/// The first cipher in the client's list that the server implements.
+fn select_cipher(ciphers: &[u16]) -> Option<Cipher> {
+    ciphers.iter().find_map(|&id| Cipher::from_id(id))
 }
 
 /// What the client's 3.1.1 NegotiateContextList asks of the response.
@@ -67,6 +87,9 @@ struct ClientContexts {
     /// The signing algorithm picked from the client's
     /// SMB2_SIGNING_CAPABILITIES, when it sent one.
     signing_algorithm: Option<u16>,
+    /// The cipher picked from the client's SMB2_ENCRYPTION_CAPABILITIES,
+    /// when it sent one: `Some(None)` when no cipher is in common.
+    cipher: Option<Option<Cipher>>,
 }
 
 /// Checks the 3.1.1 NegotiateContextList of `req` (MS-SMB2 3.3.5.4).
@@ -121,7 +144,21 @@ fn read_contexts(body: &[u8], req: &NegotiateRequest) -> Result<ClientContexts, 
         }
         None => None,
     };
-    Ok(ClientContexts { signing_algorithm })
+    let cipher = match of_type(NegotiateContext::TYPE_ENCRYPTION).next() {
+        Some(ctx) => {
+            let caps = EncryptionCapabilities::read(&mut std::io::Cursor::new(&ctx.data))
+                .map_err(|_| invalid)?;
+            if caps.cipher_count == 0 {
+                return Err(invalid);
+            }
+            Some(select_cipher(&caps.ciphers))
+        }
+        None => None,
+    };
+    Ok(ClientContexts {
+        signing_algorithm,
+        cipher,
+    })
 }
 
 pub async fn handle(
@@ -165,6 +202,11 @@ pub async fn handle(
     *conn.signing_algo.write().await = match dialect {
         Dialect::Smb202 | Dialect::Smb210 => SigningAlgo::HmacSha256,
         _ => SigningAlgo::AesCmac,
+    };
+    *conn.cipher.write().await = match (dialect, &contexts) {
+        (Dialect::Smb300 | Dialect::Smb302, _) => cipher_30(req.capabilities),
+        (Dialect::Smb311, Some(c)) => c.cipher.flatten(),
+        _ => None,
     };
 
     // Build SPNEGO security blob (mech-list-only, advertising NTLMSSP).
@@ -223,6 +265,26 @@ pub async fn handle(
                 data: signing_data,
             });
         }
+        // ENCRYPTION_CAPABILITIES too, with cipher 0 when none is in common.
+        if let Some(cipher) = client_contexts.cipher {
+            let encryption_caps = EncryptionCapabilities {
+                cipher_count: 1,
+                ciphers: vec![cipher.map_or(0, Cipher::id)],
+            };
+            let encryption_data = {
+                use binrw::BinWrite;
+                let mut c = std::io::Cursor::new(Vec::new());
+                BinWrite::write(&encryption_caps, &mut c)
+                    .expect("encryption negotiate context encodes");
+                c.into_inner()
+            };
+            ctxs.push(NegotiateContext {
+                context_type: NegotiateContext::TYPE_ENCRYPTION,
+                data_length: encryption_data.len() as u16,
+                reserved: 0,
+                data: encryption_data,
+            });
+        }
         if let Err(e) = NegotiateContext::encode_list(&ctxs, &mut contexts_bytes) {
             tracing::error!(error = %e, "encode_list failed");
             return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
@@ -245,7 +307,7 @@ pub async fn handle(
         dialect_revision: chosen,
         negotiate_context_count_or_reserved: context_count,
         server_guid: *server.config.server_guid.as_bytes(),
-        capabilities: server_capabilities(dialect),
+        capabilities: server_capabilities(dialect, req.capabilities),
         max_transact_size,
         max_read_size,
         max_write_size,

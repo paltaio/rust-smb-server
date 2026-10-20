@@ -3,7 +3,8 @@
 use std::sync::Arc;
 
 use crate::proto::auth::ntlm::Identity;
-use crate::proto::crypto::{PreauthIntegrity, sign};
+use crate::proto::crypto::encrypt::{is_transform, transform_session_id};
+use crate::proto::crypto::{PreauthIntegrity, SessionCipher, TRANSFORM_HEADER_LEN, sign};
 use crate::proto::framing::MAX_FRAME_PAYLOAD;
 use crate::proto::header::{
     Command, HeaderTail, SMB2_FLAGS_ASYNC_COMMAND, SMB2_FLAGS_RELATED_OPERATIONS,
@@ -15,8 +16,8 @@ use tracing::{Instrument, debug, debug_span, error, warn};
 use crate::conn::chain;
 use crate::conn::credits::{CreditWindow, charge_covers};
 use crate::conn::limits::supports_multi_credit;
-use crate::conn::related::RelatedContext;
-use crate::conn::state::Connection;
+use crate::conn::related::{RelatedContext, needs_session, needs_tree};
+use crate::conn::state::{Connection, Session};
 use crate::handlers;
 use crate::ntstatus;
 use crate::server::ServerState;
@@ -73,6 +74,16 @@ impl HandlerResponse {
     }
 }
 
+/// One response of a frame, before the responses are joined.
+struct Reply {
+    bytes: Vec<u8>,
+    /// The key the response is signed with.
+    signing_key: Option<[u8; 16]>,
+    /// The session the response is encrypted for and its keys, when it
+    /// must be encrypted.
+    cipher: Option<(u64, Arc<SessionCipher>)>,
+}
+
 /// Top-level frame dispatch. Returns the bytes to push into the writer
 /// channel, or `None` if the request elicits no response (CANCEL).
 pub async fn dispatch_frame(
@@ -97,8 +108,28 @@ pub async fn dispatch_frame(
         }
         return reply;
     }
+    let decrypted;
+    let (frame, transform) = if is_transform(frame) {
+        match decrypt_frame(conn, frame).await {
+            Ok((message, session_id, cipher)) => {
+                decrypted = message;
+                (&decrypted[..], Some((session_id, cipher)))
+            }
+            Err(reason) => {
+                warn!(%reason, "encrypted message refused; closing connection");
+                conn.request_disconnect();
+                return None;
+            }
+        }
+    } else {
+        (frame, None)
+    };
+    let encrypted = transform.is_some();
     let dialect = *conn.dialect.read().await;
-    let requests = match chain::split(frame, dialect) {
+    let requests = match chain::split(frame, dialect).and_then(|requests| match &transform {
+        Some((session_id, _)) => chain::check_encrypted(&requests, *session_id).map(|()| requests),
+        None => Ok(requests),
+    }) {
         Ok(requests) => requests,
         Err(reason) => {
             warn!(%reason, "malformed frame; closing connection");
@@ -146,29 +177,45 @@ pub async fn dispatch_frame(
                     status,
                     "related request fails without running"
                 );
+                let session = conn.sessions.read().await.get(&req_hdr.session_id).cloned();
+                let cipher = response_cipher(&req_hdr, encrypted, session.as_ref()).await;
                 let granted = grant_credits(conn, &req_hdr);
-                let error = HandlerResponse::err(status);
-                Some(build_response_bytes(conn, &req_hdr, error, None, granted).await)
+                let mut error = HandlerResponse::err(status);
+                error.skip_signing = encrypted || cipher.is_some();
+                let (bytes, signing_key) =
+                    build_response_bytes(conn, &req_hdr, error, None, granted).await;
+                Some(Reply {
+                    bytes,
+                    signing_key,
+                    cipher: cipher.map(|c| (req_hdr.session_id, c)),
+                })
             }
             None => {
-                let response = dispatch_one(server, conn, &sub_frame, received).await;
-                if let Some((bytes, _)) = &response {
-                    related.update(req_hdr.command, &sub_frame, bytes);
+                let response = dispatch_one(server, conn, &sub_frame, received, encrypted).await;
+                if let Some(reply) = &response {
+                    related.update(req_hdr.command, &sub_frame, &reply.bytes);
                 }
                 response
             }
         };
         if let Some(mut response) = response {
             // Keep room for an error response to every request in the frame.
-            if align_8(response_len) + response.0.len() + 2 * frame.len()
+            if align_8(response_len) + response.bytes.len() + 2 * frame.len() + TRANSFORM_HEADER_LEN
                 > MAX_FRAME_PAYLOAD as usize
             {
-                warn!(len = response.0.len(), "response does not fit in one frame");
-                let error = HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
-                let granted = read_u16(&response.0, 0x0E);
-                response = build_response_bytes(conn, &req_hdr, error, None, granted).await;
+                warn!(
+                    len = response.bytes.len(),
+                    "response does not fit in one frame"
+                );
+                let mut error = HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
+                error.skip_signing = encrypted || response.cipher.is_some();
+                let granted = read_u16(&response.bytes, 0x0E);
+                let (bytes, signing_key) =
+                    build_response_bytes(conn, &req_hdr, error, None, granted).await;
+                response.bytes = bytes;
+                response.signing_key = signing_key;
             }
-            response_len = align_8(response_len) + response.0.len();
+            response_len = align_8(response_len) + response.bytes.len();
             responses.push(response);
         }
     }
@@ -177,7 +224,50 @@ pub async fn dispatch_frame(
         return None;
     }
 
-    Some(stitch_responses(conn, responses).await)
+    // A reply to an encrypted message is encrypted with the keys it came
+    // with; otherwise the frame is encrypted when one of its responses must
+    // be (MS-SMB2 3.3.4.1.4).
+    let cipher = transform.or_else(|| responses.iter().find_map(|r| r.cipher.clone()));
+    let out = stitch_responses(conn, responses).await;
+    let Some((session_id, cipher)) = cipher else {
+        return Some(out);
+    };
+    match cipher.encrypt(session_id, &out) {
+        Ok(encrypted) => Some(encrypted),
+        Err(e) => {
+            error!(error = %e, "cannot encrypt response; closing connection");
+            conn.request_disconnect();
+            None
+        }
+    }
+}
+
+/// Decrypts an encrypted message (MS-SMB2 3.3.5.2.1.1) and returns the SMB2
+/// message inside, its TRANSFORM_HEADER SessionId and that session's keys.
+/// Every failure closes the connection.
+async fn decrypt_frame(
+    conn: &Connection,
+    frame: &[u8],
+) -> Result<(Vec<u8>, u64, Arc<SessionCipher>), String> {
+    if conn.cipher.read().await.is_none() {
+        return Err("encryption is not negotiated".into());
+    }
+    let session_id = transform_session_id(frame).ok_or("message shorter than its header")?;
+    let session = conn
+        .sessions
+        .read()
+        .await
+        .get(&session_id)
+        .cloned()
+        .ok_or(format!("unknown session {session_id:#x}"))?;
+    let cipher = session
+        .read()
+        .await
+        .cipher
+        .clone()
+        .ok_or("session has no encryption keys")?;
+    let message = cipher.decrypt(frame).map_err(|e| e.to_string())?;
+    Ok((message, session_id, cipher))
 }
 
 /// Takes each request's MessageIds out of the connection's window: one id,
@@ -223,15 +313,13 @@ fn grant_credits(conn: &Connection, req_hdr: &Smb2Header) -> u16 {
 
 /// Joins compound responses into one frame. Each response but the last is
 /// padded to 8 bytes and signed over its padding (MS-SMB2 3.1.4.1).
-async fn stitch_responses(
-    conn: &Arc<Connection>,
-    responses: Vec<(Vec<u8>, Option<[u8; 16]>)>,
-) -> Vec<u8> {
+async fn stitch_responses(conn: &Arc<Connection>, responses: Vec<Reply>) -> Vec<u8> {
     let mut out = Vec::new();
     let mut signed = Vec::with_capacity(responses.len());
     let response_count = responses.len();
 
-    for (index, (mut response, key)) in responses.into_iter().enumerate() {
+    for (index, reply) in responses.into_iter().enumerate() {
+        let mut response = reply.bytes;
         let start = out.len();
         let mut len = response.len();
         if index + 1 < response_count {
@@ -240,7 +328,7 @@ async fn stitch_responses(
         }
         out.extend_from_slice(&response);
         out.resize(start + len, 0);
-        if let Some(key) = key {
+        if let Some(key) = reply.signing_key {
             signed.push((start, len, key));
         }
     }
@@ -273,14 +361,15 @@ pub(crate) fn read_u64(buf: &[u8], offset: usize) -> u64 {
 
 /// Handles one request. `frame` is the request with related-operation ids
 /// filled in; `received` is the same request as it arrived, which is what
-/// the client signed and hashed. Returns the response and the key it was
-/// signed with.
+/// the client signed and hashed; `encrypted` tells whether it arrived
+/// encrypted.
 async fn dispatch_one(
     server: &Arc<ServerState>,
     conn: &Arc<Connection>,
     frame: &[u8],
     received: &[u8],
-) -> Option<(Vec<u8>, Option<[u8; 16]>)> {
+    encrypted: bool,
+) -> Option<Reply> {
     let (req_hdr, body_bytes) = match Smb2Header::parse(frame) {
         Ok(p) => p,
         Err(e) => {
@@ -301,14 +390,29 @@ async fn dispatch_one(
         // The request's session, kept so LOGOFF's response can still be
         // signed with its key after the handler removes it.
         let request_session = conn.sessions.read().await.get(&sid).cloned();
-
-        // Verify signature on incoming request (when applicable).
-        if let Err(status) = verify_request_signature(server, conn, &req_hdr, received).await {
-            let resp = HandlerResponse::err(status);
+        let cipher = response_cipher(&req_hdr, encrypted, request_session.as_ref()).await;
+        let reply = async |mut resp: HandlerResponse| {
+            resp.skip_signing |= cipher.is_some() || encrypted;
             let granted = grant_credits(conn, &req_hdr);
-            return Some(
-                build_response_bytes(conn, &req_hdr, resp, request_session.as_ref(), granted).await,
-            );
+            let (bytes, signing_key) =
+                build_response_bytes(conn, &req_hdr, resp, request_session.as_ref(), granted).await;
+            Reply {
+                bytes,
+                signing_key,
+                cipher: cipher.clone().map(|c| (req_hdr.session_id, c)),
+            }
+        };
+
+        // An encrypted request is not signed; its decryption checked it.
+        if !encrypted
+            && let Err(status) = verify_request_signature(server, conn, &req_hdr, received).await
+        {
+            return Some(reply(HandlerResponse::err(status)).await);
+        }
+        if let Err(status) =
+            check_encryption(server, conn, &req_hdr, encrypted, request_session.as_ref()).await
+        {
+            return Some(reply(HandlerResponse::err(status)).await);
         }
 
         // CANCEL is fire-and-forget - no response.
@@ -331,11 +435,7 @@ async fn dispatch_one(
             );
         }
         if malformed || undercharged {
-            let resp = HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
-            let granted = grant_credits(conn, &req_hdr);
-            return Some(
-                build_response_bytes(conn, &req_hdr, resp, request_session.as_ref(), granted).await,
-            );
+            return Some(reply(HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER)).await);
         }
 
         let mut session_preauth = None;
@@ -359,7 +459,7 @@ async fn dispatch_one(
         if cmd == Command::SessionSetup {
             drop_stale_auths(conn, server.config.limits.handshake_timeout).await;
         }
-        let resp = handlers::dispatch_command(server, conn, &req_hdr, body_bytes).await;
+        let resp = handlers::dispatch_command(server, conn, &req_hdr, body_bytes, encrypted).await;
         if cmd == Command::SessionSetup {
             track_pending_auth(conn, &req_hdr, &resp);
         }
@@ -375,32 +475,40 @@ async fn dispatch_one(
             if let Some(sess_arc) = sessions.get(&sid) {
                 let mut sess = sess_arc.write().await;
                 sess.preauth_snapshot = Some(snap);
-                // For 3.1.1, recompute signing key now that we have the snapshot.
+                // For 3.1.1, derive the session keys from the snapshot.
                 let dialect = *conn.dialect.read().await;
                 if dialect == Some(crate::proto::messages::Dialect::Smb311) {
                     sess.signing_key =
                         crate::proto::crypto::signing_key_311(&sess.session_base_key, &snap);
+                    if let Some(cipher) = *conn.cipher.read().await
+                        && !sess.is_anonymous()
+                    {
+                        sess.cipher = Some(Arc::new(SessionCipher::derive(
+                            cipher,
+                            &sess.session_base_key,
+                            Some(&snap),
+                        )));
+                    }
                 }
             }
         }
 
-        let granted = grant_credits(conn, &req_hdr);
-        let (bytes, key) =
-            build_response_bytes(conn, &req_hdr, resp, request_session.as_ref(), granted).await;
+        let response = reply(resp).await;
+        let bytes = &response.bytes;
 
         if cmd == Command::Negotiate {
             let mut p = conn
                 .preauth
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            p.update(&bytes);
+            p.update(bytes);
         } else if cmd == Command::SessionSetup
             && dialect == Some(crate::proto::messages::Dialect::Smb311)
         {
-            if read_u32(&bytes, 0x08) == ntstatus::STATUS_MORE_PROCESSING_REQUIRED {
+            if read_u32(bytes, 0x08) == ntstatus::STATUS_MORE_PROCESSING_REQUIRED {
                 if let Some(mut p) = session_preauth {
-                    p.update(&bytes);
-                    let sid = read_u64(&bytes, 0x28);
+                    p.update(bytes);
+                    let sid = read_u64(bytes, 0x28);
                     conn.session_preauth.write().await.insert(sid, p);
                 }
             } else {
@@ -411,10 +519,87 @@ async fn dispatch_one(
             }
         }
 
-        Some((bytes, key))
+        Some(response)
     }
     .instrument(span)
     .await
+}
+
+/// The session keys a response is encrypted with (MS-SMB2 3.3.4.1.4): any
+/// reply to an encrypted request; on an encrypted session, every reply but
+/// NEGOTIATE and SESSION_SETUP; on a tree of an encrypted share, every
+/// reply but those and TREE_CONNECT.
+async fn response_cipher(
+    hdr: &Smb2Header,
+    encrypted: bool,
+    session: Option<&Arc<tokio::sync::RwLock<Session>>>,
+) -> Option<Arc<SessionCipher>> {
+    let sess = session?.read().await;
+    let cipher = sess.cipher.clone()?;
+    if encrypted {
+        return Some(cipher);
+    }
+    if matches!(hdr.command, Command::Negotiate | Command::SessionSetup) {
+        return None;
+    }
+    if sess.encrypt_data {
+        return Some(cipher);
+    }
+    if hdr.command == Command::TreeConnect {
+        return None;
+    }
+    let tree = sess.trees.read().await.get(&hdr.tree_id()?).cloned()?;
+    let encrypted_share = tree.read().await.share.encrypt_data;
+    encrypted_share.then_some(cipher)
+}
+
+/// Refuses an unencrypted request on a session or on a tree whose traffic
+/// is encrypted (MS-SMB2 3.3.5.2.9, 3.3.5.2.11). On SMB 3.0 and 3.0.2 that
+/// holds only while RejectUnencryptedAccess is set. A session that cannot
+/// encrypt is refused on an encrypted share while it is set.
+async fn check_encryption(
+    server: &ServerState,
+    conn: &Connection,
+    hdr: &Smb2Header,
+    encrypted: bool,
+    session: Option<&Arc<tokio::sync::RwLock<Session>>>,
+) -> Result<(), u32> {
+    let Some(session) = session else {
+        return Ok(());
+    };
+    if encrypted || !needs_session(hdr.command) {
+        return Ok(());
+    }
+    let reject = server.auth.settings.reject_unencrypted_access;
+    let required = reject || *conn.dialect.read().await == Some(Dialect::Smb311);
+    let sess = session.read().await;
+    if sess.encrypt_data && required {
+        warn!(command = ?hdr.command, "unencrypted request on an encrypted session");
+        return Err(ntstatus::STATUS_ACCESS_DENIED);
+    }
+    if !needs_tree(hdr.command) {
+        return Ok(());
+    }
+    let Some(tree) = sess
+        .trees
+        .read()
+        .await
+        .get(&hdr.tree_id().unwrap_or(0))
+        .cloned()
+    else {
+        return Ok(());
+    };
+    let encrypted_share = tree.read().await.share.encrypt_data;
+    let refused = if sess.cipher.is_some() {
+        required
+    } else {
+        reject
+    };
+    if encrypted_share && refused {
+        warn!(command = ?hdr.command, "unencrypted request on an encrypted share");
+        return Err(ntstatus::STATUS_ACCESS_DENIED);
+    }
+    Ok(())
 }
 
 /// Drops SESSION_SETUP exchanges that started more than `timeout` ago, so

@@ -48,6 +48,8 @@ pub struct ShareBindings {
     pub acl: RwLock<ShareAcl>,
     /// `IPC$` synthetic share. Accepted at TREE_CONNECT; opens on it fail.
     pub is_ipc: bool,
+    /// Share.EncryptData: traffic to the share is encrypted.
+    pub encrypt_data: bool,
     /// Every file on the share that has an open, on any connection.
     pub(crate) files: crate::files::FileTable,
 }
@@ -65,6 +67,21 @@ impl ShareBindings {
             backend,
             acl: RwLock::new(ShareAcl { mode, users }),
             is_ipc,
+            encrypt_data: false,
+            files: crate::files::FileTable::default(),
+        })
+    }
+
+    pub(crate) fn from_share(share: Share) -> Arc<Self> {
+        Arc::new(Self {
+            name: share.name,
+            backend: share.backend,
+            acl: RwLock::new(ShareAcl {
+                mode: share.mode,
+                users: share.users,
+            }),
+            is_ipc: false,
+            encrypt_data: share.encrypt_data,
             files: crate::files::FileTable::default(),
         })
     }
@@ -328,7 +345,7 @@ impl ConfigHandle {
             }
         }
 
-        let binding = ShareBindings::new(share.name, share.backend, share.mode, share.users, false);
+        let binding = ShareBindings::from_share(share);
         self.state.shares.insert(binding).await
     }
 

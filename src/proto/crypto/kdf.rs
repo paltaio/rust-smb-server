@@ -3,7 +3,7 @@
 //! Fixed input fed to the PRF (HMAC-SHA-256) is:
 //!
 //! ```text
-//! i (u32be=1) || Label || 0x00 || Context || L (u32be=128)
+//! i (u32be=1) || Label || 0x00 || Context || L (u32be, 128 or 256)
 //! ```
 //!
 //! Convention in this crate:
@@ -17,7 +17,7 @@ use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// SP 800-108 CTR-mode KDF using HMAC-SHA-256.
+/// SP 800-108 CTR-mode KDF using HMAC-SHA-256 with L = 128.
 ///
 /// * `key` - the input key (session key, typically 16 bytes).
 /// * `label` - the label string with trailing NUL (e.g. `b"SMB2AESCMAC\x00"`).
@@ -26,6 +26,16 @@ type HmacSha256 = Hmac<Sha256>;
 /// Returns the first 16 bytes of `HMAC-SHA-256(key, fixed_input)` where
 /// `fixed_input = [0,0,0,1] || label || 0x00 || context || [0,0,0,0x80]`.
 pub fn smb2_kdf(key: &[u8], label: &[u8], context: &[u8]) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    smb2_kdf_into(key, label, context, &mut out);
+    out
+}
+
+/// SP 800-108 CTR-mode KDF using HMAC-SHA-256, filling `out` with
+/// L = `out.len() * 8` bits. One HMAC block covers the 16- and 32-byte keys
+/// SMB derives.
+pub(crate) fn smb2_kdf_into(key: &[u8], label: &[u8], context: &[u8], out: &mut [u8]) {
+    assert!(out.len() <= 32, "SMB keys are at most 256 bits");
     let mut mac =
         <HmacSha256 as Mac>::new_from_slice(key).expect("HMAC-SHA-256 accepts keys of any length");
 
@@ -39,13 +49,11 @@ pub fn smb2_kdf(key: &[u8], label: &[u8], context: &[u8]) -> [u8; 16] {
     // Context (including trailing NUL provided by caller, or for 3.1.1 the
     // 64-byte preauth hash)
     mac.update(context);
-    // L = 128 bits (big-endian u32)
-    mac.update(&[0x00, 0x00, 0x00, 0x80]);
+    // L in bits (big-endian u32)
+    mac.update(&(out.len() as u32 * 8).to_be_bytes());
 
     let full = mac.finalize().into_bytes();
-    let mut out = [0u8; 16];
-    out.copy_from_slice(&full[..16]);
-    out
+    out.copy_from_slice(&full[..out.len()]);
 }
 
 // --- Convenience helpers ---------------------------------------------------

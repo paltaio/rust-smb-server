@@ -73,11 +73,34 @@ server.serve().await?;
 
 Removing a user revokes that user's active sessions. Removing a share or revoking share access closes matching active tree connections and open handles.
 
+## Encryption
+
+SMB 3.1.1 clients negotiate AES-128 or AES-256 in CCM or GCM mode; SMB 3.0 and 3.0.2 clients with the encryption capability use AES-128-CCM. A client that sends encrypted requests gets encrypted replies.
+
+To require encryption on one share:
+
+```rust
+use smb_server::{Access, LocalFsBackend, Share, SmbServer};
+
+let server = SmbServer::builder()
+    .listen("0.0.0.0:4445".parse()?)
+    .user("alice", "password")
+    .share(
+        Share::new("secret", LocalFsBackend::new("/srv/secret")?)
+            .user("alice", Access::ReadWrite)
+            .encrypt_data(),
+    )
+    .build()?;
+```
+
+To require it for every session, call `.encrypt_data(true)` on the builder.
+
+Where encryption is required, clients that cannot encrypt are refused: SMB 2.x, SMB 3.x without a cipher in common, and anonymous sessions, which get a session but no tree. `reject_unencrypted_access(false)` serves them unencrypted instead.
+
 ## Limitations
 
 Not supported:
 
-- SMB3 encryption
 - Kerberos; authentication is NTLM only
 - oplocks, leases and durable handles
 - change notifications

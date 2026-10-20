@@ -1,4 +1,4 @@
-//! Server-wide logon policy: signing, the per-connection session limit and
+//! Server-wide logon policy: signing, encryption, the per-connection session limit and
 //! per-session tree limit, the failed-logon throttle, and SessionId
 //! allocation.
 
@@ -24,6 +24,13 @@ pub struct AuthSettings {
     /// Set Session.SigningRequired on every authenticated session
     /// (RequireMessageSigning in MS-SMB2 3.3.1.5).
     pub require_signing: bool,
+    /// Encrypt every authenticated SMB 3.x session that can encrypt
+    /// (EncryptData in MS-SMB2 3.3.1.5).
+    pub encrypt_data: bool,
+    /// Refuse sessions and trees that must be encrypted to clients that
+    /// cannot encrypt, and on SMB 3.0 and 3.0.2 refuse their unencrypted
+    /// requests (RejectUnencryptedAccess in MS-SMB2 3.3.1.5).
+    pub reject_unencrypted_access: bool,
     pub max_sessions_per_connection: usize,
     pub max_trees_per_session: usize,
     /// Failed logons before a user name is locked out and a connection is
@@ -37,6 +44,8 @@ impl Default for AuthSettings {
     fn default() -> Self {
         Self {
             require_signing: false,
+            encrypt_data: false,
+            reject_unencrypted_access: true,
             max_sessions_per_connection: 64,
             max_trees_per_session: 128,
             max_logon_failures: 10,

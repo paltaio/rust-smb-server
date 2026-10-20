@@ -704,6 +704,7 @@ impl NtlmServer {
             | flags::NTLMSSP_REQUEST_TARGET
             | flags::NTLMSSP_NEGOTIATE_NTLM
             | flags::NTLMSSP_NEGOTIATE_SIGN
+            | flags::NTLMSSP_NEGOTIATE_SEAL
             | flags::NTLMSSP_NEGOTIATE_ALWAYS_SIGN
             | flags::NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY
             | flags::NTLMSSP_TARGET_TYPE_SERVER

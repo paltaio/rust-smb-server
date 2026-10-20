@@ -3,7 +3,7 @@
 use std::ops::Range;
 
 use crate::conn::limits::{MAX_SMALL_REQUEST, is_bulk, supports_multi_credit};
-use crate::proto::header::{Command, SMB2_HEADER_LEN, Smb2Header};
+use crate::proto::header::{Command, SMB2_FLAGS_RELATED_OPERATIONS, SMB2_HEADER_LEN, Smb2Header};
 use crate::proto::messages::Dialect;
 
 /// One request of a received frame.
@@ -53,6 +53,30 @@ pub fn split(frame: &[u8], dialect: Option<Dialect>) -> Result<Vec<Request>, Str
         }
         offset += next;
     }
+}
+
+/// Checks the requests of a decrypted message against the SessionId of its
+/// TRANSFORM_HEADER (MS-SMB2 3.3.5.2.1.1): the first request is not related
+/// and is on that session, each later one is related or on that session,
+/// and each later one starts 8-byte aligned. A failure closes the
+/// connection.
+pub fn check_encrypted(requests: &[Request], session_id: u64) -> Result<(), String> {
+    for (index, request) in requests.iter().enumerate() {
+        let related = request.header.flags & SMB2_FLAGS_RELATED_OPERATIONS != 0;
+        if index == 0 && related {
+            return Err("first request of an encrypted message is related".into());
+        }
+        if !related && request.header.session_id != session_id {
+            return Err(format!(
+                "request on session {:#x} encrypted for session {session_id:#x}",
+                request.header.session_id
+            ));
+        }
+        if index > 0 && request.range.start % 8 != 0 {
+            return Err("encrypted compound request is not 8-byte aligned".into());
+        }
+    }
+    Ok(())
 }
 
 /// Bytes a request sends or may get back in its variable part, whichever
@@ -112,7 +136,6 @@ pub fn body_is_well_formed(command: Command, body: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proto::header::SMB2_FLAGS_RELATED_OPERATIONS;
 
     const NEGOTIATED: Option<Dialect> = Some(Dialect::Smb210);
 

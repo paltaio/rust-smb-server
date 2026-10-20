@@ -11,7 +11,7 @@ use crate::proto::auth::ntlm::{
 use crate::proto::auth::spnego::{
     NegState, NegTokenInit, OID_NTLMSSP, decode_init_token, decode_resp_token, encode_resp_token,
 };
-use crate::proto::crypto::signing_key_30;
+use crate::proto::crypto::{SessionCipher, signing_key_30};
 use crate::proto::header::Smb2Header;
 use crate::proto::messages::{Dialect, SessionSetupRequest, SessionSetupResponse};
 use tracing::{debug, info, warn};
@@ -90,6 +90,16 @@ pub async fn handle(
     let blob = &req.security_buffer;
     if blob.is_empty() {
         return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
+    }
+    // MS-SMB2 3.3.5.5: while every session is encrypted and unencrypted
+    // access is rejected, a client that cannot encrypt gets no session.
+    let settings = &server.auth.settings;
+    if settings.encrypt_data
+        && settings.reject_unencrypted_access
+        && conn.cipher.read().await.is_none()
+    {
+        info!("session setup refused: the server encrypts and the client cannot");
+        return HandlerResponse::err(ntstatus::STATUS_ACCESS_DENIED);
     }
     if tracing::enabled!(tracing::Level::DEBUG) {
         let mut first8 = String::with_capacity(16);
@@ -382,10 +392,16 @@ async fn continue_exchange(
     };
 
     // MS-SMB2 3.3.5.5.3: anonymous sessions are flagged IS_NULL. There is no
-    // guest account, so IS_GUEST is never set.
+    // guest account, so IS_GUEST is never set. Authenticated sessions on a
+    // connection with a cipher get encryption keys, and are encrypted when
+    // the server encrypts every session.
     let anonymous = matches!(outcome.identity, Identity::Anonymous);
+    let cipher = (*conn.cipher.read().await).filter(|_| !anonymous);
+    let encrypt_data = server.auth.settings.encrypt_data && cipher.is_some();
     let session_flags = if anonymous {
         SessionSetupResponse::FLAG_IS_NULL
+    } else if encrypt_data {
+        SessionSetupResponse::FLAG_ENCRYPT_DATA
     } else {
         0
     };
@@ -419,13 +435,24 @@ async fn continue_exchange(
 
     let signing_key = signing_key(dialect, &session_base_key);
     let signing_required = signing_required(server, conn, req, &outcome.identity);
-    let session = Session::new(
+    let mut session = Session::new(
         outcome.identity.clone(),
         session_base_key,
         signing_key,
         signing_required,
         None,
     );
+    session.encrypt_data = encrypt_data;
+    // SMB 3.1.1 keys come from the preauth hash, once it is known.
+    if dialect != Dialect::Smb311
+        && let Some(cipher) = cipher
+    {
+        session.cipher = Some(Arc::new(SessionCipher::derive(
+            cipher,
+            &session_base_key,
+            None,
+        )));
+    }
     let session_arc = Arc::new(tokio::sync::RwLock::new(session));
     {
         let mut sessions = conn.sessions.write().await;
