@@ -6,6 +6,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
 use std::time::Duration;
 
+use common::client::{Create, FILE_GENERIC_WRITE, FILE_OVERWRITE_IF, write_request};
 use common::transport::{
     ECHO_BODY, WAIT, anonymous_tree, assert_closed, assert_open, compound, connect,
     connect_in_session_setup, connect_negotiated, open_file, read_body, read_response, with_share,
@@ -14,6 +15,7 @@ use common::{build_header, framed, message, start_server};
 use smb_server::SmbServer;
 use smb_server::ntstatus::STATUS_INVALID_PARAMETER;
 use smb_server::wire::header::{Command, Smb2Header};
+use smb_server::wire::messages::{CreateResponse, WriteResponse};
 use tokio::io::AsyncWriteExt;
 
 /// Records the largest single allocation and the bytes in use.
@@ -183,5 +185,56 @@ async fn responses_too_large_for_a_frame_fail_instead_of_wrapping() {
         .expect("write");
     let (hdr, _) = read_response(&mut s).await;
     assert_eq!(hdr.command, Command::Echo);
+    handle.abort();
+}
+
+#[tokio::test]
+async fn write_of_the_largest_negotiated_size_succeeds() {
+    let _measuring = MEASURING.lock().await;
+    const MIB: u32 = 1024 * 1024;
+    let (builder, td) = with_share(&[]);
+    let (addr, handle) = start_server(builder.max_write_size(8 * MIB)).await;
+    let (mut s, session_id, tree_id) = anonymous_tree(addr).await;
+    let mut hdr = build_header(Command::Echo, 4, 0, 0);
+    hdr.credit_request_response = 1024;
+    s.write_all(&framed(&message(&hdr, &ECHO_BODY)))
+        .await
+        .expect("write");
+    read_response(&mut s).await;
+
+    let create = Create {
+        name: "big.bin",
+        access: FILE_GENERIC_WRITE,
+        disposition: FILE_OVERWRITE_IF,
+        ..Create::default()
+    };
+    let hdr = build_header(Command::Create, 5, session_id, tree_id);
+    s.write_all(&framed(&message(&hdr, &create.body())))
+        .await
+        .expect("write");
+    let (created, frame) = read_response(&mut s).await;
+    assert_eq!(created.channel_sequence_status, 0, "CREATE");
+    let file_id = CreateResponse::parse(&frame[64..]).expect("create").file_id;
+
+    let data = vec![0xA5; 8 * MIB as usize];
+    let mut body = Vec::new();
+    write_request(file_id, 0, &data)
+        .write_to(&mut body)
+        .expect("body");
+    let mut hdr = build_header(Command::Write, 6, session_id, tree_id);
+    hdr.credit_charge = 128;
+    s.write_all(&framed(&message(&hdr, &body)))
+        .await
+        .expect("write");
+    let (written, frame) = read_response(&mut s).await;
+    assert_eq!(written.channel_sequence_status, 0, "WRITE");
+    let count = WriteResponse::parse(&frame[64..])
+        .expect("write response")
+        .count;
+    assert_eq!(count, 8 * MIB);
+    assert_eq!(
+        std::fs::read(td.path().join("big.bin")).expect("file"),
+        data
+    );
     handle.abort();
 }

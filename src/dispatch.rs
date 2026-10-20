@@ -154,7 +154,8 @@ pub async fn dispatch_frame(
     let mut chain_failure = (requests[0].header.flags & SMB2_FLAGS_RELATED_OPERATIONS != 0)
         .then_some(ntstatus::STATUS_INVALID_PARAMETER);
 
-    for request in requests {
+    let request_count = requests.len();
+    for (index, request) in requests.into_iter().enumerate() {
         let mut req_hdr = request.header;
         let received = &frame[request.range];
         let mut sub_frame = received.to_vec();
@@ -199,8 +200,9 @@ pub async fn dispatch_frame(
             }
         };
         if let Some(mut response) = response {
-            // Keep room for an error response to every request in the frame.
-            if align_8(response_len) + response.bytes.len() + 2 * frame.len() + TRANSFORM_HEADER_LEN
+            // Keep room for an error response to each request after this one.
+            let reserved = (request_count - index - 1) * ERROR_RESPONSE_ROOM;
+            if align_8(response_len) + response.bytes.len() + reserved + TRANSFORM_HEADER_LEN
                 > MAX_FRAME_PAYLOAD as usize
             {
                 warn!(
@@ -342,6 +344,10 @@ async fn stitch_responses(conn: &Arc<Connection>, responses: Vec<Reply>) -> Vec<
 
     out
 }
+
+/// Bytes an error response takes in a compound response: the header, the
+/// 9-byte ERROR body and padding to 8 bytes.
+const ERROR_RESPONSE_ROOM: usize = align_8(SMB2_HEADER_LEN + 9);
 
 const fn align_8(n: usize) -> usize {
     (n + 7) & !7
