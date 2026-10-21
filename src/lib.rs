@@ -154,6 +154,17 @@
 //!   STATUS_DUPLICATE_OBJECTID unless it is marked as a replay; one marked
 //!   as a replay opens the file anew rather than answering with that
 //!   open.
+//! - Share listing: unless [`SmbServerBuilder::share_listing`] turns it
+//!   off, IPC$ serves the `srvsvc` pipe, so clients can list the server's
+//!   shares. A session sees the shares it may connect to, in the order
+//!   they were added, and IPC$; for an anonymous session that is the
+//!   public shares, and a session that cannot encrypt does not see shares
+//!   whose traffic is encrypted. [`Share::listed`] leaves a share out of
+//!   the list without hiding it from lookups by name, and
+//!   [`Share::remark`] sets the comment shown next to it. Backends are not
+//!   called. Other pipe names fail with STATUS_OBJECT_NAME_NOT_FOUND,
+//!   DCE/RPC binds that carry authentication are refused, and one
+//!   connection may hold 16 pipes at once.
 //! - READ and WRITE lengths are bounded by the negotiated maximum sizes.
 //! - Each [`SmbError`] maps to one NTSTATUS for the client; see
 //!   [`SmbError::to_nt_status`].
@@ -345,6 +356,40 @@ pub mod fuzzing {
                 assert!(assoc.held() <= (64 << 10) + usize::from(u16::MAX));
             }
         }
+    }
+
+    /// Runs `data` as a srvsvc request stub. The first byte picks the
+    /// operation: NetrShareEnum, NetrShareGetInfo, NetrServerGetInfo or,
+    /// with the second byte, any opnum. The caller sees three shares.
+    pub fn srvsvc_request(data: &[u8]) {
+        use crate::rpc::srvsvc::{self, ListedShare, ShareView};
+
+        let Some((&pick, stub)) = data.split_first() else {
+            return;
+        };
+        let (opnum, stub) = match pick % 4 {
+            0 => (srvsvc::OPNUM_SHARE_ENUM, stub),
+            1 => (srvsvc::OPNUM_SHARE_GET_INFO, stub),
+            2 => (srvsvc::OPNUM_SERVER_GET_INFO, stub),
+            _ => match stub.split_first() {
+                Some((&opnum, stub)) => (u16::from(opnum), stub),
+                None => return,
+            },
+        };
+        let share = |name: &str, kind, remark: &str| ListedShare {
+            name: name.to_string(),
+            kind,
+            remark: remark.to_string(),
+        };
+        let view = ShareView {
+            server_name: "FUZZ".to_string(),
+            shares: vec![
+                share("public", 0, ""),
+                share("d\u{f6}cs$", 0, "\u{1F9A4} remark"),
+                share("IPC$", 0x8000_0003, "Remote IPC"),
+            ],
+        };
+        let _ = srvsvc::call(opnum, stub, &view);
     }
 
     /// Dispatches one frame payload on a fresh connection to `server`.

@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
-use crate::proto::auth::ntlm::UserCreds;
+use crate::proto::auth::ntlm::{Identity, UserCreds};
 use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, RwLock, Semaphore};
@@ -16,7 +16,9 @@ use tracing::{Instrument, debug, error, info, info_span, warn};
 use uuid::Uuid;
 
 use crate::backend::ShareBackend;
-use crate::builder::{Access, Share, ShareNameError, SmbServerBuilder, check_share_name};
+use crate::builder::{
+    Access, Share, ShareNameError, SmbServerBuilder, check_share_name, valid_remark,
+};
 use crate::conn::connection_loop;
 use crate::conn::limits::Limits;
 use crate::conn::listener::{AcceptBackoff, configure_socket};
@@ -41,6 +43,38 @@ pub struct ShareAcl {
     pub users: HashMap<String, Access>,
 }
 
+impl ShareAcl {
+    /// The access `identity` gets to the share, or `None` when it may not
+    /// connect: public shares admit everyone, other shares their users.
+    pub(crate) fn authorize(&self, identity: &Identity) -> Option<Access> {
+        match self.mode {
+            ShareMode::Public => Some(Access::ReadWrite),
+            ShareMode::PublicReadOnly => Some(Access::Read),
+            ShareMode::AuthenticatedOnly => match identity {
+                Identity::Anonymous => None,
+                Identity::User { user, .. } => self.users.get(user).copied(),
+            },
+        }
+    }
+}
+
+/// A session as share admission sees it.
+#[derive(Debug, Clone)]
+pub(crate) struct Caller {
+    pub identity: Identity,
+    /// The session has encryption keys.
+    pub can_encrypt: bool,
+}
+
+impl Caller {
+    pub(crate) fn of(session: &crate::conn::state::Session) -> Self {
+        Self {
+            identity: session.identity.clone(),
+            can_encrypt: session.cipher.is_some(),
+        }
+    }
+}
+
 /// Compiled binding for a single share: the per-server-state form of `Share`.
 pub struct ShareBindings {
     pub name: String,
@@ -55,6 +89,10 @@ pub struct ShareBindings {
     pub(crate) leases: bool,
     /// Opens asking for a durable handle get one.
     pub(crate) durable_handles: bool,
+    /// The share appears when clients list the server's shares.
+    pub(crate) listed: bool,
+    /// The comment shown next to the share in share lists.
+    pub(crate) remark: String,
     /// Every file on the share that has an open, on any connection.
     pub(crate) files: crate::files::FileTable,
 }
@@ -77,6 +115,8 @@ impl ShareBindings {
             encrypt_data: false,
             leases,
             durable_handles,
+            listed: true,
+            remark: String::new(),
             files: crate::files::FileTable::default(),
         })
     }
@@ -93,6 +133,8 @@ impl ShareBindings {
             encrypt_data: share.encrypt_data,
             leases: share.leases,
             durable_handles: share.durable_handles,
+            listed: share.listed,
+            remark: share.remark,
             files: crate::files::FileTable::default(),
         })
     }
@@ -123,6 +165,8 @@ pub struct ServerConfig {
     pub max_write_size: u32,
     pub server_guid: Uuid,
     pub limits: Limits,
+    /// IPC$ serves the srvsvc pipe, so clients can list the shares.
+    pub share_listing: bool,
 }
 
 pub struct ServerUsers {
@@ -131,16 +175,20 @@ pub struct ServerUsers {
 }
 
 pub struct ServerShares {
-    by_name: RwLock<HashMap<String, Arc<ShareBindings>>>,
+    /// Each share by its lowercased name, with its place in the order the
+    /// shares were added.
+    by_name: RwLock<HashMap<String, (u64, Arc<ShareBindings>)>>,
+    next_seq: AtomicU64,
 }
 
 impl ServerShares {
     pub fn new(shares: Vec<Arc<ShareBindings>>) -> Self {
         let mut by_name = HashMap::with_capacity(shares.len());
-        for share in shares {
-            by_name.insert(share.name.to_ascii_lowercase(), share);
+        for (seq, share) in (0..).zip(shares) {
+            by_name.insert(share.name.to_ascii_lowercase(), (seq, share));
         }
         Self {
+            next_seq: AtomicU64::new(by_name.len() as u64),
             by_name: RwLock::new(by_name),
         }
     }
@@ -150,16 +198,18 @@ impl ServerShares {
             .read()
             .await
             .get(&name.to_ascii_lowercase())
-            .cloned()
+            .map(|(_, share)| Arc::clone(share))
     }
 
+    /// Adds `share` after every share there is.
     pub async fn insert(&self, share: Arc<ShareBindings>) -> Result<(), ConfigError> {
         let key = share.name.to_ascii_lowercase();
         let mut by_name = self.by_name.write().await;
         if by_name.contains_key(&key) {
             return Err(ConfigError::DuplicateShare(share.name.clone()));
         }
-        by_name.insert(key, share);
+        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+        by_name.insert(key, (seq, share));
         Ok(())
     }
 
@@ -168,10 +218,31 @@ impl ServerShares {
             .write()
             .await
             .remove(&name.to_ascii_lowercase())
+            .map(|(_, share)| share)
     }
 
     pub async fn all(&self) -> Vec<Arc<ShareBindings>> {
-        self.by_name.read().await.values().cloned().collect()
+        self.by_name
+            .read()
+            .await
+            .values()
+            .map(|(_, share)| Arc::clone(share))
+            .collect()
+    }
+
+    /// Holds the share table for writing, so lookups wait.
+    #[cfg(test)]
+    pub(crate) async fn hold(
+        &self,
+    ) -> tokio::sync::RwLockWriteGuard<'_, HashMap<String, (u64, Arc<ShareBindings>)>> {
+        self.by_name.write().await
+    }
+
+    /// Every share, in the order the shares were added (MS-SRVS 3.1.4.8).
+    pub(crate) async fn all_in_order(&self) -> Vec<Arc<ShareBindings>> {
+        let mut shares: Vec<_> = self.by_name.read().await.values().cloned().collect();
+        shares.sort_unstable_by_key(|(seq, _)| *seq);
+        shares.into_iter().map(|(_, share)| share).collect()
     }
 }
 
@@ -269,6 +340,26 @@ impl ServerState {
         }
     }
 
+    /// The access `caller` gets at TREE_CONNECT to `share`, whose ACL is
+    /// `acl`, or `None` when it is refused: the ACL must admit the caller,
+    /// and while unencrypted access is refused, a share whose traffic is
+    /// encrypted refuses a session that cannot encrypt (MS-SMB2 3.3.5.7).
+    pub(crate) fn admits(
+        &self,
+        share: &ShareBindings,
+        acl: &ShareAcl,
+        caller: &Caller,
+    ) -> Option<Access> {
+        let settings = &self.auth.settings;
+        if (settings.encrypt_data || share.encrypt_data)
+            && settings.reject_unencrypted_access
+            && !caller.can_encrypt
+        {
+            return None;
+        }
+        acl.authorize(&caller.identity)
+    }
+
     /// Find a share by case-insensitive name.
     pub async fn find_share(&self, name: &str) -> Option<Arc<ShareBindings>> {
         self.shares.find(name).await
@@ -307,8 +398,10 @@ pub enum ConfigError {
     EmptyUserName,
     #[error("share name `{0}` is reserved")]
     ReservedShareName(String),
-    #[error("share name `{0}` must be non-empty and contain no `\\` or `/`")]
+    #[error("share name `{0}` must be non-empty and contain no `\\`, `/` or NUL")]
     InvalidShareName(String),
+    #[error("remark of share `{0}` must hold no NUL and at most 1024 UTF-16 code units")]
+    InvalidShareRemark(String),
 }
 
 #[derive(Clone)]
@@ -361,6 +454,9 @@ impl ConfigHandle {
         let is_public = matches!(share.mode, ShareMode::Public | ShareMode::PublicReadOnly);
         if is_public && !share.users.is_empty() {
             return Err(ConfigError::PublicMixedWithUsers(share.name));
+        }
+        if !valid_remark(&share.remark) {
+            return Err(ConfigError::InvalidShareRemark(share.name));
         }
         let users = self.state.users.table.read().await;
         for user in share.users.keys() {

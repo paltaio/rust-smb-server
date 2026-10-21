@@ -315,3 +315,339 @@ pub fn ioctl_output(status: u32, body: &[u8]) -> Vec<u8> {
     assert_eq!(resp.output_offset, 0x70);
     resp.output
 }
+
+pub const OPNUM_SHARE_ENUM: u16 = 15;
+pub const OPNUM_SHARE_GET_INFO: u16 = 16;
+pub const OPNUM_SERVER_GET_INFO: u16 = 21;
+/// NetrShareEnumSticky, which the server does not serve.
+pub const OPNUM_SHARE_ENUM_STICKY: u16 = 36;
+
+pub const BAD_STUB_DATA: u32 = 0x0000_06F7;
+pub const ERROR_ACCESS_DENIED: u32 = 5;
+pub const ERROR_INVALID_PARAMETER: u32 = 87;
+pub const ERROR_INVALID_LEVEL: u32 = 124;
+pub const ERROR_MORE_DATA: u32 = 234;
+pub const NERR_NET_NAME_NOT_FOUND: u32 = 2310;
+
+pub const STYPE_DISKTREE: u32 = 0;
+pub const STYPE_IPC_SPECIAL: u32 = 0x8000_0003;
+
+/// NDR as a client writes it (C706 chapter 14): aligned integers, referent
+/// ids from 0x20000, conformant varying strings with their NUL.
+pub struct NdrOut {
+    buf: Vec<u8>,
+    next: u32,
+}
+
+impl Default for NdrOut {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl NdrOut {
+    pub fn new() -> Self {
+        Self {
+            buf: Vec::new(),
+            next: 0x0002_0000,
+        }
+    }
+
+    pub fn u32(&mut self, value: u32) -> &mut Self {
+        self.buf.resize(self.buf.len().next_multiple_of(4), 0);
+        self.buf.extend_from_slice(&value.to_le_bytes());
+        self
+    }
+
+    pub fn pointer(&mut self, present: bool) -> &mut Self {
+        let id = if present { self.next } else { 0 };
+        if present {
+            self.next += 4;
+        }
+        self.u32(id)
+    }
+
+    pub fn string(&mut self, text: &str) -> &mut Self {
+        let units: Vec<u16> = text.encode_utf16().chain([0]).collect();
+        self.u32(units.len() as u32).u32(0).u32(units.len() as u32);
+        for unit in units {
+            self.buf.extend_from_slice(&unit.to_le_bytes());
+        }
+        self
+    }
+
+    pub fn finish(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.buf)
+    }
+}
+
+/// NetrShareEnum: ServerName `\\127.0.0.1`, an empty container of
+/// `level`, PreferedMaximumLength and ResumeHandle.
+pub fn enum_request(level: u32, preferred_max: u32, resume: Option<u32>) -> Vec<u8> {
+    let mut w = NdrOut::new();
+    w.pointer(true)
+        .string("\\\\127.0.0.1")
+        .u32(level)
+        .u32(level);
+    w.pointer(true).u32(0).pointer(false).u32(preferred_max);
+    w.pointer(resume.is_some());
+    if let Some(resume) = resume {
+        w.u32(resume);
+    }
+    w.finish()
+}
+
+/// NetrShareGetInfo for the share `name` at `level`.
+pub fn get_info_request(name: &str, level: u32) -> Vec<u8> {
+    NdrOut::new()
+        .pointer(true)
+        .string("127.0.0.1")
+        .string(name)
+        .u32(level)
+        .finish()
+}
+
+/// NetrServerGetInfo at `level`, with no ServerName.
+pub fn server_info_request(level: u32) -> Vec<u8> {
+    NdrOut::new().pointer(false).u32(level).finish()
+}
+
+/// Reads a response stub.
+pub struct NdrIn<'a> {
+    buf: &'a [u8],
+    at: usize,
+}
+
+impl<'a> NdrIn<'a> {
+    pub fn new(buf: &'a [u8]) -> Self {
+        Self { buf, at: 0 }
+    }
+
+    pub fn u32(&mut self) -> u32 {
+        self.at = self.at.next_multiple_of(4);
+        let value = u32::from_le_bytes(self.buf[self.at..self.at + 4].try_into().unwrap());
+        self.at += 4;
+        value
+    }
+
+    /// A conformant varying string, without its NUL.
+    pub fn string(&mut self) -> String {
+        let max = self.u32();
+        assert_eq!(self.u32(), 0, "offset");
+        let actual = self.u32() as usize;
+        assert_eq!(max as usize, actual);
+        let units: Vec<u16> = self.buf[self.at..self.at + 2 * actual]
+            .chunks_exact(2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .collect();
+        self.at += 2 * actual;
+        assert_eq!(units.last(), Some(&0), "NUL");
+        String::from_utf16(&units[..actual - 1]).expect("UTF-16")
+    }
+
+    pub fn end(&self) {
+        assert_eq!(self.at, self.buf.len(), "bytes after the stub");
+    }
+}
+
+/// One share of a SHARE_INFO_0, _1 or _501.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entry {
+    pub name: String,
+    pub kind: Option<u32>,
+    pub remark: Option<String>,
+    pub flags: Option<u32>,
+}
+
+impl Entry {
+    /// The fixed part of an entry of `level`, its strings still to come.
+    fn read_fixed(r: &mut NdrIn<'_>, level: u32) -> Self {
+        assert_ne!(r.u32(), 0, "netname pointer");
+        let mut entry = Entry {
+            name: String::new(),
+            kind: None,
+            remark: None,
+            flags: None,
+        };
+        if level != 0 {
+            entry.kind = Some(r.u32());
+            assert_ne!(r.u32(), 0, "remark pointer");
+            entry.remark = Some(String::new());
+        }
+        if level == 501 {
+            entry.flags = Some(r.u32());
+        }
+        entry
+    }
+
+    fn read_strings(&mut self, r: &mut NdrIn<'_>) {
+        self.name = r.string();
+        if self.remark.is_some() {
+            self.remark = Some(r.string());
+        }
+    }
+}
+
+/// A NetrShareEnum response.
+#[derive(Debug)]
+pub struct EnumReply {
+    pub level: u32,
+    pub entries: Vec<Entry>,
+    pub total: u32,
+    pub resume: Option<u32>,
+    pub status: u32,
+}
+
+impl EnumReply {
+    pub fn names(&self) -> Vec<&str> {
+        self.entries.iter().map(|e| e.name.as_str()).collect()
+    }
+}
+
+pub fn decode_enum(stub: &[u8]) -> EnumReply {
+    let mut r = NdrIn::new(stub);
+    let level = r.u32();
+    assert_eq!(r.u32(), level, "discriminant");
+    let mut entries = Vec::new();
+    if [0, 1, 2, 501, 502, 503].contains(&level) && r.u32() != 0 {
+        let count = r.u32();
+        if r.u32() != 0 {
+            assert_eq!(r.u32(), count, "max_count");
+            for _ in 0..count {
+                entries.push(Entry::read_fixed(&mut r, level));
+            }
+            for entry in &mut entries {
+                entry.read_strings(&mut r);
+            }
+        } else {
+            assert_eq!(count, 0);
+        }
+    }
+    let total = r.u32();
+    let resume = (r.u32() != 0).then(|| r.u32());
+    let status = r.u32();
+    r.end();
+    EnumReply {
+        level,
+        entries,
+        total,
+        resume,
+        status,
+    }
+}
+
+/// A NetrShareGetInfo response: the level, the share and the status. A
+/// level 1005 answer is an entry with only flags.
+pub fn decode_get_info(stub: &[u8]) -> (u32, Option<Entry>, u32) {
+    let mut r = NdrIn::new(stub);
+    let level = r.u32();
+    let arms = [0, 1, 2, 501, 502, 503, 1004, 1005, 1006, 1501];
+    let mut entry = None;
+    if arms.contains(&level) && r.u32() != 0 {
+        if level == 1005 {
+            entry = Some(Entry {
+                name: String::new(),
+                kind: None,
+                remark: None,
+                flags: Some(r.u32()),
+            });
+        } else {
+            let mut e = Entry::read_fixed(&mut r, level);
+            e.read_strings(&mut r);
+            entry = Some(e);
+        }
+    }
+    let status = r.u32();
+    r.end();
+    (level, entry, status)
+}
+
+/// What a SERVER_INFO_100 or _101 holds.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ServerInfo {
+    pub platform_id: u32,
+    pub name: String,
+    /// Major and minor version, server type and comment, at level 101.
+    pub details: Option<(u32, u32, u32, String)>,
+}
+
+/// A NetrServerGetInfo response with an arm for level 100, 101 or 102:
+/// the level, the information and the status.
+pub fn decode_server_info(stub: &[u8]) -> (u32, Option<ServerInfo>, u32) {
+    let mut r = NdrIn::new(stub);
+    let level = r.u32();
+    let mut info = None;
+    if r.u32() != 0 {
+        let platform_id = r.u32();
+        assert_ne!(r.u32(), 0);
+        let mut details = None;
+        if level == 101 {
+            let (major, minor, kind) = (r.u32(), r.u32(), r.u32());
+            assert_ne!(r.u32(), 0);
+            details = Some((major, minor, kind, String::new()));
+        }
+        let name = r.string();
+        if let Some(d) = details.as_mut() {
+            d.3 = r.string();
+        }
+        info = Some(ServerInfo {
+            platform_id,
+            name,
+            details,
+        });
+    }
+    let status = r.u32();
+    r.end();
+    (level, info, status)
+}
+
+impl Client {
+    /// Runs one call on a bound pipe: the request goes in one fragment by
+    /// FSCTL_PIPE_TRANSCEIVE, and the rest of the response is read. Returns
+    /// the response stub, or the status of the fault that answers it.
+    pub async fn call(
+        &mut self,
+        file_id: FileId,
+        call_id: u32,
+        opnum: u16,
+        stub: &[u8],
+    ) -> Result<Vec<u8>, u32> {
+        let request = request_pdu(call_id, FIRST | LAST, 0, opnum, stub);
+        let (status, mut pdu) = self.transceive(file_id, &request, 4280).await;
+        assert_eq!(status, STATUS_SUCCESS);
+        let mut out = Vec::new();
+        loop {
+            assert_eq!(super::rpc::call_id(&pdu), call_id);
+            if ptype(&pdu) == PTYPE_FAULT {
+                return Err(fault_status(&pdu));
+            }
+            assert_pdu(&pdu, PTYPE_RESPONSE);
+            out.extend_from_slice(&pdu[24..]);
+            if pfc_flags(&pdu) & LAST != 0 {
+                return Ok(out);
+            }
+            let (status, next) = self.pipe_read(file_id, 4280).await;
+            assert_eq!(status, STATUS_SUCCESS);
+            pdu = next;
+        }
+    }
+
+    /// A pipe open and bound to srvsvc.
+    pub async fn srvsvc(&mut self) -> FileId {
+        self.bound_pipe().await.0
+    }
+
+    /// NetrShareEnum at `level`, every entry at once, decoded.
+    pub async fn list_shares(&mut self, file_id: FileId, level: u32) -> EnumReply {
+        let stub = self
+            .call(
+                file_id,
+                7,
+                OPNUM_SHARE_ENUM,
+                &enum_request(level, u32::MAX, Some(0)),
+            )
+            .await
+            .expect("NetrShareEnum");
+        decode_enum(&stub)
+    }
+}

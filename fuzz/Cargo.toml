@@ -100,3 +100,10 @@ path = "fuzz_targets/rpc_association.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "srvsvc_request"
+path = "fuzz_targets/srvsvc_request.rs"
+test = false
+doc = false
+bench = false

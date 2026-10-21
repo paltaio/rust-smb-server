@@ -16,7 +16,7 @@ use crate::conn::state::{Connection, TreeConnect};
 use crate::dispatch::HandlerResponse;
 use crate::files::OpenSlot;
 use crate::handlers::create::FILE_OPENED;
-use crate::handlers::shared::{channel_is_valid, lookup_session_tree};
+use crate::handlers::shared::{channel_is_valid, lookup_session, lookup_session_tree};
 use crate::handlers::{Outcome, Pending, ioctl, query_info};
 use crate::info_class::FILE_STANDARD_INFORMATION;
 use crate::ntstatus;
@@ -29,7 +29,7 @@ use crate::proto::messages::{
 };
 use crate::rpc::SRVSVC_PIPE;
 use crate::rpc::pipe::{MAX_PIPES_PER_CONNECTION, Pipe, Read};
-use crate::server::ServerState;
+use crate::server::{Caller, ServerState};
 use crate::utils::utf16le_to_units;
 
 /// The access a pipe open may hold: FILE_GENERIC_READ | FILE_GENERIC_WRITE.
@@ -85,7 +85,7 @@ pub(crate) async fn route(
         return None;
     }
     let response = match hdr.command {
-        Command::Create => create(server, conn, &tree, body).await,
+        Command::Create => create(server, conn, hdr, &tree, body).await,
         Command::Read => {
             let req = ReadRequest::parse(body).ok()?;
             let pipe = find(&tree, req.file_id).await?;
@@ -93,7 +93,7 @@ pub(crate) async fn route(
         }
         Command::Write => {
             let req = WriteRequest::parse(body).ok()?;
-            write(conn, find(&tree, req.file_id).await?, &req).await
+            write(server, conn, find(&tree, req.file_id).await?, &req).await
         }
         Command::Ioctl => {
             let req = IoctlRequest::parse(body).ok()?;
@@ -101,10 +101,10 @@ pub(crate) async fn route(
                 if req.fsctl() != Fsctl::PipeWait || req.file_id != FileId::any() {
                     return None;
                 }
-                pipe_wait(conn, &req, body).await
+                pipe_wait(server, conn, &req, body).await
             } else {
                 let pipe = find(&tree, req.file_id).await?;
-                return Some(fsctl(conn, hdr, pipe, &req, body, retained).await);
+                return Some(fsctl(server, conn, hdr, pipe, &req, body, retained).await);
             }
         }
         Command::QueryInfo => {
@@ -157,13 +157,16 @@ async fn find(tree: &Arc<RwLock<TreeConnect>>, file_id: FileId) -> Option<Arc<Pi
 }
 
 /// MS-SMB2 3.3.5.9 for a pipe. Every open is a new instance of the pipe;
-/// only `srvsvc`, compared ignoring ASCII case, exists. FileAttributes,
+/// only `srvsvc`, compared ignoring ASCII case, exists, and only while
+/// share listing is on. The pipe answers for the session: its user and
+/// whether it can encrypt. FileAttributes,
 /// ShareAccess and CreateDisposition are ignored, and so is every create
 /// context but a durable handle reconnect, which names no pipe. The
 /// response grants no oplock and carries no context.
 async fn create(
     server: &Arc<ServerState>,
     conn: &Arc<Connection>,
+    hdr: &Smb2Header,
     tree: &Arc<RwLock<TreeConnect>>,
     body: &[u8],
 ) -> HandlerResponse {
@@ -186,7 +189,7 @@ async fn create(
         return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
     };
     let name = String::from_utf16_lossy(&units);
-    if !name.eq_ignore_ascii_case(SRVSVC_PIPE) {
+    if !server.config.share_listing || !name.eq_ignore_ascii_case(SRVSVC_PIPE) {
         debug!(name = %name, "no such pipe");
         return HandlerResponse::err(ntstatus::STATUS_OBJECT_NAME_NOT_FOUND);
     }
@@ -195,6 +198,10 @@ async fn create(
         return HandlerResponse::err(ntstatus::STATUS_ACCESS_DENIED);
     };
     let limit = server.max_opens_per_connection.load(Ordering::Relaxed);
+    let caller = match lookup_session(conn, hdr.session_id).await {
+        Ok(session) => Caller::of(&*session.read().await),
+        Err(status) => return HandlerResponse::err(status),
+    };
     let Some(slot) = OpenSlot::acquire(&conn.open_count, limit) else {
         warn!(limit, "open limit reached");
         return HandlerResponse::err(ntstatus::STATUS_INSUFFICIENT_RESOURCES);
@@ -204,7 +211,7 @@ async fn create(
         return HandlerResponse::err(ntstatus::STATUS_NETWORK_NAME_DELETED);
     }
     let file_id = tree.alloc_file_id();
-    let Some(pipe) = Pipe::new(file_id, access, slot, &conn.pipe_budget) else {
+    let Some(pipe) = Pipe::new(file_id, access, caller, slot, &conn.pipe_budget) else {
         warn!(limit = MAX_PIPES_PER_CONNECTION, "pipe limit reached");
         return HandlerResponse::err(ntstatus::STATUS_INSUFFICIENT_RESOURCES);
     };
@@ -362,7 +369,12 @@ async fn still_open(conn: &Arc<Connection>, hdr: &Smb2Header, file_id: FileId) -
 }
 
 /// MS-SMB2 3.3.5.13 for a pipe. Offset is ignored; every byte is taken.
-async fn write(conn: &Arc<Connection>, pipe: Arc<Pipe>, req: &WriteRequest) -> HandlerResponse {
+async fn write(
+    server: &Arc<ServerState>,
+    conn: &Arc<Connection>,
+    pipe: Arc<Pipe>,
+    req: &WriteRequest,
+) -> HandlerResponse {
     if pipe.granted_access & (FILE_WRITE_DATA | FILE_APPEND_DATA) == 0 {
         return HandlerResponse::err(ntstatus::STATUS_ACCESS_DENIED);
     }
@@ -382,7 +394,7 @@ async fn write(conn: &Arc<Connection>, pipe: Arc<Pipe>, req: &WriteRequest) -> H
     if write_through || unbuffered {
         return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
     }
-    if let Err(status) = pipe.write(&req.data).await {
+    if let Err(status) = pipe.write(server, &req.data).await {
         return HandlerResponse::err(status);
     }
     let mut buf = Vec::new();
@@ -397,6 +409,7 @@ async fn write(conn: &Arc<Connection>, pipe: Arc<Pipe>, req: &WriteRequest) -> H
 /// reply, waiting for one when the write produced none. Other FSCTLs get
 /// STATUS_NOT_SUPPORTED.
 async fn fsctl(
+    server: &Arc<ServerState>,
     conn: &Arc<Connection>,
     hdr: &Smb2Header,
     pipe: Arc<Pipe>,
@@ -424,7 +437,7 @@ async fn fsctl(
         )
     };
     let len = req.max_output_response as usize;
-    match pipe.transceive(input, len).await {
+    match pipe.transceive(server, input, len).await {
         Ok(Read::Data { bytes, more }) => Outcome::Done(answer(bytes, more)),
         Ok(Read::Empty) => wait(conn, hdr, pipe, len, retained, answer),
         Ok(Read::Disconnected) => fail(ntstatus::STATUS_PIPE_DISCONNECTED),
@@ -432,14 +445,19 @@ async fn fsctl(
     }
 }
 
-/// MS-SMB2 3.3.5.15.10. Pipe instances are not limited, so a pipe that
-/// exists is available at once.
-async fn pipe_wait(conn: &Arc<Connection>, req: &IoctlRequest, body: &[u8]) -> HandlerResponse {
+/// MS-SMB2 3.3.5.15.10. A pipe that exists is available at once: every
+/// CREATE gets a new instance of it.
+async fn pipe_wait(
+    server: &Arc<ServerState>,
+    conn: &Arc<Connection>,
+    req: &IoctlRequest,
+    body: &[u8],
+) -> HandlerResponse {
     let input = match checked_input(conn, req, body).await {
         Ok(input) => input,
         Err(status) => return HandlerResponse::err(status),
     };
-    if !wait_names_srvsvc(input) {
+    if !server.config.share_listing || !wait_names_srvsvc(input) {
         return HandlerResponse::err(ntstatus::STATUS_OBJECT_NAME_NOT_FOUND);
     }
     ioctl::response(Fsctl::PIPE_WAIT, FileId::any(), Vec::new())

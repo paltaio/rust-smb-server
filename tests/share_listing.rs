@@ -16,7 +16,7 @@ use smb_server::wire::messages::{
     ChangeNotifyRequest, CloseRequest, CreateResponse, FileId, Fsctl, IoctlRequest,
     QueryInfoResponse, ReadRequest, ReadResponse, WriteRequest,
 };
-use smb_server::{Share, SmbServer, SmbServerBuilder};
+use smb_server::{Access, Share, ShareMode, SmbServer, SmbServerBuilder};
 use tempfile::TempDir;
 
 const DELETE: u32 = 0x0001_0000;
@@ -229,7 +229,7 @@ async fn pipe_wait_finds_srvsvc_only() {
 }
 
 #[tokio::test]
-async fn a_bind_is_answered_and_every_call_faults() {
+async fn a_bind_is_answered_and_unknown_operations_fault() {
     let (server, _td) = server().await;
     let mut c = ipc(&server).await;
     let (file_id, ack) = c.bound_pipe().await;
@@ -242,7 +242,7 @@ async fn a_bind_is_answered_and_every_call_faults() {
     let (status, fault) = c
         .transceive(
             file_id,
-            &request_pdu(2, FIRST | LAST, 0, 15, &[0; 40]),
+            &request_pdu(2, FIRST | LAST, 0, OPNUM_SHARE_ENUM_STICKY, &[0; 40]),
             4280,
         )
         .await;
@@ -255,17 +255,40 @@ async fn a_bind_is_answered_and_every_call_faults() {
 async fn faults_leave_the_pipe_working() {
     let (server, _td) = server().await;
     let mut c = ipc_client(server.addr, SMB21, Some("alice")).await;
-    let (file_id, _) = c.bound_pipe().await;
+    let file_id = c.srvsvc().await;
+    let enum_stub = enum_request(1, u32::MAX, Some(0));
     let cases = [
-        (request_pdu(2, FIRST | LAST, 0, 99, &[]), NCA_OP_RNG_ERROR),
-        (request_pdu(3, FIRST | LAST, 5, 15, &[]), NCA_UNK_IF),
-        (request_pdu(4, FIRST | LAST, 0, 15, &[]), NCA_OP_RNG_ERROR),
+        (
+            request_pdu(2, FIRST | LAST, 0, 99, &[]),
+            NCA_OP_RNG_ERROR,
+            0x23,
+        ),
+        (
+            request_pdu(3, FIRST | LAST, 5, 15, &enum_stub),
+            NCA_UNK_IF,
+            0x23,
+        ),
+        (
+            request_pdu(4, FIRST | LAST, 0, 15, &enum_stub[..enum_stub.len() - 2]),
+            BAD_STUB_DATA,
+            0x03,
+        ),
+        (
+            request_pdu(5, FIRST | LAST, 0, 16, &[0; 4]),
+            BAD_STUB_DATA,
+            0x03,
+        ),
     ];
-    for (request, expected) in cases {
+    for (request, expected, flags) in cases {
         let (status, fault) = c.transceive(file_id, &request, 4280).await;
         assert_eq!(status, STATUS_SUCCESS);
         assert_eq!(fault_status(&fault), expected);
+        assert_eq!(pfc_flags(&fault), flags);
         assert_eq!(call_id(&fault), call_id(&request));
+        assert!(
+            !c.list_shares(file_id, 1).await.entries.is_empty(),
+            "still works"
+        );
     }
 }
 
@@ -273,46 +296,47 @@ async fn faults_leave_the_pipe_working() {
 async fn a_request_in_fragments_is_answered_once_whole() {
     let (server, _td) = server().await;
     let mut c = ipc(&server).await;
-    let (file_id, _) = c.bound_pipe().await;
+    let file_id = c.srvsvc().await;
+    let stub = enum_request(1, u32::MAX, Some(0));
+    let (a, rest) = stub.split_at(16);
+    let (b, last) = rest.split_at(12);
     assert_eq!(
-        c.pipe_write(file_id, &request_pdu(7, FIRST, 0, 15, &[1; 100]))
+        c.pipe_write(file_id, &request_pdu(7, FIRST, 0, 15, a))
             .await,
         STATUS_SUCCESS
     );
     assert_eq!(
-        c.pipe_write(file_id, &request_pdu(7, 0, 0, 15, &[2; 100]))
-            .await,
+        c.pipe_write(file_id, &request_pdu(7, 0, 0, 15, b)).await,
         STATUS_SUCCESS
     );
-    let (status, fault) = c
-        .transceive(file_id, &request_pdu(7, LAST, 0, 15, &[3; 100]), 4280)
+    let (status, response) = c
+        .transceive(file_id, &request_pdu(7, LAST, 0, 15, last), 4280)
         .await;
     assert_eq!(status, STATUS_SUCCESS);
-    assert_eq!(
-        (fault_status(&fault), call_id(&fault)),
-        (NCA_OP_RNG_ERROR, 7)
-    );
+    assert_pdu(&response, PTYPE_RESPONSE);
+    assert_eq!(call_id(&response), 7);
+    assert_eq!(decode_enum(&response[24..]).names(), ["public", "IPC$"]);
 
     // A transceive that completes no request waits for the reply.
     let mid = c
         .send_no_wait(
             Command::Ioctl,
-            &transceive_body(file_id, &request_pdu(8, FIRST, 0, 15, &[1; 8]), 4280),
+            &transceive_body(file_id, &request_pdu(8, FIRST, 0, 15, a), 4280),
         )
         .await;
     c.recv_interim(mid).await;
+    let mut tail = b.to_vec();
+    tail.extend_from_slice(last);
     assert_eq!(
-        c.pipe_write(file_id, &request_pdu(8, LAST, 0, 15, &[2; 8]))
+        c.pipe_write(file_id, &request_pdu(8, LAST, 0, 15, &tail))
             .await,
         STATUS_SUCCESS
     );
     let (status, body) = c.recv(mid, Command::Ioctl).await;
     assert_eq!(status, STATUS_SUCCESS);
-    let fault = ioctl_output(status, &body);
-    assert_eq!(
-        (fault_status(&fault), call_id(&fault)),
-        (NCA_OP_RNG_ERROR, 8)
-    );
+    let response = ioctl_output(status, &body);
+    assert_eq!(call_id(&response), 8);
+    assert_eq!(decode_enum(&response[24..]).names(), ["public", "IPC$"]);
 }
 
 #[tokio::test]
@@ -329,7 +353,13 @@ async fn pdus_are_cut_from_the_bytes_written() {
 
     let file_id = c.open_pipe("srvsvc").await.expect("open").file_id;
     let mut both = srvsvc_bind(1);
-    both.extend(request_pdu(2, FIRST | LAST, 0, 15, &[]));
+    both.extend(request_pdu(
+        2,
+        FIRST | LAST,
+        0,
+        OPNUM_SHARE_ENUM_STICKY,
+        &[],
+    ));
     assert_eq!(c.pipe_write(file_id, &both).await, STATUS_SUCCESS);
     let (_, ack) = c.pipe_read(file_id, 4280).await;
     assert_pdu(&ack, PTYPE_BIND_ACK);
@@ -354,7 +384,11 @@ async fn short_reads_get_the_rest_of_a_message_next() {
     assert_pdu(&ack, PTYPE_BIND_ACK);
 
     let (status, head) = c
-        .transceive(file_id, &request_pdu(2, FIRST | LAST, 0, 15, &[]), 10)
+        .transceive(
+            file_id,
+            &request_pdu(2, FIRST | LAST, 0, OPNUM_SHARE_ENUM_STICKY, &[]),
+            10,
+        )
         .await;
     assert_eq!((status, head.len()), (STATUS_BUFFER_OVERFLOW, 10));
     let (status, rest) = c.pipe_read(file_id, 4280).await;
@@ -362,7 +396,11 @@ async fn short_reads_get_the_rest_of_a_message_next() {
     assert_eq!(fault_status(&[head, rest].concat()), NCA_OP_RNG_ERROR);
 
     let (status, out) = c
-        .transceive(file_id, &request_pdu(3, FIRST | LAST, 0, 15, &[]), 0)
+        .transceive(
+            file_id,
+            &request_pdu(3, FIRST | LAST, 0, OPNUM_SHARE_ENUM_STICKY, &[]),
+            0,
+        )
         .await;
     assert_eq!((status, out.len()), (STATUS_BUFFER_OVERFLOW, 0));
     assert_eq!(c.pipe_read(file_id, 4280).await.1.len(), 32);
@@ -374,7 +412,7 @@ async fn transceive_with_a_reply_unread_is_busy() {
     let mut c = ipc(&server).await;
     let file_id = c.open_pipe("srvsvc").await.expect("open").file_id;
     assert_eq!(c.pipe_write(file_id, &srvsvc_bind(1)).await, STATUS_SUCCESS);
-    let request = request_pdu(2, FIRST | LAST, 0, 15, &[]);
+    let request = request_pdu(2, FIRST | LAST, 0, OPNUM_SHARE_ENUM_STICKY, &[]);
     assert_eq!(
         c.transceive(file_id, &request, 4280).await.0,
         STATUS_PIPE_BUSY
@@ -391,7 +429,7 @@ async fn a_request_before_the_bind_ends_the_association() {
     let (server, _td) = server().await;
     let mut c = ipc(&server).await;
     let file_id = c.open_pipe("srvsvc").await.expect("open").file_id;
-    let request = request_pdu(4, FIRST | LAST, 0, 15, &[]);
+    let request = request_pdu(4, FIRST | LAST, 0, OPNUM_SHARE_ENUM_STICKY, &[]);
     assert_eq!(c.pipe_write(file_id, &request).await, STATUS_SUCCESS);
     let (status, nak) = c.pipe_read(file_id, 4280).await;
     assert_eq!(status, STATUS_SUCCESS);
@@ -503,7 +541,11 @@ async fn other_commands_on_a_pipe_get_a_pipes_answers() {
     ] {
         let req = WriteRequest {
             flags,
-            ..write_request(file_id, 0, &request_pdu(2, FIRST | LAST, 0, 15, &[]))
+            ..write_request(
+                file_id,
+                0,
+                &request_pdu(2, FIRST | LAST, 0, OPNUM_SHARE_ENUM_STICKY, &[]),
+            )
         };
         assert_eq!(c.write_raw(req).await, Err(STATUS_INVALID_PARAMETER));
     }
@@ -546,7 +588,7 @@ async fn write_through_is_refused_from_smb_2_1_on() {
     let (server, _td) = server().await;
     let mut c = ipc(&server).await;
     let (file_id, _) = c.bound_pipe().await;
-    let request = request_pdu(2, FIRST | LAST, 0, 15, &[]);
+    let request = request_pdu(2, FIRST | LAST, 0, OPNUM_SHARE_ENUM_STICKY, &[]);
     let through = WriteRequest {
         flags: WriteRequest::FLAG_WRITE_THROUGH,
         ..write_request(file_id, 0, &request)
@@ -687,4 +729,566 @@ async fn unknown_file_ids_on_ipc_are_closed() {
     assert_eq!(c.pipe_read(gone, 10).await.0, STATUS_FILE_CLOSED);
     assert_eq!(c.transceive(gone, &[], 10).await.0, STATUS_FILE_CLOSED);
     assert_eq!(c.close_with(gone, 0).await.0, STATUS_FILE_CLOSED);
+}
+
+/// Users alice and bob, and shares, in this order: `public` (public),
+/// `home` and `secret$` (alice), `archive` (alice, unlisted), `docs`
+/// (public, with a remark).
+fn listing_builder() -> (SmbServerBuilder, TempDir) {
+    let td = tempfile::tempdir().expect("tempdir");
+    let local = || common::client::local(td.path());
+    let builder = SmbServer::builder()
+        .netbios_name("LISTSRV")
+        .user("alice", "password")
+        .user("bob", "password")
+        .share(Share::new("public", local()).public())
+        .share(Share::new("home", local()).user("alice", Access::ReadWrite))
+        .share(Share::new("secret$", local()).user("alice", Access::Read))
+        .share(
+            Share::new("archive", local())
+                .user("alice", Access::Read)
+                .listed(false),
+        )
+        .share(
+            Share::new("docs", local())
+                .public_read_only()
+                .remark("Docs"),
+        );
+    (builder, td)
+}
+
+async fn listing_server() -> (Server, TempDir) {
+    let (builder, td) = listing_builder();
+    (Server::start(builder).await, td)
+}
+
+fn entry(name: &str, kind: u32, remark: &str) -> Entry {
+    Entry {
+        name: name.to_string(),
+        kind: Some(kind),
+        remark: Some(remark.to_string()),
+        flags: None,
+    }
+}
+
+#[tokio::test]
+async fn anonymous_sessions_see_the_public_shares_and_ipc() {
+    let (server, _td) = listing_server().await;
+    let mut c = ipc(&server).await;
+    let file_id = c.srvsvc().await;
+    let reply = c.list_shares(file_id, 1).await;
+    assert_eq!(reply.status, 0);
+    assert_eq!(
+        reply.entries,
+        [
+            entry("public", STYPE_DISKTREE, ""),
+            entry("docs", STYPE_DISKTREE, "Docs"),
+            entry("IPC$", STYPE_IPC_SPECIAL, "Remote IPC"),
+        ]
+    );
+    assert_eq!((reply.total, reply.resume), (3, Some(0)));
+
+    let level_0 = c.list_shares(file_id, 0).await;
+    assert_eq!(level_0.names(), ["public", "docs", "IPC$"]);
+    assert!(level_0.entries.iter().all(|e| e.kind.is_none()));
+    let level_501 = c.list_shares(file_id, 501).await;
+    assert_eq!(level_501.names(), ["public", "docs", "IPC$"]);
+    assert!(level_501.entries.iter().all(|e| e.flags == Some(0)));
+    assert_eq!(level_501.entries[1].remark.as_deref(), Some("Docs"));
+}
+
+#[tokio::test]
+async fn users_see_the_shares_they_may_connect_to() {
+    let (server, _td) = listing_server().await;
+    let mut alice = ipc_client(server.addr, SMB21, Some("alice")).await;
+    let file_id = alice.srvsvc().await;
+    let reply = alice.list_shares(file_id, 1).await;
+    assert_eq!(reply.names(), ["public", "home", "secret$", "docs", "IPC$"]);
+    // A name ending in `$` is an ordinary disk share.
+    assert_eq!(reply.entries[2].kind, Some(STYPE_DISKTREE));
+
+    let mut bob = ipc_client(server.addr, SMB21, Some("bob")).await;
+    let file_id = bob.srvsvc().await;
+    assert_eq!(
+        bob.list_shares(file_id, 1).await.names(),
+        ["public", "docs", "IPC$"]
+    );
+}
+
+#[tokio::test]
+async fn share_get_info_finds_only_the_shares_listed_to_the_caller() {
+    let (server, _td) = listing_server().await;
+    let mut alice = ipc_client(server.addr, SMB21, Some("alice")).await;
+    let a = alice.srvsvc().await;
+    let mut bob = ipc_client(server.addr, SMB21, Some("bob")).await;
+    let b = bob.srvsvc().await;
+    let get = async |c: &mut Client, file_id, name: &str, level| {
+        let stub = c
+            .call(
+                file_id,
+                9,
+                OPNUM_SHARE_GET_INFO,
+                &get_info_request(name, level),
+            )
+            .await
+            .expect("NetrShareGetInfo");
+        decode_get_info(&stub)
+    };
+
+    assert_eq!(
+        get(&mut alice, a, "HOME", 1).await,
+        (1, Some(entry("home", STYPE_DISKTREE, "")), 0)
+    );
+    assert_eq!(
+        get(&mut bob, b, "home", 1).await,
+        (1, None, NERR_NET_NAME_NOT_FOUND)
+    );
+    assert_eq!(
+        get(&mut alice, a, "archive", 1).await,
+        (1, Some(entry("archive", STYPE_DISKTREE, "")), 0),
+        "an unlisted share is found by those who may connect to it"
+    );
+    assert_eq!(
+        get(&mut bob, b, "archive", 1).await,
+        (1, None, NERR_NET_NAME_NOT_FOUND)
+    );
+    assert_eq!(
+        get(&mut bob, b, "ipc$", 501).await,
+        (
+            501,
+            Some(Entry {
+                flags: Some(0),
+                ..entry("IPC$", STYPE_IPC_SPECIAL, "Remote IPC")
+            }),
+            0
+        )
+    );
+    let (_, info, status) = get(&mut bob, b, "docs", 0).await;
+    assert_eq!(
+        (info.map(|e| e.name), status),
+        (Some("docs".to_string()), 0)
+    );
+    let (_, info, status) = get(&mut bob, b, "docs", 1005).await;
+    assert_eq!((info.and_then(|e| e.flags), status), (Some(0), 0));
+    assert_eq!(
+        get(&mut bob, b, "", 1).await,
+        (1, None, ERROR_INVALID_PARAMETER)
+    );
+    for level in [2, 502, 503] {
+        assert_eq!(
+            get(&mut alice, a, "home", level).await,
+            (level, None, ERROR_ACCESS_DENIED)
+        );
+    }
+    assert_eq!(get(&mut alice, a, "home", 7).await.2, ERROR_INVALID_LEVEL);
+}
+
+#[tokio::test]
+async fn server_get_info_reports_the_netbios_name() {
+    let (server, _td) = listing_server().await;
+    let mut c = ipc(&server).await;
+    let file_id = c.srvsvc().await;
+    let get = async |c: &mut Client, level| {
+        let stub = c
+            .call(
+                file_id,
+                3,
+                OPNUM_SERVER_GET_INFO,
+                &server_info_request(level),
+            )
+            .await
+            .expect("NetrServerGetInfo");
+        decode_server_info(&stub)
+    };
+    let info = |details| ServerInfo {
+        platform_id: 500,
+        name: "LISTSRV".to_string(),
+        details,
+    };
+    assert_eq!(get(&mut c, 100).await, (100, Some(info(None)), 0));
+    assert_eq!(
+        get(&mut c, 101).await,
+        (101, Some(info(Some((10, 0, 0x9003, String::new())))), 0)
+    );
+    assert_eq!(get(&mut c, 102).await, (102, None, ERROR_ACCESS_DENIED));
+}
+
+#[tokio::test]
+async fn share_enum_refuses_the_levels_it_does_not_serve() {
+    let (server, _td) = listing_server().await;
+    let mut c = ipc(&server).await;
+    let file_id = c.srvsvc().await;
+    for (level, status) in [(2, 5), (502, 5), (503, 5), (9, ERROR_INVALID_LEVEL)] {
+        let stub = c
+            .call(
+                file_id,
+                4,
+                OPNUM_SHARE_ENUM,
+                &enum_request(level, u32::MAX, Some(0)),
+            )
+            .await;
+        let reply = decode_enum(&stub.expect("NetrShareEnum"));
+        assert_eq!((reply.level, reply.status), (level, status));
+        assert!(reply.entries.is_empty());
+        assert_eq!(reply.total, 0);
+    }
+}
+
+#[tokio::test]
+async fn the_list_follows_the_configuration_on_a_bound_pipe() {
+    let (builder, td) = listing_builder();
+    let server = Server::start(builder).await;
+    let mut alice = ipc_client(server.addr, SMB21, Some("alice")).await;
+    let a = alice.srvsvc().await;
+    let mut bob = ipc_client(server.addr, SMB21, Some("bob")).await;
+    let b = bob.srvsvc().await;
+    let local = || common::client::local(td.path());
+
+    server
+        .config
+        .add_share(Share::new("music", local()).public().remark("Música"))
+        .await
+        .unwrap();
+    let reply = bob.list_shares(b, 1).await;
+    assert_eq!(reply.names(), ["public", "docs", "music", "IPC$"]);
+    assert_eq!(reply.entries[2].remark.as_deref(), Some("Música"));
+
+    // A share removed and added again goes last.
+    server.config.remove_share("public").await.unwrap();
+    assert_eq!(
+        bob.list_shares(b, 1).await.names(),
+        ["docs", "music", "IPC$"]
+    );
+    server
+        .config
+        .add_share(Share::new("public", local()).public())
+        .await
+        .unwrap();
+    assert_eq!(
+        bob.list_shares(b, 1).await.names(),
+        ["docs", "music", "public", "IPC$"]
+    );
+
+    server
+        .config
+        .revoke_share_user("home", "alice")
+        .await
+        .unwrap();
+    assert_eq!(
+        alice.list_shares(a, 1).await.names(),
+        ["secret$", "docs", "music", "public", "IPC$"]
+    );
+    server
+        .config
+        .set_share_mode("home", ShareMode::Public)
+        .await
+        .unwrap();
+    assert_eq!(
+        bob.list_shares(b, 1).await.names(),
+        ["home", "docs", "music", "public", "IPC$"]
+    );
+
+    // The user's sessions end with the user, and their pipes with them.
+    server.config.remove_user("alice").await.unwrap();
+    let request = request_pdu(9, FIRST | LAST, 0, 15, &enum_request(1, u32::MAX, None));
+    assert_eq!(
+        alice.pipe_write(a, &request).await,
+        STATUS_USER_SESSION_DELETED
+    );
+}
+
+#[tokio::test]
+async fn turned_off_share_listing_opens_no_pipe() {
+    let (builder, _td) = listing_builder();
+    let server = Server::start(builder.share_listing(false)).await;
+    let mut c = ipc(&server).await;
+    assert_eq!(
+        c.open_pipe("srvsvc").await.err(),
+        Some(STATUS_OBJECT_NAME_NOT_FOUND)
+    );
+    let mut input = 0i64.to_le_bytes().to_vec();
+    input.extend_from_slice(&12u32.to_le_bytes());
+    input.extend_from_slice(&[0, 0]);
+    input.extend_from_slice(&utf16le("srvsvc"));
+    let wait = ioctl_body(
+        Fsctl::PIPE_WAIT,
+        FileId::any(),
+        &input,
+        0,
+        IoctlRequest::FLAG_IS_FSCTL,
+    );
+    assert_eq!(
+        c.send(Command::Ioctl, &wait).await.0,
+        STATUS_OBJECT_NAME_NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn a_long_list_comes_in_fragments_of_the_negotiated_size() {
+    let td = tempfile::tempdir().expect("tempdir");
+    let remark = "r".repeat(40);
+    let mut builder = SmbServer::builder();
+    for i in 0..400 {
+        builder = builder.share(
+            Share::new(format!("share{i:03}"), common::client::local(td.path()))
+                .public()
+                .remark(remark.clone()),
+        );
+    }
+    let server = Server::start(builder).await;
+    let mut c = ipc(&server).await;
+    let file_id = c.open_pipe("srvsvc").await.expect("open").file_id;
+    let bind = bind_pdu(1, 2048, &[(0, SRVSVC, NDR)]);
+    assert_eq!(c.pipe_write(file_id, &bind).await, STATUS_SUCCESS);
+    let (_, ack) = c.pipe_read(file_id, 4280).await;
+    assert_eq!(&ack[16..20], [0, 8, 0, 8], "2048 both ways");
+
+    let request = request_pdu(2, FIRST | LAST, 0, 15, &enum_request(1, u32::MAX, Some(0)));
+    let (status, head) = c.transceive(file_id, &request, 1024).await;
+    assert_eq!((status, head.len()), (STATUS_BUFFER_OVERFLOW, 1024));
+    let (status, rest) = c.pipe_read(file_id, 4096).await;
+    assert_eq!(status, STATUS_SUCCESS);
+    let mut fragments = vec![[head, rest].concat()];
+    loop {
+        let (status, head) = c.pipe_read(file_id, 100).await;
+        if status == STATUS_SUCCESS {
+            fragments.push(head);
+            break;
+        }
+        assert_eq!((status, head.len()), (STATUS_BUFFER_OVERFLOW, 100));
+        let (status, rest) = c.pipe_read(file_id, 4096).await;
+        assert_eq!(status, STATUS_SUCCESS);
+        let fragment = [head, rest].concat();
+        let last = pfc_flags(&fragment) & LAST != 0;
+        fragments.push(fragment);
+        if last {
+            break;
+        }
+    }
+
+    let total: usize = fragments.iter().map(|f| f.len() - 24).sum();
+    let mut left = total;
+    let mut stub = Vec::new();
+    for (i, fragment) in fragments.iter().enumerate() {
+        assert_pdu(fragment, PTYPE_RESPONSE);
+        assert!(fragment.len() <= 2048);
+        let flags = pfc_flags(fragment);
+        assert_eq!(flags & FIRST != 0, i == 0);
+        assert_eq!(flags & LAST != 0, i == fragments.len() - 1);
+        let alloc_hint = u32::from_le_bytes(fragment[16..20].try_into().unwrap());
+        assert_eq!(alloc_hint as usize, left);
+        left -= fragment.len() - 24;
+        stub.extend_from_slice(&fragment[24..]);
+    }
+    assert!(fragments.len() > 10);
+    let reply = decode_enum(&stub);
+    assert_eq!(reply.entries.len(), 401);
+    assert_eq!(reply.entries[399].remark.as_deref(), Some(remark.as_str()));
+    assert_eq!(reply.names()[400], "IPC$");
+}
+
+#[tokio::test]
+async fn pages_put_together_make_the_whole_list() {
+    let (server, _td) = listing_server().await;
+    let mut c = ipc_client(server.addr, SMB21, Some("alice")).await;
+    let file_id = c.srvsvc().await;
+    let whole = c.list_shares(file_id, 1).await;
+    let mut names = Vec::new();
+    let mut resume = 0;
+    let mut pages = 0;
+    loop {
+        let stub = c
+            .call(
+                file_id,
+                10 + pages,
+                OPNUM_SHARE_ENUM,
+                &enum_request(1, 200, Some(resume)),
+            )
+            .await
+            .expect("a page");
+        let page = decode_enum(&stub);
+        pages += 1;
+        assert_eq!(page.total as usize, whole.entries.len() - names.len());
+        names.extend(page.entries.iter().map(|e| e.name.clone()));
+        if page.status == 0 {
+            assert_eq!(page.resume, Some(0));
+            break;
+        }
+        assert_eq!(page.status, ERROR_MORE_DATA);
+        resume = page.resume.expect("a resume handle");
+        assert_eq!(resume as usize, names.len());
+    }
+    assert!(pages > 1);
+    assert_eq!(names, whole.names());
+}
+
+#[tokio::test]
+async fn every_dialect_lists_the_shares() {
+    let (server, _td) = listing_server().await;
+    for dialect in [0x0202, 0x0210, 0x0300, 0x0302] {
+        let mut c = ipc_client(server.addr, dialect, None).await;
+        let file_id = c.srvsvc().await;
+        assert_eq!(
+            c.list_shares(file_id, 1).await.names(),
+            ["public", "docs", "IPC$"],
+            "{dialect:#x}"
+        );
+    }
+}
+
+/// Opens srvsvc, binds it and lists the shares at level 1 on a session
+/// whose requests `send` sends, one at a time, returning each response.
+async fn list_through(mut send: impl AsyncFnMut(Command, &[u8]) -> Vec<u8>) -> Vec<String> {
+    let reply = send(Command::Create, &pipe_create("srvsvc").body()).await;
+    assert_eq!(common::auth::status(&reply), 0, "CREATE");
+    let file_id = CreateResponse::parse(&reply[64..]).expect("create").file_id;
+    let mut write = Vec::new();
+    write_request(file_id, 0, &srvsvc_bind(1))
+        .write_to(&mut write)
+        .unwrap();
+    assert_eq!(common::auth::status(&send(Command::Write, &write).await), 0);
+    let mut read = Vec::new();
+    ReadRequest {
+        structure_size: 49,
+        padding: ReadResponse::STANDARD_DATA_OFFSET,
+        flags: 0,
+        length: 4280,
+        offset: 0,
+        file_id,
+        minimum_count: 0,
+        channel: 0,
+        remaining_bytes: 0,
+        read_channel_info_offset: 0,
+        read_channel_info_length: 0,
+        buffer: vec![0],
+    }
+    .write_to(&mut read)
+    .unwrap();
+    let reply = send(Command::Read, &read).await;
+    assert_pdu(
+        &ReadResponse::parse(&reply[64..]).unwrap().data,
+        PTYPE_BIND_ACK,
+    );
+
+    let request = request_pdu(2, FIRST | LAST, 0, 15, &enum_request(1, u32::MAX, None));
+    let reply = send(Command::Ioctl, &transceive_body(file_id, &request, 4280)).await;
+    assert_eq!(common::auth::status(&reply), 0, "IOCTL");
+    let response = smb_server::wire::messages::IoctlResponse::parse(&reply[64..])
+        .unwrap()
+        .output;
+    decode_enum(&response[24..])
+        .entries
+        .into_iter()
+        .map(|e| e.name)
+        .collect()
+}
+
+#[tokio::test]
+async fn an_encrypted_session_lists_the_shares() {
+    use common::crypto::{Cipher, EncryptedSession};
+
+    let (builder, _td) = listing_builder();
+    let server = Server::start(builder.encrypt_data(true)).await;
+    let mut s =
+        EncryptedSession::smb311(server.addr, &[Cipher::Aes128Gcm], "alice", "password").await;
+    let reply = s.tree_connect("\\\\127.0.0.1\\IPC$").await;
+    assert_eq!(common::auth::status(&reply), 0);
+    let names = list_through(async |command, body| s.send_encrypted(command, body).await).await;
+    assert_eq!(names, ["public", "home", "secret$", "docs", "IPC$"]);
+}
+
+#[tokio::test]
+async fn shares_whose_traffic_is_encrypted_are_listed_to_sessions_that_can_encrypt() {
+    use common::crypto::EncryptedSession;
+
+    let td = tempfile::tempdir().expect("tempdir");
+    let local = || common::client::local(td.path());
+    let builder = SmbServer::builder()
+        .user("alice", "password")
+        .share(Share::new("open", local()).public())
+        .share(
+            Share::new("sealed", local())
+                .user("alice", Access::Read)
+                .encrypt_data(),
+        );
+    let server = Server::start(builder).await;
+
+    for user in [None, Some("alice")] {
+        let mut c = ipc_client(server.addr, SMB21, user).await;
+        let file_id = c.srvsvc().await;
+        assert_eq!(
+            c.list_shares(file_id, 1).await.names(),
+            ["open", "IPC$"],
+            "{user:?}"
+        );
+        let stub = c
+            .call(
+                file_id,
+                3,
+                OPNUM_SHARE_GET_INFO,
+                &get_info_request("sealed", 1),
+            )
+            .await
+            .expect("NetrShareGetInfo");
+        assert_eq!(
+            decode_get_info(&stub).2,
+            NERR_NET_NAME_NOT_FOUND,
+            "{user:?}"
+        );
+    }
+
+    let mut s = EncryptedSession::smb30(server.addr, SMB302, "alice", "password").await;
+    let reply = s.tree_connect("\\\\127.0.0.1\\IPC$").await;
+    assert_eq!(common::auth::status(&reply), 0);
+    let names = list_through(async |command, body| s.send_encrypted(command, body).await).await;
+    assert_eq!(names, ["open", "sealed", "IPC$"]);
+}
+
+#[tokio::test]
+async fn a_signed_smb311_session_lists_the_shares() {
+    use common::auth::{negotiate_311_body, preauth_context};
+    use common::crypto::{
+        Cipher, PREAUTH_SHA512, cmac_sign, hashed_login, hashed_negotiate, keys_311,
+    };
+    use smb_server::wire::header::SMB2_FLAGS_SIGNED;
+    use tokio::io::AsyncWriteExt;
+
+    let (builder, _td) = listing_builder();
+    let server = Server::start(builder).await;
+    let mut s = tokio::net::TcpStream::connect(server.addr)
+        .await
+        .expect("connect");
+    let mut hash = [0u8; 64];
+    let body = negotiate_311_body(&[0x0311], &[preauth_context(&[PREAUTH_SHA512])]);
+    let negotiate = hashed_negotiate(&mut s, &body, &mut hash).await;
+    assert_eq!(common::auth::status(&negotiate), 0);
+    let login = hashed_login(&mut s, 1, "alice", "password", &mut hash).await;
+    assert_eq!(login.status, 0);
+    // The signing key does not depend on the cipher, and none was agreed.
+    let key = keys_311(&login.key, Cipher::Aes128Gcm, &hash).signing;
+
+    let mut mid = 3;
+    let mut tree_id = 0;
+    let mut send = async |command: Command, body: &[u8]| {
+        let hdr = common::build_header(command, mid, login.session_id, tree_id);
+        mid += 1;
+        let mut msg = common::message(&hdr, body);
+        cmac_sign(&mut msg, &key);
+        s.write_all(&common::framed(&msg)).await.expect("write");
+        let reply = common::read_frame(&mut s).await;
+        let (rh, _) = common::parse_response_header(&reply);
+        assert_ne!(rh.flags & SMB2_FLAGS_SIGNED, 0, "{command:?} reply signed");
+        if command == Command::TreeConnect {
+            tree_id = rh.tree_id().expect("tree id");
+        }
+        reply
+    };
+    let reply = send(
+        Command::TreeConnect,
+        &common::tree_connect_body("\\\\127.0.0.1\\IPC$"),
+    )
+    .await;
+    assert_eq!(common::auth::status(&reply), 0);
+    let names = list_through(send).await;
+    assert_eq!(names, ["public", "home", "secret$", "docs", "IPC$"]);
 }

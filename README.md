@@ -109,6 +109,31 @@ A file opened with a durable handle request, version 1 or 2, and a lease that ca
 
 `durable_handle_timeout` and `max_disconnected_opens` on the builder set the time and the most files kept at once. Call `.durable_handles(false)` on a `Share` to turn them off there.
 
+## Share listing
+
+Clients that list a server's shares, such as Explorer and `net view` on Windows, the Finder and `smbutil view` on macOS, and `smbclient -L`, get the shares they may connect to, in the order they were added, and IPC$. An anonymous session gets the public shares, and a session that cannot encrypt does not get shares whose traffic is encrypted. Shares whose name ends in `$` are listed too; clients hide them from ordinary lists.
+
+```rust
+use smb_server::{Access, LocalFsBackend, Share, SmbServer};
+
+let server = SmbServer::builder()
+    .listen("0.0.0.0:4445".parse()?)
+    .user("alice", "password")
+    .share(
+        Share::new("photos", LocalFsBackend::new("/srv/photos")?)
+            .user("alice", Access::Read)
+            .remark("Family photos"),
+    )
+    .share(
+        Share::new("archive", LocalFsBackend::new("/srv/archive")?)
+            .user("alice", Access::Read)
+            .listed(false),
+    )
+    .build()?;
+```
+
+`remark` sets the comment shown next to a share. `listed(false)` leaves a share out of the list; it is still reachable and can be looked up by name, so it is not access control. `share_listing(false)` on the builder turns listing off.
+
 ## Limitations
 
 Not supported:
@@ -117,7 +142,7 @@ Not supported:
 - oplocks and directory leases
 - answering a replayed CREATE with the open it repeats, and persistent and resilient handles
 - change notifications
-- named pipes and RPC, so clients can't list a server's shares
+- named pipes other than `srvsvc`, and RPC calls other than listing shares and describing the server
 - DFS
 - multichannel and compression
 - alternate data streams and extended attributes

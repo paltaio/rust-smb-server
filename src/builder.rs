@@ -51,6 +51,8 @@ pub struct Share {
     pub(crate) encrypt_data: bool,
     pub(crate) leases: bool,
     pub(crate) durable_handles: bool,
+    pub(crate) listed: bool,
+    pub(crate) remark: String,
 }
 
 impl Share {
@@ -64,6 +66,8 @@ impl Share {
             encrypt_data: false,
             leases: true,
             durable_handles: true,
+            listed: true,
+            remark: String::new(),
         }
     }
 
@@ -142,6 +146,33 @@ impl Share {
         self.durable_handles = enabled;
         self
     }
+
+    /// Whether the share appears when clients list the server's shares.
+    /// An unlisted share is still reachable by name, and a client that may
+    /// connect to it can still look it up by name, so this is not access
+    /// control. Clients hide shares whose name ends in `$` from ordinary
+    /// lists; `net view /all` and `smbclient -L` show them. On by default.
+    pub fn listed(mut self, listed: bool) -> Self {
+        self.listed = listed;
+        self
+    }
+
+    /// Text shown next to the share in share lists: the Comment column of
+    /// Explorer and `smbclient -L`, the Remark column of `net view`. At most
+    /// 1024 UTF-16 code units, without NUL. Empty by default.
+    pub fn remark(mut self, remark: impl Into<String>) -> Self {
+        self.remark = remark.into();
+        self
+    }
+}
+
+/// Longest share remark, in UTF-16 code units.
+const MAX_REMARK_UNITS: usize = 1024;
+
+/// Whether `remark` can be sent as a share's remark: no NUL, and at most
+/// [`MAX_REMARK_UNITS`] UTF-16 code units.
+pub(crate) fn valid_remark(remark: &str) -> bool {
+    !remark.contains('\0') && remark.encode_utf16().count() <= MAX_REMARK_UNITS
 }
 
 // ---------------------------------------------------------------------------
@@ -165,8 +196,10 @@ pub enum BuildError {
     EmptyUserName,
     #[error("share name `{0}` is reserved")]
     ReservedShareName(String),
-    #[error("share name `{0}` must be non-empty and contain no `\\` or `/`")]
+    #[error("share name `{0}` must be non-empty and contain no `\\`, `/` or NUL")]
     InvalidShareName(String),
+    #[error("remark of share `{0}` must hold no NUL and at most 1024 UTF-16 code units")]
+    InvalidShareRemark(String),
     #[error("`{setting}` must be {expected}")]
     OutOfRange {
         setting: &'static str,
@@ -178,7 +211,7 @@ pub enum BuildError {
 pub(crate) enum ShareNameError {
     /// IPC$, which the server provides itself.
     Reserved,
-    /// Empty, or contains `\` or `/`, so no UNC path reaches it.
+    /// Empty, or contains `\`, `/` or NUL, so no UNC path reaches it.
     Invalid,
 }
 
@@ -188,7 +221,7 @@ pub(crate) fn check_share_name(name: &str) -> Result<(), ShareNameError> {
     if name.eq_ignore_ascii_case("IPC$") {
         return Err(ShareNameError::Reserved);
     }
-    if name.is_empty() || name.contains(['\\', '/']) {
+    if name.is_empty() || name.contains(['\\', '/', '\0']) {
         return Err(ShareNameError::Invalid);
     }
     Ok(())
@@ -212,6 +245,7 @@ pub struct SmbServerBuilder {
     auth: crate::auth_policy::AuthSettings,
     max_opens_per_connection: usize,
     max_locks_per_open: usize,
+    share_listing: bool,
 }
 
 impl Default for SmbServerBuilder {
@@ -235,6 +269,7 @@ impl SmbServerBuilder {
             auth: crate::auth_policy::AuthSettings::default(),
             max_opens_per_connection: crate::files::DEFAULT_MAX_OPENS_PER_CONNECTION,
             max_locks_per_open: crate::files::DEFAULT_MAX_LOCKS_PER_OPEN,
+            share_listing: true,
         }
     }
 
@@ -380,12 +415,27 @@ impl SmbServerBuilder {
 
     /// Most files and named pipes one connection may hold open at once. A
     /// CREATE past the limit fails with STATUS_INSUFFICIENT_RESOURCES.
-    /// Defaults to
+    /// Named pipes are also limited to 16 per connection. Defaults to
     /// [`DEFAULT_MAX_OPENS_PER_CONNECTION`](crate::DEFAULT_MAX_OPENS_PER_CONNECTION).
     /// [`ConfigHandle::set_max_opens_per_connection`](crate::ConfigHandle::set_max_opens_per_connection)
     /// changes it at run time.
     pub fn max_opens_per_connection(mut self, opens: usize) -> Self {
         self.max_opens_per_connection = opens;
+        self
+    }
+
+    /// Answer clients that list the server's shares: Explorer and `net
+    /// view` on Windows, the Finder and `smbutil view` on macOS, `smbclient
+    /// -L` and file managers on Linux. A client sees the shares its session
+    /// may connect to, the public ones for an anonymous session, and IPC$,
+    /// in the order the shares were added; a share whose traffic is
+    /// encrypted is left out for a session that cannot encrypt. Shares left
+    /// out with [`Share::listed`] are not in the list. Clients list shares through the
+    /// `srvsvc` named pipe on IPC$; one connection may hold 16 named pipes
+    /// at once. On by default; turned off, IPC$ opens no pipe and clients
+    /// get no list.
+    pub fn share_listing(mut self, enabled: bool) -> Self {
+        self.share_listing = enabled;
         self
     }
 
@@ -482,6 +532,9 @@ impl SmbServerBuilder {
                 }
                 Ok(()) => {}
             }
+            if !valid_remark(&share.remark) {
+                return Err(BuildError::InvalidShareRemark(share.name.clone()));
+            }
             if !seen_names.insert(share.name.to_ascii_lowercase()) {
                 return Err(BuildError::DuplicateShare(share.name.clone()));
             }
@@ -526,6 +579,7 @@ impl SmbServerBuilder {
             max_write_size: self.max_write_size,
             server_guid,
             limits: self.limits,
+            share_listing: self.share_listing,
         };
         let users = ServerUsers {
             table: tokio::sync::RwLock::new(user_table),
@@ -612,13 +666,37 @@ mod tests {
                 Err(BuildError::ReservedShareName(n)) if n == name
             ));
         }
-        for name in ["", "a\\b", "a/b", "\\share"] {
+        for name in ["", "a\\b", "a/b", "\\share", "a\0b"] {
             assert!(matches!(
                 build_with_share(name),
                 Err(BuildError::InvalidShareName(n)) if n == name
             ));
         }
         assert!(build_with_share("share$").is_ok());
+    }
+
+    #[test]
+    fn remarks_hold_no_nul_and_at_most_1024_units() {
+        let build = |remark: String| {
+            SmbServer::builder()
+                .listen("127.0.0.1:0".parse().unwrap())
+                .share(Share::new("s", MemFsBackend::new()).remark(remark).public())
+                .build()
+        };
+        // U+1F9A4 takes two UTF-16 code units.
+        for remark in ["a".repeat(1024), "\u{1F9A4}".repeat(512)] {
+            assert!(build(remark).is_ok());
+        }
+        for remark in [
+            "a".repeat(1025),
+            "\u{1F9A4}".repeat(513),
+            "a\0b".to_string(),
+        ] {
+            assert!(matches!(
+                build(remark),
+                Err(BuildError::InvalidShareRemark(n)) if n == "s"
+            ));
+        }
     }
 
     #[test]

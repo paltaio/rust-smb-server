@@ -3,8 +3,10 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 
 pub(crate) mod association;
+pub(crate) mod ndr;
 pub(crate) mod pdu;
 pub(crate) mod pipe;
+pub(crate) mod srvsvc;
 
 /// The pipe IPC$ serves, as a CREATE names it.
 pub(crate) const SRVSVC_PIPE: &str = "srvsvc";

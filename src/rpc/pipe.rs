@@ -11,11 +11,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::{Mutex, Notify};
 use tracing::{debug, warn};
 
-use super::association::{Association, Call, Fault, Step};
-use super::pdu::{Header, NCA_OP_RNG_ERROR};
+use super::association::{Association, Step};
+use super::pdu::Header;
+use super::srvsvc;
 use crate::files::OpenSlot;
 use crate::ntstatus;
 use crate::proto::messages::FileId;
+use crate::server::{Caller, ServerState};
 
 /// Pipes one connection may hold open at once.
 pub(crate) const MAX_PIPES_PER_CONNECTION: usize = 16;
@@ -56,6 +58,8 @@ pub(crate) struct Pipe {
     pub(crate) file_id: FileId,
     /// Open.GrantedAccess.
     pub(crate) granted_access: u32,
+    /// The session that opened the pipe.
+    caller: Caller,
     state: Mutex<State>,
     /// Held by the reader whose turn it is; the others queue for it.
     readers: Mutex<()>,
@@ -93,11 +97,13 @@ pub(crate) enum Read {
 }
 
 impl Pipe {
-    /// A new pipe counted by `open` and against `budget`, or `None` when
-    /// the connection already holds [`MAX_PIPES_PER_CONNECTION`] pipes.
+    /// A new pipe for `caller`, counted by `open` and against `budget`, or
+    /// `None` when the connection already holds
+    /// [`MAX_PIPES_PER_CONNECTION`] pipes.
     pub(crate) fn new(
         file_id: FileId,
         granted_access: u32,
+        caller: Caller,
         open: OpenSlot,
         budget: &Arc<PipeBudget>,
     ) -> Option<Self> {
@@ -105,6 +111,7 @@ impl Pipe {
         Some(Self {
             file_id,
             granted_access,
+            caller,
             state: Mutex::new(State {
                 assoc: Association::default(),
                 outbox: VecDeque::new(),
@@ -128,10 +135,10 @@ impl Pipe {
     /// pipes hold [`MAX_CONNECTION_BYTES`]; nothing is written then. A
     /// write that reaches either limit ends the association: the request
     /// that found no room is answered with a fault, and the bytes after it
-    /// are dropped.
-    pub(crate) async fn write(&self, data: &[u8]) -> Result<(), u32> {
+    /// are dropped. Calls see the shares of `server`.
+    pub(crate) async fn write(&self, server: &ServerState, data: &[u8]) -> Result<(), u32> {
         let mut state = self.state.lock().await;
-        self.feed(&mut state, data)
+        self.feed(server, &mut state, data).await
     }
 
     /// Reads up to `len` bytes of the oldest reply, unless another reader
@@ -168,20 +175,27 @@ impl Pipe {
     /// (FSCTL_PIPE_TRANSCEIVE). Fails with STATUS_PIPE_BUSY while a reply is
     /// unread (MS-FSCC 2.3.48), and as [`Pipe::write`] does. The read part
     /// finds nothing while another reader waits before it.
-    pub(crate) async fn transceive(&self, data: &[u8], len: usize) -> Result<Read, u32> {
+    pub(crate) async fn transceive(
+        &self,
+        server: &ServerState,
+        data: &[u8],
+        len: usize,
+    ) -> Result<Read, u32> {
         let turn = self.readers.try_lock();
         let mut state = self.state.lock().await;
         if !state.outbox.is_empty() {
             return Err(ntstatus::STATUS_PIPE_BUSY);
         }
-        self.feed(&mut state, data)?;
+        self.feed(server, &mut state, data).await?;
         Ok(match turn {
             Ok(_) => state.take(len),
             Err(_) => Read::Empty,
         })
     }
 
-    fn feed(&self, state: &mut State, data: &[u8]) -> Result<(), u32> {
+    /// Runs the PDUs in `data`. The share list a call answers from is
+    /// read with the pipe locked, so calls on one pipe run in order.
+    async fn feed(&self, server: &ServerState, state: &mut State, data: &[u8]) -> Result<(), u32> {
         if state.assoc.is_closed() {
             return Err(ntstatus::STATUS_PIPE_DISCONNECTED);
         }
@@ -204,7 +218,8 @@ impl Pipe {
             match step {
                 Step::Send(pdu) => state.push(pdu),
                 Step::Call(call) => {
-                    let result = run(&call);
+                    let result = srvsvc::serve(server, &self.caller, call.opnum, &call.stub).await;
+                    debug!(opnum = call.opnum, ok = result.is_ok(), "rpc call");
                     for reply in state.assoc.reply(&call, result) {
                         state.push(reply);
                     }
@@ -272,28 +287,33 @@ impl Drop for State {
     }
 }
 
-/// Runs `call`. No srvsvc operation is served, so every call fails with
-/// nca_op_rng_error before it runs.
-fn run(call: &Call) -> Result<Vec<u8>, Fault> {
-    debug!(opnum = call.opnum, "rpc call to an unknown operation");
-    Err(Fault {
-        status: NCA_OP_RNG_ERROR,
-        did_not_execute: true,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
+
+    use std::sync::LazyLock;
 
     use super::*;
     use crate::rpc::pdu::tests::{BIND_3CTX, unhex};
     use crate::rpc::pdu::{NCA_SERVER_TOO_BUSY, PTYPE_BIND_ACK, PTYPE_FAULT};
 
+    /// A server the calls in these tests run against.
+    static SERVER: LazyLock<Arc<ServerState>> = LazyLock::new(|| {
+        crate::SmbServer::builder()
+            .listen("127.0.0.1:0".parse().unwrap())
+            .build()
+            .expect("build")
+            .state()
+    });
+
     fn pipe_on(budget: &Arc<PipeBudget>) -> Option<Pipe> {
         let count = Arc::new(AtomicUsize::new(0));
         let open = OpenSlot::acquire(&count, 1).expect("a slot");
-        Pipe::new(FileId::new(1, 1), 0x0012_019F, open, budget)
+        let caller = Caller {
+            identity: crate::proto::auth::ntlm::Identity::Anonymous,
+            can_encrypt: false,
+        };
+        Pipe::new(FileId::new(1, 1), 0x0012_019F, caller, open, budget)
     }
 
     fn pipe() -> Pipe {
@@ -336,7 +356,7 @@ mod tests {
         assert_eq!(pipe.read(100).await, Read::Empty);
         let mut writes = unhex(BIND_3CTX);
         writes.extend(request(2, 15));
-        pipe.write(&writes).await.unwrap();
+        pipe.write(&SERVER, &writes).await.unwrap();
 
         let (head, more) = data(pipe.read(10).await);
         assert!(more);
@@ -353,30 +373,34 @@ mod tests {
     #[tokio::test]
     async fn transceive_refuses_while_a_reply_is_unread() {
         let pipe = pipe();
-        pipe.write(&unhex(BIND_3CTX)).await.unwrap();
+        pipe.write(&SERVER, &unhex(BIND_3CTX)).await.unwrap();
         assert_eq!(
-            pipe.transceive(&request(2, 15), 4280).await,
+            pipe.transceive(&SERVER, &request(2, 15), 4280).await,
             Err(ntstatus::STATUS_PIPE_BUSY)
         );
         data(pipe.read(4280).await);
-        let (fault, _) = data(pipe.transceive(&request(2, 15), 4280).await.unwrap());
+        let (fault, _) = data(
+            pipe.transceive(&SERVER, &request(2, 15), 4280)
+                .await
+                .unwrap(),
+        );
         assert_eq!(fault[2], PTYPE_FAULT);
-        assert_eq!(pipe.transceive(&[], 0).await, Ok(Read::Empty));
+        assert_eq!(pipe.transceive(&SERVER, &[], 0).await, Ok(Read::Empty));
     }
 
     #[tokio::test]
     async fn after_a_protocol_error_the_replies_drain_and_the_pipe_disconnects() {
         let pipe = pipe();
-        pipe.write(&request(1, 15)).await.unwrap();
+        pipe.write(&SERVER, &request(1, 15)).await.unwrap();
         assert_eq!(
-            pipe.write(&unhex(BIND_3CTX)).await,
+            pipe.write(&SERVER, &unhex(BIND_3CTX)).await,
             Err(ntstatus::STATUS_PIPE_DISCONNECTED)
         );
         let (nak, _) = data(pipe.read(4280).await);
         assert_eq!(nak.len(), 24);
         assert_eq!(pipe.read(4280).await, Read::Disconnected);
         assert_eq!(
-            pipe.transceive(&[], 10).await,
+            pipe.transceive(&SERVER, &[], 10).await,
             Err(ntstatus::STATUS_PIPE_DISCONNECTED)
         );
     }
@@ -384,12 +408,14 @@ mod tests {
     #[tokio::test]
     async fn a_write_past_the_outbox_limit_ends_the_association() {
         let pipe = pipe();
-        pipe.write(&unhex(BIND_3CTX)).await.unwrap();
+        pipe.write(&SERVER, &unhex(BIND_3CTX)).await.unwrap();
         data(pipe.read(4280).await);
         // Each request queues a 32-byte fault; the limit is crossed by the
         // request that comes after 32768 of them.
         let limit = (MAX_OUTBOX / 32) as u32;
-        pipe.write(&requests(10, limit + 100)).await.unwrap();
+        pipe.write(&SERVER, &requests(10, limit + 100))
+            .await
+            .unwrap();
         let mut faults = Vec::new();
         while let Read::Data { bytes, .. } = pipe.read(4280).await {
             faults.push(bytes);
@@ -403,7 +429,7 @@ mod tests {
         );
         assert_eq!(pipe.read(4280).await, Read::Disconnected);
         assert_eq!(
-            pipe.write(&request(1, 15)).await,
+            pipe.write(&SERVER, &request(1, 15)).await,
             Err(ntstatus::STATUS_PIPE_DISCONNECTED)
         );
     }
@@ -413,7 +439,7 @@ mod tests {
         let budget = Arc::default();
         let pipes: Vec<Pipe> = (0..5).map(|_| pipe_on(&budget).unwrap()).collect();
         for pipe in &pipes {
-            pipe.write(&unhex(BIND_3CTX)).await.unwrap();
+            pipe.write(&SERVER, &unhex(BIND_3CTX)).await.unwrap();
             data(pipe.read(4280).await);
         }
         // 1000 KiB of faults on each of four pipes stays under each pipe's
@@ -421,7 +447,7 @@ mod tests {
         let batch = requests(10, 320);
         for pipe in &pipes[..4] {
             for _ in 0..100 {
-                pipe.write(&batch).await.unwrap();
+                pipe.write(&SERVER, &batch).await.unwrap();
             }
             assert_eq!(queued(pipe).await, 1000 * 1024);
         }
@@ -430,22 +456,25 @@ mod tests {
         // past; until replies are read, the pipes take no write.
         let room = (MAX_CONNECTION_BYTES - budget.held_bytes()) / 32;
         pipes[4]
-            .write(&requests(10, room as u32 + 1))
+            .write(&SERVER, &requests(10, room as u32 + 1))
             .await
             .unwrap();
         assert!(budget.held_bytes() > MAX_CONNECTION_BYTES);
         for pipe in [&pipes[1], &pipes[4]] {
             assert_eq!(
-                pipe.write(&request(1, 15)).await,
+                pipe.write(&SERVER, &request(1, 15)).await,
                 Err(ntstatus::STATUS_INSUFFICIENT_RESOURCES)
             );
         }
         while let Read::Data { .. } = pipes[0].read(4280).await {}
-        pipes[1].write(&request(1, 15)).await.unwrap();
+        pipes[1].write(&SERVER, &request(1, 15)).await.unwrap();
 
         // A write that passes the limit before its end ends the
         // association of its pipe, and its last reply says why.
-        pipes[4].write(&requests(10, 40_000)).await.unwrap();
+        pipes[4]
+            .write(&SERVER, &requests(10, 40_000))
+            .await
+            .unwrap();
         let mut last = Vec::new();
         while let Read::Data { bytes, .. } = pipes[4].read(4280).await {
             last = bytes;
@@ -473,18 +502,18 @@ mod tests {
     async fn a_request_being_reassembled_counts_against_the_budget() {
         let budget = Arc::default();
         let pipe = pipe_on(&budget).unwrap();
-        pipe.write(&unhex(BIND_3CTX)).await.unwrap();
+        pipe.write(&SERVER, &unhex(BIND_3CTX)).await.unwrap();
         data(pipe.read(4280).await);
         let base = budget.held_bytes();
         let mut first = request(5, 15);
         first[3] = 1;
         first.extend_from_slice(&[0; 1000]);
         first[8..10].copy_from_slice(&1024u16.to_le_bytes());
-        pipe.write(&first).await.unwrap();
+        pipe.write(&SERVER, &first).await.unwrap();
         assert!(budget.held_bytes() >= base + 1000);
         let mut last = request(5, 15);
         last[3] = 2;
-        pipe.write(&last).await.unwrap();
+        pipe.write(&SERVER, &last).await.unwrap();
         data(pipe.read(4280).await);
         // The stub is gone; the buffer that held the largest PDU stays.
         assert!(budget.held_bytes() <= base + 1024);
@@ -493,7 +522,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_reply_queued_while_a_reader_finds_the_pipe_empty_wakes_it() {
         let pipe = Arc::new(pipe());
-        pipe.write(&unhex(BIND_3CTX)).await.unwrap();
+        pipe.write(&SERVER, &unhex(BIND_3CTX)).await.unwrap();
         data(pipe.read(4280).await);
         // The reader stops between finding the pipe empty and waiting;
         // the reply is queued then.
@@ -506,7 +535,7 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert!(pipe.readers.try_lock().is_err(), "the reader has its turn");
-        pipe.write(&request(2, 15)).await.unwrap();
+        pipe.write(&SERVER, &request(2, 15)).await.unwrap();
         drop(gap);
         let read = tokio::time::timeout(Duration::from_secs(60), reader)
             .await
@@ -518,7 +547,7 @@ mod tests {
     #[tokio::test]
     async fn waiting_readers_are_served_in_order() {
         let pipe = Arc::new(pipe());
-        pipe.write(&unhex(BIND_3CTX)).await.unwrap();
+        pipe.write(&SERVER, &unhex(BIND_3CTX)).await.unwrap();
         data(pipe.read(4280).await);
         let first = tokio::spawn({
             let pipe = Arc::clone(&pipe);
@@ -531,11 +560,11 @@ mod tests {
         });
         tokio::task::yield_now().await;
         // A read that comes while they wait finds nothing.
-        pipe.write(&request(7, 15)).await.unwrap();
+        pipe.write(&SERVER, &request(7, 15)).await.unwrap();
         assert_eq!(pipe.read(4280).await, Read::Empty);
         assert_eq!(data(first.await.unwrap()).0[12], 7);
         assert!(!second.is_finished());
-        pipe.write(&request(8, 15)).await.unwrap();
+        pipe.write(&SERVER, &request(8, 15)).await.unwrap();
         assert_eq!(data(second.await.unwrap()).0[12], 8);
     }
 }

@@ -2,7 +2,6 @@
 
 use std::sync::Arc;
 
-use crate::proto::auth::ntlm::Identity;
 use crate::proto::header::{SMB2_FLAGS_SIGNED, Smb2Header};
 use crate::proto::messages::{Dialect, TreeConnectRequest, TreeConnectResponse};
 use tracing::{info, warn};
@@ -13,7 +12,7 @@ use crate::conn::state::{Connection, TreeConnect};
 use crate::dispatch::HandlerResponse;
 use crate::handlers::shared::lookup_session;
 use crate::ntstatus;
-use crate::server::{ServerState, ShareMode};
+use crate::server::{Caller, ServerState};
 use crate::utils::utf16le_to_units;
 
 const SHARE_TYPE_DISK: u8 = 0x01;
@@ -32,9 +31,8 @@ pub async fn handle(
         Err(s) => return HandlerResponse::err(s),
     };
     let sess = sess_arc.read().await;
-    let identity = sess.identity.clone();
+    let caller = Caller::of(&sess);
     let anonymous = sess.is_anonymous();
-    let can_encrypt = sess.cipher.is_some();
     drop(sess);
 
     // MS-SMB2 3.3.5.7: on 3.1.1 an authenticated session's TREE_CONNECT
@@ -76,17 +74,6 @@ pub async fn handle(
             None => return HandlerResponse::err(ntstatus::STATUS_BAD_NETWORK_NAME),
         }
     };
-    // MS-SMB2 3.3.5.7: a session that cannot encrypt is refused a share
-    // whose traffic is encrypted.
-    let settings = &server.auth.settings;
-    if (settings.encrypt_data || share.encrypt_data)
-        && settings.reject_unencrypted_access
-        && !can_encrypt
-    {
-        warn!(share = %share.name, "TREE_CONNECT to an encrypted share without encryption");
-        return HandlerResponse::err(ntstatus::STATUS_ACCESS_DENIED);
-    }
-
     // The share and its ACL are checked with the session's tree table
     // locked. ConfigHandle changes them first and then sweeps the trees,
     // and the sweep waits for this lock, so a tree inserted here is either
@@ -106,10 +93,10 @@ pub async fn handle(
         return HandlerResponse::err(ntstatus::STATUS_BAD_NETWORK_NAME);
     }
     let acl = share.acl.read().await;
-    let granted = match authorize(&acl.mode, &acl.users, &identity) {
+    let granted = match server.admits(&share, &acl, &caller) {
         Some(a) => a,
         None => {
-            warn!(?identity, share = %share.name, "TREE_CONNECT denied");
+            warn!(identity = ?caller.identity, share = %share.name, "TREE_CONNECT denied");
             return HandlerResponse::err(ntstatus::STATUS_ACCESS_DENIED);
         }
     };
@@ -136,7 +123,7 @@ pub async fn handle(
             SHARE_TYPE_DISK
         },
         reserved: 0,
-        share_flags: if share.encrypt_data && can_encrypt {
+        share_flags: if share.encrypt_data && caller.can_encrypt {
             SHAREFLAG_ENCRYPT_DATA
         } else {
             0
@@ -173,25 +160,11 @@ fn share_name(unc: &str) -> Option<&str> {
     Some(share)
 }
 
-fn authorize(
-    mode: &ShareMode,
-    users: &std::collections::HashMap<String, Access>,
-    identity: &Identity,
-) -> Option<Access> {
-    match mode {
-        ShareMode::Public => Some(Access::ReadWrite),
-        ShareMode::PublicReadOnly => Some(Access::Read),
-        ShareMode::AuthenticatedOnly => match identity {
-            Identity::Anonymous => None,
-            Identity::User { user, .. } => users.get(user).copied(),
-        },
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::conn::state::Session;
+    use crate::proto::auth::ntlm::Identity;
     use crate::proto::header::{Command, HeaderTail};
     use tokio::sync::RwLock;
 

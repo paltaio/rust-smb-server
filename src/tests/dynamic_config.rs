@@ -97,7 +97,7 @@ async fn config_handle_rejects_the_share_names_build_rejects() {
             Err(ConfigError::ReservedShareName(name.to_string()))
         );
     }
-    for name in ["", "a\\b", "a/b", "\\share"] {
+    for name in ["", "a\\b", "a/b", "\\share", "a\0b"] {
         assert_eq!(
             add(name).await,
             Err(ConfigError::InvalidShareName(name.to_string()))
