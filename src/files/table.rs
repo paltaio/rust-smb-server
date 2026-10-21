@@ -126,6 +126,12 @@ struct OpenEntry {
     lease: Option<LeaseId>,
     /// The connection the open belongs to, where breaks of its lease go.
     owner: Weak<Outbound>,
+    /// A CREATE waiting for other clients to give up write caching. It
+    /// counts against their write caching but not in the sharing check of
+    /// other opens; it runs its own sharing check once the wait ends
+    /// (MS-FSA 2.1.5.1 checks for oplock breaks before the open joins the
+    /// file's opens).
+    waiting: bool,
 }
 
 /// A new open, as [`FileRef::register`] enters it.
@@ -317,11 +323,16 @@ impl FileNode {
 impl FileState {
     /// MS-FSA 2.1.5.1: a delete-pending file opens for nobody; otherwise the
     /// sharing check of 2.1.5.1.2.2 runs against every open on the file.
-    fn admit(&self, sharing: Sharing) -> Result<(), u32> {
+    /// Waiting CREATEs and the open `except` take no part.
+    fn admit(&self, sharing: Sharing, except: Option<u64>) -> Result<(), u32> {
         if self.delete_pending.is_some() {
             return Err(ntstatus::STATUS_DELETE_PENDING);
         }
-        if self.opens.iter().any(|e| e.sharing.conflicts_with(sharing)) {
+        if self
+            .opens
+            .iter()
+            .any(|e| !e.waiting && Some(e.id) != except && e.sharing.conflicts_with(sharing))
+        {
             return Err(ntstatus::STATUS_SHARING_VIOLATION);
         }
         Ok(())
@@ -410,6 +421,14 @@ impl FileState {
     fn handle_break_pending(&self, exempt: Option<LeaseId>) -> bool {
         self.leases.iter().any(|l| {
             Some(l.id) != exempt && l.breaking.is_some() && l.state.contains(LeaseState::H)
+        })
+    }
+
+    /// Whether a lease other than `exempt` still caches writes while a
+    /// break of it is in progress.
+    fn write_break_pending(&self, exempt: Option<LeaseId>) -> bool {
+        self.leases.iter().any(|l| {
+            Some(l.id) != exempt && l.breaking.is_some() && l.state.contains(LeaseState::W)
         })
     }
 
@@ -559,6 +578,18 @@ impl FileTable {
         drop(all);
     }
 
+    /// Stops every acknowledgment timer on the share, as if they were lost.
+    #[cfg(test)]
+    pub(crate) fn stop_timers(&self) {
+        for node in self.files().values() {
+            for lease in &mut node.state().leases {
+                if let Some(timer) = lease.breaking.as_mut().and_then(|b| b.timer.take()) {
+                    timer.abort();
+                }
+            }
+        }
+    }
+
     /// Moves every open whose name is `from`, or lies below it, to the
     /// matching name under `to`.
     pub(crate) fn rename_paths(&self, from: &SmbPath, to: &SmbPath, case_sensitive: bool) {
@@ -614,16 +645,18 @@ pub(crate) struct FileRef {
 
 impl FileRef {
     /// Adds the open `req` describes of the file `info` describes, reached
-    /// through `path`. Fails with STATUS_DELETE_PENDING or
-    /// STATUS_SHARING_VIOLATION when the opens already on the file do not
-    /// allow it. An open that is not attribute-only breaks the leases it
-    /// conflicts with.
+    /// through `path`, holding the lease it asks for. Fails with
+    /// STATUS_DELETE_PENDING or STATUS_SHARING_VIOLATION when the opens
+    /// already on the file do not allow it. An open that is not
+    /// attribute-only breaks the leases it conflicts with, and returns a
+    /// wait when other clients have to write back what they cache first
+    /// (MS-FSA 2.1.4.12, OPEN).
     pub(crate) fn register(
         share: &Arc<ShareBindings>,
         info: &FileInfo,
         path: &SmbPath,
         req: OpenRequest,
-    ) -> Result<Self, Refused> {
+    ) -> Result<(Self, Option<BreakWait>), Refused> {
         let case_sensitive = share.backend.capabilities().case_sensitive;
         let key = FileKey::new(info.file_index, path, case_sensitive);
         let table = &share.files;
@@ -645,7 +678,7 @@ impl FileRef {
             })
             .clone();
         let mut state = node.state();
-        if let Err(status) = state.admit(req.sharing) {
+        if let Err(status) = state.admit(req.sharing, None) {
             let mut wait = None;
             let mut notices = Notices::default();
             if status == ntstatus::STATUS_SHARING_VIOLATION {
@@ -667,27 +700,54 @@ impl FileRef {
             id,
             sharing: req.sharing,
             path: path.clone(),
-            lease: None,
+            lease: req.lease,
             owner: req.owner,
+            waiting: false,
         });
-        let notices = if stat_only(req.sharing.access) {
-            Notices::default()
+        let (notices, wait) = if stat_only(req.sharing.access) {
+            (Notices::default(), None)
         } else {
             let trigger = Trigger::Open {
                 overwrite: req.overwrite,
             };
-            state.break_for(trigger, req.lease).0
+            let (notices, waits) = state.break_for(trigger, req.lease);
+            if waits && let Some(entry) = state.opens.last_mut() {
+                entry.waiting = true;
+            }
+            (notices, waits.then(|| state.wait()))
         };
         drop(state);
         drop(files);
         drop(notices);
-        Ok(Self {
+        let file = Self {
             share: Arc::clone(share),
             node,
             id,
             lease: None,
             released: false,
-        })
+        };
+        Ok((file, wait))
+    }
+
+    /// Ends the wait of a CREATE that waited for other clients to give up
+    /// write caching: `Ok(None)` once it may go ahead, after it passes the
+    /// delete-pending and sharing checks the opens on the file now ask
+    /// for; a wait while a write break is still in progress; or the
+    /// status the CREATE fails with.
+    pub(crate) fn end_wait(&self) -> Result<Option<BreakWait>, u32> {
+        let mut state = self.node.state();
+        let Some(entry) = state.entry(self.id) else {
+            return Err(ntstatus::STATUS_FILE_CLOSED);
+        };
+        let (lease, sharing) = (entry.lease, entry.sharing);
+        if state.write_break_pending(lease) {
+            return Ok(Some(state.wait()));
+        }
+        state.admit(sharing, Some(self.id))?;
+        if let Some(entry) = state.opens.iter_mut().find(|e| e.id == self.id) {
+            entry.waiting = false;
+        }
+        Ok(None)
     }
 
     /// Whether this open's file is `node`.
@@ -856,19 +916,31 @@ impl FileRef {
         if state.range_conflicts(self.id, offset, length, exclusive, true) {
             return Err(ntstatus::STATUS_LOCK_NOT_GRANTED);
         }
-        state.locks.push(RangeLock {
-            owner: self.id,
-            offset,
-            length,
-            exclusive,
-        });
         // MS-FSA 2.1.5.8: a lock breaks the leases on the file, all but the
         // one this open holds, wherever the range lies. Under the same lock
-        // no lease can be granted between the two.
+        // no lease can be granted between the two. While another lease
+        // still caches writes, which only an attribute-only open allows,
+        // the lock is refused: a lock taken now would keep that client from
+        // writing back. Lock requests do not wait, so the client retries.
         let exempt = state.entry(self.id).and_then(|e| e.lease);
+        let caching_writes = state
+            .leases
+            .iter()
+            .any(|l| Some(l.id) != exempt && l.state.contains(LeaseState::W));
         let notices = state.break_for(Trigger::Write, exempt).0;
+        if !caching_writes {
+            state.locks.push(RangeLock {
+                owner: self.id,
+                offset,
+                length,
+                exclusive,
+            });
+        }
         drop(state);
         drop(notices);
+        if caching_writes {
+            return Err(ntstatus::STATUS_LOCK_NOT_GRANTED);
+        }
         Ok(())
     }
 
@@ -1077,6 +1149,7 @@ mod tests {
             }
             .into(),
         )
+        .map(|(file, _)| file)
         .map_err(|r| r.status)
     }
 
@@ -1281,7 +1354,8 @@ mod tests {
             }
             .into(),
         )
-        .unwrap();
+        .unwrap()
+        .0;
         s.files.rename_paths(&p("d"), &p("e"), false);
         assert!(s.files.path_is_open(&p("E\\F"), false));
         assert!(!s.files.path_is_open(&p("d\\f"), false));

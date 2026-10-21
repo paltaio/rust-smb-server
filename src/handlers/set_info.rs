@@ -12,7 +12,7 @@ use crate::backend::{
 use crate::conn::pending::{Stop, stopped};
 use crate::conn::state::{Connection, Open};
 use crate::dispatch::HandlerResponse;
-use crate::files::{BreakWait, Trigger};
+use crate::files::{BreakWait, MAX_BREAK_WAIT, Trigger};
 use crate::handlers::shared::{lookup_open, lookup_session_tree, restore_fixed_times};
 use crate::handlers::{Outcome, Pending};
 use crate::info_class as ic;
@@ -178,10 +178,6 @@ async fn set(
     Ok(set_info_ok())
 }
 
-/// Most attempts a waiting rename makes; each follows a change on the
-/// target while a lease break is in progress.
-const MAX_WAIT_ATTEMPTS: u32 = 64;
-
 /// A FileRenameInformation request.
 struct Rename {
     file_id: FileId,
@@ -221,12 +217,13 @@ fn wait_for_rename(
         ));
     };
     let (conn, hdr) = (Arc::clone(conn), *hdr);
-    // The wait ends when the break completes, at the latest when its
-    // acknowledgment times out. A wait that runs out with nothing changed
-    // fails the rename.
+    // The wait ends when the break completes, which its acknowledgment
+    // timer bounds. A wait that runs out with nothing changed on the
+    // target, or one that outlasts [`MAX_BREAK_WAIT`], fails the rename.
     let work = async move {
+        let give_up = tokio::time::Instant::now() + MAX_BREAK_WAIT;
         let mut wait = wait;
-        for _ in 0..MAX_WAIT_ATTEMPTS {
+        loop {
             let changed = tokio::select! {
                 biased;
                 why = stopped(&mut stop) => {
@@ -236,15 +233,17 @@ fn wait_for_rename(
                     true
                 }
                 changed = wait.changed() => changed,
+                () = tokio::time::sleep_until(give_up) => false,
             };
             match rename_attempt(&conn, &hdr, &rename, Stage::AfterHandleBreak).await {
                 Renamed::Done(Ok(())) => return set_info_ok(),
                 Renamed::Done(Err(status)) => return HandlerResponse::err(status),
-                Renamed::Wait(_) if !changed => break,
+                Renamed::Wait(_) if !changed => {
+                    return HandlerResponse::err(ntstatus::STATUS_ACCESS_DENIED);
+                }
                 Renamed::Wait(next) => wait = next,
             }
         }
-        HandlerResponse::err(ntstatus::STATUS_ACCESS_DENIED)
     };
     Outcome::Pending(Pending {
         op,
@@ -541,7 +540,9 @@ mod tests {
                 access: DELETE,
                 share: 7,
             };
-            let file = FileRef::register(&share, &info, &path, sharing.into()).unwrap();
+            let file = FileRef::register(&share, &info, &path, sharing.into())
+                .unwrap()
+                .0;
             let file_id = tree.alloc_file_id();
             let open = Open {
                 file_id,

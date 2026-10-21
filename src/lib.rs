@@ -45,10 +45,15 @@
 //!   the protocol layer per share, across every connection, keyed by
 //!   [`FileInfo::file_index`], or by path when it is 0. Two shares over
 //!   the same directory do not see each other's opens. A CREATE that would
-//!   truncate first opens the file without write access, runs the checks
-//!   and enters the open in the table, so the sharing mode holds while
-//!   `open` truncates. Any other CREATE refused by the share-mode check has
-//!   already called `open` and closes the new handle again.
+//!   truncate first opens the file without truncating it, for reading or,
+//!   when reading is refused, with the access the CREATE was granted. It
+//!   runs the checks, enters the open in the table and waits for lease
+//!   breaks, so the sharing mode holds and clients caching writes have
+//!   written back before `open` truncates. When that first open finds no
+//!   file, the CREATE calls `open` with [`OpenIntent::Create`] instead and
+//!   starts over if the file appeared meanwhile. Any other CREATE refused
+//!   by the share-mode check has already called `open` and closes the new
+//!   handle again.
 //! - [`Handle::close`] runs on every path that ends an open: CLOSE,
 //!   TREE_DISCONNECT, LOGOFF, the end of a session or connection, and
 //!   [`ConfigHandle`] changes that end sessions or trees. Before it,
@@ -86,6 +91,25 @@
 //!   file is delete-pending or has no links left. The filesystem
 //!   QUERY_INFO classes, and the VolumeId of the on-disk id CREATE context,
 //!   come from [`ShareBackend::volume_info`].
+//! - Leases: on every share unless [`Share::leases`] turns them off, files
+//!   get read, handle and write caching leases. A client holding one
+//!   caches what it reads, keeps files open after its applications close
+//!   them, and caches writes while every other open of the file holds the
+//!   same lease or is attribute-only. An open, write, size change,
+//!   byte-range lock, rename or delete made through an open that does not
+//!   hold the lease breaks it when it needs what the lease caches, whether
+//!   that open belongs to another client or to the same client under
+//!   another lease key or none; attribute-only opens and opens holding the
+//!   same lease break nothing. An open or rename that needs the client to
+//!   write back or close first waits until the client acknowledges the
+//!   break or closes, or until the break times out 35 seconds after the
+//!   server sent it; meanwhile its backend handle stays open, except for
+//!   one that truncates, which calls `open` after the wait. A byte-range
+//!   lock asked for while another lease still caches writes is refused
+//!   with STATUS_LOCK_NOT_GRANTED until that client has written back.
+//!   Changes made outside the server, including through another share over
+//!   the same directory, break nothing: clients keep serving stale cached
+//!   data. Turn leases off on such shares.
 //! - READ and WRITE lengths are bounded by the negotiated maximum sizes.
 //! - Each [`SmbError`] maps to one NTSTATUS for the client; see
 //!   [`SmbError::to_nt_status`].

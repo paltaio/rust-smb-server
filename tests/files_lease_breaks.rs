@@ -40,13 +40,13 @@ async fn server() -> (Server, TempDir) {
     (Server::public(local(td.path())).await, td)
 }
 
-/// Opens `name` sharing `share`, asking for RWH under `key`; checks that RH
+/// Opens `name` sharing `share`, asking for RH under `key`; checks that RH
 /// is granted.
 async fn hold_rh(c: &mut Client, name: &str, key: [u8; 16], share: u32) -> FileId {
     let resp = c
         .create(Create {
             share,
-            ..leased(name, rqls_v1(key, RWH))
+            ..leased(name, rqls_v1(key, RH))
         })
         .await
         .expect("create");
@@ -201,7 +201,7 @@ async fn one_connection_waits_for_its_own_handle_break() {
         match second_key {
             Some(key) => {
                 let lease = lease_reply(&resp).expect("lease");
-                assert_eq!((lease.key, lease.state), (key, RH));
+                assert_eq!((lease.key, lease.state), (key, RWH));
             }
             None => assert_eq!(lease_data(&resp), None),
         }
@@ -502,7 +502,7 @@ async fn an_interim_response_is_encrypted_like_the_request() {
     }
     let create = Create {
         share: SHARE_READ | SHARE_WRITE,
-        ..leased("f.txt", rqls_v2(KEY_A, RWH, None, 0))
+        ..leased("f.txt", rqls_v2(KEY_A, RH, None, 0))
     };
     let resp = holder.send_encrypted(Command::Create, &create.body()).await;
     let held = CreateResponse::parse(&resp[64..]).unwrap();

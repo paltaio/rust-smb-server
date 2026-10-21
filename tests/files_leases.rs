@@ -80,7 +80,7 @@ async fn leasing_is_advertised_from_smb_2_1_on() {
 }
 
 #[tokio::test]
-async fn opens_get_read_and_handle_caching_in_the_version_they_asked_for() {
+async fn a_sole_opener_gets_full_caching_in_the_version_it_asked_for() {
     let (server, _td) = server().await;
     let mut c = server.client().await;
     let resp = open_leased(&mut c, "f.txt", rqls_v1(KEY_A, RWH)).await;
@@ -88,10 +88,8 @@ async fn opens_get_read_and_handle_caching_in_the_version_they_asked_for() {
     let data = lease_data(&resp).expect("lease context");
     assert_eq!(data.len(), 32);
     let lease = LeaseContext::parse(&data).unwrap();
-    assert_eq!(
-        (lease.key, lease.state, lease.flags),
-        (KEY_A, LEASE_READ_CACHING | LEASE_HANDLE_CACHING, 0)
-    );
+    assert_eq!((lease.key, lease.state, lease.flags), (KEY_A, RWH, 0));
+    c.close(resp.file_id).await;
 
     let mut c = server.client_at(0x0302).await;
     let parent = [0x99; 16];
@@ -100,7 +98,7 @@ async fn opens_get_read_and_handle_caching_in_the_version_they_asked_for() {
     let data = lease_data(&resp).expect("lease context");
     assert_eq!(data.len(), 52);
     let lease = LeaseContext::parse(&data).unwrap();
-    assert_eq!(lease.state, LEASE_READ_CACHING | LEASE_HANDLE_CACHING);
+    assert_eq!(lease.state, RWH);
     assert_eq!(lease.epoch, 5);
     assert_eq!(lease.flags, LeaseContext::FLAG_PARENT_LEASE_KEY_SET);
     assert_eq!(lease.parent_key, parent);

@@ -17,7 +17,7 @@ use crate::handlers::shared::restore_fixed_times;
 pub(crate) use lease::{Granted, LeaseId, LeaseRequest, LeaseState, LeaseVersion, Trigger};
 #[cfg(test)]
 pub(crate) use leases::LEASE_BREAK_TIMEOUT;
-pub(crate) use leases::{AfterSend, BreakWait, LeaseTable};
+pub(crate) use leases::{AfterSend, BreakWait, LeaseRef, LeaseTable, MAX_BREAK_WAIT};
 pub(crate) use table::{FileRef, FileTable, OpenRequest, Refused, Sharing};
 
 /// Default for
@@ -164,7 +164,9 @@ mod tests {
             access: DELETE,
             share: 0,
         };
-        let file = FileRef::register(share, &info, &path, sharing.into()).unwrap();
+        let file = FileRef::register(share, &info, &path, sharing.into())
+            .unwrap()
+            .0;
         drop(Open {
             file_id: FileId::default(),
             handle: Some(handle),

@@ -93,16 +93,23 @@ impl Share {
         self
     }
 
-    /// Grant read and handle caching leases on this share's files. A client
-    /// holding one caches what it reads and keeps files open after its
-    /// applications close them. The server tells it to drop the cached data
-    /// before a write, a size change, a byte-range lock or an overwriting
-    /// open made on the share through an open that does not hold that
-    /// lease, and to close the handles it keeps before an open they block,
-    /// a rename or delete of the file, or a rename over it. An open or
-    /// rename that needs those handles closed waits until the client
-    /// acknowledges the break or closes them, or until the break times out
-    /// 35 seconds after the server sent it. On by default.
+    /// Grant read, handle and write caching leases on this share's files. A
+    /// client holding one caches what it reads, keeps files open after its
+    /// applications close them, and caches what it writes while every other
+    /// open of the file holds the same lease or is attribute-only.
+    ///
+    /// Opens on the share that do not hold the lease, from another client
+    /// or from the same client under another lease key or none, break it:
+    /// the client writes back and stops caching writes before such an
+    /// open, drops cached data before a write, a size change, a byte-range
+    /// lock or an overwrite through it, and closes the handles it keeps
+    /// before an open they block, a rename or delete of the file, or a
+    /// rename over it. Attribute-only opens and opens holding the same lease
+    /// break nothing. An open or rename that needs the client to write back
+    /// or close first waits until the client acknowledges the break or
+    /// closes, or until the break times out 35 seconds after the server
+    /// sent it; a byte-range lock is refused instead until the client has
+    /// written back. On by default.
     ///
     /// Changes made outside the server, or through another share over the
     /// same directory, break no lease: clients keep serving the old data.

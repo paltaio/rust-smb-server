@@ -25,6 +25,7 @@ impl LeaseState {
     pub const R: Self = Self(LEASE_READ_CACHING as u8);
     pub const H: Self = Self(LEASE_HANDLE_CACHING as u8);
     pub const W: Self = Self(LEASE_WRITE_CACHING as u8);
+    #[cfg(test)]
     pub const RH: Self = Self(Self::R.0 | Self::H.0);
     pub const RWH: Self = Self(Self::R.0 | Self::W.0 | Self::H.0);
 
@@ -53,7 +54,7 @@ impl LeaseState {
         self.0 & other.0 == other.0
     }
 
-    fn without(self, other: Self) -> Self {
+    pub fn without(self, other: Self) -> Self {
         Self(self.0 & !other.0)
     }
 

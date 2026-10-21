@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use tokio::sync::RwLock;
 
+use crate::ShareBackend;
 use crate::conn::state::{Connection, Session, TreeConnect};
 use crate::conn::writer::{ResponseReceiver, response_queue};
 use crate::dispatch::{Outgoing, dispatch_frame, read_u32};
@@ -145,12 +146,18 @@ impl Peer {
 }
 
 fn create_body(access: u32, share: u32, lease: bool) -> Vec<u8> {
+    create_body_with(access, share, lease.then_some(RH))
+}
+
+/// A CREATE of f.txt asking for the lease state `lease` under
+/// `LEASE_KEY`.
+fn create_body_with(access: u32, share: u32, lease: Option<u32>) -> Vec<u8> {
     let name = crate::utils::utf16le("f.txt");
     let mut contexts = Vec::new();
-    if lease {
+    if let Some(state) = lease {
         let data = LeaseContext {
             key: LEASE_KEY,
-            state: 0x7,
+            state,
             ..LeaseContext::default()
         }
         .encode();
@@ -172,7 +179,7 @@ fn create_body(access: u32, share: u32, lease: bool) -> Vec<u8> {
     CreateRequest {
         structure_size: 57,
         security_flags: 0,
-        requested_oplock_level: if lease { 0xFF } else { 0 },
+        requested_oplock_level: if lease.is_some() { 0xFF } else { 0 },
         impersonation_level: 2,
         smb_create_flags: 0,
         reserved: 0,
@@ -183,7 +190,7 @@ fn create_body(access: u32, share: u32, lease: bool) -> Vec<u8> {
         create_options: 0,
         name_offset: 0x78,
         name_length: name.len() as u16,
-        create_contexts_offset: if lease {
+        create_contexts_offset: if lease.is_some() {
             0x78 + name_padded.len() as u32
         } else {
             0
@@ -234,12 +241,29 @@ fn header(frame: &[u8]) -> Smb2Header {
 }
 
 async fn server() -> Arc<ServerState> {
+    serve(MemFsBackend::new().with_file("f.txt", b"data")).await
+}
+
+/// A server with the public share `home` on `backend`.
+async fn serve(backend: impl crate::ShareBackend) -> Arc<ServerState> {
     let server = SmbServer::builder()
         .listen("127.0.0.1:0".parse().unwrap())
-        .share(Share::new("home", MemFsBackend::new().with_file("f.txt", b"data")).public())
+        .share(Share::new("home", backend).public())
         .build()
         .expect("build");
     server.state()
+}
+
+/// A server whose `home` share holds f.txt, and a view of its files.
+async fn server_with_files() -> (Arc<ServerState>, MemFsBackend) {
+    let backend = MemFsBackend::new().with_file("f.txt", b"data");
+    (serve(backend.clone()).await, backend)
+}
+
+/// Whether an open on `home` has f.txt as its name.
+async fn f_is_open(state: &Arc<ServerState>) -> bool {
+    let share = state.find_share("home").await.expect("share");
+    share.files.path_is_open(&"f.txt".parse().unwrap(), false)
 }
 
 /// A holder with RH on f.txt that shares read and write only, and a waiter
@@ -675,4 +699,209 @@ async fn a_create_past_the_waiting_limit_is_refused() {
         waiter.conn.pending.len(),
         crate::conn::pending::MAX_PENDING_REQUESTS
     );
+}
+
+/// A holder with RWH on f.txt, sharing everything, and a waiter whose open
+/// for reading and writing waits for write caching to be given up.
+async fn waiting_for_write_caching(state: &Arc<ServerState>) -> (Peer, Peer) {
+    let mut holder = Peer::new(state, false).await;
+    let (_, reply) = holder
+        .request(
+            state,
+            Command::Create,
+            &create_body_with(READ_WRITE, 0x7, Some(0x7)),
+        )
+        .await;
+    assert_eq!(status(&reply), 0);
+    let mut waiter = Peer::new(state, false).await;
+    let (_, interim) = waiter
+        .request(state, Command::Create, &create_body(READ_WRITE, 0x7, false))
+        .await;
+    assert_eq!(status(&interim), ntstatus::STATUS_PENDING);
+    let notice = holder.rx.try_recv().expect("write break");
+    let n = LeaseBreakNotification::parse(&notice[SMB2_HEADER_LEN..]).expect("break");
+    assert_eq!((n.current_lease_state, n.new_lease_state), (0x7, RH));
+    (holder, waiter)
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_waiting_open_goes_ahead_once_an_unacknowledged_write_break_times_out() {
+    let state = server().await;
+    let started = tokio::time::Instant::now();
+    let (mut holder, mut waiter) = waiting_for_write_caching(&state).await;
+    let last = waiter.next().await;
+    assert_eq!(status(&last), 0);
+    assert!(started.elapsed() >= LEASE_BREAK_TIMEOUT);
+    // The lease dropped to NONE: nothing is left to acknowledge.
+    let (_, reply) = holder
+        .request(&state, Command::OplockBreak, &ack_body(RH))
+        .await;
+    assert_eq!(status(&reply), ntstatus::STATUS_UNSUCCESSFUL);
+}
+
+#[tokio::test]
+async fn a_cancelled_open_waiting_in_the_table_leaves_it() {
+    let state = server().await;
+    let (holder, mut waiter) = waiting_for_write_caching(&state).await;
+    let share = state.find_share("home").await.expect("share");
+    let cancel = waiter.message_with(Command::Cancel, 1, 1, &[4, 0, 0, 0]);
+    assert!(waiter.dispatch(&state, &cancel).await.is_none());
+    assert_eq!(status(&waiter.next().await), ntstatus::STATUS_CANCELLED);
+    // Only the holder's open is left on the file.
+    holder.conn.close_all().await;
+    assert!(!share.files.path_is_open(&"f.txt".parse().unwrap(), false));
+}
+
+#[tokio::test]
+async fn teardown_ends_an_open_waiting_in_the_table() {
+    let (state, files) = server_with_files().await;
+    let (holder, mut waiter) = waiting_for_write_caching(&state).await;
+    assert_eq!(files.open_handles(), 2);
+    waiter.conn.pending.shutdown(Duration::from_secs(1)).await;
+    assert_eq!(status(&waiter.next().await), ntstatus::STATUS_CANCELLED);
+    assert_eq!(
+        files.open_handles(),
+        1,
+        "the waiting open's handle is closed"
+    );
+    holder.conn.close_all().await;
+    assert!(!f_is_open(&state).await, "and its table entry is gone");
+}
+
+#[tokio::test]
+async fn logoff_and_tree_disconnect_end_an_open_waiting_in_the_table() {
+    for command in [Command::Logoff, Command::TreeDisconnect] {
+        let (state, files) = server_with_files().await;
+        let (_holder, mut waiter) = waiting_for_write_caching(&state).await;
+        let (_, reply) = waiter.request(&state, command, &[4, 0, 0, 0]).await;
+        assert_eq!(status(&reply), 0);
+        let expected = match command {
+            Command::Logoff => ntstatus::STATUS_USER_SESSION_DELETED,
+            _ => ntstatus::STATUS_NETWORK_NAME_DELETED,
+        };
+        assert_eq!(status(&waiter.next().await), expected, "{command:?}");
+        assert_eq!(files.open_handles(), 1, "{command:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_holder_that_closes_instead_of_acknowledging_lets_the_open_go_ahead() {
+    let (state, files) = server_with_files().await;
+    let (holder, mut waiter) = waiting_for_write_caching(&state).await;
+    holder.conn.close_all().await;
+    assert_eq!(status(&waiter.next().await), 0);
+    assert_eq!(files.open_handles(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_wait_whose_timer_is_lost_gives_up_and_closes_what_it_opened() {
+    let (state, files) = server_with_files().await;
+    let (_holder, mut waiter) = waiting_for_write_caching(&state).await;
+    let share = state.find_share("home").await.expect("share");
+    // Let the timer start, then lose it.
+    tokio::task::yield_now().await;
+    share.files.stop_timers();
+    let started = tokio::time::Instant::now();
+    let last = waiter.next().await;
+    assert_eq!(status(&last), ntstatus::STATUS_SHARING_VIOLATION);
+    assert!(started.elapsed() > LEASE_BREAK_TIMEOUT);
+    assert!(started.elapsed() <= crate::files::MAX_BREAK_WAIT);
+    assert_eq!(files.open_handles(), 1);
+}
+
+/// Memory backend whose next `misses` plain opens report the file missing,
+/// as if it appeared just after.
+struct LateFile {
+    inner: MemFsBackend,
+    misses: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl crate::ShareBackend for LateFile {
+    async fn open(
+        &self,
+        path: &crate::SmbPath,
+        opts: crate::OpenOptions,
+    ) -> crate::SmbResult<(Box<dyn crate::Handle>, crate::OpenAction)> {
+        let miss = opts.intent == crate::OpenIntent::Open
+            && self
+                .misses
+                .fetch_update(
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                    |n| n.checked_sub(1),
+                )
+                .is_ok();
+        if miss {
+            return Err(crate::SmbError::NotFound);
+        }
+        self.inner.open(path, opts).await
+    }
+
+    async fn unlink(&self, path: &crate::SmbPath) -> crate::SmbResult<()> {
+        self.inner.unlink(path).await
+    }
+
+    async fn rename(
+        &self,
+        from: &crate::SmbPath,
+        to: &crate::SmbPath,
+        replace: bool,
+    ) -> crate::SmbResult<()> {
+        self.inner.rename(from, to, replace).await
+    }
+
+    fn capabilities(&self) -> crate::BackendCapabilities {
+        self.inner.capabilities()
+    }
+}
+
+#[tokio::test]
+async fn an_overwrite_that_finds_no_file_and_then_one_still_waits_before_truncating() {
+    let files = MemFsBackend::new().with_file("f.txt", b"data");
+    let misses = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let state = serve(LateFile {
+        inner: files.clone(),
+        misses: Arc::clone(&misses),
+    })
+    .await;
+    let mut holder = Peer::new(&state, false).await;
+    let (_, reply) = holder
+        .request(
+            &state,
+            Command::Create,
+            &create_body_with(READ_WRITE, 0x7, Some(0x7)),
+        )
+        .await;
+    assert_eq!(status(&reply), 0);
+
+    misses.store(1, std::sync::atomic::Ordering::Release);
+    let mut waiter = Peer::new(&state, false).await;
+    let mut body = create_body(READ_WRITE, 0x7, false);
+    // CreateDisposition FILE_OVERWRITE_IF.
+    body[36..40].copy_from_slice(&5u32.to_le_bytes());
+    let (_, interim) = waiter.request(&state, Command::Create, &body).await;
+    assert_eq!(status(&interim), ntstatus::STATUS_PENDING);
+    let size = async || {
+        let path: crate::SmbPath = "f.txt".parse().unwrap();
+        let (handle, _) = files
+            .open(&path, crate::OpenOptions::default())
+            .await
+            .unwrap();
+        let size = handle.stat().await.unwrap().end_of_file;
+        handle.close().await.unwrap();
+        size
+    };
+    assert_eq!(
+        size().await,
+        4,
+        "nothing truncated while the holder caches writes"
+    );
+
+    let (_, reply) = holder
+        .request(&state, Command::OplockBreak, &ack_body(0))
+        .await;
+    assert_eq!(status(&reply), 0);
+    assert_eq!(status(&waiter.next().await), 0);
+    assert_eq!(size().await, 0);
 }

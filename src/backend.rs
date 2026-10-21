@@ -107,7 +107,11 @@ pub struct FileInfo {
     /// below the share root, reported as the file id by QUERY_INFO and
     /// QUERY_DIRECTORY. Backends return the same value from `Handle::stat`
     /// and `Handle::list_dir` for the same file, across opens and renames.
-    /// `0` if the backend has none.
+    /// `0` if the backend has none; the server then tells files apart by
+    /// path, so a file reached through two hard links counts as two files:
+    /// share modes, byte-range locks and leases taken through one name do
+    /// not see opens through the other, and clients on the two names can
+    /// both cache writes to it.
     pub file_index: u64,
 }
 

@@ -11,7 +11,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 
 /// In-memory backend for unit tests. Files and directories are keyed by
-/// backslash-joined path.
+/// backslash-joined path. Clones share the same files.
+#[derive(Clone)]
 pub struct MemFsBackend {
     inner: std::sync::Arc<Mutex<MemInner>>,
 }
@@ -22,6 +23,8 @@ struct MemInner {
     /// All directories present (always includes "" for the root). Each
     /// directory is keyed by canonical path string.
     dirs: HashMap<String, ()>,
+    /// Handles opened and not yet closed.
+    open_handles: usize,
 }
 
 impl Default for MemFsBackend {
@@ -37,6 +40,11 @@ impl MemFsBackend {
         Self {
             inner: std::sync::Arc::new(Mutex::new(inner)),
         }
+    }
+
+    /// Handles opened and not yet closed.
+    pub fn open_handles(&self) -> usize {
+        self.inner.lock().unwrap().open_handles
     }
 
     pub fn with_file(self, path: &str, contents: &[u8]) -> Self {
@@ -83,6 +91,7 @@ impl ShareBackend for MemFsBackend {
             } else if opts.intent == OpenIntent::Create {
                 return Err(SmbError::Exists);
             }
+            g.open_handles += 1;
             return Ok((Box::new(MemHandle::dir(self.inner.clone(), k)), action));
         }
 
@@ -127,6 +136,7 @@ impl ShareBackend for MemFsBackend {
                 }
             }
         };
+        g.open_handles += 1;
         Ok((Box::new(MemHandle::file(self.inner.clone(), k)), action))
     }
 
@@ -331,6 +341,7 @@ impl Handle for MemHandle {
     }
 
     async fn close(self: Box<Self>) -> SmbResult<()> {
+        self.inner.lock().unwrap().open_handles -= 1;
         Ok(())
     }
 }

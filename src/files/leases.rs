@@ -33,6 +33,11 @@ pub(crate) const LEASE_BREAK_TIMEOUT: Duration = Duration::from_secs(35);
 /// [`LEASE_BREAK_TIMEOUT`] before it gives up, in case a timer was lost.
 const WAIT_SLACK: Duration = Duration::from_secs(5);
 
+/// The longest a request waits for lease breaks: a handle break and then a
+/// write break, each up to [`LEASE_BREAK_TIMEOUT`], plus slack.
+pub(crate) const MAX_BREAK_WAIT: Duration =
+    Duration::from_secs(2 * LEASE_BREAK_TIMEOUT.as_secs() + WAIT_SLACK.as_secs());
+
 /// Every lease on the server, by client and key.
 #[derive(Default)]
 pub(crate) struct LeaseTable {
@@ -440,7 +445,7 @@ mod tests {
             overwrite: false,
             break_handles: false,
         };
-        FileRef::register(share, &info, &p(name), req).unwrap()
+        FileRef::register(share, &info, &p(name), req).unwrap().0
     }
 
     /// Opens file `index` as `name` holding the lease `n`.
@@ -479,7 +484,7 @@ mod tests {
             overwrite: false,
             break_handles: true,
         };
-        let mut file = FileRef::register(share, &info, &p("f"), req).unwrap();
+        let mut file = FileRef::register(share, &info, &p("f"), req).unwrap().0;
         let (granted, _) = table
             .grant(lease_ref, &mut file, &req_state(n, 7), LeaseState::RH)
             .unwrap();
@@ -600,6 +605,56 @@ mod tests {
         let refused = conflicting(&s, &holder);
         assert!(refused.wait.is_some());
         assert_eq!(ack(&table, id(1), 1), Err(ntstatus::STATUS_UNSUCCESSFUL));
+    }
+
+    #[test]
+    fn an_open_beside_write_caching_waits_for_the_write_back() {
+        let table = Arc::new(LeaseTable::default());
+        let s = share();
+        let (holder, mut rx) = connection();
+        let lease_ref = table.acquire(id(1), &s, &p("f")).unwrap();
+        let mut held = open(&s, 7, "f", &holder, Some(id(1)));
+        let (granted, _) = table
+            .grant(lease_ref, &mut held, &req(1), LeaseState::RWH)
+            .unwrap();
+        assert_eq!(granted.state, LeaseState::RWH);
+
+        let mut info = FileInfo::new("");
+        info.file_index = 7;
+        let request = OpenRequest {
+            sharing: Sharing {
+                access: FILE_READ_DATA,
+                share: ALL,
+            },
+            owner: Arc::downgrade(&holder),
+            lease: None,
+            overwrite: false,
+            break_handles: true,
+        };
+        let (other, wait) = FileRef::register(&s, &info, &p("f"), request).unwrap();
+        assert!(wait.is_some());
+        let n = notification(&rx.try_recv().unwrap());
+        assert_eq!(n.flags, LeaseBreakNotification::FLAG_ACK_REQUIRED);
+        assert_eq!((n.current_lease_state, n.new_lease_state), (7, 3));
+        assert!(matches!(other.end_wait(), Ok(Some(_))));
+
+        assert_eq!(ack(&table, id(1), 3), Ok(LeaseState::RH));
+        // The waiting open keeps the holder from taking write caching back
+        // before it has run its own checks.
+        let lease_ref = table.acquire(id(1), &s, &p("f")).unwrap();
+        let mut early = open(&s, 7, "f", &holder, Some(id(1)));
+        let (granted, _) = table
+            .grant(lease_ref, &mut early, &req(1), LeaseState::RWH)
+            .unwrap();
+        assert_eq!(granted.state, LeaseState::RH);
+        assert!(matches!(other.end_wait(), Ok(None)));
+        // The other open keeps the holder from taking write caching back.
+        let lease_ref = table.acquire(id(1), &s, &p("f")).unwrap();
+        let mut again = open(&s, 7, "f", &holder, Some(id(1)));
+        let (granted, _) = table
+            .grant(lease_ref, &mut again, &req(1), LeaseState::RWH)
+            .unwrap();
+        assert_eq!(granted.state, LeaseState::RH);
     }
 
     #[test]

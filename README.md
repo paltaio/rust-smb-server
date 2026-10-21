@@ -97,12 +97,18 @@ To require it for every session, call `.encrypt_data(true)` on the builder.
 
 Where encryption is required, clients that cannot encrypt are refused: SMB 2.x, SMB 3.x without a cipher in common, and anonymous sessions, which get a session but no tree. `reject_unencrypted_access(false)` serves them unencrypted instead.
 
+## Leases
+
+Files on every share get SMB2 leases with read, handle and write caching: a client caches what it reads, keeps files open after its applications close them, and caches writes while every other open of the file holds the same lease or only reads attributes. An open, write, lock, rename or delete through any open that doesn't hold the lease, including the same client's opens under another lease key or none, breaks it when it needs what the lease caches. An open or rename that needs the client to write back or close its handles first waits until the client acknowledges or closes, or until 35 seconds after the break is sent; a lock is refused until the client has written back.
+
+Changes made outside the server, or through another share over the same directory, break no lease, so clients keep serving their cached copies. Call `.leases(false)` on such a `Share` to turn leases off there.
+
 ## Limitations
 
 Not supported:
 
 - Kerberos; authentication is NTLM only
-- oplocks, write caching leases, directory leases, and durable handles
+- oplocks, directory leases and durable handles
 - change notifications
 - named pipes and RPC, so clients can't list a server's shares
 - DFS

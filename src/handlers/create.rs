@@ -7,6 +7,7 @@ use crate::proto::header::Smb2Header;
 use crate::proto::messages::{
     CreateContext, CreateRequest, CreateResponse, Dialect, LeaseContext, OplockLevel,
 };
+use tokio::time::Instant;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -15,16 +16,16 @@ use crate::access_mask::{
     granted_access, maximal_access,
 };
 use crate::backend::{
-    FILE_ATTRIBUTE_READONLY, FileInfo, FileTimes, Handle, OpenAction, OpenIntent, OpenOptions,
-    VALID_SET_ATTRIBUTES,
+    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_READONLY, FileInfo, FileTimes, Handle, OpenAction,
+    OpenIntent, OpenOptions, VALID_SET_ATTRIBUTES,
 };
 use crate::conn::pending::{Stop, stopped};
 use crate::conn::state::{Connection, Open};
 use crate::dispatch::HandlerResponse;
 use crate::error::SmbError;
 use crate::files::{
-    BreakWait, FileRef, Granted, LeaseId, LeaseRequest, LeaseState, LeaseVersion, OpenRequest,
-    OpenSlot, Refused, Sharing, Trigger,
+    BreakWait, FileRef, Granted, LeaseId, LeaseRef, LeaseRequest, LeaseState, LeaseVersion,
+    MAX_BREAK_WAIT, OpenRequest, OpenSlot, Refused, Sharing, Trigger,
 };
 use crate::handlers::shared::lookup_session_tree;
 use crate::handlers::{Outcome, Pending};
@@ -92,7 +93,7 @@ const FILE_OVERWRITTEN: u32 = 0x0000_0003;
 const RESPONSE_CONTEXTS_OFFSET: u32 = 0x98;
 
 /// Caching the server grants in a lease.
-const GRANTABLE_LEASE: LeaseState = LeaseState::RH;
+const GRANTABLE_LEASE: LeaseState = LeaseState::RWH;
 
 /// Create contexts of a request that the response answers (MS-SMB2
 /// 3.3.5.9.5, 3.3.5.9.9) or that fail it. Other contexts are ignored.
@@ -167,12 +168,14 @@ impl ContextQueries {
 /// The lease a CREATE asks for (MS-SMB2 3.3.5.9, 3.3.5.9.8, 3.3.5.9.11),
 /// on a connection from `client` at `dialect`. Leases need SMB 2.1 or
 /// later, and the version 2 context SMB 3.x. A request with an all-zero
-/// key gets no lease. A context of the wrong size fails the CREATE with
-/// STATUS_INVALID_PARAMETER.
+/// key gets no lease. A version 2 request whose `file_attributes` name a
+/// directory asks for no write caching. A context of the wrong size fails
+/// the CREATE with STATUS_INVALID_PARAMETER.
 fn lease_request(
     data: Option<&[u8]>,
     dialect: Option<Dialect>,
     client: Uuid,
+    file_attributes: u32,
 ) -> Result<Option<LeaseRequest>, u32> {
     let (Some(data), Some(dialect)) = (data, dialect) else {
         return Ok(None);
@@ -184,9 +187,13 @@ fn lease_request(
     if (ctx.v2 && dialect == Dialect::Smb210) || ctx.key == [0; 16] {
         return Ok(None);
     }
+    let mut state = LeaseState::requested(ctx.state);
     let (version, parent) = if ctx.v2 {
         let parent =
             (ctx.flags & LeaseContext::FLAG_PARENT_LEASE_KEY_SET != 0).then_some(ctx.parent_key);
+        if file_attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+            state = state.without(LeaseState::W);
+        }
         (LeaseVersion::V2, parent)
     } else {
         (LeaseVersion::V1, None)
@@ -196,7 +203,7 @@ fn lease_request(
             client,
             key: ctx.key,
         },
-        state: LeaseState::requested(ctx.state),
+        state,
         version,
         epoch: ctx.epoch,
         parent,
@@ -227,10 +234,6 @@ fn lease_response(granted: &Granted) -> CreateContext {
         data: ctx.encode(),
     }
 }
-
-/// Most attempts an asynchronous CREATE makes; each follows a change on the
-/// file while a lease break is in progress.
-const MAX_WAIT_ATTEMPTS: u32 = 64;
 
 /// A validated CREATE request: what each attempt to open needs.
 struct CreateArgs {
@@ -302,7 +305,13 @@ impl CreateArgs {
         let lease = if req.requested_oplock_level == OplockLevel::Lease as u8 && share.leases {
             let dialect = *conn.dialect.read().await;
             let client = *conn.client_guid.read().await;
-            lease_request(queries.lease.as_deref(), dialect, client)?.filter(|_| !directory)
+            lease_request(
+                queries.lease.as_deref(),
+                dialect,
+                client,
+                req.file_attributes,
+            )?
+            .filter(|_| !directory)
         } else {
             None
         };
@@ -380,20 +389,75 @@ impl CreateArgs {
 }
 
 /// Where an attempt to open stands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Stage {
     Start,
     /// A sharing violation broke handle caching. Another violation waits
     /// while that break is in progress and fails the CREATE once it is
     /// over (MS-FSA 2.1.5.1.2).
     AfterHandleBreak,
+    /// The open is in the file table, waiting for other clients to give up
+    /// write caching (MS-FSA 2.1.4.12, OPEN). Staying in the table keeps
+    /// its sharing mode in force and keeps those clients from regaining
+    /// write caching meanwhile.
+    Reserved(Box<Reserved>),
+}
+
+/// What a CREATE waiting in the file table holds.
+struct Reserved {
+    file: FileRef,
+    slot: OpenSlot,
+    lease_ref: Option<LeaseRef>,
+    /// The backend open, when it already ran. An open that truncates runs
+    /// it after the wait, so data the clients write back first is not lost
+    /// to the truncation.
+    opened: Option<(HeldHandle, OpenAction)>,
+}
+
+/// A backend handle a waiting CREATE keeps. One dropped without
+/// [`HeldHandle::take`], when the CREATE's task is cancelled or aborted, is
+/// closed on the current runtime.
+struct HeldHandle(Option<Box<dyn Handle>>);
+
+impl HeldHandle {
+    fn take(mut self) -> Box<dyn Handle> {
+        self.0.take().expect("a held handle is taken once")
+    }
+}
+
+impl Drop for HeldHandle {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take()
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            runtime.spawn(async move {
+                let _ = handle.close().await;
+            });
+        }
+    }
+}
+
+impl Stage {
+    fn break_handles(&self) -> bool {
+        matches!(self, Stage::Start)
+    }
+
+    /// Gives up what a waiting CREATE holds, closing its backend handle.
+    async fn release(self) {
+        if let Stage::Reserved(reserved) = self {
+            let Reserved { file, opened, .. } = *reserved;
+            if let Some((handle, _)) = opened {
+                let _ = handle.take().close().await;
+            }
+            drop(file);
+        }
+    }
 }
 
 /// How an attempt ended.
 enum Step {
     Done(HandlerResponse),
-    /// A lease break has to complete first; nothing stays open meanwhile.
-    Wait(BreakWait),
+    /// A lease break has to complete first.
+    Wait(BreakWait, Stage),
 }
 
 pub async fn handle(
@@ -407,42 +471,53 @@ pub async fn handle(
         Ok(args) => args,
         Err(status) => return Outcome::Done(HandlerResponse::err(status)),
     };
-    let wait = match attempt(server, conn, hdr, &args, Stage::Start).await {
+    let (wait, stage) = match attempt(server, conn, hdr, &args, Stage::Start).await {
         Step::Done(response) => return Outcome::Done(response),
-        Step::Wait(wait) => wait,
+        Step::Wait(wait, stage) => (wait, stage),
     };
     // MS-SMB2 3.3.4.2: past its limits the connection gets no more
     // asynchronous requests.
     let Some((op, mut stop)) = conn.pending.reserve(hdr, None, retained) else {
         warn!("too many waiting requests on the connection");
+        stage.release().await;
         return Outcome::Done(HandlerResponse::err(
             ntstatus::STATUS_INSUFFICIENT_RESOURCES,
         ));
     };
     let (server, conn, hdr) = (Arc::clone(server), Arc::clone(conn), *hdr);
-    // The wait ends when the break completes, at the latest when its
-    // acknowledgment times out. A wait that runs out with nothing changed
-    // fails the CREATE as a sharing violation.
+    // The wait ends when the breaks complete, which their acknowledgment
+    // timers bound. A wait that runs out with nothing changed on the file,
+    // or one that outlasts [`MAX_BREAK_WAIT`], fails the CREATE as a sharing
+    // violation.
     let work = async move {
+        let give_up = Instant::now() + MAX_BREAK_WAIT;
         let mut wait = wait;
-        for _ in 0..MAX_WAIT_ATTEMPTS {
+        let mut stage = stage;
+        loop {
             let changed = tokio::select! {
                 biased;
                 why = stopped(&mut stop) => {
                     if why == Stop::Cancelled {
+                        stage.release().await;
                         return HandlerResponse::err(ntstatus::STATUS_CANCELLED);
                     }
                     true
                 }
                 changed = wait.changed() => changed,
+                () = tokio::time::sleep_until(give_up) => false,
             };
-            match attempt(&server, &conn, &hdr, &args, Stage::AfterHandleBreak).await {
+            match attempt(&server, &conn, &hdr, &args, stage).await {
                 Step::Done(response) => return response,
-                Step::Wait(_) if !changed => break,
-                Step::Wait(next) => wait = next,
+                Step::Wait(_, left) if !changed => {
+                    left.release().await;
+                    return HandlerResponse::err(ntstatus::STATUS_SHARING_VIOLATION);
+                }
+                Step::Wait(next, left) => {
+                    wait = next;
+                    stage = left;
+                }
             }
         }
-        HandlerResponse::err(ntstatus::STATUS_SHARING_VIOLATION)
     };
     Outcome::Pending(Pending {
         op,
@@ -462,63 +537,126 @@ async fn attempt(
     let fail = |status| Step::Done(HandlerResponse::err(status));
     let tree_arc = match lookup_session_tree(conn, hdr).await {
         Ok(t) => t,
-        Err(s) => return fail(s),
+        Err(s) => {
+            stage.release().await;
+            return fail(s);
+        }
     };
     let share = Arc::clone(&tree_arc.read().await.share);
     let backend = Arc::clone(&share.backend);
     let path = &args.path;
 
-    let limit = server.max_opens_per_connection.load(Ordering::Relaxed);
-    let Some(slot) = OpenSlot::acquire(&conn.open_count, limit) else {
-        warn!(limit, "open limit reached");
-        return fail(ntstatus::STATUS_INSUFFICIENT_RESOURCES);
-    };
-
-    let open_request = |overwrite| OpenRequest {
+    let open_request = |overwrite, break_handles| OpenRequest {
         sharing: args.sharing,
         owner: Arc::downgrade(&conn.outbound),
         lease: args.lease.map(|l| l.id),
         overwrite,
-        break_handles: stage == Stage::Start,
+        break_handles,
     };
-    let refused = |refused: Refused| match refused.wait {
-        Some(wait) => Step::Wait(wait),
+    let break_handles = stage.break_handles();
+    let refused = |refused: Refused, stage: Stage| match refused.wait {
+        Some(wait) => Step::Wait(wait, stage),
         None => fail(refused.status),
     };
-    let lease_ref = match &args.lease {
-        Some(l) => match server.leases.acquire(l.id, &share, path) {
-            Ok(lease_ref) => Some(lease_ref),
-            Err(status) => return fail(status),
-        },
-        None => None,
-    };
 
-    // An open that truncates checks the file and takes its place in the
-    // table first, so a refused open leaves the file as it was and no other
-    // open slips in while the backend truncates.
-    let reserved = if matches!(
-        args.intent,
-        OpenIntent::Truncate | OpenIntent::OverwriteOrCreate
-    ) {
-        match reserve_existing(&share, path, args.opts, open_request(true)).await {
-            Ok(reserved) => reserved,
-            Err(r) => return refused(r),
+    let open_failed = |e: SmbError| {
+        debug!(error = %e, path = %path, "backend open failed");
+        let case_sensitive = backend.capabilities().case_sensitive;
+        if matches!(e, SmbError::Exists) && share.files.delete_pending_at(path, case_sensitive) {
+            return fail(ntstatus::STATUS_DELETE_PENDING);
         }
-    } else {
-        None
+        fail(e.to_nt_status())
     };
 
-    let (handle, action) = match backend.open(path, args.opts).await {
-        Ok(opened) => opened,
-        Err(e) => {
-            debug!(error = %e, path = %path, "backend open failed");
-            let case_sensitive = backend.capabilities().case_sensitive;
-            if matches!(e, SmbError::Exists) && share.files.delete_pending_at(path, case_sensitive)
-            {
-                return fail(ntstatus::STATUS_DELETE_PENDING);
+    let (slot, lease_ref, reserved, opened, registered) = match stage {
+        Stage::Reserved(reserved) => {
+            match reserved.file.end_wait() {
+                // Write caching other clients still hold keeps it waiting.
+                Ok(Some(wait)) => return Step::Wait(wait, Stage::Reserved(reserved)),
+                Ok(None) => {}
+                Err(status) => {
+                    Stage::Reserved(reserved).release().await;
+                    return fail(status);
+                }
             }
-            return fail(e.to_nt_status());
+            let Reserved {
+                file,
+                slot,
+                lease_ref,
+                opened,
+            } = *reserved;
+            let opened = opened.map(|(handle, action)| (handle.take(), action));
+            let registered = opened.is_some();
+            (slot, lease_ref, Some(file), opened, registered)
         }
+        Stage::Start | Stage::AfterHandleBreak => {
+            let limit = server.max_opens_per_connection.load(Ordering::Relaxed);
+            let Some(slot) = OpenSlot::acquire(&conn.open_count, limit) else {
+                warn!(limit, "open limit reached");
+                return fail(ntstatus::STATUS_INSUFFICIENT_RESOURCES);
+            };
+            let lease_ref = match &args.lease {
+                Some(l) => match server.leases.acquire(l.id, &share, path) {
+                    Ok(lease_ref) => Some(lease_ref),
+                    Err(status) => return fail(status),
+                },
+                None => None,
+            };
+            let truncating = matches!(
+                args.intent,
+                OpenIntent::Truncate | OpenIntent::OverwriteOrCreate
+            );
+            // An open that truncates checks the file and takes its place
+            // in the table first, so a refused open leaves the file as it
+            // was, no other open slips in while the backend truncates, and
+            // clients caching writes write back before it does. A file
+            // that is missing is created instead; one that appears
+            // meanwhile is checked again.
+            let mut tries = 0;
+            let (reserved, opened) = loop {
+                if !truncating {
+                    break (None, None);
+                }
+                let request = open_request(true, break_handles);
+                match reserve_existing(&share, path, args.opts, request).await {
+                    Ok(Probe::Reserved(file, Some(wait))) => {
+                        let reserved = Reserved {
+                            file,
+                            slot,
+                            lease_ref,
+                            opened: None,
+                        };
+                        return Step::Wait(wait, Stage::Reserved(Box::new(reserved)));
+                    }
+                    Ok(Probe::Reserved(file, None)) => break (Some(file), None),
+                    Ok(Probe::Missing(e)) if args.intent == OpenIntent::Truncate => {
+                        return open_failed(e);
+                    }
+                    Ok(Probe::Missing(_)) => {
+                        let create = OpenOptions {
+                            intent: OpenIntent::Create,
+                            ..args.opts
+                        };
+                        match backend.open(path, create).await {
+                            Ok(opened) => break (None, Some(opened)),
+                            Err(SmbError::Exists) if tries < 2 => tries += 1,
+                            Err(e) => return open_failed(e),
+                        }
+                    }
+                    Err(r) => return refused(r, Stage::AfterHandleBreak),
+                }
+            };
+            (slot, lease_ref, reserved, opened, false)
+        }
+    };
+
+    // The open this attempt made, or the one a waiting CREATE kept.
+    let (handle, action) = match opened {
+        Some(opened) => opened,
+        None => match backend.open(path, args.opts).await {
+            Ok(opened) => opened,
+            Err(e) => return open_failed(e),
+        },
     };
 
     // Stat for the response.
@@ -535,16 +673,25 @@ async fn attempt(
         return fail(ntstatus::STATUS_CANNOT_DELETE);
     }
     let mut file = match reserved {
-        Some(file) if file.is_for(&info, path) => file,
+        Some(file) if registered || file.is_for(&info, path) => file,
         // The file was replaced between the two opens, or did not exist.
         reserved => {
             drop(reserved);
             let overwrite = action == OpenAction::Overwritten;
-            match FileRef::register(&share, &info, path, open_request(overwrite)) {
-                Ok(f) => f,
+            match FileRef::register(&share, &info, path, open_request(overwrite, break_handles)) {
+                Ok((file, None)) => file,
+                Ok((file, Some(wait))) => {
+                    let reserved = Reserved {
+                        file,
+                        slot,
+                        lease_ref,
+                        opened: Some((HeldHandle(Some(handle)), action)),
+                    };
+                    return Step::Wait(wait, Stage::Reserved(Box::new(reserved)));
+                }
                 Err(r) => {
                     let _ = handle.close().await;
-                    return refused(r);
+                    return refused(r, Stage::AfterHandleBreak);
                 }
             }
         }
@@ -673,34 +820,58 @@ async fn attempt(
     Step::Done(response)
 }
 
-/// Before a CREATE that truncates the file at `path`, checks the existing
-/// file against the opens already on it and against delete-on-close, and
-/// enters the new open in the share's table so the file keeps this sharing
-/// mode while the backend truncates it. A file that is missing or cannot be
-/// opened for reading passes without an entry; the real open reports those.
+fn is_missing(e: &SmbError) -> bool {
+    matches!(e, SmbError::NotFound | SmbError::PathNotFound)
+}
+
+/// What the check before a truncating CREATE found.
+enum Probe {
+    /// No file at the path; the error the open reported.
+    Missing(SmbError),
+    /// The open is in the table, with a wait when clients caching writes
+    /// have to write back first.
+    Reserved(FileRef, Option<BreakWait>),
+}
+
+/// Before a CREATE that truncates the file at `path`, opens the existing
+/// file without truncating it, checks it against delete-on-close and the
+/// opens already on it, and enters the new open in the share's table. That
+/// open asks for reading, and for the access the CREATE was granted when
+/// reading is refused. Only a missing file passes without an entry; any
+/// other failure fails the CREATE, as the truncating open would.
 async fn reserve_existing(
     share: &Arc<ShareBindings>,
     path: &SmbPath,
     opts: OpenOptions,
     req: OpenRequest,
-) -> Result<Option<FileRef>, Refused> {
+) -> Result<Probe, Refused> {
     let probe = OpenOptions {
-        read: true,
-        write: false,
-        write_attributes: false,
         intent: OpenIntent::Open,
         delete_on_close: false,
         ..opts
     };
-    let Ok((handle, _)) = share.backend.open(path, probe).await else {
-        return Ok(None);
+    let read_only = OpenOptions {
+        read: true,
+        write: false,
+        write_attributes: false,
+        ..probe
+    };
+    let mut opened = share.backend.open(path, read_only).await;
+    if matches!(opened, Err(ref e) if !is_missing(e)) && probe.write {
+        opened = share.backend.open(path, probe).await;
+    }
+    let handle = match opened {
+        Ok((handle, _)) => handle,
+        Err(e) if is_missing(&e) => return Ok(Probe::Missing(e)),
+        Err(e) => return Err(e.to_nt_status().into()),
     };
     let result = match handle.stat().await {
         Ok(info) if opts.delete_on_close && info.read_only => {
             Err(ntstatus::STATUS_CANNOT_DELETE.into())
         }
-        Ok(info) => FileRef::register(share, &info, path, req).map(Some),
-        Err(_) => Ok(None),
+        Ok(info) => FileRef::register(share, &info, path, req)
+            .map(|(file, wait)| Probe::Reserved(file, wait)),
+        Err(e) => Err(e.to_nt_status().into()),
     };
     let _ = handle.close().await;
     result
@@ -797,6 +968,33 @@ mod tests {
         req.write_to(&mut body)
             .expect("encoding into a Vec cannot fail");
         body
+    }
+
+    #[test]
+    fn a_version_2_request_for_a_directory_asks_for_no_write_caching() {
+        let context = |v2| {
+            LeaseContext {
+                key: [1; 16],
+                state: 0x7,
+                v2,
+                ..LeaseContext::default()
+            }
+            .encode()
+        };
+        let state = |v2, attributes| {
+            lease_request(
+                Some(&context(v2)),
+                Some(Dialect::Smb311),
+                Uuid::nil(),
+                attributes,
+            )
+            .unwrap()
+            .unwrap()
+            .state
+        };
+        assert_eq!(state(true, FILE_ATTRIBUTE_DIRECTORY), LeaseState::RH);
+        assert_eq!(state(true, 0), LeaseState::RWH);
+        assert_eq!(state(false, FILE_ATTRIBUTE_DIRECTORY), LeaseState::RWH);
     }
 
     #[tokio::test]
