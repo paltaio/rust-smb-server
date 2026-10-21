@@ -105,7 +105,7 @@ Changes made outside the server, or through another share over the same director
 
 ## Durable handles
 
-A file opened with a durable handle request and a lease that caches handles stays open, for 2 minutes by default, after the client's connection drops or it logs off, with its share mode, byte-range locks and lease. An open, write, lock, rename or delete that needs what the lease caches closes it at once. Clients can't reconnect to a kept file: the reconnect fails, closing the kept file when it comes from the same user and client, and the client opens the file again.
+A file opened with a durable handle request and a lease that caches handles stays open, for 2 minutes by default, after the client's connection drops or it logs off, with its share mode, byte-range locks and lease. When the same user reconnects from the same client, it takes the file back and carries on with the same handle, locks and lease. An open, write, lock, rename or delete that needs what the lease caches closes a kept file at once, and so do `ConfigHandle` calls that remove the user or the share, revoke the user's access or lower it to read-only, change the share's mode, or change the user's password.
 
 `durable_handle_timeout` and `max_disconnected_opens` on the builder set the time and the most files kept at once. Call `.durable_handles(false)` on a `Share` to turn them off there.
 
@@ -115,7 +115,7 @@ Not supported:
 
 - Kerberos; authentication is NTLM only
 - oplocks and directory leases
-- reconnecting to durable handles, version 2 durable handles, and persistent and resilient handles
+- version 2 durable handles, detection of replayed CREATEs, and persistent and resilient handles
 - change notifications
 - named pipes and RPC, so clients can't list a server's shares
 - DFS

@@ -146,6 +146,7 @@ impl Peer {
     /// Ends the connection as the server does when the client goes away:
     /// nothing more goes out, and its durable opens that qualify are kept.
     pub(crate) async fn drop_connection(&self, state: &Arc<ServerState>) {
+        self.conn.mark_closing();
         self.conn
             .pending
             .shutdown(std::time::Duration::from_secs(1))

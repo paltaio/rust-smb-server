@@ -122,18 +122,20 @@ impl Share {
     }
 
     /// Keep a client's open files for a while after its connection drops or
-    /// it logs off, with their share modes, byte-range locks and leases.
-    /// Only files opened with a durable handle request and a lease that
-    /// caches handles are kept, so this does nothing when leases are off.
-    /// The backend handle stays open until
-    /// [`SmbServerBuilder::durable_handle_timeout`] runs out, or until an
-    /// open, write, size change, byte-range lock, rename or delete through
-    /// an open that does not hold the lease needs what the lease caches,
-    /// which closes the file at once. A client cannot take a kept file back:
-    /// a request to reconnect it fails, with STATUS_ACCESS_DENIED when it
-    /// comes from another user and STATUS_OBJECT_NAME_NOT_FOUND otherwise,
-    /// and closes the file when it comes from the same user and client with
-    /// the same lease key. On by default.
+    /// it logs off, with their share modes, byte-range locks and leases, so
+    /// the client can take them back when it reconnects. Only files opened
+    /// with a durable handle request and a lease that caches handles are
+    /// kept, so this does nothing when leases are off. The backend handle
+    /// stays open until [`SmbServerBuilder::durable_handle_timeout`] runs
+    /// out, or until an open, write, size change, byte-range lock, rename or
+    /// delete through an open that does not hold the lease needs what the
+    /// lease caches, which closes the file at once. The same user, from the
+    /// same client, on this share, takes a kept file back with a durable
+    /// handle reconnect that names the file and its lease. Another user gets
+    /// STATUS_ACCESS_DENIED; another client, share or lease gets
+    /// STATUS_OBJECT_NAME_NOT_FOUND. A kept file whose rights exceed what
+    /// the user's tree on the share grants at the reconnect is closed
+    /// instead. On by default.
     pub fn durable_handles(mut self, enabled: bool) -> Self {
         self.durable_handles = enabled;
         self

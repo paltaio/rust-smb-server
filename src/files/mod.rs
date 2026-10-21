@@ -15,7 +15,7 @@ use crate::backend::{FileInfo, Handle};
 use crate::conn::state::Open;
 use crate::handlers::shared::restore_fixed_times;
 
-pub(crate) use durable::{Claim, DurableReg, DurableTable};
+pub(crate) use durable::{Claim, DurableReg, DurableTable, Unclaimed};
 pub use durable::{DEFAULT_DURABLE_HANDLE_TIMEOUT, DEFAULT_MAX_DISCONNECTED_OPENS};
 pub(crate) use lease::{Granted, LeaseId, LeaseRequest, LeaseState, LeaseVersion, Trigger};
 #[cfg(test)]

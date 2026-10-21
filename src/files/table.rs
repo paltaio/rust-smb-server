@@ -967,6 +967,57 @@ impl FileRef {
         true
     }
 
+    /// Whether a lease break decided to close this open while it was kept
+    /// for reconnect.
+    pub(crate) fn is_doomed(&self) -> bool {
+        self.node
+            .state()
+            .entry(self.id)
+            .and_then(|e| e.durable.as_ref())
+            .is_some_and(|d| d.doomed)
+    }
+
+    /// Puts an open kept for reconnect back on the connection `owner`
+    /// (MS-SMB2 3.3.5.9.7): only while it is still kept, no break decided to
+    /// close it, and its lease caches handles. Returns the lease as the
+    /// CREATE response reports it, and a guard that holds back break
+    /// notifications for the lease until that response is queued.
+    pub(crate) fn reattach(&self, owner: Weak<Outbound>) -> Option<(Granted, GrantGuard)> {
+        let mut state = self.node.state();
+        let at = state.opens.iter().position(|e| e.id == self.id)?;
+        let entry = &state.opens[at];
+        let id = entry.lease?;
+        if !entry
+            .durable
+            .as_ref()
+            .is_some_and(|d| d.detached && !d.doomed)
+        {
+            return None;
+        }
+        let lease = state.leases.iter_mut().find(|l| l.id == id)?;
+        if !lease.state.contains(LeaseState::H) {
+            return None;
+        }
+        lease.grants_in_flight += 1;
+        let serial = lease.serial;
+        let granted = Granted {
+            id,
+            state: lease.state,
+            breaking: lease.breaking.is_some(),
+            epoch: lease.epoch,
+            version: lease.version,
+            parent: lease.parent,
+        };
+        let entry = &mut state.opens[at];
+        entry.owner = owner.clone();
+        if let Some(mark) = entry.durable.as_mut() {
+            mark.detached = false;
+        }
+        drop(state);
+        let guard = GrantGuard::new(Arc::clone(&self.node), id, serial, owner);
+        Some((granted, guard))
+    }
+
     /// Breaks the leases on the file that `trigger` through this open
     /// conflicts with: every lease but the one this open holds, whichever
     /// client holds it.

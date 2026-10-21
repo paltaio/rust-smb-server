@@ -6,12 +6,16 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::auth::{LoginOptions, login_with};
+use common::auth::{self, LoginOptions, login_with};
 use common::client::*;
+use common::crypto::{EncryptedSession, is_transform};
 use common::durable::*;
 use common::lease::{OPLOCK_LEVEL_LEASE, RWH, lease_reply};
 use common::{start_with_shutdown, utf16le};
-use smb_server::wire::messages::{CreateContext, CreateResponse, FileId};
+use smb_server::wire::header::Command;
+use smb_server::wire::messages::{
+    CreateContext, CreateResponse, FileId, ReadRequest, ReadResponse,
+};
 use smb_server::{Access, Share, ShareBackend, SmbServer, SmbServerBuilder, ntstatus};
 use tempfile::{TempDir, tempdir};
 
@@ -70,6 +74,14 @@ async fn open_durable(
         .expect("create");
     assert_eq!(durable_reply(&resp), Some(vec![0; 8]), "durable granted");
     resp
+}
+
+/// A DHnC for `file_id` on `name`, with `lease` as its lease context.
+fn reconnect(name: &str, file_id: FileId, lease: CreateContext) -> Create<'_> {
+    Create {
+        disposition: FILE_OPEN,
+        ..create_with(name, &[lease, dhnc(file_id)])
+    }
 }
 
 #[tokio::test]
@@ -217,7 +229,10 @@ async fn kept(state: u32, share: u32, lock: bool) -> Kept {
     let td = tempdir().unwrap();
     std::fs::write(td.path().join("f.txt"), b"0123456789").unwrap();
     let (backend, counters) = Probe::new(td.path(), Counters::default());
-    let server = Server::start(users(backend)).await;
+    let other = Share::new("other", local(td.path()))
+        .user("alice", Access::ReadWrite)
+        .user("bob", Access::ReadWrite);
+    let server = Server::start(users(backend).share(other)).await;
     let mut a = user_client(server.addr, SignIn::default()).await;
     let file_id = open_durable(&mut a, "f.txt", KEY_A, state, share)
         .await
@@ -240,6 +255,18 @@ async fn kept(state: u32, share: u32, lock: bool) -> Kept {
 }
 
 impl Kept {
+    /// A client signed in as `who` says, which asks for the kept open back
+    /// with `lease` as its lease context.
+    async fn reclaim(
+        &self,
+        who: SignIn<'_>,
+        lease: CreateContext,
+    ) -> (Client, Result<CreateResponse, u32>) {
+        let mut c = user_client(self.server.addr, who).await;
+        let resp = c.create(reconnect("f.txt", self.file_id, lease)).await;
+        (c, resp)
+    }
+
     /// bob, from another client.
     async fn bob(&self) -> Client {
         user_client(
@@ -531,100 +558,304 @@ async fn a_previous_session_of_the_same_user_keeps_its_durable_opens() {
 }
 
 #[tokio::test]
-async fn a_reconnect_fails_and_closes_only_its_owners_kept_open() {
-    let k = kept(RWH, SHARE_ALL, true).await;
-    let reconnect = |file_id: FileId, list: &[CreateContext]| {
-        let mut all = list.to_vec();
-        all.push(dhnc(file_id));
-        Create {
-            disposition: FILE_OPEN,
-            ..create_with("f.txt", &all)
+async fn a_dropped_connection_s_open_comes_back_with_its_data_lease_and_lock() {
+    for reset_it in [false, true] {
+        let td = tempdir().unwrap();
+        let (backend, counters) = Probe::new(td.path(), Counters::default());
+        let server = Server::start(users(backend)).await;
+        let mut a = user_client(server.addr, SignIn::default()).await;
+        let f = open_durable(&mut a, "f.txt", KEY_A, RWH, SHARE_ALL)
+            .await
+            .file_id;
+        let data: Vec<u8> = (0..64 * 1024).map(|n| (n % 251) as u8).collect();
+        assert_eq!(a.write(f, 0, &data).await, Ok(data.len() as u32));
+        assert_eq!(
+            a.lock(f, &[(0, 10, LOCK_EXCLUSIVE | LOCK_FAIL_IMMEDIATELY)])
+                .await,
+            0
+        );
+        // An open that is not durable, closed once the old connection is
+        // closing; the durable one may or may not be kept by then.
+        let plain = Create {
+            name: "plain.txt",
+            disposition: FILE_OPEN_IF,
+            ..Create::default()
+        };
+        a.create(plain).await.expect("plain open");
+        if reset_it {
+            reset(a);
+        } else {
+            drop(a);
         }
-    };
-    let client = async |user: &str, client_guid: [u8; 16], dialect: u16| {
-        user_client(
-            k.server.addr,
+        assert!(eventually(|| Counters::get(&counters.closes) == 1).await);
+
+        // The reconnect waits for the open to be kept if it is not yet.
+        let mut a = user_client(server.addr, SignIn::default()).await;
+        let resp = a
+            .create(reconnect("f.txt", f, lease_v1(KEY_A, RWH)))
+            .await
+            .expect("reconnected");
+        assert_eq!(resp.file_id.persistent, f.persistent);
+        assert_ne!(resp.file_id.volatile, f.volatile);
+        assert_eq!(resp.create_action, 1, "FILE_OPENED");
+        assert_eq!(resp.oplock_level, OPLOCK_LEVEL_LEASE);
+        assert_eq!(lease_reply(&resp).expect("lease").state, RWH);
+        assert_eq!(durable_reply(&resp), None);
+        assert_eq!(Counters::get(&counters.opens), 2, "the same backend handle");
+        let f = resp.file_id;
+        assert_eq!(a.read(f, 0, data.len() as u32).await.unwrap(), data);
+
+        // The lease still caches writes: bob's open waits for the break,
+        // which goes to the new connection.
+        let mut b = user_client(
+            server.addr,
             SignIn {
-                dialect,
-                client_guid,
-                user,
+                client_guid: GUID_B,
+                user: "bob",
                 ..SignIn::default()
             },
         )
+        .await;
+        let mid = b
+            .send_no_wait(
+                Command::Create,
+                &Create {
+                    name: "f.txt",
+                    ..Create::default()
+                }
+                .body(),
+            )
+            .await;
+        let n = a.next_break(Duration::from_secs(5)).await.expect("break");
+        assert_eq!((n.current_lease_state, n.new_lease_state), (RWH, RH));
+        assert_eq!(a.ack(KEY_A, RH).await, 0);
+        let (status, body) = b.recv(mid, Command::Create).await;
+        assert_eq!(status, 0, "reset {reset_it}");
+        let g = CreateResponse::parse(&body).unwrap().file_id;
+        // And the lock still holds.
+        assert_eq!(
+            b.lock(g, &[(0, 10, LOCK_EXCLUSIVE | LOCK_FAIL_IMMEDIATELY)])
+                .await,
+            ntstatus::STATUS_LOCK_NOT_GRANTED
+        );
+        assert_eq!(
+            b.read(g, 0, 10).await,
+            Err(ntstatus::STATUS_FILE_LOCK_CONFLICT)
+        );
+        assert_eq!(a.lock(f, &[(0, 10, LOCK_UNLOCK)]).await, 0);
+        assert_eq!(b.read(g, 0, 10).await.unwrap(), &data[..10]);
+    }
+}
+
+#[tokio::test]
+async fn a_session_named_as_previous_hands_its_durable_opens_over() {
+    let td = tempdir().unwrap();
+    let server = Server::start(users(local(td.path()))).await;
+    let mut a = user_client(server.addr, SignIn::default()).await;
+    let f = open_durable(&mut a, "f.txt", KEY_A, RWH, SHARE_ALL)
         .await
-    };
-    let id = k.file_id;
+        .file_id;
+    assert_eq!(a.write(f, 0, b"kept").await, Ok(4));
+    // The old connection stays up, as when the client lost it but the
+    // server did not notice.
+    let mut again = user_client(
+        server.addr,
+        SignIn {
+            previous: a.session_id,
+            ..SignIn::default()
+        },
+    )
+    .await;
+    let resp = again
+        .create(reconnect("f.txt", f, lease_v1(KEY_A, RWH)))
+        .await
+        .expect("reconnected");
+    assert_eq!(again.read(resp.file_id, 0, 4).await.unwrap(), b"kept");
+    assert_eq!(
+        a.read(f, 0, 4).await,
+        Err(ntstatus::STATUS_USER_SESSION_DELETED)
+    );
+}
+
+#[tokio::test]
+async fn only_the_owner_on_the_same_client_lease_name_and_share_gets_it_back() {
+    let k = kept(RWH, SHARE_ALL, true).await;
+    let alice = SignIn::default();
+    let lease = || lease_v1(KEY_A, RWH);
     let not_found = Some(ntstatus::STATUS_OBJECT_NAME_NOT_FOUND);
 
-    let mut bob = client("bob", GUID_A, SMB21).await;
-    let status = bob
-        .create(reconnect(id, &[lease_v1(KEY_A, RWH)]))
-        .await
-        .err();
-    assert_eq!(status, Some(ntstatus::STATUS_ACCESS_DENIED));
-    let mut elsewhere = client("alice", GUID_B, SMB21).await;
-    let status = elsewhere
-        .create(reconnect(id, &[lease_v1(KEY_A, RWH)]))
-        .await
-        .err();
-    assert_eq!(status, not_found, "another client");
-    let mut a = client("alice", GUID_A, SMB302).await;
-    for (what, list) in [
-        ("another lease key", vec![lease_v1(KEY_B, RWH)]),
-        ("no lease", vec![]),
-    ] {
-        assert_eq!(
-            a.create(reconnect(id, &list)).await.err(),
-            not_found,
-            "{what}"
-        );
-    }
-    let unknown = FileId::new(id.persistent ^ 1, 1);
-    let status = a.create(reconnect(unknown, &[lease_v1(KEY_A, RWH)])).await;
-    assert_eq!(status.err(), not_found, "another open");
+    let bob = SignIn {
+        user: "bob",
+        ..alice
+    };
+    let (_, refused) = k.reclaim(bob, lease()).await;
+    assert_eq!(refused.err(), Some(ntstatus::STATUS_ACCESS_DENIED));
+    let other_client = SignIn {
+        client_guid: GUID_B,
+        ..alice
+    };
+    let (_, refused) = k.reclaim(other_client, lease()).await;
+    assert_eq!(refused.err(), not_found, "another client");
+    let (_, refused) = k.reclaim(alice, lease_v1(KEY_B, RWH)).await;
+    assert_eq!(refused.err(), not_found, "another lease key");
+    let other_share = SignIn {
+        share: "other",
+        ..alice
+    };
+    let (_, refused) = k.reclaim(other_share, lease()).await;
+    assert_eq!(refused.err(), not_found, "another share");
+    let v3 = SignIn {
+        dialect: SMB302,
+        ..alice
+    };
+    let (mut c, refused) = k.reclaim(v3, lease_v2(KEY_A, RWH)).await;
+    assert_eq!(refused.err(), not_found, "another lease version");
+    let unknown = FileId::new(k.file_id.persistent ^ 1, 1);
+    let refused = c
+        .create(reconnect("f.txt", unknown, lease_v1(KEY_A, RWH)))
+        .await;
+    assert_eq!(refused.err(), not_found, "another open");
+    let no_lease = Create {
+        disposition: FILE_OPEN,
+        ..create_with("f.txt", &[dhnc(k.file_id)])
+    };
+    assert_eq!(c.create(no_lease).await.err(), not_found, "no lease");
     let v2 = Create {
         disposition: FILE_OPEN,
-        ..create_with("f.txt", &[lease_v2(KEY_A, RWH), dh2c(id, [7; 16], 0)])
+        ..create_with(
+            "f.txt",
+            &[lease_v2(KEY_A, RWH), dh2c(k.file_id, [7; 16], 0)],
+        )
     };
-    assert_eq!(a.create(v2).await.err(), not_found, "version 2");
+    assert_eq!(c.create(v2).await.err(), not_found, "version 2 reconnect");
     let mixed = Create {
         disposition: FILE_OPEN,
         ..create_with(
             "f.txt",
-            &[lease_v2(KEY_A, RWH), dhnc(id), dh2q(0, 0, [7; 16])],
+            &[lease_v1(KEY_A, RWH), dhnc(k.file_id), dh2q(0, 0, [7; 16])],
         )
     };
     assert_eq!(
-        a.create(mixed).await.err(),
+        c.create(mixed).await.err(),
         Some(ntstatus::STATUS_INVALID_PARAMETER)
     );
-    assert_eq!(handles(&k.counters), 1, "still kept");
+    let renamed = c.create(reconnect("g.txt", k.file_id, lease())).await;
+    assert_eq!(renamed.err(), Some(ntstatus::STATUS_INVALID_PARAMETER));
+    assert_eq!(handles(&k.counters), 1, "refusals leave the open kept");
 
-    let status = a.create(reconnect(id, &[lease_v2(KEY_A, RWH)])).await;
-    assert_eq!(status.err(), not_found);
-    assert_eq!(handles(&k.counters), 0, "closed by its owner's reconnect");
-    // The client opens the file again and takes its lock back.
-    let resp = a
-        .create(create_with("f.txt", &[lease_v2(KEY_A, RWH), dhnq()]))
+    let (mut a, resp) = k.reclaim(alice, lease()).await;
+    let resp = resp.expect("reconnected");
+    assert_eq!(a.read(resp.file_id, 0, 10).await.unwrap(), b"0123456789");
+    // Taken once: a second reconnect finds it in a session.
+    let (_, again) = k.reclaim(alice, lease()).await;
+    assert_eq!(again.err(), not_found, "second reconnect");
+    assert_eq!(a.read(resp.file_id, 0, 10).await.unwrap(), b"0123456789");
+}
+
+#[tokio::test]
+async fn an_open_gone_from_its_kept_state_cannot_be_reconnected() {
+    // A break that needed what the lease caches closed it.
+    let k = kept(RWH, SHARE_ALL, false).await;
+    k.bob()
+        .await
+        .open("f.txt", FILE_READ_DATA, SHARE_ALL)
         .await
         .unwrap();
-    assert_eq!(lease_reply(&resp).expect("lease").state, RWH);
-    assert_eq!(
-        a.lock(
-            resp.file_id,
-            &[(0, 10, LOCK_EXCLUSIVE | LOCK_FAIL_IMMEDIATELY)]
-        )
-        .await,
-        0
-    );
+    let (_, refused) = k.reclaim(SignIn::default(), lease_v1(KEY_A, RWH)).await;
+    assert_eq!(refused.err(), Some(ntstatus::STATUS_OBJECT_NAME_NOT_FOUND));
 
-    // An open still in its session cannot be reconnected.
-    let mut other = client("alice", GUID_A, SMB302).await;
-    let status = other
-        .create(reconnect(resp.file_id, &[lease_v2(KEY_A, RWH)]))
-        .await;
-    assert_eq!(status.err(), not_found, "still attached");
-    assert_eq!(a.read(resp.file_id, 0, 10).await.unwrap(), b"0123456789");
+    // The user lost write access to the share while away, or all access.
+    let k = kept(RWH, SHARE_ALL, false).await;
+    k.server
+        .config
+        .grant_share_user("share", "alice", Access::Read)
+        .await
+        .unwrap();
+    assert_eq!(handles(&k.counters), 0);
+    let (_, refused) = k.reclaim(SignIn::default(), lease_v1(KEY_A, RWH)).await;
+    assert_eq!(refused.err(), Some(ntstatus::STATUS_OBJECT_NAME_NOT_FOUND));
+    let k = kept(RWH, SHARE_ALL, false).await;
+    k.server
+        .config
+        .revoke_share_user("share", "alice")
+        .await
+        .unwrap();
+    k.server
+        .config
+        .grant_share_user("share", "alice", Access::ReadWrite)
+        .await
+        .unwrap();
+    let (_, refused) = k.reclaim(SignIn::default(), lease_v1(KEY_A, RWH)).await;
+    assert_eq!(refused.err(), Some(ntstatus::STATUS_OBJECT_NAME_NOT_FOUND));
+
+    // TREE_DISCONNECT closed it.
+    let k = kept(RWH, SHARE_ALL, false).await;
+    let (mut a, resp) = k.reclaim(SignIn::default(), lease_v1(KEY_A, RWH)).await;
+    resp.expect("reconnected");
+    assert_eq!(a.tree_disconnect().await, 0);
+    assert_eq!(handles(&k.counters), 0);
+    let (_, refused) = k.reclaim(SignIn::default(), lease_v1(KEY_A, RWH)).await;
+    assert_eq!(refused.err(), Some(ntstatus::STATUS_OBJECT_NAME_NOT_FOUND));
+}
+
+#[tokio::test]
+async fn a_reconnect_after_the_open_expired_finds_nothing() {
+    let td = tempdir().unwrap();
+    let (backend, counters) = Probe::new(td.path(), Counters::default());
+    let server = Server::start(users(backend).durable_handle_timeout(Duration::from_secs(1))).await;
+    let mut a = user_client(server.addr, SignIn::default()).await;
+    let f = open_durable(&mut a, "f.txt", KEY_A, RWH, SHARE_ALL)
+        .await
+        .file_id;
+    assert_eq!(a.logoff().await, 0);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(eventually(|| handles(&counters) == 0).await);
+    let mut a = user_client(server.addr, SignIn::default()).await;
+    let refused = a.create(reconnect("f.txt", f, lease_v1(KEY_A, RWH))).await;
+    assert_eq!(refused.err(), Some(ntstatus::STATUS_OBJECT_NAME_NOT_FOUND));
+}
+
+#[tokio::test]
+async fn a_logged_off_open_comes_back_on_the_same_connection_and_closes_as_usual() {
+    let td = tempdir().unwrap();
+    let (backend, counters) = Probe::new(td.path(), Counters::default());
+    let server = Server::start(users(backend)).await;
+    let mut a = user_client(server.addr, SignIn::default()).await;
+    let resp = a
+        .create(Create {
+            access: RW | DELETE,
+            disposition: FILE_CREATE,
+            options: FILE_DELETE_ON_CLOSE,
+            ..create_with("tmp.txt", &[lease_v1(KEY_A, RWH), dhnq()])
+        })
+        .await
+        .unwrap();
+    assert!(durable_reply(&resp).is_some());
+    assert_eq!(a.logoff().await, 0);
+    // A new session on the same connection.
+    let mid = a.take_mid();
+    a.take_mid();
+    let login = login_with(
+        &mut a.s,
+        mid,
+        0,
+        "alice",
+        "password",
+        LoginOptions::default(),
+    )
+    .await;
+    assert_eq!(login.status, 0);
+    let tree_mid = a.take_mid();
+    a.session_id = login.session_id;
+    a.tree_id =
+        common::tree_connect(&mut a.s, "\\\\127.0.0.1\\share", a.session_id, tree_mid).await;
+    let back = a
+        .create(reconnect("tmp.txt", resp.file_id, lease_v1(KEY_A, RWH)))
+        .await
+        .expect("reconnected");
+    a.close(back.file_id).await;
+    assert!(!td.path().join("tmp.txt").exists(), "delete-on-close ran");
+    assert_eq!(handles(&counters), 0);
 }
 
 #[tokio::test]
@@ -666,4 +897,83 @@ async fn a_failed_reauthentication_keeps_durable_opens() {
     .await;
     b.open("f.txt", FILE_READ_DATA, SHARE_ALL).await.unwrap();
     assert_eq!(handles(&counters), 1, "closed for bob's open");
+}
+
+#[tokio::test]
+async fn a_reconnect_in_a_compound_serves_related_requests() {
+    let k = kept(RWH, SHARE_ALL, false).await;
+    let mut a = user_client(k.server.addr, SignIn::default()).await;
+    let read = ReadRequest {
+        structure_size: 49,
+        padding: ReadResponse::STANDARD_DATA_OFFSET,
+        flags: 0,
+        length: 10,
+        offset: 0,
+        file_id: FileId::any(),
+        minimum_count: 0,
+        channel: 0,
+        remaining_bytes: 0,
+        read_channel_info_offset: 0,
+        read_channel_info_length: 0,
+        buffer: vec![0],
+    };
+    let mut read_body = Vec::new();
+    read.write_to(&mut read_body).unwrap();
+    let create = reconnect("f.txt", k.file_id, lease_v1(KEY_A, RWH)).body();
+    let replies = a
+        .send_compound(&[
+            (Command::Create, create, false),
+            (Command::Read, read_body, true),
+        ])
+        .await;
+    assert_eq!(replies[0].0, 0, "reconnect");
+    assert_eq!(replies[1].0, 0, "related read");
+    let data = ReadResponse::parse(&replies[1].1).unwrap().data;
+    assert_eq!(data, b"0123456789");
+}
+
+#[tokio::test]
+async fn an_encrypted_session_reconnects_and_gets_encrypted_answers() {
+    let td = tempdir().unwrap();
+    let (backend, counters) = Probe::new(td.path(), Counters::default());
+    let server = Server::start(users(backend).encrypt_data(true)).await;
+    let path = "\\\\127.0.0.1\\share";
+    let mut a = EncryptedSession::smb30(server.addr, SMB302, "alice", "password").await;
+    assert_eq!(auth::status(&a.tree_connect(path).await), 0);
+    let open = create_with("f.txt", &[lease_v1(KEY_A, RWH), dhnq()]);
+    let reply = a.send_encrypted(Command::Create, &open.body()).await;
+    assert_eq!(auth::status(&reply), 0);
+    let held = CreateResponse::parse(&reply[64..]).unwrap();
+    assert!(durable_reply(&held).is_some());
+    // An open that is not durable, closed once the connection is closing.
+    let plain = Create {
+        name: "plain.txt",
+        disposition: FILE_OPEN_IF,
+        ..Create::default()
+    };
+    assert_eq!(
+        auth::status(&a.send_encrypted(Command::Create, &plain.body()).await),
+        0
+    );
+    drop(a);
+    assert!(eventually(|| Counters::get(&counters.closes) == 1).await);
+
+    let mut b = EncryptedSession::smb30(server.addr, SMB302, "alice", "password").await;
+    assert_eq!(auth::status(&b.tree_connect(path).await), 0);
+    let body = reconnect("f.txt", held.file_id, lease_v1(KEY_A, RWH)).body();
+    let hdr = b.header(Command::Create);
+    let sealed = b.seal(&common::message(&hdr, &body));
+    let mut frame = b.exchange(&sealed).await;
+    loop {
+        assert!(is_transform(&frame), "answers are encrypted");
+        let reply = b.open(&frame).expect("decrypts");
+        if auth::status(&reply) != ntstatus::STATUS_PENDING {
+            assert_eq!(auth::status(&reply), 0);
+            let resp = CreateResponse::parse(&reply[64..]).unwrap();
+            assert_eq!(resp.file_id.persistent, held.file_id.persistent);
+            break;
+        }
+        frame = common::read_frame(&mut b.stream).await;
+    }
+    assert_eq!(Counters::get(&counters.opens), 2, "the kept handle");
 }

@@ -267,8 +267,9 @@ pub trait ShareBackend: Send + Sync + 'static {
 ///
 /// One handle per `CREATE`. `close` runs when CLOSE arrives, and when the
 /// tree, session or connection the open belongs to ends. A durable open's
-/// handle stays open past the end of its session or connection, until the
-/// open expires or something else closes it; see the crate docs.
+/// handle stays open past the end of its session or connection, until its
+/// client takes the open back, the open expires, or something else closes
+/// it; see the crate docs.
 #[async_trait]
 pub trait Handle: Send + Sync {
     /// Read up to `len` bytes at `offset`. May return fewer.

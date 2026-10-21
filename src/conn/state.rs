@@ -67,6 +67,9 @@ pub struct Connection {
     /// Set when the connection must close without sending a reply.
     disconnect: AtomicBool,
 
+    /// Set once the connection takes no more requests and is closing.
+    closing: AtomicBool,
+
     /// Connection.CommandSequenceWindow: the MessageIds the client may use.
     pub credits: Mutex<crate::conn::credits::CreditWindow>,
 
@@ -107,6 +110,7 @@ impl Connection {
             pending_auths: RwLock::new(HashMap::new()),
             session_preauth: RwLock::new(HashMap::new()),
             disconnect: AtomicBool::new(false),
+            closing: AtomicBool::new(false),
             credits: Mutex::new(crate::conn::credits::CreditWindow::new()),
             pending_auth_started: Mutex::new(HashMap::new()),
             client_negotiate: Mutex::new(None),
@@ -126,6 +130,17 @@ impl Connection {
     /// True once a handler has asked to close the connection.
     pub fn disconnect_requested(&self) -> bool {
         self.disconnect.load(Ordering::Acquire)
+    }
+
+    /// Marks the connection as closing: it reads no more requests, and its
+    /// sessions are about to end.
+    pub(crate) fn mark_closing(&self) {
+        self.closing.store(true, Ordering::Release);
+    }
+
+    /// True once the connection is closing.
+    pub(crate) fn is_closing(&self) -> bool {
+        self.closing.load(Ordering::Acquire)
     }
 
     /// Removes the session `session_id` and ends its opens; with `keep`,

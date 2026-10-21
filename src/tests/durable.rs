@@ -8,20 +8,23 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
 use tokio::time::Instant;
 use uuid::Uuid;
 
+use crate::Access;
+use crate::dispatch::dispatch_frame;
+use crate::error::SmbError;
 use crate::files::{LEASE_BREAK_TIMEOUT, LeaseId};
 use crate::ntstatus;
 use crate::proto::header::{Command, SMB2_HEADER_LEN};
 use crate::proto::messages::{
-    CreateContext, CreateRequest, CreateResponse, FileId, LeaseBreakAck, LeaseContext, LockElement,
-    LockRequest, ReadRequest, ReadResponse, WriteRequest,
+    CreateContext, CreateRequest, CreateResponse, FileId, LeaseBreakAck, LeaseBreakNotification,
+    LeaseContext, LockElement, LockRequest, ReadRequest, ReadResponse, WriteRequest,
 };
 use crate::server::ServerState;
 use crate::tests::memfs::MemFsBackend;
-use crate::tests::peer::{Peer, status};
+use crate::tests::peer::{Peer, header, status};
 use crate::{
     BackendCapabilities, DirEntry, FileInfo, FileTimes, Handle, OpenAction, OpenOptions, Share,
     ShareBackend, SmbPath, SmbResult, SmbServer,
@@ -62,6 +65,8 @@ struct Open {
     lease: Option<u32>,
     durable: bool,
     options: u32,
+    /// The kept open to reconnect.
+    reconnect: Option<FileId>,
 }
 
 impl Default for Open {
@@ -72,6 +77,7 @@ impl Default for Open {
             lease: None,
             durable: false,
             options: 0,
+            reconnect: None,
         }
     }
 }
@@ -82,6 +88,15 @@ impl Open {
         Self {
             lease: Some(lease),
             durable: true,
+            ..Self::default()
+        }
+    }
+
+    /// A reconnect of `file_id`, naming the lease it holds.
+    fn reconnect(file_id: FileId, lease: u32) -> Self {
+        Self {
+            lease: Some(lease),
+            reconnect: Some(file_id),
             ..Self::default()
         }
     }
@@ -104,6 +119,14 @@ impl Open {
             list.push(CreateContext {
                 name: CreateContext::NAME_DHNQ.to_vec(),
                 data: vec![0; 16],
+            });
+        }
+        if let Some(file_id) = self.reconnect {
+            let mut data = file_id.persistent.to_le_bytes().to_vec();
+            data.extend_from_slice(&file_id.volatile.to_le_bytes());
+            list.push(CreateContext {
+                name: CreateContext::NAME_DHNC.to_vec(),
+                data,
             });
         }
         let mut contexts = Vec::new();
@@ -455,18 +478,19 @@ async fn anonymous_and_unidentified_clients_get_no_durable_open() {
 /// alice's two connections from `CLIENT` with the same lease on f.txt; the
 /// first is kept after it drops. Then another client's open breaks the
 /// lease and waits, and the second connection gets the notification.
-/// Returns the second connection and the other client's.
+/// Returns the second connection, the other client's, and the kept open.
 async fn kept_beside_a_sibling(
     state: &Arc<ServerState>,
     holder: u32,
     opener: Open,
-) -> (Peer, Peer) {
+) -> (Peer, Peer, FileId) {
     let mut first = Peer::from_client(state, true, CLIENT).await;
     let open = Open {
         share: SHARE_READ_WRITE,
         ..Open::durable(holder)
     };
-    assert!(is_durable(&create(&mut first, state, open).await));
+    let kept = create(&mut first, state, open).await;
+    assert!(is_durable(&kept));
     let mut second = Peer::from_client(state, true, CLIENT).await;
     create(&mut second, state, open).await;
     first.drop_connection(state).await;
@@ -475,7 +499,7 @@ async fn kept_beside_a_sibling(
     let (_, interim) = other.request(state, Command::Create, &opener.body()).await;
     assert_eq!(status(&interim), ntstatus::STATUS_PENDING);
     assert!(second.rx.try_recv().is_some(), "break sent to the sibling");
-    (second, other)
+    (second, other, kept.file_id)
 }
 
 #[tokio::test]
@@ -485,7 +509,7 @@ async fn an_acknowledgment_without_handle_caching_closes_kept_siblings() {
         access: DELETE | READ_ATTRIBUTES,
         ..Open::default()
     };
-    let (mut second, mut other) = kept_beside_a_sibling(&state, RH, deleter).await;
+    let (mut second, mut other, _) = kept_beside_a_sibling(&state, RH, deleter).await;
     assert_eq!(files.open_handles(), 2);
     let (_, reply) = second
         .request(&state, Command::OplockBreak, &ack_body(R))
@@ -503,7 +527,7 @@ async fn an_acknowledgment_without_handle_caching_closes_kept_siblings() {
 #[tokio::test]
 async fn an_acknowledgment_keeping_handle_caching_keeps_kept_siblings() {
     let (state, files) = server().await;
-    let (mut second, mut other) = kept_beside_a_sibling(&state, RWH, Open::default()).await;
+    let (mut second, mut other, _) = kept_beside_a_sibling(&state, RWH, Open::default()).await;
     let (_, reply) = second
         .request(&state, Command::OplockBreak, &ack_body(RH))
         .await;
@@ -521,7 +545,7 @@ async fn a_break_that_times_out_closes_kept_siblings() {
         access: DELETE | READ_ATTRIBUTES,
         ..Open::default()
     };
-    let (_second, mut other) = kept_beside_a_sibling(&state, RH, deleter).await;
+    let (_second, mut other, _) = kept_beside_a_sibling(&state, RH, deleter).await;
     tokio::time::sleep(LEASE_BREAK_TIMEOUT).await;
     assert_eq!(
         status(&other.next().await),
@@ -568,32 +592,64 @@ async fn a_lease_that_stops_caching_writes_closes_kept_opens_holding_locks() {
     assert_eq!(status(&reply), 0);
 }
 
-/// Memory backend whose first handle closes only once `gate` gives a
-/// permit.
-struct GatedClose {
-    inner: MemFsBackend,
-    gate: Arc<Semaphore>,
-    gated: AtomicBool,
+/// What a [`Held`] backend's handles wait for.
+struct Gates {
+    /// Set once the first handle is opened; only that one waits on
+    /// `close`.
+    opened: AtomicBool,
+    /// When set, the first handle closes only once it gives a permit.
+    close: Option<Semaphore>,
+    /// While set, a stat announces itself on `stat_entered`, waits for a
+    /// permit from `stat`, and fails when `stat_fails` is set.
+    stat_held: AtomicBool,
+    stat_entered: Notify,
+    stat: Semaphore,
+    stat_fails: AtomicBool,
 }
 
-struct GatedHandle {
+impl Default for Gates {
+    fn default() -> Self {
+        Self {
+            opened: AtomicBool::new(false),
+            close: None,
+            stat_held: AtomicBool::new(false),
+            stat_entered: Notify::new(),
+            stat: Semaphore::new(0),
+            stat_fails: AtomicBool::new(false),
+        }
+    }
+}
+
+/// Memory backend whose handles wait on `gates`.
+struct Held {
+    inner: MemFsBackend,
+    gates: Arc<Gates>,
+}
+
+struct HeldHandle {
     inner: Box<dyn Handle>,
-    gate: Arc<Semaphore>,
+    gates: Arc<Gates>,
+    first: bool,
 }
 
 #[async_trait]
-impl ShareBackend for GatedClose {
+impl ShareBackend for Held {
     async fn open(
         &self,
         path: &SmbPath,
         opts: OpenOptions,
     ) -> SmbResult<(Box<dyn Handle>, OpenAction)> {
         let (inner, action) = self.inner.open(path, opts).await?;
-        if self.gated.swap(true, Ordering::AcqRel) {
-            return Ok((inner, action));
-        }
-        let gate = Arc::clone(&self.gate);
-        Ok((Box::new(GatedHandle { inner, gate }), action))
+        let first = !self.gates.opened.swap(true, Ordering::AcqRel);
+        let gates = Arc::clone(&self.gates);
+        Ok((
+            Box::new(HeldHandle {
+                inner,
+                gates,
+                first,
+            }),
+            action,
+        ))
     }
 
     async fn unlink(&self, path: &SmbPath) -> SmbResult<()> {
@@ -610,7 +666,7 @@ impl ShareBackend for GatedClose {
 }
 
 #[async_trait]
-impl Handle for GatedHandle {
+impl Handle for HeldHandle {
     async fn read(&self, offset: u64, len: u32) -> SmbResult<Bytes> {
         self.inner.read(offset, len).await
     }
@@ -624,6 +680,14 @@ impl Handle for GatedHandle {
     }
 
     async fn stat(&self) -> SmbResult<FileInfo> {
+        let gates = &self.gates;
+        if gates.stat_held.load(Ordering::Acquire) {
+            gates.stat_entered.notify_one();
+            gates.stat.acquire().await.expect("gate").forget();
+            if gates.stat_fails.load(Ordering::Acquire) {
+                return Err(SmbError::AccessDenied);
+            }
+        }
         self.inner.stat().await
     }
 
@@ -644,26 +708,62 @@ impl Handle for GatedHandle {
     }
 
     async fn close(self: Box<Self>) -> SmbResult<()> {
-        self.gate.acquire().await.expect("gate").forget();
+        if self.first
+            && let Some(gate) = &self.gates.close
+        {
+            gate.acquire().await.expect("gate").forget();
+        }
         self.inner.close().await
     }
 }
 
-#[tokio::test]
-async fn serve_returns_after_kept_open_closes_already_running() {
+/// A server whose public share `home` holds f.txt on a [`Held`] backend
+/// with `gates`.
+async fn held_server(gates: &Arc<Gates>) -> (SmbServer, Arc<ServerState>, MemFsBackend) {
     let files = MemFsBackend::new().with_file("f.txt", b"data");
-    let gate = Arc::new(Semaphore::new(0));
-    let backend = GatedClose {
+    let backend = Held {
         inner: files.clone(),
-        gate: Arc::clone(&gate),
-        gated: AtomicBool::new(false),
+        gates: Arc::clone(gates),
     };
     let server = SmbServer::builder()
         .listen("127.0.0.1:0".parse().unwrap())
+        .durable_handle_timeout(TIMEOUT)
         .share(Share::new("home", backend).public())
         .build()
         .expect("build");
     let state = server.state();
+    (server, state, files)
+}
+
+/// Sends a reconnect of `file_id` on `peer` on a task of its own, and
+/// returns once the reconnect has claimed the open and waits in its stat.
+async fn reconnect_held(
+    state: &Arc<ServerState>,
+    gates: &Gates,
+    peer: &mut Peer,
+    file_id: FileId,
+) -> tokio::task::JoinHandle<Vec<u8>> {
+    gates.stat_held.store(true, Ordering::Release);
+    let (_, msg) = peer.message(Command::Create, &Open::reconnect(file_id, RWH).body());
+    let (state, conn) = (Arc::clone(state), Arc::clone(&peer.conn));
+    let task = tokio::spawn(async move {
+        let out = dispatch_frame(&state, &conn, &msg)
+            .await
+            .expect("a response");
+        out.bytes
+    });
+    gates.stat_entered.notified().await;
+    gates.stat_held.store(false, Ordering::Release);
+    task
+}
+
+#[tokio::test]
+async fn serve_returns_after_kept_open_closes_already_running() {
+    let gates = Arc::new(Gates {
+        close: Some(Semaphore::new(0)),
+        ..Gates::default()
+    });
+    let (server, state, files) = held_server(&gates).await;
     let shutdown = server.shutdown_handle();
     server.bind().await.expect("bind");
     let serving = tokio::spawn(server.serve());
@@ -682,7 +782,282 @@ async fn serve_returns_after_kept_open_closes_already_running() {
     shutdown.shutdown();
     settle().await;
     assert!(!serving.is_finished(), "serve waits for the close");
-    gate.add_permits(1);
+    gates.close.as_ref().unwrap().add_permits(1);
     serving.await.expect("serve task").expect("serve");
     assert_eq!(files.open_handles(), 1, "the kept open is closed");
+}
+
+/// Sets the access the tree of `peer` grants.
+async fn set_tree_access(peer: &Peer, access: Access) {
+    let session = peer.conn.sessions.read().await[&1].clone();
+    let tree = session.read().await.trees.read().await[&1].clone();
+    tree.write().await.granted_access = access;
+}
+
+#[tokio::test]
+async fn a_reconnect_waits_for_the_old_connection_to_finish_closing() {
+    let (state, files) = server().await;
+    let mut old = Peer::from_client(&state, true, CLIENT).await;
+    let held = create(&mut old, &state, Open::durable(RWH)).await;
+    // The old connection stopped reading but has not ended its sessions.
+    old.conn.mark_closing();
+    let mut new = Peer::from_client(&state, true, CLIENT).await;
+    let (_, interim) = new
+        .request(
+            &state,
+            Command::Create,
+            &Open::reconnect(held.file_id, RWH).body(),
+        )
+        .await;
+    assert_eq!(status(&interim), ntstatus::STATUS_PENDING);
+    old.drop_connection(&state).await;
+    let last = new.next().await;
+    assert_eq!(status(&last), 0);
+    let resp = CreateResponse::parse(&last[SMB2_HEADER_LEN..]).expect("create response");
+    assert_eq!(resp.file_id.persistent, held.file_id.persistent);
+    assert_eq!(files.open_handles(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_reconnect_gives_up_on_a_connection_that_does_not_finish_closing() {
+    let (state, files) = server().await;
+    let mut old = Peer::from_client(&state, true, CLIENT).await;
+    let held = create(&mut old, &state, Open::durable(RWH)).await;
+    old.conn.mark_closing();
+    let started = Instant::now();
+    let mut new = Peer::from_client(&state, true, CLIENT).await;
+    let (_, interim) = new
+        .request(
+            &state,
+            Command::Create,
+            &Open::reconnect(held.file_id, RWH).body(),
+        )
+        .await;
+    assert_eq!(status(&interim), ntstatus::STATUS_PENDING);
+    assert_eq!(
+        status(&new.next().await),
+        ntstatus::STATUS_OBJECT_NAME_NOT_FOUND
+    );
+    assert!(started.elapsed() >= Duration::from_secs(5));
+    assert!(started.elapsed() < Duration::from_secs(6));
+    assert_eq!(files.open_handles(), 1, "the old open is left alone");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_reconnect_just_before_the_deadline_keeps_the_open() {
+    let (state, files) = server().await;
+    let (_old, file_id) = kept(&state, Open::durable(RWH)).await;
+    tokio::time::sleep(TIMEOUT - Duration::from_millis(1)).await;
+    let mut new = Peer::from_client(&state, true, CLIENT).await;
+    let body = Open::reconnect(file_id, RWH).body();
+    let (_, reply) = new.request(&state, Command::Create, &body).await;
+    assert_eq!(status(&reply), 0);
+    tokio::time::sleep(TIMEOUT * 2).await;
+    settle().await;
+    assert_eq!(
+        files.open_handles(),
+        1,
+        "a reconnected open does not expire"
+    );
+    assert!(f_is_open(&state).await);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_reconnect_just_after_the_deadline_finds_nothing() {
+    let (state, files) = server().await;
+    let (_old, file_id) = kept(&state, Open::durable(RWH)).await;
+    tokio::time::sleep(TIMEOUT + Duration::from_millis(1)).await;
+    settle().await;
+    let mut new = Peer::from_client(&state, true, CLIENT).await;
+    let body = Open::reconnect(file_id, RWH).body();
+    let (_, reply) = new.request(&state, Command::Create, &body).await;
+    assert_eq!(status(&reply), ntstatus::STATUS_OBJECT_NAME_NOT_FOUND);
+    assert_eq!(files.open_handles(), 0);
+}
+
+#[tokio::test]
+async fn a_reconnect_into_a_tree_that_grants_less_closes_the_open() {
+    let (state, files) = server().await;
+    let (_old, file_id) = kept(&state, Open::durable(RWH)).await;
+    let mut new = Peer::from_client(&state, true, CLIENT).await;
+    set_tree_access(&new, Access::Read).await;
+    let (_, reply) = new
+        .request(
+            &state,
+            Command::Create,
+            &Open::reconnect(file_id, RWH).body(),
+        )
+        .await;
+    assert_eq!(status(&reply), ntstatus::STATUS_OBJECT_NAME_NOT_FOUND);
+    assert_eq!(files.open_handles(), 0);
+    assert!(!f_is_open(&state).await);
+}
+
+#[tokio::test]
+async fn a_reconnect_past_the_open_limit_leaves_the_open_kept() {
+    let (state, files) = server().await;
+    let (_old, file_id) = kept(&state, Open::durable(RWH)).await;
+    let mut new = Peer::from_client(&state, true, CLIENT).await;
+    let body = Open::reconnect(file_id, RWH).body();
+    state
+        .max_opens_per_connection
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+    let (_, reply) = new.request(&state, Command::Create, &body).await;
+    assert_eq!(status(&reply), ntstatus::STATUS_INSUFFICIENT_RESOURCES);
+    assert_eq!(files.open_handles(), 1);
+    state
+        .max_opens_per_connection
+        .store(16, std::sync::atomic::Ordering::Relaxed);
+    let (_, reply) = new.request(&state, Command::Create, &body).await;
+    assert_eq!(status(&reply), 0);
+    assert_eq!(
+        new.conn
+            .open_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+}
+
+#[tokio::test]
+async fn a_break_after_a_reconnect_goes_to_the_new_connection() {
+    let (state, _files) = server().await;
+    let (mut old, file_id) = kept(&state, Open::durable(RWH)).await;
+    let mut new = Peer::from_client(&state, true, CLIENT).await;
+    let (_, reply) = new
+        .request(
+            &state,
+            Command::Create,
+            &Open::reconnect(file_id, RWH).body(),
+        )
+        .await;
+    assert_eq!(status(&reply), 0);
+    let mut other = Peer::new(&state, false).await;
+    let (_, interim) = other
+        .request(&state, Command::Create, &Open::default().body())
+        .await;
+    assert_eq!(status(&interim), ntstatus::STATUS_PENDING);
+    let frame = new.rx.try_recv().expect("break on the new connection");
+    let n = LeaseBreakNotification::parse(&frame[SMB2_HEADER_LEN..]).expect("lease break");
+    assert_eq!(header(&frame).command, Command::OplockBreak);
+    assert_eq!(n.lease_key, LEASE_KEY);
+    assert_eq!((n.current_lease_state, n.new_lease_state), (RWH, RH));
+    assert!(old.rx.try_recv().is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_sweep_during_a_reconnect_that_fails_closes_the_open() {
+    let gates = Arc::new(Gates::default());
+    let (_server, state, files) = held_server(&gates).await;
+    let (_old, file_id) = kept(&state, Open::durable(RWH)).await;
+    gates.stat_fails.store(true, Ordering::Release);
+    let mut new = Peer::from_client(&state, true, CLIENT).await;
+    let reconnect = reconnect_held(&state, &gates, &mut new, file_id).await;
+    // The sweep cannot see the claimed open.
+    assert!(state.durable.take_for(None, Some("alice")).is_empty());
+    gates.stat.add_permits(1);
+    let reply = reconnect.await.expect("reconnect task");
+    assert_eq!(status(&reply), ntstatus::STATUS_OBJECT_NAME_NOT_FOUND);
+    settle().await;
+    assert_eq!(files.open_handles(), 0, "closed, not kept again");
+    assert!(state.durable.take_for(None, None).is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_break_during_a_reconnect_that_fails_closes_the_open() {
+    let gates = Arc::new(Gates::default());
+    let (_server, state, files) = held_server(&gates).await;
+    let (_old, file_id) = kept(&state, Open::durable(RWH)).await;
+    gates.stat_fails.store(true, Ordering::Release);
+    let mut new = Peer::from_client(&state, true, CLIENT).await;
+    let reconnect = reconnect_held(&state, &gates, &mut new, file_id).await;
+    let started = Instant::now();
+    let mut other = Peer::new(&state, false).await;
+    let (_, interim) = other
+        .request(&state, Command::Create, &Open::default().body())
+        .await;
+    assert_eq!(status(&interim), ntstatus::STATUS_PENDING);
+    gates.stat.add_permits(1);
+    let reply = reconnect.await.expect("reconnect task");
+    assert_eq!(status(&reply), ntstatus::STATUS_OBJECT_NAME_NOT_FOUND);
+    assert_eq!(status(&other.next().await), 0);
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert_eq!(files.open_handles(), 1, "only the new open is left");
+}
+
+#[tokio::test]
+async fn of_two_reconnects_at_once_one_takes_the_open() {
+    let gates = Arc::new(Gates::default());
+    let (_server, state, files) = held_server(&gates).await;
+    let (_old, file_id) = kept(&state, Open::durable(RWH)).await;
+    let mut first = Peer::from_client(&state, true, CLIENT).await;
+    let winner = reconnect_held(&state, &gates, &mut first, file_id).await;
+    let mut second = Peer::from_client(&state, true, CLIENT).await;
+    let body = Open::reconnect(file_id, RWH).body();
+    let (_, reply) = second.request(&state, Command::Create, &body).await;
+    assert_eq!(status(&reply), ntstatus::STATUS_OBJECT_NAME_NOT_FOUND);
+    gates.stat.add_permits(1);
+    assert_eq!(status(&winner.await.expect("reconnect task")), 0);
+    assert_eq!(files.open_handles(), 1);
+}
+
+#[tokio::test]
+async fn a_logoff_during_a_reconnect_keeps_the_open_again() {
+    let gates = Arc::new(Gates::default());
+    let (_server, state, files) = held_server(&gates).await;
+    let (_old, file_id) = kept(&state, Open::durable(RWH)).await;
+    let mut new = Peer::from_client(&state, true, CLIENT).await;
+    let reconnect = reconnect_held(&state, &gates, &mut new, file_id).await;
+    let (_, reply) = new.request(&state, Command::Logoff, &[4, 0, 0, 0]).await;
+    assert_eq!(status(&reply), 0);
+    gates.stat.add_permits(1);
+    let reply = reconnect.await.expect("reconnect task");
+    assert_eq!(status(&reply), ntstatus::STATUS_NETWORK_NAME_DELETED);
+    assert_eq!(files.open_handles(), 1, "kept again");
+
+    let mut again = Peer::from_client(&state, true, CLIENT).await;
+    let body = Open::reconnect(file_id, RWH).body();
+    let (_, reply) = again.request(&state, Command::Create, &body).await;
+    assert_eq!(status(&reply), 0);
+}
+
+#[tokio::test]
+async fn a_tree_disconnect_during_a_reconnect_closes_the_open() {
+    let gates = Arc::new(Gates::default());
+    let (_server, state, files) = held_server(&gates).await;
+    let (_old, file_id) = kept(&state, Open::durable(RWH)).await;
+    let mut new = Peer::from_client(&state, true, CLIENT).await;
+    let reconnect = reconnect_held(&state, &gates, &mut new, file_id).await;
+    let (_, reply) = new
+        .request(&state, Command::TreeDisconnect, &[4, 0, 0, 0])
+        .await;
+    assert_eq!(status(&reply), 0);
+    gates.stat.add_permits(1);
+    let reply = reconnect.await.expect("reconnect task");
+    assert_eq!(status(&reply), ntstatus::STATUS_NETWORK_NAME_DELETED);
+    assert_eq!(files.open_handles(), 0);
+}
+
+#[tokio::test]
+async fn a_kept_open_comes_back_after_its_sibling_acknowledged_rh() {
+    let (state, files) = server().await;
+    let (mut second, mut other, kept) = kept_beside_a_sibling(&state, RWH, Open::default()).await;
+    let (_, reply) = second
+        .request(&state, Command::OplockBreak, &ack_body(RH))
+        .await;
+    assert_eq!(status(&reply), 0);
+    assert_eq!(status(&other.next().await), 0);
+    let mut again = Peer::from_client(&state, true, CLIENT).await;
+    let (_, reply) = again
+        .request(&state, Command::Create, &Open::reconnect(kept, RWH).body())
+        .await;
+    assert_eq!(status(&reply), 0);
+    let resp = CreateResponse::parse(&reply[SMB2_HEADER_LEN..]).expect("create response");
+    let lease = CreateContext::parse_chain(&resp.create_contexts)
+        .expect("contexts")
+        .into_iter()
+        .find(|c| c.name == CreateContext::NAME_RQLS)
+        .map(|c| LeaseContext::parse(&c.data).expect("lease"))
+        .expect("lease context");
+    assert_eq!((lease.key, lease.state), (LEASE_KEY, RH));
+    assert_eq!(files.open_handles(), 3);
 }

@@ -1,6 +1,7 @@
 //! Durable opens (MS-SMB2 3.3.1.10, 3.3.7.1): opens kept after their
-//! session ends with the connection or a LOGOFF, until they expire or
-//! another open needs what their lease caches.
+//! session ends with the connection or a LOGOFF, until their client
+//! reconnects them (MS-SMB2 3.3.5.9.7), they expire, or another open needs
+//! what their lease caches.
 //!
 //! Lock order: the table, then `LeaseTable` bindings, a share's file table,
 //! a file, a connection's outbound queue. An open is never dropped while the
@@ -13,16 +14,18 @@ use std::time::Duration;
 
 use tokio::sync::{RwLock, watch};
 use tokio::task::AbortHandle;
+use tokio::time::Instant;
 use tracing::debug;
 use uuid::Uuid;
 
-use crate::conn::state::Open;
+use crate::conn::state::{Connection, Open};
 use crate::ntstatus;
 use crate::server::ShareBindings;
 use crate::utils::fill_random;
 
 use super::close_open;
-use super::lease::LeaseId;
+use super::lease::{LeaseId, LeaseVersion};
+use super::table::FileRef;
 
 /// Default for
 /// [`SmbServerBuilder::durable_handle_timeout`](crate::SmbServerBuilder::durable_handle_timeout).
@@ -45,6 +48,9 @@ pub(crate) struct DurableTable {
     closing: Arc<watch::Sender<usize>>,
     /// Counts the times [`DurableTable::take_for`] ran.
     sweeps: AtomicU64,
+    /// Counts entries that left [`State::Attached`], for reconnects waiting
+    /// on a connection that is closing.
+    changed: watch::Sender<u64>,
 }
 
 /// One close of a kept open running on a task of its own, counted in
@@ -80,19 +86,26 @@ struct Entry {
     share: Weak<ShareBindings>,
     /// The lease the open holds. Its key never changes.
     lease: LeaseId,
+    lease_version: LeaseVersion,
     state: State,
 }
 
 enum State {
-    /// The open is in a session's tree.
-    Attached,
-    /// Kept after its session ended, until `timer` closes it.
+    /// The open is in a session's tree on `conn`.
+    Attached { conn: Weak<Connection> },
+    /// Kept after its session ended, until `timer` closes it at `deadline`.
     Detached {
         open: Arc<RwLock<Open>>,
         timer: Timer,
         /// Tells this stay from a later one of the same entry.
         generation: u64,
+        /// Open.DurableOpenScavengerTimeout.
+        deadline: Instant,
     },
+    /// Taken by a reconnect that is putting it in its new tree. A reconnect
+    /// that fails puts it back with the same deadline, unless a sweep ran
+    /// since [`DurableTable::sweeps`] was `since`.
+    Reattaching { deadline: Instant, since: u64 },
     /// Taken out to be closed. The entry leaves with the open.
     Closing,
 }
@@ -134,6 +147,7 @@ impl Drop for DurableReg {
         if let Some(table) = self.table.upgrade() {
             let removed = table.inner().remove(self.id);
             drop(removed);
+            table.bump();
         }
     }
 }
@@ -147,25 +161,41 @@ pub(crate) struct Claim<'a> {
     pub user: Option<&'a str>,
     /// Connection.ClientGuid.
     pub client: Uuid,
-    /// The lease the request names.
-    pub lease: Option<LeaseId>,
+    /// The lease the request names, and the version of its context.
+    pub lease: Option<(LeaseId, LeaseVersion)>,
+}
+
+/// Why [`DurableTable::claim`] gave no open.
+#[derive(Debug)]
+pub(crate) enum Unclaimed {
+    /// The reconnect fails with this status.
+    Status(u32),
+    /// The open is still in a session on a connection that is closing; the
+    /// receiver changes when an entry leaves a session.
+    Wait(watch::Receiver<u64>),
 }
 
 impl Inner {
     /// Takes the open out of the entry `id` when it is kept and `pick`
-    /// accepts it, leaving the entry [`State::Closing`].
+    /// accepts it, leaving the entry in `next`, which gets the stay's
+    /// deadline.
     fn take_detached(
         &mut self,
         id: u64,
         pick: impl Fn(u64) -> bool,
+        next: impl FnOnce(Instant) -> State,
     ) -> Option<(Arc<RwLock<Open>>, Timer)> {
         let entry = self.entries.get_mut(&id)?;
-        match &entry.state {
-            State::Detached { generation, .. } if pick(*generation) => {}
+        let deadline = match &entry.state {
+            State::Detached {
+                generation,
+                deadline,
+                ..
+            } if pick(*generation) => *deadline,
             _ => return None,
-        }
+        };
         let State::Detached { open, timer, .. } =
-            std::mem::replace(&mut entry.state, State::Closing)
+            std::mem::replace(&mut entry.state, next(deadline))
         else {
             unreachable!("checked above");
         };
@@ -203,7 +233,13 @@ impl DurableTable {
             max_detached,
             closing: Arc::new(watch::Sender::new(0)),
             sweeps: AtomicU64::new(0),
+            changed: watch::Sender::new(0),
         }
+    }
+
+    /// Wakes reconnects waiting for an entry to leave its session.
+    fn bump(&self) {
+        self.changed.send_modify(|n| *n = n.wrapping_add(1));
     }
 
     /// A stamp for [`DurableTable::preserve`], taken before the session
@@ -228,14 +264,16 @@ impl DurableTable {
         self.max_detached.div_ceil(4)
     }
 
-    /// Registers a durable open of `owner` on `share` holding `lease`, under
-    /// a random DurableFileId that is neither 0 nor all ones and that no
-    /// other durable open has. `None` when the system has no randomness.
+    /// Registers a durable open of `owner` on `share` holding `lease` of
+    /// `lease_version`, in a session on `conn`, under a random
+    /// DurableFileId that is neither 0 nor all ones and that no other
+    /// durable open has. `None` when the system has no randomness.
     pub(crate) fn register(
         self: &Arc<Self>,
         owner: &str,
         share: &Arc<ShareBindings>,
-        lease: LeaseId,
+        (lease, lease_version): (LeaseId, LeaseVersion),
+        conn: &Arc<Connection>,
     ) -> Option<DurableReg> {
         let mut inner = self.inner();
         let id = loop {
@@ -252,7 +290,10 @@ impl DurableTable {
                 owner: owner.to_string(),
                 share: Arc::downgrade(share),
                 lease,
-                state: State::Attached,
+                lease_version,
+                state: State::Attached {
+                    conn: Arc::downgrade(conn),
+                },
             },
         );
         Some(DurableReg {
@@ -282,6 +323,7 @@ impl DurableTable {
             drop(guard);
             return Some(open);
         };
+        let deadline = Instant::now() + self.timeout;
         let generation = {
             let mut inner = self.inner();
             let Inner {
@@ -291,7 +333,7 @@ impl DurableTable {
                 next_generation,
             } = &mut *inner;
             match entries.get_mut(&id) {
-                Some(entry) if matches!(entry.state, State::Attached) => {
+                Some(entry) if matches!(entry.state, State::Attached { .. }) => {
                     let by_user = detached_by_user.get(&entry.owner).copied().unwrap_or(0);
                     if self.sweeps() != since {
                         debug!(id, "durable open closed: configuration change");
@@ -309,6 +351,7 @@ impl DurableTable {
                             open: Arc::clone(&open),
                             timer: Timer(None),
                             generation: *next_generation,
+                            deadline,
                         };
                         Some(*next_generation)
                     } else {
@@ -326,21 +369,21 @@ impl DurableTable {
         guard.search_state = None;
         drop(guard);
         drop(open);
+        self.bump();
         debug!(id, timeout = ?self.timeout, "durable open kept");
-        self.start_timer(id, generation);
+        self.start_timer(id, generation, deadline);
         None
     }
 
     /// Starts the expiry timer of the stay `generation` of the kept open
-    /// `id` (MS-SMB2 3.3.2.2, 3.3.6.2).
-    fn start_timer(self: &Arc<Self>, id: u64, generation: u64) {
+    /// `id`, which ends at `deadline` (MS-SMB2 3.3.2.2, 3.3.6.2).
+    fn start_timer(self: &Arc<Self>, id: u64, generation: u64, deadline: Instant) {
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
         let table = Arc::downgrade(self);
-        let timeout = self.timeout;
         let task = runtime.spawn(async move {
-            tokio::time::sleep(timeout).await;
+            tokio::time::sleep_until(deadline).await;
             let expired = table.upgrade().and_then(|t| t.expire(id, generation));
             if let Some((open, _in_flight)) = expired {
                 debug!(id, "durable open closed: expired");
@@ -362,7 +405,7 @@ impl DurableTable {
     /// fired, for the timer's task to close.
     fn expire(&self, id: u64, generation: u64) -> Option<(Arc<RwLock<Open>>, InFlight)> {
         let mut inner = self.inner();
-        let (open, timer) = inner.take_detached(id, |g| g == generation)?;
+        let (open, timer) = inner.take_detached(id, |g| g == generation, |_| State::Closing)?;
         let in_flight = InFlight::new(&self.closing);
         drop(inner);
         timer.disarm();
@@ -375,19 +418,14 @@ impl DurableTable {
     /// current runtime.
     pub(crate) fn purge(&self, id: u64) {
         let mut inner = self.inner();
-        let Some((open, timer)) = inner.take_detached(id, |_| true) else {
+        let Some((open, timer)) = inner.take_detached(id, |_| true, |_| State::Closing) else {
             return;
         };
         let in_flight = InFlight::new(&self.closing);
         drop(inner);
         drop(timer);
         debug!(id, "durable open closed: lease broken");
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                close_open(&open, false).await;
-                drop(in_flight);
-            });
-        }
+        spawn_close(open, in_flight);
     }
 
     /// Takes out the kept opens on `share` and of `user`, every share or
@@ -414,7 +452,7 @@ impl DurableTable {
             .collect();
         let mut opens = Vec::with_capacity(ids.len());
         for id in ids {
-            if let Some((open, _timer)) = inner.take_detached(id, |_| true) {
+            if let Some((open, _timer)) = inner.take_detached(id, |_| true, |_| State::Closing) {
                 debug!(id, "durable open closed: configuration or shutdown");
                 opens.push(open);
             }
@@ -423,33 +461,156 @@ impl DurableTable {
         opens
     }
 
-    /// MS-SMB2 3.3.5.9.7 on a server that hands no kept open back. Checks a
-    /// request to reconnect the open `id` in the order the spec gives and,
-    /// when the open is kept and the request comes from its owner, takes it
-    /// out for the caller to close: the client opens the file anew next,
-    /// and the old open's share mode, byte-range locks and lease would be
-    /// in its way. The reconnect fails either way, with the returned status
-    /// or, for an open taken out, STATUS_OBJECT_NAME_NOT_FOUND.
-    pub(crate) fn give_up(&self, id: u64, claim: &Claim<'_>) -> Result<Arc<RwLock<Open>>, u32> {
-        let not_found = ntstatus::STATUS_OBJECT_NAME_NOT_FOUND;
+    /// MS-SMB2 3.3.5.9.7: checks a request to reconnect the open `id` in
+    /// the order the spec gives, and hands the open over when it is kept
+    /// and the request comes from its owner, on the same share, from the
+    /// same client, naming its lease with the same key and version. The
+    /// entry stays [`State::Reattaching`] until [`DurableTable::attached`]
+    /// or [`DurableTable::release_claim`]; meanwhile neither its timer nor a
+    /// break closes it. A refused request changes nothing.
+    ///
+    /// An open still in a session gives STATUS_OBJECT_NAME_NOT_FOUND, unless
+    /// that session's connection is closing: then the caller may wait for
+    /// the open to be kept and try again.
+    pub(crate) fn claim(&self, id: u64, claim: &Claim<'_>) -> Result<Arc<RwLock<Open>>, Unclaimed> {
+        let not_found = || Unclaimed::Status(ntstatus::STATUS_OBJECT_NAME_NOT_FOUND);
         let mut inner = self.inner();
-        let entry = inner.entries.get(&id).ok_or(not_found)?;
-        if entry.lease.client != claim.client
-            || claim.lease.is_none()
-            || !matches!(entry.state, State::Detached { .. })
-            || claim.lease != Some(entry.lease)
+        let entry = inner.entries.get(&id).ok_or_else(not_found)?;
+        let Some((lease, version)) = claim.lease.filter(|_| entry.lease.client == claim.client)
+        else {
+            return Err(not_found());
+        };
+        let closing = match &entry.state {
+            State::Detached { .. } => false,
+            State::Attached { conn } if conn.upgrade().is_none_or(|c| c.is_closing()) => true,
+            _ => return Err(not_found()),
+        };
+        if lease != entry.lease
+            || version != entry.lease_version
             || !std::ptr::eq(entry.share.as_ptr(), Arc::as_ptr(claim.share))
         {
-            return Err(not_found);
+            return Err(not_found());
         }
-        if claim.user != Some(entry.owner.as_str()) {
-            return Err(ntstatus::STATUS_ACCESS_DENIED);
+        let owner = claim.user == Some(entry.owner.as_str());
+        // Only a reconnect that would take the open waits for it.
+        if closing {
+            return Err(if owner {
+                Unclaimed::Wait(self.changed.subscribe())
+            } else {
+                not_found()
+            });
         }
-        let (open, timer) = inner.take_detached(id, |_| true).ok_or(not_found)?;
+        if !owner {
+            return Err(Unclaimed::Status(ntstatus::STATUS_ACCESS_DENIED));
+        }
+        let since = self.sweeps();
+        let (open, timer) = inner
+            .take_detached(
+                id,
+                |_| true,
+                |deadline| State::Reattaching { deadline, since },
+            )
+            .expect("checked above");
         drop(inner);
         drop(timer);
-        debug!(id, "durable open closed: client reconnected");
+        debug!(id, "durable open claimed");
         Ok(open)
+    }
+
+    /// Puts back the open of a reconnect that failed after
+    /// [`DurableTable::claim`], kept until the deadline it had. The open is
+    /// closed instead when a sweep ran since the claim, which could not see
+    /// it, or when a lease break decided to close it meanwhile, which could
+    /// not close it then.
+    pub(crate) async fn release_claim(self: &Arc<Self>, id: u64, open: Arc<RwLock<Open>>) {
+        let Some(open) = self.put_back(id, open) else {
+            return;
+        };
+        // A break that closes kept opens marks this one first and then
+        // purges it; a purge that came while the open was claimed did
+        // nothing.
+        let doomed = open
+            .read()
+            .await
+            .file
+            .as_ref()
+            .is_some_and(FileRef::is_doomed);
+        drop(open);
+        if doomed {
+            self.purge(id);
+        }
+    }
+
+    /// The table side of [`DurableTable::release_claim`]: returns the open
+    /// when it is kept again.
+    fn put_back(self: &Arc<Self>, id: u64, open: Arc<RwLock<Open>>) -> Option<Arc<RwLock<Open>>> {
+        let mut inner = self.inner();
+        let swept = |since| self.sweeps() != since;
+        let Inner {
+            entries,
+            detached,
+            detached_by_user,
+            next_generation,
+        } = &mut *inner;
+        let Some(entry) = entries.get_mut(&id) else {
+            drop(inner);
+            drop(open);
+            return None;
+        };
+        let deadline = match entry.state {
+            State::Reattaching { deadline, since } if !swept(since) => deadline,
+            State::Reattaching { .. } => {
+                entry.state = State::Closing;
+                let in_flight = InFlight::new(&self.closing);
+                drop(inner);
+                debug!(id, "durable open closed: configuration change");
+                spawn_close(open, in_flight);
+                return None;
+            }
+            _ => {
+                drop(inner);
+                drop(open);
+                return None;
+            }
+        };
+        *detached += 1;
+        *detached_by_user.entry(entry.owner.clone()).or_default() += 1;
+        *next_generation += 1;
+        let generation = *next_generation;
+        entry.state = State::Detached {
+            open: Arc::clone(&open),
+            timer: Timer(None),
+            generation,
+            deadline,
+        };
+        drop(inner);
+        debug!(id, "durable open kept again");
+        self.start_timer(id, generation, deadline);
+        Some(open)
+    }
+
+    /// Records that the open `id`, claimed by a reconnect, is in a session
+    /// on `conn` again.
+    pub(crate) fn attached(&self, id: u64, conn: &Arc<Connection>) {
+        if let Some(entry) = self.inner().entries.get_mut(&id)
+            && matches!(entry.state, State::Reattaching { .. })
+        {
+            entry.state = State::Attached {
+                conn: Arc::downgrade(conn),
+            };
+        }
+        debug!(id, "durable open reconnected");
+    }
+}
+
+/// Closes a kept open taken out of the table on a task of the current
+/// runtime, counted in `in_flight` until done.
+fn spawn_close(open: Arc<RwLock<Open>>, in_flight: InFlight) {
+    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        runtime.spawn(async move {
+            close_open(&open, false).await;
+            drop(in_flight);
+        });
     }
 }
 
@@ -471,6 +632,7 @@ mod tests {
 
     struct Fixture {
         table: Arc<DurableTable>,
+        conn: Arc<Connection>,
         leases: Arc<LeaseTable>,
         share: Arc<ShareBindings>,
         files: MemFsBackend,
@@ -490,6 +652,7 @@ mod tests {
         );
         Fixture {
             table: Arc::new(DurableTable::new(Duration::from_secs(60), max_detached)),
+            conn: Arc::new(Connection::new(Uuid::nil(), 1 << 16, 1 << 16)),
             leases: Arc::default(),
             share,
             files,
@@ -546,7 +709,11 @@ mod tests {
                 .unwrap();
             drop(guard);
             assert_eq!(granted.state, state);
-            let reg = self.table.register(owner, &self.share, lease(n)).unwrap();
+            let leased = (lease(n), LeaseVersion::V2);
+            let reg = self
+                .table
+                .register(owner, &self.share, leased, &self.conn)
+                .unwrap();
             file.mark_durable(&self.table, reg.id());
             Arc::new(RwLock::new(Open {
                 file_id: FileId::new(reg.id(), 1),
@@ -588,7 +755,12 @@ mod tests {
     async fn ids_are_random_unique_and_never_reserved_values() {
         let f = fixture(8);
         let regs: Vec<_> = (0..64)
-            .map(|n| f.table.register("alice", &f.share, lease(n)).unwrap())
+            .map(|n| {
+                let leased = (lease(n), LeaseVersion::V2);
+                f.table
+                    .register("alice", &f.share, leased, &f.conn)
+                    .unwrap()
+            })
             .collect();
         let mut ids: Vec<u64> = regs.iter().map(DurableReg::id).collect();
         assert!(ids.iter().all(|&id| id != 0 && id != u64::MAX));
@@ -700,7 +872,7 @@ mod tests {
         share: &'a Arc<ShareBindings>,
         user: Option<&'a str>,
         client: Uuid,
-        lease: Option<LeaseId>,
+        lease: Option<(LeaseId, LeaseVersion)>,
     ) -> Claim<'a> {
         Claim {
             share,
@@ -710,41 +882,118 @@ mod tests {
         }
     }
 
+    /// The status a claim fails with, 0 for success and `u32::MAX` for a
+    /// wait.
+    fn status(claimed: Result<Arc<RwLock<Open>>, Unclaimed>) -> u32 {
+        match claimed {
+            Ok(_) => 0,
+            Err(Unclaimed::Status(status)) => status,
+            Err(Unclaimed::Wait(_)) => u32::MAX,
+        }
+    }
+
     #[tokio::test]
-    async fn a_reconnect_takes_out_only_its_owners_kept_open() {
+    async fn a_claim_checks_the_reconnect_in_the_order_of_the_spec() {
         let f = fixture(8);
         let other = fixture(8);
         let open = f.open("a", "alice", 1, LeaseState::RH).await;
         let id = id_of(&open).await;
         let me = lease(1).client;
-        let not_found = Err(ntstatus::STATUS_OBJECT_NAME_NOT_FOUND);
-        let status = |r: Result<Arc<RwLock<Open>>, u32>| r.map(|_| ());
-        let alice = claim(&f.share, Some("alice"), me, Some(lease(1)));
+        let v2 = Some((lease(1), LeaseVersion::V2));
+        let not_found = ntstatus::STATUS_OBJECT_NAME_NOT_FOUND;
+        let alice = claim(&f.share, Some("alice"), me, v2);
 
-        // Still in a session.
-        assert_eq!(status(f.table.give_up(id, &alice)), not_found);
+        // Still in a session on a connection that is not closing.
+        assert_eq!(status(f.table.claim(id, &alice)), not_found);
         assert!(f.table.preserve(open, f.table.sweeps()).await.is_none());
-        assert_eq!(status(f.table.give_up(id ^ 1, &alice)), not_found);
+        assert_eq!(status(f.table.claim(id ^ 1, &alice)), not_found);
         for refused in [
-            claim(&f.share, Some("alice"), Uuid::nil(), Some(lease(1))),
+            claim(&f.share, Some("alice"), Uuid::nil(), v2),
             claim(&f.share, Some("alice"), me, None),
-            claim(&f.share, Some("alice"), me, Some(lease(2))),
-            claim(&other.share, Some("alice"), me, Some(lease(1))),
+            claim(
+                &f.share,
+                Some("alice"),
+                me,
+                Some((lease(2), LeaseVersion::V2)),
+            ),
+            claim(
+                &f.share,
+                Some("alice"),
+                me,
+                Some((lease(1), LeaseVersion::V1)),
+            ),
+            claim(&other.share, Some("alice"), me, v2),
         ] {
-            assert_eq!(status(f.table.give_up(id, &refused)), not_found);
+            assert_eq!(status(f.table.claim(id, &refused)), not_found);
         }
         for user in [Some("bob"), None] {
-            let refused = claim(&f.share, user, me, Some(lease(1)));
+            let refused = claim(&f.share, user, me, v2);
             assert_eq!(
-                status(f.table.give_up(id, &refused)),
-                Err(ntstatus::STATUS_ACCESS_DENIED)
+                status(f.table.claim(id, &refused)),
+                ntstatus::STATUS_ACCESS_DENIED
             );
         }
-        assert_eq!(f.counts().1, 1);
-        let open = f.table.give_up(id, &alice).unwrap();
+        assert_eq!(f.counts().1, 1, "refusals change nothing");
+
+        let open = f.table.claim(id, &alice).unwrap();
         assert_eq!(f.counts().1, 0);
-        close_open(&open, false).await;
-        drop(open);
+        assert_eq!(status(f.table.claim(id, &alice)), not_found, "claimed once");
+        f.table.purge(id);
+        assert!(f.table.take_for(None, None).is_empty());
+        let owner = Arc::downgrade(&f.outbound);
+        let reattached = open.read().await.file.as_ref().unwrap().reattach(owner);
+        assert!(reattached.is_some());
+        drop(reattached);
+        f.table.attached(id, &f.conn);
+        assert_eq!(status(f.table.claim(id, &alice)), not_found, "attached");
+        // In a session again, it can be kept again.
+        assert!(f.table.preserve(open, f.table.sweeps()).await.is_none());
+        assert_eq!(f.counts().1, 1);
+    }
+
+    #[tokio::test]
+    async fn a_claim_on_a_closing_connection_waits_for_the_open_to_be_kept() {
+        let f = fixture(8);
+        let open = f.open("a", "alice", 1, LeaseState::RH).await;
+        let id = id_of(&open).await;
+        let alice = claim(
+            &f.share,
+            Some("alice"),
+            lease(1).client,
+            Some((lease(1), LeaseVersion::V2)),
+        );
+        f.conn.mark_closing();
+        let Err(Unclaimed::Wait(wait)) = f.table.claim(id, &alice) else {
+            panic!("a claim on a closing connection waits");
+        };
+        assert!(!wait.has_changed().unwrap());
+        assert!(f.table.preserve(open, f.table.sweeps()).await.is_none());
+        assert!(wait.has_changed().unwrap());
+        assert!(f.table.claim(id, &alice).is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_released_claim_keeps_the_open_until_its_first_deadline() {
+        let f = fixture(8);
+        let open = f.open("a", "alice", 1, LeaseState::RH).await;
+        let id = id_of(&open).await;
+        let alice = claim(
+            &f.share,
+            Some("alice"),
+            lease(1).client,
+            Some((lease(1), LeaseVersion::V2)),
+        );
+        assert!(f.table.preserve(open, f.table.sweeps()).await.is_none());
+        tokio::time::sleep(Duration::from_secs(40)).await;
+        let open = f.table.claim(id, &alice).unwrap();
+        // The claim stopped the timer: the deadline passes with the open out.
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        settle().await;
+        assert_eq!(f.files.open_handles(), 1);
+        f.table.release_claim(id, open).await;
+        assert_eq!(f.counts().1, 1);
+        // Put back past its deadline, it expires at once.
+        settle().await;
         assert_eq!(f.files.open_handles(), 0);
         assert_eq!(f.counts(), (0, 0, 0));
     }

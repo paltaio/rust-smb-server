@@ -30,6 +30,7 @@ mod oplock_break;
 mod query_directory;
 mod query_info;
 mod read;
+mod reconnect;
 mod session_setup;
 mod set_info;
 pub(crate) mod shared;

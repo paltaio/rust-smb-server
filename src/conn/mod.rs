@@ -50,6 +50,7 @@ pub async fn connection_loop(
     info!("connection accepted");
     let reader_result = reader::reader_task(read_half, server.clone(), conn.clone(), tx).await;
     debug!(?reader_result, "reader exited");
+    conn.mark_closing();
     // Requests still waiting are cancelled and answered while the writer
     // runs. Then the writer drains; messages for this connection raised
     // from now on are not sent.

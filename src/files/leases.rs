@@ -963,6 +963,34 @@ mod tests {
     }
 
     #[test]
+    fn a_kept_open_comes_back_unless_a_break_doomed_it() {
+        let table = Arc::new(LeaseTable::default());
+        let durable = durable_table();
+        let s = share();
+        let (first, _first_rx) = connection();
+        let (second, mut second_rx) = connection();
+
+        let doomed = hold_rh(&table, &s, &first, 1);
+        doomed.mark_durable(&durable, 1);
+        assert!(doomed.try_detach());
+        assert!(conflicting(&s, &second).wait.is_some());
+        assert!(doomed.reattach(Arc::downgrade(&second)).is_none());
+        drop(doomed);
+
+        let kept = hold_rh(&table, &s, &first, 2);
+        kept.mark_durable(&durable, 2);
+        assert!(kept.try_detach());
+        let (granted, guard) = kept.reattach(Arc::downgrade(&second)).unwrap();
+        assert_eq!((granted.state, granted.breaking), (LeaseState::RH, false));
+        // A break raised before the response is queued follows it.
+        assert!(conflicting(&s, &second).wait.is_some());
+        assert!(second_rx.try_recv().is_none(), "held back for the response");
+        drop(guard);
+        let n = notification(&second_rx.try_recv().expect("break after the response"));
+        assert_eq!((n.current_lease_state, n.new_lease_state), (3, 1));
+    }
+
+    #[test]
     fn a_full_connection_is_killed_and_the_next_one_tried() {
         let s = share();
         let table = Arc::new(LeaseTable::default());

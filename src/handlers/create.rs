@@ -25,9 +25,10 @@ use crate::conn::state::{Connection, Open};
 use crate::dispatch::HandlerResponse;
 use crate::error::SmbError;
 use crate::files::{
-    BreakWait, Claim, FileRef, Granted, LeaseId, LeaseRef, LeaseRequest, LeaseState, LeaseVersion,
-    MAX_BREAK_WAIT, OpenRequest, OpenSlot, Refused, Sharing, Trigger, close_open,
+    BreakWait, FileRef, Granted, LeaseId, LeaseRef, LeaseRequest, LeaseState, LeaseVersion,
+    MAX_BREAK_WAIT, OpenRequest, OpenSlot, Refused, Sharing, Trigger,
 };
+use crate::handlers::reconnect::{self, Reconnect};
 use crate::handlers::shared::{lookup_session, lookup_session_tree};
 use crate::handlers::{Outcome, Pending};
 use crate::info_class::VOLUME_SERIAL_NUMBER;
@@ -86,7 +87,7 @@ const FILE_OVERWRITE_IF: u32 = 0x0000_0005;
 
 // CreateAction in response (MS-SMB2 2.2.14)
 const FILE_SUPERSEDED: u32 = 0x0000_0000;
-const FILE_OPENED: u32 = 0x0000_0001;
+pub(super) const FILE_OPENED: u32 = 0x0000_0001;
 const FILE_CREATED: u32 = 0x0000_0002;
 const FILE_OVERWRITTEN: u32 = 0x0000_0003;
 
@@ -99,7 +100,7 @@ const GRANTABLE_LEASE: LeaseState = LeaseState::RWH;
 
 /// Create contexts of a request that the response answers (MS-SMB2
 /// 3.3.5.9.5, 3.3.5.9.9) or that fail it. Other contexts are ignored.
-struct ContextQueries {
+pub(super) struct ContextQueries {
     /// QUERY_MAXIMAL_ACCESS, with its timestamp if it has one.
     maximal_access: Option<Option<u64>>,
     query_on_disk_id: bool,
@@ -201,7 +202,12 @@ impl ContextQueries {
     /// Response contexts for an open of a file with `info` on a tree whose
     /// MaximalAccess is `maximal`, on the volume with serial number
     /// `volume_serial`.
-    fn answer(&self, info: &FileInfo, maximal: u32, volume_serial: u32) -> Vec<CreateContext> {
+    pub(super) fn answer(
+        &self,
+        info: &FileInfo,
+        maximal: u32,
+        volume_serial: u32,
+    ) -> Vec<CreateContext> {
         let mut out = Vec::new();
         if let Some(timestamp) = self.maximal_access {
             let (status, access) = if timestamp == Some(info.change_time) {
@@ -277,7 +283,7 @@ fn lease_request(
 
 /// The response lease context for `granted`, in the lease's version
 /// (MS-SMB2 2.2.14.2.10, 2.2.14.2.11).
-fn lease_response(granted: &Granted) -> CreateContext {
+pub(super) fn lease_response(granted: &Granted) -> CreateContext {
     let v2 = granted.version == LeaseVersion::V2;
     let mut flags = 0;
     if granted.breaking {
@@ -325,18 +331,6 @@ enum Request {
     Reconnect(Reconnect),
 }
 
-/// A request to reconnect a durable open.
-struct Reconnect {
-    /// The FileId the request names.
-    file_id: FileId,
-    /// DH2C rather than DHnC.
-    v2: bool,
-    share: Arc<ShareBindings>,
-    owner: Option<String>,
-    client: Uuid,
-    lease: Option<LeaseId>,
-}
-
 impl CreateArgs {
     /// Checks the request against the tree it targets (MS-SMB2 3.3.5.9).
     async fn parse(conn: &Arc<Connection>, hdr: &Smb2Header, body: &[u8]) -> Result<Request, u32> {
@@ -369,13 +363,15 @@ impl CreateArgs {
         };
         if let Some((file_id, v2)) = reconnect {
             let lease = lease_request(queries.lease.as_deref(), dialect, client, 0)?;
+            let name = utf16le_to_units(&req.name).and_then(|u| SmbPath::from_utf16(&u).ok());
             return Ok(Request::Reconnect(Reconnect {
                 file_id,
                 v2,
-                share,
+                name,
                 owner,
                 client,
-                lease: lease.map(|l| l.id),
+                lease,
+                queries,
             }));
         }
 
@@ -584,7 +580,7 @@ pub async fn handle(
     let args = match CreateArgs::parse(conn, hdr, body).await {
         Ok(Request::Open(args)) => args,
         Ok(Request::Reconnect(r)) => {
-            return Outcome::Done(HandlerResponse::err(refuse_reconnect(server, r).await));
+            return reconnect::handle(server, conn, hdr, r, retained).await;
         }
         Err(status) => return Outcome::Done(HandlerResponse::err(status)),
     };
@@ -640,35 +636,6 @@ pub async fn handle(
         op,
         work: Box::pin(work),
     })
-}
-
-/// MS-SMB2 3.3.5.9.7 and 3.3.5.9.12 on a server that hands no durable open
-/// back: every reconnect fails. A DHnC from the owner of a kept open, with
-/// its client and lease key, closes that open first, as
-/// `DurableTable::give_up` describes. No durable open on this server has a
-/// CreateGuid, so a DH2C names none (MS-SMB2 3.3.5.9.12).
-async fn refuse_reconnect(server: &ServerState, r: Reconnect) -> u32 {
-    let id = r.file_id.persistent;
-    if r.v2 {
-        debug!(id, "durable reconnect refused");
-        return ntstatus::STATUS_OBJECT_NAME_NOT_FOUND;
-    }
-    let claim = Claim {
-        share: &r.share,
-        user: r.owner.as_deref(),
-        client: r.client,
-        lease: r.lease,
-    };
-    match server.durable.give_up(id, &claim) {
-        Ok(open) => {
-            close_open(&open, false).await;
-            ntstatus::STATUS_OBJECT_NAME_NOT_FOUND
-        }
-        Err(status) => {
-            debug!(id, status, "durable reconnect refused");
-            status
-        }
-    }
 }
 
 /// One try at opening the file. Runs the session and tree checks again, so
@@ -872,7 +839,9 @@ async fn attempt(
                 && share.durable_handles
                 && !lease.id.client.is_nil() =>
         {
-            server.durable.register(owner, &share, lease.id)
+            server
+                .durable
+                .register(owner, &share, (lease.id, lease.version), conn)
         }
         _ => None,
     };
@@ -962,11 +931,28 @@ async fn attempt(
             data: DurableResponse.encode(),
         });
     }
+    let buf = encode_response(&info, file_id, granted.is_some(), create_action, &answers);
+    let mut response = HandlerResponse::ok(buf);
+    if let Some(guard) = after_send {
+        response.after_send.push(Box::new(guard));
+    }
+    Step::Done(response)
+}
+
+/// The CREATE response body for an open of a file with `info`, holding a
+/// lease when `leased`, with the response contexts `answers`.
+pub(super) fn encode_response(
+    info: &FileInfo,
+    file_id: FileId,
+    leased: bool,
+    create_action: u32,
+    answers: &[CreateContext],
+) -> Vec<u8> {
     let mut contexts = Vec::new();
-    CreateContext::encode_chain(&answers, &mut contexts).expect("encoding into a Vec cannot fail");
+    CreateContext::encode_chain(answers, &mut contexts).expect("encoding into a Vec cannot fail");
     let resp = CreateResponse {
         structure_size: 89,
-        oplock_level: if granted.is_some() {
+        oplock_level: if leased {
             OplockLevel::Lease as u8
         } else {
             OplockLevel::None as u8
@@ -992,11 +978,7 @@ async fn attempt(
     };
     let mut buf = Vec::new();
     resp.write_to(&mut buf).expect("encode");
-    let mut response = HandlerResponse::ok(buf);
-    if let Some(guard) = after_send {
-        response.after_send.push(Box::new(guard));
-    }
-    Step::Done(response)
+    buf
 }
 
 fn is_missing(e: &SmbError) -> bool {
