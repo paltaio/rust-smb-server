@@ -184,6 +184,7 @@ pub(crate) mod info_class;
 pub mod ntstatus;
 mod path;
 mod proto;
+mod rpc;
 mod server;
 #[cfg(test)]
 mod tests {
@@ -192,6 +193,7 @@ mod tests {
     mod dynamic_config;
     pub(crate) mod memfs;
     pub(crate) mod peer;
+    mod pipes;
 }
 mod utils;
 mod wildcard;
@@ -292,6 +294,56 @@ pub mod fuzzing {
             Some(Dialect::Smb2Wildcard),
         ] {
             let _ = crate::handlers::create::durable_ask(&contexts, dialect);
+        }
+    }
+
+    /// Parses `data` as a DCE/RPC PDU a client sends.
+    pub fn rpc_pdu(data: &[u8]) {
+        let _ = crate::rpc::pdu::parse(data);
+    }
+
+    /// Writes `data` to an association in chunks whose size the first
+    /// byte picks, answering every call with a fault and with its stub as
+    /// a response. Every PDU sent back parses, a response fits in the size
+    /// the bind negotiated, and what the association holds stays bounded.
+    pub fn rpc_association(data: &[u8]) {
+        use crate::rpc::association::{Association, Fault, Step};
+        use crate::rpc::pdu::{
+            self, MAX_FRAG, NCA_OP_RNG_ERROR, PTYPE_ALTER_CONTEXT_RESP, PTYPE_BIND_ACK,
+            PTYPE_RESPONSE,
+        };
+
+        let Some((&chunk, data)) = data.split_first() else {
+            return;
+        };
+        let chunk = usize::from(chunk).max(1);
+        let mut assoc = Association::default();
+        let mut max_frag = MAX_FRAG;
+        for mut piece in data.chunks(chunk) {
+            while let Some(step) = assoc.next_step(&mut piece) {
+                let sent = match step {
+                    Step::Send(pdu) => vec![pdu],
+                    Step::Call(call) => {
+                        let fault = Fault {
+                            status: NCA_OP_RNG_ERROR,
+                            did_not_execute: true,
+                        };
+                        let mut replies = assoc.reply(&call, Err(fault));
+                        replies.extend(assoc.reply(&call, Ok(call.stub.clone())));
+                        replies
+                    }
+                };
+                for pdu in sent {
+                    assert!(pdu::parse(&pdu).is_some());
+                    match pdu[2] {
+                        PTYPE_BIND_ACK => max_frag = u16::from_le_bytes([pdu[16], pdu[17]]),
+                        PTYPE_RESPONSE => assert!(pdu.len() <= usize::from(max_frag)),
+                        PTYPE_ALTER_CONTEXT_RESP => {}
+                        _ => assert!(pdu.len() <= usize::from(MAX_FRAG)),
+                    }
+                }
+                assert!(assoc.held() <= (64 << 10) + usize::from(u16::MAX));
+            }
         }
     }
 

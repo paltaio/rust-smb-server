@@ -86,3 +86,17 @@ path = "fuzz_targets/durable_ask.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "rpc_pdu"
+path = "fuzz_targets/rpc_pdu.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rpc_association"
+path = "fuzz_targets/rpc_association.rs"
+test = false
+doc = false
+bench = false

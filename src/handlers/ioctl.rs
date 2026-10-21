@@ -43,15 +43,7 @@ pub async fn handle(
     }
 
     let fsctl = req.fsctl();
-    let no_file = matches!(
-        fsctl,
-        Fsctl::DfsGetReferrals
-            | Fsctl::DfsGetReferralsEx
-            | Fsctl::QueryNetworkInterfaceInfo
-            | Fsctl::ValidateNegotiateInfo
-            | Fsctl::PipeWait
-    );
-    let open = if no_file {
+    let open = if takes_no_file(fsctl) {
         if req.file_id != FileId::any() {
             return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
         }
@@ -95,9 +87,22 @@ pub async fn handle(
     }
 }
 
+/// Whether `fsctl` names no open: its FileId must be all 0xFF (MS-SMB2
+/// 3.3.5.15).
+pub(super) fn takes_no_file(fsctl: Fsctl) -> bool {
+    matches!(
+        fsctl,
+        Fsctl::DfsGetReferrals
+            | Fsctl::DfsGetReferralsEx
+            | Fsctl::QueryNetworkInterfaceInfo
+            | Fsctl::ValidateNegotiateInfo
+            | Fsctl::PipeWait
+    )
+}
+
 /// The request's input buffer, located by InputOffset, or `None` when the
 /// offset and count break the rules of MS-SMB2 3.3.5.15.
-fn input_buffer<'a>(req: &IoctlRequest, body: &'a [u8]) -> Option<&'a [u8]> {
+pub(super) fn input_buffer<'a>(req: &IoctlRequest, body: &'a [u8]) -> Option<&'a [u8]> {
     if req.input_count == 0 {
         return Some(&[]);
     }
@@ -110,7 +115,8 @@ fn input_buffer<'a>(req: &IoctlRequest, body: &'a [u8]) -> Option<&'a [u8]> {
     body.get(start..end)
 }
 
-fn response(ctl_code: u32, file_id: FileId, output: Vec<u8>) -> HandlerResponse {
+/// An IOCTL response carrying `output` (MS-SMB2 2.2.32).
+pub(super) fn response(ctl_code: u32, file_id: FileId, output: Vec<u8>) -> HandlerResponse {
     let resp = IoctlResponse {
         structure_size: 49,
         reserved: 0,

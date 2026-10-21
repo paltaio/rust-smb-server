@@ -19,6 +19,7 @@ use crate::files::{
     DurableReg, DurableTable, FileRef, OpenSlot, close_opens, end_opens, finish_close,
 };
 use crate::path::SmbPath;
+use crate::rpc::pipe::{Pipe, PipeBudget};
 use crate::server::ShareBindings;
 
 /// In-flight NTLM acceptor + a `is_raw_ntlmssp` flag (true = raw, false =
@@ -93,6 +94,9 @@ pub struct Connection {
 
     /// Requests answered asynchronously that are still running.
     pub(crate) pending: PendingOps,
+
+    /// The named pipes open on this connection and the bytes they hold.
+    pub(crate) pipe_budget: Arc<PipeBudget>,
 }
 
 impl Connection {
@@ -119,6 +123,7 @@ impl Connection {
             peer_addr: None,
             outbound: Arc::default(),
             pending: PendingOps::default(),
+            pipe_budget: Arc::default(),
         }
     }
 
@@ -299,10 +304,14 @@ async fn detach_session(sess_arc: &Arc<RwLock<Session>>) -> Vec<Arc<RwLock<Open>
 }
 
 /// Marks a tree that is no longer reachable as closed, so no CREATE adds to
-/// it, and takes its opens. Waits for no request.
+/// it, drops its pipes and takes its opens. Waits for no request.
 async fn detach_tree(tree_arc: &Arc<RwLock<TreeConnect>>) -> Vec<Arc<RwLock<Open>>> {
     let mut tree = tree_arc.write().await;
     tree.closed = true;
+    tree.pipes
+        .get_mut()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
     let opens: Vec<_> = tree.opens.write().await.drain().map(|(_, o)| o).collect();
     opens
 }
@@ -369,6 +378,9 @@ pub struct TreeConnect {
     pub share: Arc<ShareBindings>,
     pub granted_access: Access,
     pub opens: RwLock<HashMap<FileId, Arc<RwLock<Open>>>>,
+    /// Named pipe opens, on an IPC$ tree. They hold no backend handle and
+    /// no place in a file table.
+    pub(crate) pipes: Mutex<HashMap<FileId, Arc<Pipe>>>,
     /// Set once the tree is disconnected or revoked. Opens are no longer
     /// added to it.
     pub closed: bool,
@@ -385,6 +397,7 @@ impl TreeConnect {
             share,
             granted_access,
             opens: RwLock::new(HashMap::new()),
+            pipes: Mutex::default(),
             closed: false,
         }
     }

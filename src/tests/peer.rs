@@ -14,13 +14,14 @@ use crate::proto::auth::ntlm::Identity;
 use crate::proto::crypto::{SigningAlgo, sign};
 use crate::proto::header::{Command, HeaderTail, SMB2_FLAGS_SIGNED, Smb2Header};
 use crate::proto::messages::Dialect;
-use crate::server::ServerState;
+use crate::server::{ServerState, ShareBindings};
 
 /// Signing key of the signed sessions.
 pub(crate) const KEY: [u8; 16] = [0x5A; 16];
 
-/// One connection with session 1 on tree 1 of `home`, and the queue its
-/// unsolicited messages and late responses go to.
+/// One connection with session 1 on tree 1, of `home` unless made with
+/// [`Peer::on_ipc`], and the queue its unsolicited messages and late
+/// responses go to.
 pub(crate) struct Peer {
     pub(crate) conn: Arc<Connection>,
     pub(crate) rx: ResponseReceiver,
@@ -37,6 +38,23 @@ impl Peer {
 
     /// [`Peer::new`] from the client `client`.
     pub(crate) async fn from_client(state: &Arc<ServerState>, signed: bool, client: Uuid) -> Self {
+        let share = state.find_share("home").await.expect("share");
+        Self::on_share(state, signed, client, share, Access::ReadWrite).await
+    }
+
+    /// [`Peer::new`] with tree 1 on IPC$.
+    pub(crate) async fn on_ipc(state: &Arc<ServerState>, signed: bool) -> Self {
+        let ipc = ShareBindings::ipc();
+        Self::on_share(state, signed, Uuid::nil(), ipc, Access::Read).await
+    }
+
+    async fn on_share(
+        state: &Arc<ServerState>,
+        signed: bool,
+        client: Uuid,
+        share: Arc<ShareBindings>,
+        access: Access,
+    ) -> Self {
         let conn = Arc::new(Connection::new(state.config.server_guid, 1 << 20, 1 << 20));
         *conn.dialect.write().await = Some(Dialect::Smb300);
         *conn.signing_algo.write().await = SigningAlgo::AesCmac;
@@ -55,8 +73,7 @@ impl Peer {
             Identity::Anonymous
         };
         let session = Session::new(identity, [0; 16], KEY, false, None);
-        let share = state.find_share("home").await.expect("share");
-        let tree = TreeConnect::new(1, share, Access::ReadWrite);
+        let tree = TreeConnect::new(1, share, access);
         session
             .trees
             .write()

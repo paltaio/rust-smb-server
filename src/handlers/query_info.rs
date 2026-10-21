@@ -109,7 +109,7 @@ pub async fn handle(
 
 /// STATUS_INFO_LENGTH_MISMATCH with the error data of MS-SMB2 3.3.5.20.1:
 /// on SMB 3.1.1 one empty error context, otherwise none.
-fn info_length_mismatch(smb311: bool) -> HandlerResponse {
+pub(super) fn info_length_mismatch(smb311: bool) -> HandlerResponse {
     let mut response = HandlerResponse::err(ntstatus::STATUS_INFO_LENGTH_MISMATCH);
     if smb311 {
         // StructureSize, ErrorContextCount, Reserved, ByteCount, then an

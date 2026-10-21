@@ -27,6 +27,7 @@ mod lock;
 mod logoff;
 pub(crate) mod negotiate;
 mod oplock_break;
+mod pipe;
 mod query_directory;
 mod query_info;
 mod read;
@@ -37,6 +38,8 @@ pub(crate) mod shared;
 mod tree_connect;
 mod tree_disconnect;
 mod write;
+
+pub(crate) use pipe::pipes;
 
 /// What a handler produced: a response, or a request that completes later.
 pub(crate) enum Outcome {
@@ -64,6 +67,9 @@ pub(crate) async fn dispatch_command(
     encrypted: bool,
     retained: usize,
 ) -> Outcome {
+    if let Some(outcome) = pipe::route(server, conn, hdr, body, retained).await {
+        return outcome;
+    }
     let response = match hdr.command {
         Command::Create => return create::handle(server, conn, hdr, body, retained).await,
         Command::SetInfo => return set_info::handle(server, conn, hdr, body, retained).await,

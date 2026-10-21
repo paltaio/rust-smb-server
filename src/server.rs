@@ -46,7 +46,8 @@ pub struct ShareBindings {
     pub name: String,
     pub backend: Arc<dyn ShareBackend>,
     pub acl: RwLock<ShareAcl>,
-    /// `IPC$` synthetic share. Accepted at TREE_CONNECT; opens on it fail.
+    /// `IPC$` synthetic share. Accepted at TREE_CONNECT; its opens are
+    /// named pipes.
     pub is_ipc: bool,
     /// Share.EncryptData: traffic to the share is encrypted.
     pub encrypt_data: bool,
@@ -96,7 +97,7 @@ impl ShareBindings {
         })
     }
 
-    /// Synthetic IPC$ share. Opens on it fail.
+    /// Synthetic IPC$ share, whose opens are named pipes.
     pub fn ipc() -> Arc<Self> {
         Self::new(
             "IPC$".to_string(),
@@ -459,9 +460,9 @@ impl ConfigHandle {
         Ok(())
     }
 
-    /// Set how many files one connection may hold open at once. A CREATE
-    /// past the limit fails with STATUS_INSUFFICIENT_RESOURCES; opens already
-    /// held stay open. The default is
+    /// Set how many files and named pipes one connection may hold open at
+    /// once. A CREATE past the limit fails with STATUS_INSUFFICIENT_RESOURCES;
+    /// opens already held stay open. The default is
     /// [`DEFAULT_MAX_OPENS_PER_CONNECTION`](crate::DEFAULT_MAX_OPENS_PER_CONNECTION).
     pub fn set_max_opens_per_connection(&self, limit: usize) {
         self.state

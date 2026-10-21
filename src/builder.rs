@@ -378,8 +378,9 @@ impl SmbServerBuilder {
         self
     }
 
-    /// Most files one connection may hold open at once. A CREATE past the
-    /// limit fails with STATUS_INSUFFICIENT_RESOURCES. Defaults to
+    /// Most files and named pipes one connection may hold open at once. A
+    /// CREATE past the limit fails with STATUS_INSUFFICIENT_RESOURCES.
+    /// Defaults to
     /// [`DEFAULT_MAX_OPENS_PER_CONNECTION`](crate::DEFAULT_MAX_OPENS_PER_CONNECTION).
     /// [`ConfigHandle::set_max_opens_per_connection`](crate::ConfigHandle::set_max_opens_per_connection)
     /// changes it at run time.

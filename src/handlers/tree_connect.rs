@@ -66,7 +66,7 @@ pub async fn handle(
         return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
     };
 
-    // IPC$: synthetic share. Accepted at TREE_CONNECT; opens on it fail.
+    // IPC$: synthetic share, whose opens are named pipes.
     let is_ipc = share_name.eq_ignore_ascii_case("IPC$");
     let share = if is_ipc {
         crate::server::ShareBindings::ipc()

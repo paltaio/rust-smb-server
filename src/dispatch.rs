@@ -574,14 +574,18 @@ fn created_file_id(response: &[u8]) -> Option<FileId> {
     Some(FileId::new(read_u64(bytes, 0), read_u64(bytes, 8)))
 }
 
-/// Closes the open `file_id` that the CREATE `req_hdr` made.
+/// Closes the open or pipe `file_id` that the CREATE `req_hdr` made.
 async fn discard_open(conn: &Arc<Connection>, req_hdr: &Smb2Header, file_id: FileId) {
     let Ok(tree) = handlers::shared::lookup_session_tree(conn, req_hdr).await else {
         return;
     };
-    let removed = tree.read().await.opens.write().await.remove(&file_id);
+    let tree = tree.read().await;
+    let removed = tree.opens.write().await.remove(&file_id);
     if let Some(open) = removed {
+        drop(tree);
         crate::files::close_open(&open, false).await;
+    } else {
+        handlers::pipes(&tree).remove(&file_id);
     }
 }
 
