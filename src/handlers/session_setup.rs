@@ -274,6 +274,7 @@ fn more_processing(sid: u64, outbound: &[u8]) -> HandlerResponse {
         override_session_id: Some(sid),
         skip_signing: true, // no key yet
         take_preauth_snapshot_for_session: None,
+        after_send: None,
     }
 }
 
@@ -420,6 +421,7 @@ async fn continue_exchange(
         // Anonymous sessions have no key; the dispatcher signs the rest.
         skip_signing: anonymous,
         take_preauth_snapshot_for_session: None,
+        after_send: None,
     };
 
     // Reauthentication keeps the session, its key and its trees

@@ -1,5 +1,7 @@
 //! State of open files shared by every connection, and closing an open.
 
+mod lease;
+mod leases;
 mod table;
 
 use std::sync::Arc;
@@ -12,7 +14,9 @@ use crate::backend::{FileInfo, Handle};
 use crate::conn::state::Open;
 use crate::handlers::shared::restore_fixed_times;
 
-pub(crate) use table::{FileRef, FileTable, Sharing};
+pub(crate) use lease::{Granted, LeaseId, LeaseRequest, LeaseState, LeaseVersion, Trigger};
+pub(crate) use leases::{GrantGuard, LeaseTable};
+pub(crate) use table::{FileRef, FileTable, OpenRequest, Sharing};
 
 /// Default for
 /// [`SmbServerBuilder::max_opens_per_connection`](crate::SmbServerBuilder::max_opens_per_connection)
@@ -135,6 +139,7 @@ mod tests {
             ShareMode::Public,
             HashMap::new(),
             false,
+            true,
         )
     }
 
@@ -157,7 +162,7 @@ mod tests {
             access: DELETE,
             share: 0,
         };
-        let file = FileRef::register(share, &info, &path, sharing).unwrap();
+        let file = FileRef::register(share, &info, &path, sharing.into()).unwrap();
         drop(Open {
             file_id: FileId::default(),
             handle: Some(handle),

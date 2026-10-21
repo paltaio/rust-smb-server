@@ -5,6 +5,7 @@
 pub mod auth;
 pub mod client;
 pub mod crypto;
+pub mod lease;
 pub mod transport;
 
 use std::io;
@@ -132,15 +133,28 @@ pub fn parse_response_header(frame: &[u8]) -> (Smb2Header, &[u8]) {
     (h, rest)
 }
 
+/// ClientGuid of the NEGOTIATE requests the helpers send.
+pub const CLIENT_GUID: [u8; 16] = [0xCD; 16];
+
 /// NEGOTIATE request body.
 pub fn negotiate_body(dialects: &[u16], security_mode: u16, capabilities: u32) -> Vec<u8> {
+    negotiate_body_from(dialects, security_mode, capabilities, CLIENT_GUID)
+}
+
+/// NEGOTIATE request body with `client_guid`.
+pub fn negotiate_body_from(
+    dialects: &[u16],
+    security_mode: u16,
+    capabilities: u32,
+    client_guid: [u8; 16],
+) -> Vec<u8> {
     let req = NegotiateRequest {
         structure_size: 36,
         dialect_count: dialects.len() as u16,
         security_mode,
         reserved: 0,
         capabilities,
-        client_guid: [0xCD; 16],
+        client_guid,
         negotiate_context_offset_or_client_start_time: 0,
         dialects: dialects.to_vec(),
     };
@@ -151,7 +165,16 @@ pub fn negotiate_body(dialects: &[u16], security_mode: u16, capabilities: u32) -
 
 /// NEGOTIATE offering `dialects` (2.x or 3.0 to 3.0.2) with MessageId 0.
 pub async fn negotiate_dialects(s: &mut TcpStream, dialects: &[u16]) -> NegotiateResponse {
-    let body = negotiate_body(dialects, 0x0001, 0);
+    negotiate_dialects_from(s, dialects, CLIENT_GUID).await
+}
+
+/// [`negotiate_dialects`] from the client `client_guid`.
+pub async fn negotiate_dialects_from(
+    s: &mut TcpStream,
+    dialects: &[u16],
+    client_guid: [u8; 16],
+) -> NegotiateResponse {
+    let body = negotiate_body_from(dialects, 0x0001, 0, client_guid);
     let hdr = build_header(Command::Negotiate, 0, 0, 0);
     write_frame(s, &hdr, &body).await;
 

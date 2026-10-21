@@ -1,5 +1,6 @@
 //! SMB2 client and backends for the file and query tests.
 
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
@@ -7,7 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use smb_server::ntstatus::STATUS_SUCCESS;
-use smb_server::wire::header::Command;
+use smb_server::wire::header::{Command, SMB2_FLAGS_RELATED_OPERATIONS};
 use smb_server::wire::messages::{
     CloseRequest, CloseResponse, CreateRequest, CreateResponse, FileId, FileInfoClass,
     FlushRequest, InfoType, LockElement, LockRequest, LogoffRequest, QueryDirectoryRequest,
@@ -19,13 +20,16 @@ use smb_server::{
     LocalFsBackend, OpenAction, OpenOptions, Share, ShareBackend, SmbPath, SmbResult, SmbServer,
     SmbServerBuilder,
 };
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
+use super::lease::is_break;
+use super::transport::compound;
 use super::{
-    anonymous_session_setup, build_header, id_both_entries, negotiate, negotiate_dialects,
-    parse_response_header, read_frame, tree_connect, utf16le, write_frame,
+    CLIENT_GUID, anonymous_session_setup, build_header, id_both_entries, message,
+    negotiate_dialects_from, parse_response_header, read_frame, tree_connect, utf16le, write_frame,
 };
 
 pub const FILE_READ_DATA: u32 = 0x0000_0001;
@@ -145,6 +149,8 @@ pub struct Client {
     pub s: TcpStream,
     pub session_id: u64,
     pub tree_id: u32,
+    /// Lease break notifications that arrived while waiting for a response.
+    pub breaks: VecDeque<Vec<u8>>,
     next_mid: u64,
 }
 
@@ -153,6 +159,7 @@ pub struct Client {
 #[derive(Clone)]
 pub struct Create<'a> {
     pub name: &'a str,
+    pub oplock: u8,
     pub access: u32,
     pub share: u32,
     pub disposition: u32,
@@ -165,6 +172,7 @@ impl Default for Create<'_> {
     fn default() -> Self {
         Self {
             name: "",
+            oplock: 0,
             access: RW,
             share: SHARE_ALL,
             disposition: FILE_OPEN,
@@ -190,7 +198,7 @@ impl Create<'_> {
         let req = CreateRequest {
             structure_size: 57,
             security_flags: 0,
-            requested_oplock_level: 0,
+            requested_oplock_level: self.oplock,
             impersonation_level: 2,
             smb_create_flags: 0,
             reserved: 0,
@@ -214,23 +222,24 @@ impl Create<'_> {
 
 impl Client {
     pub async fn connect(addr: SocketAddr, dialect: Option<u16>) -> Self {
+        Self::connect_with(addr, dialect, CLIENT_GUID, "share").await
+    }
+
+    /// An anonymous client `client_guid` on `share`, negotiated at
+    /// `dialect`, or at SMB 2.1 offering 2.0.2 and 2.1.
+    pub async fn connect_with(
+        addr: SocketAddr,
+        dialect: Option<u16>,
+        client_guid: [u8; 16],
+        share: &str,
+    ) -> Self {
         let mut s = TcpStream::connect(addr).await.expect("connect");
-        match dialect {
-            None => {
-                let _ = negotiate(&mut s).await;
-            }
-            Some(d) => {
-                negotiate_dialects(&mut s, &[d]).await;
-            }
-        }
+        let dialects = dialect.map_or(vec![0x0202, 0x0210], |d| vec![d]);
+        negotiate_dialects_from(&mut s, &dialects, client_guid).await;
         let session_id = anonymous_session_setup(&mut s).await;
-        let tree_id = tree_connect(&mut s, "\\\\127.0.0.1\\share", session_id, 3).await;
-        Self {
-            s,
-            session_id,
-            tree_id,
-            next_mid: 4,
-        }
+        let path = format!("\\\\127.0.0.1\\{share}");
+        let tree_id = tree_connect(&mut s, &path, session_id, 3).await;
+        Self::from_parts(s, session_id, tree_id)
     }
 
     /// A client on a connection that already has a session and a tree.
@@ -239,19 +248,74 @@ impl Client {
             s,
             session_id,
             tree_id,
+            breaks: VecDeque::new(),
             next_mid: 4,
         }
     }
 
-    /// Sends a request on this client's session and tree.
+    /// Sends a request on this client's session and tree. Lease breaks
+    /// that arrive first are kept in [`Client::breaks`].
     pub async fn send(&mut self, command: Command, body: &[u8]) -> Reply {
+        self.send_no_wait(command, body).await;
+        self.recv(command).await
+    }
+
+    /// Sends a request without reading its response.
+    pub async fn send_no_wait(&mut self, command: Command, body: &[u8]) {
         let hdr = build_header(command, self.next_mid, self.session_id, self.tree_id);
         self.next_mid += 1;
         write_frame(&mut self.s, &hdr, body).await;
-        let resp = read_frame(&mut self.s).await;
+    }
+
+    /// Reads the next frame that is not a lease break, keeping breaks in
+    /// [`Client::breaks`].
+    async fn next_response(&mut self) -> Vec<u8> {
+        loop {
+            let frame = read_frame(&mut self.s).await;
+            if !is_break(&frame) {
+                return frame;
+            }
+            self.breaks.push_back(frame);
+        }
+    }
+
+    /// Reads the response to a `command` request.
+    pub async fn recv(&mut self, command: Command) -> Reply {
+        let resp = self.next_response().await;
         let (rh, rb) = parse_response_header(&resp);
         assert_eq!(rh.command, command);
         (rh.channel_sequence_status, rb.to_vec())
+    }
+
+    /// Sends `requests` as one compound frame, each marked related when
+    /// its flag is set, and returns the status and body of each response.
+    pub async fn send_compound(&mut self, requests: &[(Command, Vec<u8>, bool)]) -> Vec<Reply> {
+        let messages: Vec<Vec<u8>> = requests
+            .iter()
+            .map(|(command, body, related)| {
+                let mut hdr = build_header(*command, self.next_mid, self.session_id, self.tree_id);
+                self.next_mid += 1;
+                if *related {
+                    hdr.flags |= SMB2_FLAGS_RELATED_OPERATIONS;
+                }
+                message(&hdr, body)
+            })
+            .collect();
+        self.s.write_all(&compound(&messages)).await.expect("write");
+        let frame = self.next_response().await;
+        let mut replies = Vec::new();
+        let mut rest = &frame[..];
+        for (command, _, _) in requests {
+            let (rh, _) = parse_response_header(rest);
+            assert_eq!(rh.command, *command);
+            let len = match rh.next_command as usize {
+                0 => rest.len(),
+                next => next,
+            };
+            replies.push((rh.channel_sequence_status, rest[64..len].to_vec()));
+            rest = &rest[len..];
+        }
+        replies
     }
 
     /// CREATE; returns the status and the raw response body.
@@ -639,6 +703,10 @@ pub struct Counters {
     pub open_gate: Option<Semaphore>,
     /// When set, every read waits for a permit.
     pub read_gate: Option<Semaphore>,
+    /// Writes that have reached the backend.
+    pub writes: AtomicUsize,
+    /// When set, every write waits for a permit.
+    pub write_gate: Option<Semaphore>,
 }
 
 impl Counters {
@@ -711,6 +779,10 @@ impl Handle for ProbeHandle {
     }
 
     async fn write(&self, offset: u64, data: &[u8]) -> SmbResult<u32> {
+        self.counters.writes.fetch_add(1, Ordering::SeqCst);
+        if let Some(gate) = &self.counters.write_gate {
+            gate.acquire().await.expect("gate").forget();
+        }
         self.inner.write(offset, data).await
     }
 

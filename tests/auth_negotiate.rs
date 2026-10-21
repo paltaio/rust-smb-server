@@ -52,7 +52,7 @@ async fn large_mtu_is_offered_only_with_multi_credit_dialects() {
     assert_eq!(status(&frame), 0);
     assert_eq!(parse(&frame).capabilities, 0);
     let frame = negotiate_frame(&negotiate_body(&[0x0202, 0x0210], 1, 0)).await;
-    assert_eq!(parse(&frame).capabilities, 0x0000_0004);
+    assert_eq!(parse(&frame).capabilities, 0x0000_0006);
 }
 
 #[tokio::test]

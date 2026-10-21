@@ -180,6 +180,16 @@ pub mod fuzzing {
         let _ = ntlm::NtlmAuthenticate::parse(data);
     }
 
+    /// Parses `data` as the data of a lease create context.
+    pub fn lease_context(data: &[u8]) {
+        let _ = crate::proto::messages::LeaseContext::parse(data);
+    }
+
+    /// Parses `data` as a lease break acknowledgment.
+    pub fn lease_ack(data: &[u8]) {
+        let _ = crate::proto::messages::LeaseBreakAck::parse(data);
+    }
+
     /// Dispatches one frame payload on a fresh connection to `server`.
     pub async fn dispatch(server: &crate::SmbServer, frame: &[u8]) -> Option<Vec<u8>> {
         let state = server.state();
@@ -188,6 +198,8 @@ pub mod fuzzing {
             state.config.max_read_size,
             state.config.max_write_size,
         ));
-        crate::dispatch::dispatch_frame(&state, &conn, frame).await
+        crate::dispatch::dispatch_frame(&state, &conn, frame)
+            .await
+            .map(|out| out.bytes)
     }
 }

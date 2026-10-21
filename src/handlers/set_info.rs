@@ -11,6 +11,7 @@ use crate::backend::{
 };
 use crate::conn::state::{Connection, Open};
 use crate::dispatch::HandlerResponse;
+use crate::files::Trigger;
 use crate::handlers::shared::{lookup_open, lookup_session_tree, restore_fixed_times};
 use crate::info_class as ic;
 use crate::ntstatus;
@@ -243,13 +244,25 @@ async fn truncate(open: &Open, size: u64, allocation: bool) -> Result<(), u32> {
         return Err(ntstatus::STATUS_INVALID_PARAMETER);
     }
     let handle = open.handle.as_ref().ok_or(ntstatus::STATUS_FILE_CLOSED)?;
+    // MS-FSA 2.1.5.15.1, 2.1.5.15.5: the leases on the file, all but the
+    // one this open holds, break even when the size stays. They break again
+    // once the size has changed, so a lease granted meanwhile does not keep
+    // the old contents cached.
+    let break_leases = || {
+        if let Some(file) = open.file.as_ref() {
+            file.break_leases(Trigger::Write);
+        }
+    };
+    break_leases();
     if allocation {
         let info = handle.stat().await.map_err(|e| e.to_nt_status())?;
         if size >= info.end_of_file {
             return Ok(());
         }
     }
-    handle.truncate(size).await.map_err(|e| e.to_nt_status())?;
+    let result = handle.truncate(size).await;
+    break_leases();
+    result.map_err(|e| e.to_nt_status())?;
     restore_fixed_times(open).await;
     Ok(())
 }
@@ -393,7 +406,7 @@ mod tests {
                 access: DELETE,
                 share: 7,
             };
-            let file = FileRef::register(&share, &info, &path, sharing).unwrap();
+            let file = FileRef::register(&share, &info, &path, sharing.into()).unwrap();
             let file_id = tree.alloc_file_id();
             let open = Open {
                 file_id,

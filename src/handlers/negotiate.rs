@@ -23,6 +23,7 @@ use crate::utils::{fill_random, now_filetime};
 const SIGNING_ENABLED: u16 = 0x0001;
 const SIGNING_REQUIRED: u16 = 0x0002;
 
+const CAP_LEASING: u32 = 0x0000_0002;
 const CAP_LARGE_MTU: u32 = 0x0000_0004;
 const CAP_ENCRYPTION: u32 = 0x0000_0040;
 
@@ -55,13 +56,14 @@ pub(crate) fn server_security_mode(server: &ServerState) -> u16 {
 }
 
 /// Capabilities the server sends for `dialect` to a client that sent
-/// `client_capabilities` (Connection.ServerCapabilities). LARGE_MTU needs
-/// multi-credit support, which SMB 2.0.2 lacks. ENCRYPTION goes to SMB 3.0
-/// and 3.0.2 clients that have it; 3.1.1 negotiates a cipher instead.
+/// `client_capabilities` (Connection.ServerCapabilities). LEASING is not
+/// defined for SMB 2.0.2, and LARGE_MTU needs multi-credit support, which
+/// SMB 2.0.2 lacks. ENCRYPTION goes to SMB 3.0 and 3.0.2 clients that have
+/// it; 3.1.1 negotiates a cipher instead.
 pub(crate) fn server_capabilities(dialect: Dialect, client_capabilities: u32) -> u32 {
     let mut caps = match dialect {
         Dialect::Smb202 => 0,
-        _ => CAP_LARGE_MTU,
+        _ => CAP_LEASING | CAP_LARGE_MTU,
     };
     if matches!(dialect, Dialect::Smb300 | Dialect::Smb302)
         && client_capabilities & CAP_ENCRYPTION != 0
@@ -373,7 +375,12 @@ pub async fn multi_protocol_response(
         dialect_revision: chosen,
         negotiate_context_count_or_reserved: 0,
         server_guid: *server.config.server_guid.as_bytes(),
-        capabilities: 0,
+        // MS-SMB2 3.3.5.3.1: the "SMB 2.???" reply advertises leasing.
+        capabilities: if chosen == Dialect::Smb2Wildcard.as_u16() {
+            CAP_LEASING
+        } else {
+            0
+        },
         max_transact_size,
         max_read_size,
         max_write_size,

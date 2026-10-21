@@ -18,6 +18,7 @@ use crate::conn::credits::{CreditWindow, charge_covers};
 use crate::conn::limits::supports_multi_credit;
 use crate::conn::related::{RelatedContext, needs_session, needs_tree};
 use crate::conn::state::{Connection, Session};
+use crate::files::GrantGuard;
 use crate::handlers;
 use crate::ntstatus;
 use crate::server::ServerState;
@@ -45,6 +46,8 @@ pub struct HandlerResponse {
     /// SESSION_SETUP on the round that produces STATUS_SUCCESS, so the
     /// session's KDF context can use the snapshot.
     pub take_preauth_snapshot_for_session: Option<u64>,
+    /// Lease breaks held back until this response is queued.
+    pub(crate) after_send: Option<GrantGuard>,
 }
 
 impl HandlerResponse {
@@ -56,6 +59,7 @@ impl HandlerResponse {
             override_session_id: None,
             skip_signing: false,
             take_preauth_snapshot_for_session: None,
+            after_send: None,
         }
     }
 
@@ -70,6 +74,7 @@ impl HandlerResponse {
             override_session_id: None,
             skip_signing: false,
             take_preauth_snapshot_for_session: None,
+            after_send: None,
         }
     }
 }
@@ -82,15 +87,33 @@ struct Reply {
     /// The session the response is encrypted for and its keys, when it
     /// must be encrypted.
     cipher: Option<(u64, Arc<SessionCipher>)>,
+    after_send: Option<GrantGuard>,
 }
 
-/// Top-level frame dispatch. Returns the bytes to push into the writer
+/// The frame answering a request frame.
+pub(crate) struct Outgoing {
+    pub bytes: Vec<u8>,
+    /// Dropped once `bytes` is queued, which sends the lease breaks held
+    /// back until then.
+    pub after_send: Vec<GrantGuard>,
+}
+
+impl Outgoing {
+    fn plain(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes,
+            after_send: Vec::new(),
+        }
+    }
+}
+
+/// Top-level frame dispatch. Returns the frame to push into the writer
 /// channel, or `None` if the request elicits no response (CANCEL).
-pub async fn dispatch_frame(
+pub(crate) async fn dispatch_frame(
     server: &Arc<ServerState>,
     conn: &Arc<Connection>,
     frame: &[u8],
-) -> Option<Vec<u8>> {
+) -> Option<Outgoing> {
     // SMB1 multi-protocol bootstrap (MS-SMB2 §3.3.5.3.1). The only SMB1 we
     // accept: a NEGOTIATE_REQUEST listing "SMB 2.???" or "SMB 2.002", as the
     // first request on the connection (3.3.5.3).
@@ -106,7 +129,7 @@ pub async fn dispatch_frame(
             warn!("SMB1 NEGOTIATE without an SMB2 dialect; closing connection");
             conn.request_disconnect();
         }
-        return reply;
+        return reply.map(Outgoing::plain);
     }
     let decrypted;
     let (frame, transform) = if is_transform(frame) {
@@ -189,6 +212,7 @@ pub async fn dispatch_frame(
                     bytes,
                     signing_key,
                     cipher: cipher.map(|c| (req_hdr.session_id, c)),
+                    after_send: None,
                 })
             }
             None => {
@@ -230,12 +254,22 @@ pub async fn dispatch_frame(
     // with; otherwise the frame is encrypted when one of its responses must
     // be (MS-SMB2 3.3.4.1.4).
     let cipher = transform.or_else(|| responses.iter().find_map(|r| r.cipher.clone()));
+    let after_send = responses
+        .iter_mut()
+        .filter_map(|r| r.after_send.take())
+        .collect();
     let out = stitch_responses(conn, responses).await;
     let Some((session_id, cipher)) = cipher else {
-        return Some(out);
+        return Some(Outgoing {
+            bytes: out,
+            after_send,
+        });
     };
     match cipher.encrypt(session_id, &out) {
-        Ok(encrypted) => Some(encrypted),
+        Ok(encrypted) => Some(Outgoing {
+            bytes: encrypted,
+            after_send,
+        }),
         Err(e) => {
             error!(error = %e, "cannot encrypt response; closing connection");
             conn.request_disconnect();
@@ -399,6 +433,7 @@ async fn dispatch_one(
         let cipher = response_cipher(&req_hdr, encrypted, request_session.as_ref()).await;
         let reply = async |mut resp: HandlerResponse| {
             resp.skip_signing |= cipher.is_some() || encrypted;
+            let after_send = resp.after_send.take();
             let granted = grant_credits(conn, &req_hdr);
             let (bytes, signing_key) =
                 build_response_bytes(conn, &req_hdr, resp, request_session.as_ref(), granted).await;
@@ -406,6 +441,7 @@ async fn dispatch_one(
                 bytes,
                 signing_key,
                 cipher: cipher.clone().map(|c| (req_hdr.session_id, c)),
+                after_send,
             }
         };
 
@@ -1056,7 +1092,8 @@ mod tests {
         let (state, conn) = signed_session().await;
         let frame = dispatch_frame(&state, &conn, &create_query_close())
             .await
-            .expect("response");
+            .expect("response")
+            .bytes;
         let statuses: Vec<u32> = split_responses(&frame).iter().map(|r| r.0).collect();
         assert_eq!(statuses, [ntstatus::STATUS_SUCCESS; 3]);
     }
@@ -1066,7 +1103,8 @@ mod tests {
         let (state, conn) = signed_session().await;
         let frame = dispatch_frame(&state, &conn, &create_query_close())
             .await
-            .expect("response");
+            .expect("response")
+            .bytes;
         for (index, (_, response)) in split_responses(&frame).into_iter().enumerate() {
             assert_ne!(read_u32(response, 0x10) & SMB2_FLAGS_SIGNED, 0);
             assert!(
@@ -1086,7 +1124,8 @@ mod tests {
         let request = signed_compound(&[(Command::Logoff, body)]);
         let response = dispatch_frame(&state, &conn, &request)
             .await
-            .expect("response");
+            .expect("response")
+            .bytes;
         assert_eq!(read_u32(&response, 0x08), ntstatus::STATUS_SUCCESS);
         assert_ne!(read_u32(&response, 0x10) & SMB2_FLAGS_SIGNED, 0);
         assert!(verify(&response, &KEY, SigningAlgo::AesCmac).is_ok());

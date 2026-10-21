@@ -58,3 +58,17 @@ path = "fuzz_targets/dispatch.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "lease_context"
+path = "fuzz_targets/lease_context.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "lease_ack"
+path = "fuzz_targets/lease_ack.rs"
+test = false
+doc = false
+bench = false

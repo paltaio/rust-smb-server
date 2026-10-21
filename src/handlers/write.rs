@@ -8,6 +8,7 @@ use crate::proto::messages::{Dialect, WriteRequest, WriteResponse};
 use crate::access_mask::{FILE_APPEND_DATA, FILE_WRITE_DATA};
 use crate::conn::state::Connection;
 use crate::dispatch::HandlerResponse;
+use crate::files::Trigger;
 use crate::handlers::create::{FILE_NO_INTERMEDIATE_BUFFERING, WRITE_THROUGH_OPTIONS};
 use crate::handlers::shared::{
     channel_is_valid, lookup_open, lookup_session_tree, restore_fixed_times,
@@ -96,13 +97,19 @@ pub async fn handle(
             .expect("encoding into a Vec cannot fail");
         return HandlerResponse::ok(buf);
     }
-    if let Some(file) = open.file.as_ref()
-        && let Err(status) = file.check_io(req.offset, length, true)
-    {
-        return HandlerResponse::err(status);
+    if let Some(file) = open.file.as_ref() {
+        if let Err(status) = file.check_io(req.offset, length, true) {
+            return HandlerResponse::err(status);
+        }
+        file.break_leases(Trigger::Write);
     }
 
     let mut result = handle.write_owned(req.offset, req.data).await;
+    // A lease granted while the data was being written breaks now, so it
+    // does not keep the old contents cached.
+    if let Some(file) = open.file.as_ref() {
+        file.break_leases(Trigger::Write);
+    }
     if result.is_ok() && write_through {
         result = handle.flush().await.and(result);
     }

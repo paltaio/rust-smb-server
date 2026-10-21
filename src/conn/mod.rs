@@ -4,6 +4,7 @@ pub mod chain;
 pub mod credits;
 pub mod limits;
 pub mod listener;
+pub mod outbound;
 pub mod reader;
 pub mod related;
 pub mod state;
@@ -36,6 +37,7 @@ pub async fn connection_loop(
     let conn = Arc::new(conn);
     let conn_id = server.active_connections.register(&conn).await;
     let (tx, rx) = writer::response_queue();
+    conn.outbound.attach(tx.clone());
 
     let writer_handle = tokio::spawn(writer::writer_task(
         write_half,
@@ -46,7 +48,9 @@ pub async fn connection_loop(
     info!("connection accepted");
     let reader_result = reader::reader_task(read_half, server.clone(), conn.clone(), tx).await;
     debug!(?reader_result, "reader exited");
-    // Wait for writer to drain.
+    // Wait for writer to drain. Messages for this connection raised from
+    // now on are not sent.
+    conn.outbound.close();
     let _ = writer_handle.await;
     conn.close_all().await;
     server.active_connections.unregister(conn_id).await;

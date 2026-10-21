@@ -1,20 +1,27 @@
 //! Opens of each file on a share, across every connection, keyed by file
 //! identity. This holds the state MS-FSA keeps per file rather than per
-//! open: sharing modes (2.1.5.1.2.2), the delete-pending flag (2.1.5.15.3)
-//! and byte-range locks (2.1.5.8).
+//! open: sharing modes (2.1.5.1.2.2), the delete-pending flag (2.1.5.15.3),
+//! byte-range locks (2.1.5.8) and leases (MS-SMB2 3.3.1.4).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use tracing::{debug, warn};
 
 use crate::access_mask::{DELETE, FILE_APPEND_DATA, FILE_EXECUTE, FILE_READ_DATA, FILE_WRITE_DATA};
 use crate::backend::FileInfo;
+use crate::conn::outbound::Outbound;
 use crate::error::SmbError;
 use crate::ntstatus;
 use crate::path::{SmbPath, rebase, same_path};
 use crate::server::ShareBindings;
+
+use super::lease::{
+    FileLease, FileView, Granted, LeaseId, LeaseRequest, LeaseState, OpenView, Trigger, break_to,
+    grant, stat_only,
+};
+use super::leases::{GrantGuard, LeaseRef, Notices, break_notification};
 
 // ShareAccess (MS-SMB2 2.2.13)
 pub(crate) const FILE_SHARE_READ: u32 = 0x0000_0001;
@@ -55,7 +62,7 @@ fn path_key(path: &SmbPath, case_sensitive: bool) -> String {
 }
 
 /// Access and sharing mode of an open, as CREATE requested them.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct Sharing {
     /// Open.GrantedAccess.
     pub access: u32,
@@ -77,6 +84,9 @@ impl Sharing {
     }
 }
 
+/// Source of [`FileLease::serial`].
+static NEXT_LEASE_SERIAL: AtomicU64 = AtomicU64::new(1);
+
 /// Every file on one share that has an open.
 #[derive(Default)]
 pub(crate) struct FileTable {
@@ -85,7 +95,7 @@ pub(crate) struct FileTable {
     renames: tokio::sync::Mutex<()>,
 }
 
-struct FileNode {
+pub(super) struct FileNode {
     state: Mutex<FileState>,
 }
 
@@ -96,12 +106,41 @@ struct FileState {
     /// delete-pending.
     delete_pending: Option<SmbPath>,
     locks: Vec<RangeLock>,
+    /// Leases held by the opens, one per LeaseId.
+    leases: Vec<FileLease>,
 }
 
 struct OpenEntry {
     id: u64,
     sharing: Sharing,
     path: SmbPath,
+    /// The lease the open holds.
+    lease: Option<LeaseId>,
+    /// The connection the open belongs to, where breaks of its lease go.
+    owner: Weak<Outbound>,
+}
+
+/// A new open, as [`FileRef::register`] enters it.
+#[derive(Default)]
+pub(crate) struct OpenRequest {
+    pub sharing: Sharing,
+    /// The connection the open belongs to.
+    pub owner: Weak<Outbound>,
+    /// The lease the CREATE asks for. Its own lease is not broken by the
+    /// open (MS-FSA 2.1.4.12.2).
+    pub lease: Option<LeaseId>,
+    /// The CREATE supersedes or overwrites the file.
+    pub overwrite: bool,
+}
+
+#[cfg(test)]
+impl From<Sharing> for OpenRequest {
+    fn from(sharing: Sharing) -> Self {
+        Self {
+            sharing,
+            ..Self::default()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -120,6 +159,53 @@ impl FileNode {
     fn state(&self) -> MutexGuard<'_, FileState> {
         lock(&self.state)
     }
+
+    /// Whether the lease `id` is held on this file.
+    pub(super) fn has_lease(&self, id: LeaseId) -> bool {
+        self.state().leases.iter().any(|l| l.id == id)
+    }
+
+    /// The names of the opens holding the lease `id`, or `None` when the
+    /// lease is not held on this file.
+    pub(super) fn lease_paths(&self, id: LeaseId) -> Option<Vec<SmbPath>> {
+        let state = self.state();
+        state.leases.iter().any(|l| l.id == id).then(|| {
+            state
+                .opens
+                .iter()
+                .filter(|e| e.lease == Some(id))
+                .map(|e| e.path.clone())
+                .collect()
+        })
+    }
+
+    /// Ends one CREATE response's hold on the lease `id` created as
+    /// `serial`, and returns the break notification held back for it once
+    /// no response is pending. The notification goes first to `sender`,
+    /// whose response was just queued, so it follows that response on the
+    /// same connection. A hold on a lease that has since ended does nothing.
+    pub(super) fn end_grant(&self, id: LeaseId, serial: u64, sender: &Weak<Outbound>) -> Notices {
+        let mut state = self.state();
+        let mut notices = Notices::default();
+        let Some(lease) = state
+            .leases
+            .iter_mut()
+            .find(|l| l.id == id && l.serial == serial)
+        else {
+            return notices;
+        };
+        lease.grants_in_flight -= 1;
+        if lease.grants_in_flight == 0
+            && let Some(bytes) = lease.unsent.take()
+        {
+            let mut owners = state.owners(id);
+            if let Some(at) = owners.iter().position(|o| o.ptr_eq(sender)) {
+                owners[..=at].rotate_right(1);
+            }
+            notices.push(bytes, owners);
+        }
+        notices
+    }
 }
 
 impl FileState {
@@ -137,6 +223,48 @@ impl FileState {
 
     fn entry(&self, id: u64) -> Option<&OpenEntry> {
         self.opens.iter().find(|e| e.id == id)
+    }
+
+    /// The connections of the opens holding the lease `id`, each once, in
+    /// open order: where a break of the lease may go (MS-SMB2 3.3.4.7).
+    fn owners(&self, id: LeaseId) -> Vec<Weak<Outbound>> {
+        let mut owners: Vec<Weak<Outbound>> = Vec::new();
+        for entry in self.opens.iter().filter(|e| e.lease == Some(id)) {
+            if !owners.iter().any(|o| o.ptr_eq(&entry.owner)) {
+                owners.push(entry.owner.clone());
+            }
+        }
+        owners
+    }
+
+    /// Breaks every lease but `exempt` that `trigger` conflicts with
+    /// (MS-FSA 2.1.4.12, MS-SMB2 3.3.4.7) and returns the notifications to
+    /// send once the file is unlocked. Only read leases are granted, and
+    /// breaking one needs no acknowledgment, so the new state applies at
+    /// once. A notification for a lease whose grant is not yet sent waits
+    /// for it.
+    fn break_for(&mut self, trigger: Trigger, exempt: Option<LeaseId>) -> Notices {
+        let mut notices = Notices::default();
+        for at in 0..self.leases.len() {
+            let lease = &mut self.leases[at];
+            if Some(lease.id) == exempt {
+                continue;
+            }
+            let Some(to) = break_to(trigger, lease.state) else {
+                continue;
+            };
+            let from = lease.state;
+            lease.set_state(to);
+            debug!(key = ?lease.id.key, ?from, ?to, "lease broken");
+            let bytes = break_notification(lease, from);
+            if lease.grants_in_flight > 0 {
+                lease.unsent = Some(bytes);
+            } else {
+                let id = lease.id;
+                notices.push(bytes, self.owners(id));
+            }
+        }
+        notices
     }
 
     /// MS-FSA 2.1.4.10: whether the range conflicts with a lock. `exclusive`
@@ -263,19 +391,23 @@ pub(crate) struct FileRef {
     share: Arc<ShareBindings>,
     node: Arc<FileNode>,
     id: u64,
+    /// The binding of this open's lease, released after the entry leaves
+    /// the table.
+    lease: Option<LeaseRef>,
     released: bool,
 }
 
 impl FileRef {
-    /// Adds an open with `sharing` of the file `info` describes, reached
+    /// Adds the open `req` describes of the file `info` describes, reached
     /// through `path`. Fails with STATUS_DELETE_PENDING or
     /// STATUS_SHARING_VIOLATION when the opens already on the file do not
-    /// allow it.
+    /// allow it. An open that is not attribute-only breaks the leases it
+    /// conflicts with.
     pub(crate) fn register(
         share: &Arc<ShareBindings>,
         info: &FileInfo,
         path: &SmbPath,
-        sharing: Sharing,
+        req: OpenRequest,
     ) -> Result<Self, u32> {
         let case_sensitive = share.backend.capabilities().case_sensitive;
         let key = FileKey::new(info.file_index, path, case_sensitive);
@@ -290,25 +422,129 @@ impl FileRef {
                         opens: Vec::new(),
                         delete_pending: None,
                         locks: Vec::new(),
+                        leases: Vec::new(),
                     }),
                 })
             })
             .clone();
         let mut state = node.state();
-        state.admit(sharing)?;
+        state.admit(req.sharing)?;
         let id = table.next_open.fetch_add(1, Ordering::Relaxed);
         state.opens.push(OpenEntry {
             id,
-            sharing,
+            sharing: req.sharing,
             path: path.clone(),
+            lease: None,
+            owner: req.owner,
         });
+        let notices = if stat_only(req.sharing.access) {
+            Notices::default()
+        } else {
+            let trigger = Trigger::Open {
+                overwrite: req.overwrite,
+            };
+            state.break_for(trigger, req.lease)
+        };
         drop(state);
+        drop(files);
+        drop(notices);
         Ok(Self {
             share: Arc::clone(share),
             node,
             id,
+            lease: None,
             released: false,
         })
+    }
+
+    /// Whether this open's file is `node`.
+    pub(super) fn is_on(&self, node: &Arc<FileNode>) -> bool {
+        Arc::ptr_eq(&self.node, node)
+    }
+
+    pub(super) fn node(&self) -> &Arc<FileNode> {
+        &self.node
+    }
+
+    pub(super) fn share(&self) -> &Arc<ShareBindings> {
+        &self.share
+    }
+
+    /// Makes this open a holder of the lease `req` asks for and grants it
+    /// the best state within `grantable` that the file allows (MS-SMB2
+    /// 3.3.5.9.8, 3.3.5.9.11). Lease breaks held back until the CREATE
+    /// response is queued wait for the returned guard.
+    pub(super) fn grant_lease(
+        &self,
+        req: &LeaseRequest,
+        grantable: LeaseState,
+    ) -> (Granted, GrantGuard) {
+        let mut state = self.node.state();
+        let mut sender = Weak::new();
+        if let Some(entry) = state.opens.iter_mut().find(|e| e.id == self.id) {
+            entry.lease = Some(req.id);
+            sender = entry.owner.clone();
+        }
+        let opens: Vec<OpenView> = state
+            .opens
+            .iter()
+            .map(|e| OpenView {
+                lease: e.lease,
+                stat_only: stat_only(e.sharing.access),
+            })
+            .collect();
+        let leases: Vec<(LeaseId, LeaseState)> =
+            state.leases.iter().map(|l| (l.id, l.state)).collect();
+        let file = FileView {
+            opens: &opens,
+            leases: &leases,
+            has_locks: !state.locks.is_empty(),
+        };
+        let existing = state.leases.iter().position(|l| l.id == req.id);
+        let current = existing.map(|at| state.leases[at].state);
+        let granted = grant(req.id, req.state, current, &file, grantable);
+        let lease = match existing {
+            Some(at) => {
+                let lease = &mut state.leases[at];
+                lease.set_state(granted);
+                lease
+            }
+            None => {
+                let serial = NEXT_LEASE_SERIAL.fetch_add(1, Ordering::Relaxed);
+                state.leases.push(FileLease::new(req, granted, serial));
+                state.leases.last_mut().expect("just pushed")
+            }
+        };
+        lease.grants_in_flight += 1;
+        debug!(key = ?req.id.key, state = ?lease.state, "lease granted");
+        let serial = lease.serial;
+        let snapshot = Granted {
+            id: lease.id,
+            state: lease.state,
+            epoch: lease.epoch,
+            version: lease.version,
+            parent: lease.parent,
+        };
+        drop(state);
+        let guard = GrantGuard::new(Arc::clone(&self.node), req.id, serial, sender);
+        (snapshot, guard)
+    }
+
+    /// Keeps the lease binding for as long as this open lasts.
+    pub(super) fn keep_lease(&mut self, lease: LeaseRef) {
+        self.lease = Some(lease);
+    }
+
+    /// Breaks the leases on the file that `trigger` through this open
+    /// conflicts with: every lease but the one this open holds, whichever
+    /// client holds it.
+    pub(crate) fn break_leases(&self, trigger: Trigger) {
+        let notices = {
+            let mut state = self.node.state();
+            let exempt = state.entry(self.id).and_then(|e| e.lease);
+            state.break_for(trigger, exempt)
+        };
+        drop(notices);
     }
 
     /// The open's current name.
@@ -372,6 +608,13 @@ impl FileRef {
             length,
             exclusive,
         });
+        // MS-FSA 2.1.5.8: a lock breaks the leases on the file, all but the
+        // one this open holds, wherever the range lies. Under the same lock
+        // no lease can be granted between the two.
+        let exempt = state.entry(self.id).and_then(|e| e.lease);
+        let notices = state.break_for(Trigger::Write, exempt);
+        drop(state);
+        drop(notices);
         Ok(())
     }
 
@@ -445,6 +688,13 @@ impl FileRef {
             .position(|e| e.id == self.id)
             .map(|at| state.opens.remove(at));
         state.locks.retain(|l| l.owner != self.id);
+        // MS-SMB2 3.3.4.17: a lease ends with its last open, without a
+        // notification.
+        if let Some(id) = entry.as_ref().and_then(|e| e.lease)
+            && !state.opens.iter().any(|e| e.lease == Some(id))
+        {
+            state.leases.retain(|l| l.id != id);
+        }
         if delete_on_close && let Some(entry) = entry {
             state.delete_pending = Some(entry.path);
         }
@@ -540,6 +790,7 @@ mod tests {
             ShareMode::Public,
             HashMap::new(),
             false,
+            true,
         )
     }
 
@@ -566,7 +817,8 @@ mod tests {
             Sharing {
                 access,
                 share: share_access,
-            },
+            }
+            .into(),
         )
     }
 
@@ -768,7 +1020,8 @@ mod tests {
             Sharing {
                 access: FILE_WRITE_DATA,
                 share: 0,
-            },
+            }
+            .into(),
         )
         .unwrap();
         s.files.rename_paths(&p("d"), &p("e"), false);
@@ -781,7 +1034,8 @@ mod tests {
             Sharing {
                 access: FILE_READ_DATA,
                 share: ALL,
-            },
+            }
+            .into(),
         );
         assert_eq!(conflict.err(), Some(ntstatus::STATUS_SHARING_VIOLATION));
         a.set_delete_pending(true);

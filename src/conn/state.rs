@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 use crate::backend::{FileTimes, Handle};
 use crate::builder::Access;
+use crate::conn::outbound::Outbound;
 use crate::files::{FileRef, OpenSlot, close_opens, finish_close};
 use crate::path::SmbPath;
 use crate::server::ShareBindings;
@@ -80,6 +81,9 @@ pub struct Connection {
 
     /// The client's address, set when the connection is accepted.
     pub peer_addr: Option<std::net::SocketAddr>,
+
+    /// Where lease breaks for this connection's opens are sent.
+    pub(crate) outbound: Arc<Outbound>,
 }
 
 impl Connection {
@@ -103,6 +107,7 @@ impl Connection {
             logon_failures: AtomicU32::new(0),
             open_count: Arc::default(),
             peer_addr: None,
+            outbound: Arc::default(),
         }
     }
 

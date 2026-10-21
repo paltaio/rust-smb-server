@@ -16,6 +16,7 @@ pub mod echo;
 pub mod error_response;
 pub mod flush;
 pub mod ioctl;
+pub mod lease;
 pub mod lock;
 pub mod logoff;
 pub mod negotiate;
@@ -39,6 +40,7 @@ pub use echo::{EchoRequest, EchoResponse};
 pub use error_response::{ErrorContext, ErrorResponse};
 pub use flush::{FlushRequest, FlushResponse};
 pub use ioctl::{Fsctl, IoctlRequest, IoctlResponse};
+pub use lease::{LeaseBreakAck, LeaseBreakNotification, LeaseContext};
 pub use lock::{LockElement, LockRequest, LockResponse};
 pub use logoff::{LogoffRequest, LogoffResponse};
 pub use negotiate::{

@@ -49,6 +49,7 @@ pub struct Share {
     pub(crate) mode: ShareMode,
     pub(crate) users: HashMap<String, Access>,
     pub(crate) encrypt_data: bool,
+    pub(crate) leases: bool,
 }
 
 impl Share {
@@ -60,6 +61,7 @@ impl Share {
             mode: ShareMode::AuthenticatedOnly,
             users: HashMap::new(),
             encrypt_data: false,
+            leases: true,
         }
     }
 
@@ -88,6 +90,20 @@ impl Share {
     /// turned off.
     pub fn encrypt_data(mut self) -> Self {
         self.encrypt_data = true;
+        self
+    }
+
+    /// Grant read leases on this share's files. A client holding one caches
+    /// what it reads, and the server tells it to drop the cache before a
+    /// write, a size change, a byte-range lock or an overwriting open made
+    /// on the share through an open that does not hold that lease. On by
+    /// default.
+    ///
+    /// Changes made outside the server, or through another share over the
+    /// same directory, break no lease: clients keep serving the old data.
+    /// Turn leases off for such a share.
+    pub fn leases(mut self, enabled: bool) -> Self {
+        self.leases = enabled;
         self
     }
 }

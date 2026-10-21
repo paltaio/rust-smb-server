@@ -104,6 +104,10 @@ pub async fn reader_task(
                 debug!("writer closed; reader exiting");
                 return Ok(());
             }
+            _ = conn.outbound.killed() => {
+                info!("client stopped reading lease breaks; closing connection");
+                return Ok(());
+            }
             _ = tokio::time::sleep_until(deadline) => {
                 if !has_session {
                     info!("no session established in time; closing connection");
@@ -146,11 +150,13 @@ pub async fn reader_task(
             debug!("closing connection without a reply");
             return Ok(());
         }
-        if let Some(bytes) = response
-            && tx.send(bytes).await.is_err()
-        {
-            debug!("writer channel closed; reader exiting");
-            return Ok(());
+        if let Some(out) = response {
+            if tx.send(out.bytes).await.is_err() {
+                debug!("writer channel closed; reader exiting");
+                return Ok(());
+            }
+            // Lease breaks held back for these responses follow them.
+            drop(out.after_send);
         }
         has_session = has_session || !conn.sessions.read().await.is_empty();
         if has_session {

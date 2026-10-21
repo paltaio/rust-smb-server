@@ -4,8 +4,11 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use crate::proto::header::Smb2Header;
-use crate::proto::messages::{CreateContext, CreateRequest, CreateResponse};
+use crate::proto::messages::{
+    CreateContext, CreateRequest, CreateResponse, Dialect, LeaseContext, OplockLevel,
+};
 use tracing::{debug, warn};
+use uuid::Uuid;
 
 use crate::access_mask::{
     DELETE, FILE_APPEND_DATA, FILE_READ_DATA, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA,
@@ -18,7 +21,10 @@ use crate::backend::{
 use crate::conn::state::{Connection, Open};
 use crate::dispatch::HandlerResponse;
 use crate::error::SmbError;
-use crate::files::{FileRef, OpenSlot, Sharing};
+use crate::files::{
+    FileRef, Granted, LeaseId, LeaseRequest, LeaseState, LeaseVersion, OpenRequest, OpenSlot,
+    Sharing, Trigger,
+};
 use crate::handlers::shared::lookup_session_tree;
 use crate::info_class::VOLUME_SERIAL_NUMBER;
 use crate::ntstatus;
@@ -83,6 +89,9 @@ const FILE_OVERWRITTEN: u32 = 0x0000_0003;
 /// header: 64 + 88.
 const RESPONSE_CONTEXTS_OFFSET: u32 = 0x98;
 
+/// Caching the server grants in a lease.
+const GRANTABLE_LEASE: LeaseState = LeaseState::R;
+
 /// Create contexts of a request that the response answers (MS-SMB2
 /// 3.3.5.9.5, 3.3.5.9.9) or that fail it. Other contexts are ignored.
 struct ContextQueries {
@@ -93,6 +102,8 @@ struct ContextQueries {
     ea_buffer: bool,
     /// A timewarp token, which needs snapshots (MS-SMB2 3.3.5.9.4).
     timewarp: bool,
+    /// Data of a lease request.
+    lease: Option<Vec<u8>>,
 }
 
 impl ContextQueries {
@@ -115,6 +126,7 @@ impl ContextQueries {
             query_on_disk_id,
             ea_buffer: find(CreateContext::NAME_EXTA).is_some(),
             timewarp: find(CreateContext::NAME_TWRP).is_some(),
+            lease: find(CreateContext::NAME_RQLS).map(|c| c.data.clone()),
         })
     }
 
@@ -147,6 +159,67 @@ impl ContextQueries {
             });
         }
         out
+    }
+}
+
+/// The lease a CREATE asks for (MS-SMB2 3.3.5.9, 3.3.5.9.8, 3.3.5.9.11),
+/// on a connection from `client` at `dialect`. Leases need SMB 2.1 or
+/// later, and the version 2 context SMB 3.x. A request with an all-zero
+/// key gets no lease. A context of the wrong size fails the CREATE with
+/// STATUS_INVALID_PARAMETER.
+fn lease_request(
+    data: Option<&[u8]>,
+    dialect: Option<Dialect>,
+    client: Uuid,
+) -> Result<Option<LeaseRequest>, u32> {
+    let (Some(data), Some(dialect)) = (data, dialect) else {
+        return Ok(None);
+    };
+    if matches!(dialect, Dialect::Smb202 | Dialect::Smb2Wildcard) {
+        return Ok(None);
+    }
+    let ctx = LeaseContext::parse(data).map_err(|_| ntstatus::STATUS_INVALID_PARAMETER)?;
+    if (ctx.v2 && dialect == Dialect::Smb210) || ctx.key == [0; 16] {
+        return Ok(None);
+    }
+    let (version, parent) = if ctx.v2 {
+        let parent =
+            (ctx.flags & LeaseContext::FLAG_PARENT_LEASE_KEY_SET != 0).then_some(ctx.parent_key);
+        (LeaseVersion::V2, parent)
+    } else {
+        (LeaseVersion::V1, None)
+    };
+    Ok(Some(LeaseRequest {
+        id: LeaseId {
+            client,
+            key: ctx.key,
+        },
+        state: LeaseState::requested(ctx.state),
+        version,
+        epoch: ctx.epoch,
+        parent,
+    }))
+}
+
+/// The response lease context for `granted`, in the lease's version
+/// (MS-SMB2 2.2.14.2.10, 2.2.14.2.11).
+fn lease_response(granted: &Granted) -> CreateContext {
+    let v2 = granted.version == LeaseVersion::V2;
+    let ctx = LeaseContext {
+        key: granted.id.key,
+        state: granted.state.bits(),
+        flags: if v2 && granted.parent.is_some() {
+            LeaseContext::FLAG_PARENT_LEASE_KEY_SET
+        } else {
+            0
+        },
+        parent_key: granted.parent.unwrap_or_default(),
+        epoch: if v2 { granted.epoch } else { 0 },
+        v2,
+    };
+    CreateContext {
+        name: CreateContext::NAME_RQLS.to_vec(),
+        data: ctx.encode(),
     }
 }
 
@@ -216,6 +289,17 @@ pub async fn handle(
     if queries.ea_buffer {
         return HandlerResponse::err(ntstatus::STATUS_EAS_NOT_SUPPORTED);
     }
+    // Directories get no lease, and neither do shares that turn leases off.
+    let lease = if req.requested_oplock_level == OplockLevel::Lease as u8 && share.leases {
+        let dialect = *conn.dialect.read().await;
+        let client = *conn.client_guid.read().await;
+        match lease_request(queries.lease.as_deref(), dialect, client) {
+            Ok(lease) => lease.filter(|_| !directory),
+            Err(status) => return HandlerResponse::err(status),
+        }
+    } else {
+        None
+    };
 
     let maximal = maximal_access(tree_access);
     let delete_on_close = options & FILE_DELETE_ON_CLOSE != 0;
@@ -280,12 +364,25 @@ pub async fn handle(
         access: open_access,
         share: req.share_access,
     };
+    let open_request = |overwrite| OpenRequest {
+        sharing,
+        owner: Arc::downgrade(&conn.outbound),
+        lease: lease.map(|l| l.id),
+        overwrite,
+    };
+    let lease_ref = match &lease {
+        Some(l) => match server.leases.acquire(l.id, &share, &path) {
+            Ok(lease_ref) => Some(lease_ref),
+            Err(status) => return HandlerResponse::err(status),
+        },
+        None => None,
+    };
 
     // An open that truncates checks the file and takes its place in the
     // table first, so a refused open leaves the file as it was and no other
     // open slips in while the backend truncates.
     let reserved = if matches!(intent, OpenIntent::Truncate | OpenIntent::OverwriteOrCreate) {
-        match reserve_existing(&share, &path, opts, sharing).await {
+        match reserve_existing(&share, &path, opts, open_request(true)).await {
             Ok(reserved) => reserved,
             Err(status) => return HandlerResponse::err(status),
         }
@@ -319,12 +416,13 @@ pub async fn handle(
         let _ = handle.close().await;
         return HandlerResponse::err(ntstatus::STATUS_CANNOT_DELETE);
     }
-    let file = match reserved {
+    let mut file = match reserved {
         Some(file) if file.is_for(&info, &path) => file,
         // The file was replaced between the two opens, or did not exist.
         reserved => {
             drop(reserved);
-            match FileRef::register(&share, &info, &path, sharing) {
+            let overwrite = action == OpenAction::Overwritten;
+            match FileRef::register(&share, &info, &path, open_request(overwrite)) {
                 Ok(f) => f,
                 Err(status) => {
                     let _ = handle.close().await;
@@ -333,6 +431,32 @@ pub async fn handle(
             }
         }
     };
+    let mut granted = None;
+    let mut after_send = None;
+    if let (Some(lease), Some(lease_ref)) = (lease, lease_ref)
+        && !info.is_directory
+    {
+        match server
+            .leases
+            .grant(lease_ref, &mut file, &lease, GRANTABLE_LEASE)
+        {
+            Ok((lease, guard)) => {
+                granted = Some(lease);
+                after_send = Some(guard);
+            }
+            Err(status) => {
+                drop(file);
+                let _ = handle.close().await;
+                return HandlerResponse::err(status);
+            }
+        }
+    }
+    // An overwrite that took the file's place in the table before the
+    // backend truncated it broke the leases then; one granted since breaks
+    // now, so it does not keep the old contents cached.
+    if action == OpenAction::Overwritten {
+        file.break_leases(Trigger::Open { overwrite: true });
+    }
 
     if action != OpenAction::Opened
         && new_attributes != 0
@@ -360,6 +484,10 @@ pub async fn handle(
     let mut tree = tree_arc.write().await;
     if tree.closed {
         drop(tree);
+        // The open leaves the table, ending a lease it alone held, before
+        // the guard could send a break held back for that lease.
+        drop(file);
+        drop(after_send);
         let _ = handle.close().await;
         return HandlerResponse::err(ntstatus::STATUS_NETWORK_NAME_DELETED);
     }
@@ -386,15 +514,19 @@ pub async fn handle(
         OpenAction::Overwritten if req.create_disposition == FILE_SUPERSEDE => FILE_SUPERSEDED,
         OpenAction::Overwritten => FILE_OVERWRITTEN,
     };
+    let mut answers = queries.answer(&info, maximal, volume_serial);
+    if let Some(granted) = &granted {
+        answers.push(lease_response(granted));
+    }
     let mut contexts = Vec::new();
-    CreateContext::encode_chain(
-        &queries.answer(&info, maximal, volume_serial),
-        &mut contexts,
-    )
-    .expect("encoding into a Vec cannot fail");
+    CreateContext::encode_chain(&answers, &mut contexts).expect("encoding into a Vec cannot fail");
     let resp = CreateResponse {
         structure_size: 89,
-        oplock_level: 0,
+        oplock_level: if granted.is_some() {
+            OplockLevel::Lease as u8
+        } else {
+            OplockLevel::None as u8
+        },
         flags: 0,
         create_action,
         creation_time: info.creation_time,
@@ -416,7 +548,9 @@ pub async fn handle(
     };
     let mut buf = Vec::new();
     resp.write_to(&mut buf).expect("encode");
-    HandlerResponse::ok(buf)
+    let mut response = HandlerResponse::ok(buf);
+    response.after_send = after_send;
+    response
 }
 
 /// Before a CREATE that truncates the file at `path`, checks the existing
@@ -428,7 +562,7 @@ async fn reserve_existing(
     share: &Arc<ShareBindings>,
     path: &SmbPath,
     opts: OpenOptions,
-    sharing: Sharing,
+    req: OpenRequest,
 ) -> Result<Option<FileRef>, u32> {
     let probe = OpenOptions {
         read: true,
@@ -443,7 +577,7 @@ async fn reserve_existing(
     };
     let result = match handle.stat().await {
         Ok(info) if opts.delete_on_close && info.read_only => Err(ntstatus::STATUS_CANNOT_DELETE),
-        Ok(info) => FileRef::register(share, &info, path, sharing).map(Some),
+        Ok(info) => FileRef::register(share, &info, path, req).map(Some),
         Err(_) => Ok(None),
     };
     let _ = handle.close().await;
@@ -606,7 +740,8 @@ mod tests {
             Sharing {
                 access: FILE_READ_DATA,
                 share: 0,
-            },
+            }
+            .into(),
         );
         assert_eq!(exclusive.err(), Some(ntstatus::STATUS_SHARING_VIOLATION));
 

@@ -84,6 +84,7 @@ async fn smb1_wildcard_negotiate_grants_a_credit_and_leads_to_smb2_negotiate() {
     assert!(hdr.credit_request_response >= 1, "no credit granted");
     let resp = NegotiateResponse::parse(&frame[64..]).expect("negotiate response");
     assert_eq!(resp.dialect_revision, 0x02FF);
+    assert_eq!(resp.capabilities, 0x0000_0002, "LEASING");
 
     s.write_all(&negotiate_with_id(1)).await.expect("write");
     let (hdr, frame) = read_response(&mut s).await;
@@ -105,6 +106,7 @@ async fn smb1_negotiate_for_2_0_2_alone_allows_logon() {
     assert!(hdr.credit_request_response >= 1, "no credit granted");
     let resp = NegotiateResponse::parse(&frame[64..]).expect("negotiate response");
     assert_eq!(resp.dialect_revision, 0x0202);
+    assert_eq!(resp.capabilities, 0);
 
     let session_id = common::anonymous_session_setup(&mut s).await;
     assert_ne!(session_id, 0);

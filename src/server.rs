@@ -50,6 +50,8 @@ pub struct ShareBindings {
     pub is_ipc: bool,
     /// Share.EncryptData: traffic to the share is encrypted.
     pub encrypt_data: bool,
+    /// Leases are granted on the share's files.
+    pub(crate) leases: bool,
     /// Every file on the share that has an open, on any connection.
     pub(crate) files: crate::files::FileTable,
 }
@@ -61,6 +63,7 @@ impl ShareBindings {
         mode: ShareMode,
         users: HashMap<String, Access>,
         is_ipc: bool,
+        leases: bool,
     ) -> Arc<Self> {
         Arc::new(Self {
             name,
@@ -68,6 +71,7 @@ impl ShareBindings {
             acl: RwLock::new(ShareAcl { mode, users }),
             is_ipc,
             encrypt_data: false,
+            leases,
             files: crate::files::FileTable::default(),
         })
     }
@@ -82,6 +86,7 @@ impl ShareBindings {
             }),
             is_ipc: false,
             encrypt_data: share.encrypt_data,
+            leases: share.leases,
             files: crate::files::FileTable::default(),
         })
     }
@@ -94,6 +99,7 @@ impl ShareBindings {
             ShareMode::PublicReadOnly,
             HashMap::new(),
             true,
+            false,
         )
     }
 }
@@ -225,6 +231,8 @@ pub struct ServerState {
     /// Byte-range locks one open may hold at once. LOCK past it fails with
     /// STATUS_INSUFFICIENT_RESOURCES.
     pub max_locks_per_open: std::sync::atomic::AtomicUsize,
+    /// Every lease held on a file of any share.
+    pub(crate) leases: Arc<crate::files::LeaseTable>,
 }
 
 impl ServerState {
@@ -243,6 +251,7 @@ impl ServerState {
             max_locks_per_open: std::sync::atomic::AtomicUsize::new(
                 crate::files::DEFAULT_MAX_LOCKS_PER_OPEN,
             ),
+            leases: Arc::default(),
         }
     }
 
