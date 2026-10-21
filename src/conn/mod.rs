@@ -5,6 +5,7 @@ pub mod credits;
 pub mod limits;
 pub mod listener;
 pub mod outbound;
+pub mod pending;
 pub mod reader;
 pub mod related;
 pub mod state;
@@ -48,8 +49,10 @@ pub async fn connection_loop(
     info!("connection accepted");
     let reader_result = reader::reader_task(read_half, server.clone(), conn.clone(), tx).await;
     debug!(?reader_result, "reader exited");
-    // Wait for writer to drain. Messages for this connection raised from
-    // now on are not sent.
+    // Requests still waiting are cancelled and answered while the writer
+    // runs. Then the writer drains; messages for this connection raised
+    // from now on are not sent.
+    conn.pending.shutdown(server.config.limits.io_timeout).await;
     conn.outbound.close();
     let _ = writer_handle.await;
     conn.close_all().await;

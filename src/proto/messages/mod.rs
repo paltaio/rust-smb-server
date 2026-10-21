@@ -40,7 +40,7 @@ pub use echo::{EchoRequest, EchoResponse};
 pub use error_response::{ErrorContext, ErrorResponse};
 pub use flush::{FlushRequest, FlushResponse};
 pub use ioctl::{Fsctl, IoctlRequest, IoctlResponse};
-pub use lease::{LeaseBreakAck, LeaseBreakNotification, LeaseContext};
+pub use lease::{LeaseBreakAck, LeaseBreakNotification, LeaseBreakResponse, LeaseContext};
 pub use lock::{LockElement, LockRequest, LockResponse};
 pub use logoff::{LogoffRequest, LogoffResponse};
 pub use negotiate::{

@@ -8,7 +8,6 @@ use smb_server::wire::messages::{
 };
 
 use super::client::{Client, Create};
-use super::read_frame;
 
 pub use smb_server::wire::messages::lease::{
     LEASE_HANDLE_CACHING, LEASE_READ_CACHING, LEASE_WRITE_CACHING,
@@ -123,12 +122,7 @@ pub fn lease_ack_body(key: [u8; 16], state: u32) -> Vec<u8> {
 impl Client {
     /// The next lease break for this client, waiting up to `within`.
     pub async fn next_break(&mut self, within: Duration) -> Option<LeaseBreakNotification> {
-        let frame = match self.breaks.pop_front() {
-            Some(frame) => frame,
-            None => tokio::time::timeout(within, read_frame(&mut self.s))
-                .await
-                .ok()?,
-        };
+        let frame = tokio::time::timeout(within, self.read_break()).await.ok()?;
         let (hdr, notification) = parse_break(&frame);
         assert_eq!(hdr.flags, SMB2_FLAGS_SERVER_TO_REDIR);
         assert_eq!(hdr.credit_charge, 0);

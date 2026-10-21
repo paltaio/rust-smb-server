@@ -14,6 +14,7 @@ use uuid::Uuid;
 use crate::backend::{FileTimes, Handle};
 use crate::builder::Access;
 use crate::conn::outbound::Outbound;
+use crate::conn::pending::{PendingOps, Stop};
 use crate::files::{FileRef, OpenSlot, close_opens, finish_close};
 use crate::path::SmbPath;
 use crate::server::ShareBindings;
@@ -84,6 +85,9 @@ pub struct Connection {
 
     /// Where lease breaks for this connection's opens are sent.
     pub(crate) outbound: Arc<Outbound>,
+
+    /// Requests answered asynchronously that are still running.
+    pub(crate) pending: PendingOps,
 }
 
 impl Connection {
@@ -108,6 +112,7 @@ impl Connection {
             open_count: Arc::default(),
             peer_addr: None,
             outbound: Arc::default(),
+            pending: PendingOps::default(),
         }
     }
 
@@ -126,6 +131,8 @@ impl Connection {
         let Some(sess_arc) = removed else {
             return false;
         };
+        self.pending
+            .stop_where(Stop::Retry, |op| op.session_id == session_id);
         close_opens(detach_session(&sess_arc).await).await;
         true
     }
@@ -146,6 +153,9 @@ impl Connection {
         let Some(tree_arc) = removed else {
             return false;
         };
+        self.pending.stop_where(Stop::Retry, |op| {
+            op.session_id == session_id && op.tree_id == tree_id
+        });
         close_opens(detach_tree(&tree_arc).await).await;
         true
     }
@@ -163,6 +173,8 @@ impl Connection {
                     ids.push(*session_id);
                 }
             }
+            self.pending
+                .stop_where(Stop::Retry, |op| ids.contains(&op.session_id));
             ids.into_iter()
                 .filter_map(|id| sessions.remove(&id))
                 .collect::<Vec<_>>()
@@ -204,11 +216,14 @@ impl Connection {
     ) -> Vec<Arc<RwLock<Open>>> {
         let sessions: Vec<_> = {
             let sessions = self.sessions.read().await;
-            sessions.values().cloned().collect()
+            sessions
+                .iter()
+                .map(|(id, s)| (*id, Arc::clone(s)))
+                .collect()
         };
 
         let mut opens = Vec::new();
-        for sess_arc in sessions {
+        for (session_id, sess_arc) in sessions {
             let removed = {
                 let sess = sess_arc.read().await;
                 let mut trees = sess.trees.write().await;
@@ -219,6 +234,9 @@ impl Connection {
                         ids.push(*tree_id);
                     }
                 }
+                self.pending.stop_where(Stop::Retry, |op| {
+                    op.session_id == session_id && ids.contains(&op.tree_id)
+                });
                 ids.into_iter()
                     .filter_map(|id| trees.remove(&id))
                     .collect::<Vec<_>>()

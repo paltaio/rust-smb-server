@@ -18,10 +18,10 @@ use crate::path::{SmbPath, rebase, same_path};
 use crate::server::ShareBindings;
 
 use super::lease::{
-    FileLease, FileView, Granted, LeaseId, LeaseRequest, LeaseState, OpenView, Trigger, break_to,
-    grant, stat_only,
+    Breaking, Current, FileLease, FileView, Granted, LeaseId, LeaseRequest, LeaseState, OpenView,
+    Trigger, break_to, grant, needs_ack, stat_only,
 };
-use super::leases::{GrantGuard, LeaseRef, Notices, break_notification};
+use super::leases::{AckWait, BreakWait, GrantGuard, LeaseRef, Notices, break_notification};
 
 // ShareAccess (MS-SMB2 2.2.13)
 pub(crate) const FILE_SHARE_READ: u32 = 0x0000_0001;
@@ -87,6 +87,9 @@ impl Sharing {
 /// Source of [`FileLease::serial`].
 static NEXT_LEASE_SERIAL: AtomicU64 = AtomicU64::new(1);
 
+/// Source of [`Breaking::seq`].
+static NEXT_BREAK_SEQ: AtomicU64 = AtomicU64::new(1);
+
 /// Every file on one share that has an open.
 #[derive(Default)]
 pub(crate) struct FileTable {
@@ -100,6 +103,8 @@ pub(super) struct FileNode {
 }
 
 struct FileState {
+    /// The node holding this state.
+    me: Weak<FileNode>,
     key: FileKey,
     opens: Vec<OpenEntry>,
     /// The name to remove once the last open closes, while the file is
@@ -108,6 +113,9 @@ struct FileState {
     locks: Vec<RangeLock>,
     /// Leases held by the opens, one per LeaseId.
     leases: Vec<FileLease>,
+    /// Counts changes that can unblock an operation waiting on the file: a
+    /// lease break that completed, a lease that ended, an open that left.
+    changed: tokio::sync::watch::Sender<u64>,
 }
 
 struct OpenEntry {
@@ -131,6 +139,26 @@ pub(crate) struct OpenRequest {
     pub lease: Option<LeaseId>,
     /// The CREATE supersedes or overwrites the file.
     pub overwrite: bool,
+    /// On a sharing violation, break the handle caching of the leases on
+    /// the file so their clients can close the handles they keep open
+    /// (MS-FSA 2.1.5.1.2). Without it, a violation still waits while such a
+    /// break is in progress.
+    pub break_handles: bool,
+}
+
+/// Why [`FileRef::register`] refused an open.
+#[derive(Debug)]
+pub(crate) struct Refused {
+    pub status: u32,
+    /// Set when the refusal was a sharing violation that broke handle
+    /// caching: once it completes, the open may succeed.
+    pub wait: Option<BreakWait>,
+}
+
+impl From<u32> for Refused {
+    fn from(status: u32) -> Self {
+        Self { status, wait: None }
+    }
 }
 
 #[cfg(test)]
@@ -179,6 +207,78 @@ impl FileNode {
         })
     }
 
+    /// MS-SMB2 3.3.5.22.2: completes the break of the lease `id` with the
+    /// state `bits` the client acknowledged, and returns that state. When a
+    /// later trigger needs less than that, the lease breaks on at once.
+    /// Fails with STATUS_OBJECT_NAME_NOT_FOUND when the lease is not held
+    /// here, STATUS_UNSUCCESSFUL when no break is in progress and
+    /// STATUS_REQUEST_NOT_ACCEPTED when the state is not within the one
+    /// notified.
+    pub(super) fn acknowledge(&self, id: LeaseId, bits: u32) -> Result<(LeaseState, Notices), u32> {
+        let mut state = self.state();
+        let at = state
+            .leases
+            .iter()
+            .position(|l| l.id == id)
+            .ok_or(ntstatus::STATUS_OBJECT_NAME_NOT_FOUND)?;
+        let lease = &mut state.leases[at];
+        let breaking = lease
+            .breaking
+            .as_ref()
+            .ok_or(ntstatus::STATUS_UNSUCCESSFUL)?;
+        if bits & !breaking.to.bits() != 0 {
+            return Err(ntstatus::STATUS_REQUEST_NOT_ACCEPTED);
+        }
+        let required = breaking.required;
+        let acked = LeaseState::from_bits(bits);
+        lease.breaking = None;
+        lease.state = acked;
+        debug!(key = ?id.key, state = ?acked, "lease break acknowledged");
+        let mut notices = Notices::default();
+        if !required.contains(acked) {
+            state.start_break(at, acked.and(required), &mut notices);
+        }
+        state.bump();
+        Ok((acked, notices))
+    }
+
+    /// Ends the break `seq` of the lease `id` with NONE, when it is still in
+    /// progress: the client did not acknowledge in time (MS-SMB2 3.3.6.5),
+    /// or no connection took the notification (MS-SMB2 3.3.4.7).
+    pub(super) fn drop_break(&self, id: LeaseId, seq: u64) {
+        let mut state = self.state();
+        let Some(lease) = state
+            .leases
+            .iter_mut()
+            .find(|l| l.id == id && l.breaking.as_ref().is_some_and(|b| b.seq == seq))
+        else {
+            return;
+        };
+        lease.breaking = None;
+        lease.state = LeaseState::NONE;
+        debug!(key = ?id.key, "lease break not acknowledged; lease dropped to none");
+        state.bump();
+    }
+
+    /// Keeps `timer` as the acknowledgment timer of the break `seq` of the
+    /// lease `id`, or stops it when that break is over.
+    pub(super) fn set_timer(&self, id: LeaseId, seq: u64, timer: tokio::task::AbortHandle) {
+        let mut state = self.state();
+        let breaking = state
+            .leases
+            .iter_mut()
+            .find(|l| l.id == id)
+            .and_then(|l| l.breaking.as_mut())
+            .filter(|b| b.seq == seq);
+        match breaking {
+            Some(breaking) => {
+                breaking.timer = Some(timer);
+                state.bump();
+            }
+            None => timer.abort(),
+        }
+    }
+
     /// Ends one CREATE response's hold on the lease `id` created as
     /// `serial`, and returns the break notification held back for it once
     /// no response is pending. The notification goes first to `sender`,
@@ -186,6 +286,7 @@ impl FileNode {
     /// same connection. A hold on a lease that has since ended does nothing.
     pub(super) fn end_grant(&self, id: LeaseId, serial: u64, sender: &Weak<Outbound>) -> Notices {
         let mut state = self.state();
+        let me = state.me.clone();
         let mut notices = Notices::default();
         let Some(lease) = state
             .leases
@@ -198,11 +299,16 @@ impl FileNode {
         if lease.grants_in_flight == 0
             && let Some(bytes) = lease.unsent.take()
         {
+            let ack = lease.breaking.as_ref().map(|b| AckWait {
+                node: me,
+                id,
+                seq: b.seq,
+            });
             let mut owners = state.owners(id);
             if let Some(at) = owners.iter().position(|o| o.ptr_eq(sender)) {
                 owners[..=at].rotate_right(1);
             }
-            notices.push(bytes, owners);
+            notices.push(bytes, owners, ack);
         }
         notices
     }
@@ -238,13 +344,14 @@ impl FileState {
     }
 
     /// Breaks every lease but `exempt` that `trigger` conflicts with
-    /// (MS-FSA 2.1.4.12, MS-SMB2 3.3.4.7) and returns the notifications to
-    /// send once the file is unlocked. Only read leases are granted, and
-    /// breaking one needs no acknowledgment, so the new state applies at
-    /// once. A notification for a lease whose grant is not yet sent waits
-    /// for it.
-    fn break_for(&mut self, trigger: Trigger, exempt: Option<LeaseId>) -> Notices {
+    /// (MS-FSA 2.1.4.12, MS-SMB2 3.3.4.7). Returns the notifications to send
+    /// once the file is unlocked, and whether the operation has to wait for
+    /// a break to complete. A lease already breaking gets no second
+    /// notification: what the server needs is lowered instead, and the
+    /// acknowledgment breaks on to it.
+    fn break_for(&mut self, trigger: Trigger, exempt: Option<LeaseId>) -> (Notices, bool) {
         let mut notices = Notices::default();
+        let mut wait = false;
         for at in 0..self.leases.len() {
             let lease = &mut self.leases[at];
             if Some(lease.id) == exempt {
@@ -253,18 +360,67 @@ impl FileState {
             let Some(to) = break_to(trigger, lease.state) else {
                 continue;
             };
-            let from = lease.state;
-            lease.set_state(to);
-            debug!(key = ?lease.id.key, ?from, ?to, "lease broken");
-            let bytes = break_notification(lease, from);
-            if lease.grants_in_flight > 0 {
-                lease.unsent = Some(bytes);
-            } else {
-                let id = lease.id;
-                notices.push(bytes, self.owners(id));
+            wait |= to.wait;
+            match &mut lease.breaking {
+                Some(breaking) => breaking.required = breaking.required.and(to.to),
+                None => self.start_break(at, to.to, &mut notices),
             }
         }
-        notices
+        (notices, wait)
+    }
+
+    /// Breaks the lease at `at` to `to`. A read lease drops at once; one
+    /// caching more keeps its state until the client acknowledges, the
+    /// acknowledgment times out, or no connection takes the notification.
+    /// A notification for a lease whose grant is not yet sent waits for it.
+    fn start_break(&mut self, at: usize, to: LeaseState, notices: &mut Notices) {
+        let lease = &mut self.leases[at];
+        let from = lease.state;
+        let ack = needs_ack(from);
+        let mut wait = None;
+        if ack {
+            lease.bump_epoch();
+            let seq = NEXT_BREAK_SEQ.fetch_add(1, Ordering::Relaxed);
+            lease.breaking = Some(Breaking {
+                to,
+                required: to,
+                seq,
+                timer: None,
+            });
+            wait = Some(AckWait {
+                node: self.me.clone(),
+                id: lease.id,
+                seq,
+            });
+        } else {
+            lease.set_state(to);
+        }
+        debug!(key = ?lease.id.key, ?from, ?to, ack, "lease broken");
+        let bytes = break_notification(lease, from, to, ack);
+        if lease.grants_in_flight > 0 {
+            lease.unsent = Some(bytes);
+        } else {
+            let id = lease.id;
+            notices.push(bytes, self.owners(id), wait);
+        }
+    }
+
+    /// Whether a lease other than `exempt` still caches handles while a
+    /// break of it is in progress.
+    fn handle_break_pending(&self, exempt: Option<LeaseId>) -> bool {
+        self.leases.iter().any(|l| {
+            Some(l.id) != exempt && l.breaking.is_some() && l.state.contains(LeaseState::H)
+        })
+    }
+
+    /// Wakes operations waiting on the file.
+    fn bump(&self) {
+        self.changed.send_modify(|n| *n = n.wrapping_add(1));
+    }
+
+    /// A wait for the next change on the file.
+    fn wait(&self) -> BreakWait {
+        BreakWait::new(self.changed.subscribe())
     }
 
     /// MS-FSA 2.1.4.10: whether the range conflicts with a lock. `exclusive`
@@ -344,6 +500,65 @@ impl FileTable {
         })
     }
 
+    /// Breaks the handle caching of the leases on the file open as `path`,
+    /// all but `exempt` (MS-FSA 2.1.4.12, SET_INFORMATION rename), when
+    /// `start`. Returns a wait for the break to complete while one is in
+    /// progress.
+    pub(crate) fn break_handles_at(
+        &self,
+        path: &SmbPath,
+        case_sensitive: bool,
+        exempt: Option<LeaseId>,
+        start: bool,
+    ) -> Option<BreakWait> {
+        let mut all = Vec::new();
+        let mut wait = None;
+        let files = self.files();
+        for node in files.values() {
+            let mut state = node.state();
+            if !state
+                .opens
+                .iter()
+                .any(|e| same_path(&e.path, path, case_sensitive))
+            {
+                continue;
+            }
+            let waits = if start {
+                let (notices, waits) = state.break_for(Trigger::Handle, exempt);
+                all.push(notices);
+                waits
+            } else {
+                state.handle_break_pending(exempt)
+            };
+            if waits && wait.is_none() {
+                wait = Some(state.wait());
+            }
+        }
+        drop(files);
+        drop(all);
+        wait
+    }
+
+    /// Breaks the handle caching of every lease on a file open below the
+    /// directory `dir`, which is being renamed (MS-SMB2 3.3.1.4). Nothing
+    /// waits for these breaks: the opens stay valid under the new name.
+    pub(crate) fn break_handles_below(&self, dir: &SmbPath, case_sensitive: bool) {
+        let mut all = Vec::new();
+        let files = self.files();
+        for node in files.values() {
+            let mut state = node.state();
+            let below = state.opens.iter().any(|e| {
+                e.path.components().len() > dir.components().len()
+                    && rebase(&e.path, dir, dir, case_sensitive).is_some()
+            });
+            if below {
+                all.push(state.break_for(Trigger::Handle, None).0);
+            }
+        }
+        drop(files);
+        drop(all);
+    }
+
     /// Moves every open whose name is `from`, or lies below it, to the
     /// matching name under `to`.
     pub(crate) fn rename_paths(&self, from: &SmbPath, to: &SmbPath, case_sensitive: bool) {
@@ -408,7 +623,7 @@ impl FileRef {
         info: &FileInfo,
         path: &SmbPath,
         req: OpenRequest,
-    ) -> Result<Self, u32> {
+    ) -> Result<Self, Refused> {
         let case_sensitive = share.backend.capabilities().case_sensitive;
         let key = FileKey::new(info.file_index, path, case_sensitive);
         let table = &share.files;
@@ -416,19 +631,37 @@ impl FileRef {
         let node = files
             .entry(key.clone())
             .or_insert_with(|| {
-                Arc::new(FileNode {
+                Arc::new_cyclic(|me| FileNode {
                     state: Mutex::new(FileState {
+                        me: me.clone(),
                         key,
                         opens: Vec::new(),
                         delete_pending: None,
                         locks: Vec::new(),
                         leases: Vec::new(),
+                        changed: tokio::sync::watch::Sender::new(0),
                     }),
                 })
             })
             .clone();
         let mut state = node.state();
-        state.admit(req.sharing)?;
+        if let Err(status) = state.admit(req.sharing) {
+            let mut wait = None;
+            let mut notices = Notices::default();
+            if status == ntstatus::STATUS_SHARING_VIOLATION {
+                if req.break_handles {
+                    let (sent, waits) = state.break_for(Trigger::SharingViolation, req.lease);
+                    notices = sent;
+                    wait = waits.then(|| state.wait());
+                } else if state.handle_break_pending(req.lease) {
+                    wait = Some(state.wait());
+                }
+            }
+            drop(state);
+            drop(files);
+            drop(notices);
+            return Err(Refused { status, wait });
+        }
         let id = table.next_open.fetch_add(1, Ordering::Relaxed);
         state.opens.push(OpenEntry {
             id,
@@ -443,7 +676,7 @@ impl FileRef {
             let trigger = Trigger::Open {
                 overwrite: req.overwrite,
             };
-            state.break_for(trigger, req.lease)
+            state.break_for(trigger, req.lease).0
         };
         drop(state);
         drop(files);
@@ -499,10 +732,14 @@ impl FileRef {
             opens: &opens,
             leases: &leases,
             has_locks: !state.locks.is_empty(),
+            delete_pending: state.delete_pending.is_some(),
         };
         let existing = state.leases.iter().position(|l| l.id == req.id);
-        let current = existing.map(|at| state.leases[at].state);
-        let granted = grant(req.id, req.state, current, &file, grantable);
+        let current = existing.map(|at| Current {
+            state: state.leases[at].state,
+            breaking: state.leases[at].breaking.is_some(),
+        });
+        let (granted, breaking) = grant(req.id, req.state, current, &file, grantable);
         let lease = match existing {
             Some(at) => {
                 let lease = &mut state.leases[at];
@@ -521,6 +758,7 @@ impl FileRef {
         let snapshot = Granted {
             id: lease.id,
             state: lease.state,
+            breaking,
             epoch: lease.epoch,
             version: lease.version,
             parent: lease.parent,
@@ -542,9 +780,14 @@ impl FileRef {
         let notices = {
             let mut state = self.node.state();
             let exempt = state.entry(self.id).and_then(|e| e.lease);
-            state.break_for(trigger, exempt)
+            state.break_for(trigger, exempt).0
         };
         drop(notices);
+    }
+
+    /// The lease this open holds.
+    pub(crate) fn lease_id(&self) -> Option<LeaseId> {
+        self.node.state().entry(self.id).and_then(|e| e.lease)
     }
 
     /// The open's current name.
@@ -571,13 +814,24 @@ impl FileRef {
     /// Sets or clears the delete-pending flag of the file (MS-FSA
     /// 2.1.5.15.3). The file is removed under this open's name when its last
     /// open closes.
+    ///
+    /// Marking the file breaks the handle caching of its leases, all but
+    /// this open's, under the same lock, so no lease caches handles to a
+    /// delete-pending file (MS-FSA 2.1.4.12, 2.1.5.18).
     pub(crate) fn set_delete_pending(&self, delete: bool) {
-        let mut state = self.node.state();
-        state.delete_pending = if delete {
-            state.entry(self.id).map(|e| e.path.clone())
-        } else {
-            None
+        let notices = {
+            let mut state = self.node.state();
+            if delete {
+                let entry = state.entry(self.id).map(|e| (e.lease, e.path.clone()));
+                let exempt = entry.as_ref().and_then(|e| e.0);
+                state.delete_pending = entry.map(|e| e.1);
+                state.break_for(Trigger::Handle, exempt).0
+            } else {
+                state.delete_pending = None;
+                Notices::default()
+            }
         };
+        drop(notices);
     }
 
     /// Takes a byte-range lock for this open (MS-FSA 2.1.5.8). Fails with
@@ -612,7 +866,7 @@ impl FileRef {
         // one this open holds, wherever the range lies. Under the same lock
         // no lease can be granted between the two.
         let exempt = state.entry(self.id).and_then(|e| e.lease);
-        let notices = state.break_for(Trigger::Write, exempt);
+        let notices = state.break_for(Trigger::Write, exempt).0;
         drop(state);
         drop(notices);
         Ok(())
@@ -689,11 +943,14 @@ impl FileRef {
             .map(|at| state.opens.remove(at));
         state.locks.retain(|l| l.owner != self.id);
         // MS-SMB2 3.3.4.17: a lease ends with its last open, without a
-        // notification.
+        // notification; a break in progress completes with it.
         if let Some(id) = entry.as_ref().and_then(|e| e.lease)
             && !state.opens.iter().any(|e| e.lease == Some(id))
         {
             state.leases.retain(|l| l.id != id);
+        }
+        if entry.is_some() {
+            state.bump();
         }
         if delete_on_close && let Some(entry) = entry {
             state.delete_pending = Some(entry.path);
@@ -820,6 +1077,7 @@ mod tests {
             }
             .into(),
         )
+        .map_err(|r| r.status)
     }
 
     #[test]
@@ -1037,7 +1295,10 @@ mod tests {
             }
             .into(),
         );
-        assert_eq!(conflict.err(), Some(ntstatus::STATUS_SHARING_VIOLATION));
+        assert_eq!(
+            conflict.err().map(|r| r.status),
+            Some(ntstatus::STATUS_SHARING_VIOLATION)
+        );
         a.set_delete_pending(true);
         assert!(s.files.delete_pending_at(&p("e\\f"), false));
         let pending = a.release(false).expect("pending removal");

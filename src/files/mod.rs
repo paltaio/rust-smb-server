@@ -15,8 +15,10 @@ use crate::conn::state::Open;
 use crate::handlers::shared::restore_fixed_times;
 
 pub(crate) use lease::{Granted, LeaseId, LeaseRequest, LeaseState, LeaseVersion, Trigger};
-pub(crate) use leases::{GrantGuard, LeaseTable};
-pub(crate) use table::{FileRef, FileTable, OpenRequest, Sharing};
+#[cfg(test)]
+pub(crate) use leases::LEASE_BREAK_TIMEOUT;
+pub(crate) use leases::{AfterSend, BreakWait, LeaseTable};
+pub(crate) use table::{FileRef, FileTable, OpenRequest, Refused, Sharing};
 
 /// Default for
 /// [`SmbServerBuilder::max_opens_per_connection`](crate::SmbServerBuilder::max_opens_per_connection)

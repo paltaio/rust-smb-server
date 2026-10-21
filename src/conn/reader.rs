@@ -157,6 +157,12 @@ pub async fn reader_task(
             }
             // Lease breaks held back for these responses follow them.
             drop(out.after_send);
+            // The interim response is queued, so the final one cannot pass
+            // it.
+            if let Some(continuation) = out.continuation {
+                conn.pending
+                    .spawn(continuation.run(Arc::clone(&server), Arc::clone(&conn)));
+            }
         }
         has_session = has_session || !conn.sessions.read().await.is_empty();
         if has_session {

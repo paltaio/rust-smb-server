@@ -25,6 +25,7 @@ impl LeaseState {
     pub const R: Self = Self(LEASE_READ_CACHING as u8);
     pub const H: Self = Self(LEASE_HANDLE_CACHING as u8);
     pub const W: Self = Self(LEASE_WRITE_CACHING as u8);
+    pub const RH: Self = Self(Self::R.0 | Self::H.0);
     pub const RWH: Self = Self(Self::R.0 | Self::W.0 | Self::H.0);
 
     /// The state a CREATE asks for. Only NONE, R, RH, RW and RWH are lease
@@ -39,6 +40,11 @@ impl LeaseState {
         }
     }
 
+    /// The caching bits of `bits`, as a client acknowledges them.
+    pub fn from_bits(bits: u32) -> Self {
+        Self((bits & Self::RWH.bits()) as u8)
+    }
+
     pub fn bits(self) -> u32 {
         u32::from(self.0)
     }
@@ -49,6 +55,11 @@ impl LeaseState {
 
     fn without(self, other: Self) -> Self {
         Self(self.0 & !other.0)
+    }
+
+    /// The caching both states grant.
+    pub fn and(self, other: Self) -> Self {
+        Self(self.0 & other.0)
     }
 }
 
@@ -91,6 +102,31 @@ pub(crate) struct FileLease {
     pub grants_in_flight: u32,
     /// Lease.BreakNotification not yet sent.
     pub unsent: Option<Vec<u8>>,
+    /// A break the client has to acknowledge (Lease.Breaking).
+    pub breaking: Option<Breaking>,
+}
+
+/// A break in progress, waiting for the client's acknowledgment.
+#[derive(Debug)]
+pub(crate) struct Breaking {
+    /// Lease.BreakToLeaseState, as notified: the acknowledged state must be
+    /// within it.
+    pub to: LeaseState,
+    /// What the server needs once the break completes, within `to`. A later
+    /// trigger lowers it, and the acknowledgment then breaks on to it.
+    pub required: LeaseState,
+    /// Tells this break from a later one of the same lease.
+    pub seq: u64,
+    /// The acknowledgment timer, once the notification is sent.
+    pub timer: Option<tokio::task::AbortHandle>,
+}
+
+impl Drop for Breaking {
+    fn drop(&mut self) {
+        if let Some(timer) = self.timer.take() {
+            timer.abort();
+        }
+    }
 }
 
 impl FileLease {
@@ -112,6 +148,7 @@ impl FileLease {
             parent: req.parent,
             grants_in_flight: 0,
             unsent: None,
+            breaking: None,
         }
     }
 
@@ -120,9 +157,14 @@ impl FileLease {
     pub fn set_state(&mut self, state: LeaseState) {
         if state != self.state {
             self.state = state;
-            if self.version == LeaseVersion::V2 {
-                self.epoch = self.epoch.wrapping_add(1);
-            }
+            self.bump_epoch();
+        }
+    }
+
+    /// Counts a state change in a version 2 lease's epoch.
+    pub fn bump_epoch(&mut self) {
+        if self.version == LeaseVersion::V2 {
+            self.epoch = self.epoch.wrapping_add(1);
         }
     }
 }
@@ -132,6 +174,8 @@ impl FileLease {
 pub(crate) struct Granted {
     pub id: LeaseId,
     pub state: LeaseState,
+    /// SMB2_LEASE_FLAG_BREAK_IN_PROGRESS.
+    pub breaking: bool,
     pub epoch: u16,
     pub version: LeaseVersion,
     pub parent: Option<[u8; 16]>,
@@ -157,14 +201,19 @@ pub(crate) struct FileView<'a> {
     /// Every lease on the file.
     pub leases: &'a [(LeaseId, LeaseState)],
     pub has_locks: bool,
+    pub delete_pending: bool,
 }
 
 impl FileView<'_> {
     /// MS-FSA 2.1.5.18.1 and 2.1.5.18.2 for leases. Write caching needs every
     /// other open to be attribute-only and no other lease to hold anything.
     /// Read and handle caching need no other lease with write caching and no
-    /// byte-range lock. Opens and leases with `me` as key never count.
+    /// byte-range lock. Handle caching is refused on a delete-pending file
+    /// (MS-FSA 2.1.5.18). Opens and leases with `me` as key never count.
     fn can_grant(&self, me: LeaseId, state: LeaseState) -> bool {
+        if self.delete_pending && state.contains(LeaseState::H) {
+            return false;
+        }
         let mut others = self.leases.iter().filter(|(id, _)| *id != me);
         if state.contains(LeaseState::W) {
             self.opens
@@ -196,27 +245,42 @@ fn candidates(requested: LeaseState) -> impl Iterator<Item = LeaseState> {
         .map(|(_, c)| c)
 }
 
+/// A lease another open already holds.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Current {
+    pub state: LeaseState,
+    pub breaking: bool,
+}
+
 /// The state the lease `me` holds after a CREATE requests `requested` on
-/// `file`, with `existing` the lease when another open already holds it.
-/// Nothing outside `grantable` is granted. An existing lease is never
-/// downgraded, and is upgraded only to a superset the request covers
-/// (MS-SMB2 3.3.5.9.8: a request that is not a superset promotes nothing).
+/// `file`, with `existing` the lease when another open already holds it,
+/// and whether a break of it is in progress. Nothing outside `grantable` is
+/// granted. An existing lease is never downgraded, and is upgraded only to
+/// a superset the request covers and only while no break is in progress
+/// (MS-SMB2 3.3.5.9.8: such a request promotes nothing).
 pub(crate) fn grant(
     me: LeaseId,
     requested: LeaseState,
-    existing: Option<LeaseState>,
+    existing: Option<Current>,
     file: &FileView<'_>,
     grantable: LeaseState,
-) -> LeaseState {
+) -> (LeaseState, bool) {
     let fits = |c: LeaseState| grantable.contains(c) && file.can_grant(me, c);
     match existing {
-        None => candidates(requested)
-            .find(|&c| fits(c))
-            .unwrap_or(LeaseState::NONE),
-        Some(current) if !requested.contains(current) => current,
-        Some(current) => candidates(requested)
-            .find(|&c| c.contains(current) && c != current && fits(c))
-            .unwrap_or(current),
+        None => (
+            candidates(requested)
+                .find(|&c| fits(c))
+                .unwrap_or(LeaseState::NONE),
+            false,
+        ),
+        Some(current) if current.breaking => (current.state, true),
+        Some(current) if !requested.contains(current.state) => (current.state, false),
+        Some(current) => (
+            candidates(requested)
+                .find(|&c| c.contains(current.state) && c != current.state && fits(c))
+                .unwrap_or(current.state),
+            false,
+        ),
     }
 }
 
@@ -230,17 +294,44 @@ pub(crate) enum Trigger {
     /// WRITE, SET_INFO EndOfFile or Allocation, and LOCK (MS-FSA 2.1.4.12,
     /// WRITE, SET_INFORMATION, LOCK_CONTROL).
     Write,
+    /// An open that fails the sharing check while handles are cached
+    /// (MS-FSA 2.1.5.1.2, OPEN_BREAK_H).
+    SharingViolation,
+    /// A rename of the file or over it, or marking it delete-pending
+    /// (MS-FSA 2.1.4.12, SET_INFORMATION).
+    Handle,
 }
 
-/// The state a lease in `state` breaks to for `trigger`, or `None` when it
-/// keeps its state. An open breaks write caching; an overwrite or a write
-/// breaks every lease to NONE.
-pub(crate) fn break_to(trigger: Trigger, state: LeaseState) -> Option<LeaseState> {
-    let to = match trigger {
-        Trigger::Open { overwrite: false } => state.without(LeaseState::W),
-        Trigger::Open { overwrite: true } | Trigger::Write => LeaseState::NONE,
+/// How a lease breaks for a trigger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BreakTo {
+    pub to: LeaseState,
+    /// The caching the trigger needs gone is cached by the client until it
+    /// acknowledges, so the operation waits for the break to complete
+    /// (MS-FSA 2.1.4.12: write caching, or handle caching when only that
+    /// is broken).
+    pub wait: bool,
+}
+
+/// How a lease in `state` breaks for `trigger`, or `None` when it keeps its
+/// state. An open breaks write caching; an overwrite or a write breaks
+/// every lease to NONE; a sharing violation, a rename or a delete breaks
+/// handle caching.
+pub(crate) fn break_to(trigger: Trigger, state: LeaseState) -> Option<BreakTo> {
+    let (to, wait) = match trigger {
+        Trigger::Open { overwrite: false } => (state.without(LeaseState::W), true),
+        Trigger::Open { overwrite: true } | Trigger::Write => {
+            (LeaseState::NONE, state.contains(LeaseState::W))
+        }
+        Trigger::SharingViolation | Trigger::Handle => (state.without(LeaseState::H), true),
     };
-    (to != state).then_some(to)
+    (to != state).then_some(BreakTo { to, wait })
+}
+
+/// Whether breaking a lease in `state` needs the client's acknowledgment:
+/// anything beyond read caching does (MS-SMB2 3.3.4.7).
+pub(crate) fn needs_ack(state: LeaseState) -> bool {
+    state.without(LeaseState::R) != LeaseState::NONE
 }
 
 #[cfg(test)]
@@ -248,7 +339,6 @@ mod tests {
     use super::*;
 
     impl LeaseState {
-        const RH: Self = Self(Self::R.0 | Self::H.0);
         const RW: Self = Self(Self::R.0 | Self::W.0);
     }
 
@@ -301,35 +391,50 @@ mod tests {
     #[test]
     fn break_table() {
         use LeaseState as S;
-        let open = Trigger::Open { overwrite: false };
-        let overwrite = Trigger::Open { overwrite: true };
+        let b = |to, wait| Some(BreakTo { to, wait });
         let rows = [
-            (open, [None, None, None, Some(S::R), Some(S::RH)]),
             (
-                overwrite,
+                Trigger::Open { overwrite: false },
+                [None, None, None, b(S::R, true), b(S::RH, true)],
+            ),
+            (
+                Trigger::Open { overwrite: true },
                 [
                     None,
-                    Some(S::NONE),
-                    Some(S::NONE),
-                    Some(S::NONE),
-                    Some(S::NONE),
+                    b(S::NONE, false),
+                    b(S::NONE, false),
+                    b(S::NONE, true),
+                    b(S::NONE, true),
                 ],
             ),
             (
                 Trigger::Write,
                 [
                     None,
-                    Some(S::NONE),
-                    Some(S::NONE),
-                    Some(S::NONE),
-                    Some(S::NONE),
+                    b(S::NONE, false),
+                    b(S::NONE, false),
+                    b(S::NONE, true),
+                    b(S::NONE, true),
                 ],
+            ),
+            (
+                Trigger::SharingViolation,
+                [None, None, b(S::R, true), None, b(S::RW, true)],
+            ),
+            (
+                Trigger::Handle,
+                [None, None, b(S::R, true), None, b(S::RW, true)],
             ),
         ];
         for (trigger, expected) in rows {
             for (state, to) in STATES.into_iter().zip(expected) {
                 assert_eq!(break_to(trigger, state), to, "{trigger:?} {state:?}");
             }
+        }
+        assert!(!needs_ack(S::NONE));
+        assert!(!needs_ack(S::R));
+        for state in [S::RH, S::RW, S::RWH] {
+            assert!(needs_ack(state));
         }
     }
 
@@ -364,6 +469,18 @@ mod tests {
         let mut lease = FileLease::new(&req(LeaseVersion::V1), LeaseState::R, 0);
         lease.set_state(LeaseState::NONE);
         assert_eq!(lease.epoch, 0);
+    }
+
+    #[tokio::test]
+    async fn a_finished_break_stops_its_timer() {
+        let timer = tokio::spawn(std::future::pending::<()>());
+        drop(Breaking {
+            to: LeaseState::R,
+            required: LeaseState::R,
+            seq: 1,
+            timer: Some(timer.abort_handle()),
+        });
+        assert!(timer.await.unwrap_err().is_cancelled());
     }
 
     #[test]
@@ -403,16 +520,20 @@ mod tests {
             });
             for (s2, s3) in STATES.iter().flat_map(|&a| STATES.map(|b| (a, b))) {
                 let leases = [(id(2), s2), (id(3), s3)];
-                for has_locks in [false, true] {
+                for (has_locks, delete_pending) in [(false, false), (true, false), (false, true)] {
                     let file = FileView {
                         opens: &opens,
                         leases: &leases,
                         has_locks,
+                        delete_pending,
                     };
                     for bits in 0..8 {
                         let requested = LeaseState::requested(bits);
                         for grantable in grantables {
-                            for existing in std::iter::once(None).chain(STATES.map(Some)) {
+                            let existing = STATES.into_iter().flat_map(|state| {
+                                [false, true].map(|breaking| Some(Current { state, breaking }))
+                            });
+                            for existing in std::iter::once(None).chain(existing) {
                                 let got = grant(me, requested, existing, &file, grantable);
                                 check(&file, me, requested, existing, grantable, got);
                             }
@@ -427,22 +548,33 @@ mod tests {
         file: &FileView<'_>,
         me: LeaseId,
         requested: LeaseState,
-        existing: Option<LeaseState>,
+        existing: Option<Current>,
         grantable: LeaseState,
-        got: LeaseState,
+        (got, in_progress): (LeaseState, bool),
     ) {
         let ctx = || format!("{requested:?} {existing:?} {grantable:?} -> {got:?}");
         assert!(STATES.contains(&got), "{}", ctx());
+        assert_eq!(
+            in_progress,
+            existing.is_some_and(|c| c.breaking),
+            "{}",
+            ctx()
+        );
         if let Some(current) = existing {
-            assert!(got.contains(current), "downgraded: {}", ctx());
-            if !requested.contains(current) {
-                assert_eq!(got, current, "promoted without a superset: {}", ctx());
+            assert!(got.contains(current.state), "downgraded: {}", ctx());
+            if !requested.contains(current.state) || current.breaking {
+                assert_eq!(got, current.state, "promoted: {}", ctx());
             }
-            if got == current {
+            if got == current.state {
                 return;
             }
         }
         assert!(grantable.contains(got), "{}", ctx());
+        assert!(
+            !(file.delete_pending && got.contains(LeaseState::H)),
+            "handle caching on a delete-pending file: {}",
+            ctx()
+        );
         assert!(requested.contains(got), "{}", ctx());
         let others = || file.leases.iter().filter(|(id, _)| *id != me);
         if got.contains(LeaseState::W) {

@@ -18,14 +18,16 @@ use crate::backend::{
     FILE_ATTRIBUTE_READONLY, FileInfo, FileTimes, Handle, OpenAction, OpenIntent, OpenOptions,
     VALID_SET_ATTRIBUTES,
 };
+use crate::conn::pending::{Stop, stopped};
 use crate::conn::state::{Connection, Open};
 use crate::dispatch::HandlerResponse;
 use crate::error::SmbError;
 use crate::files::{
-    FileRef, Granted, LeaseId, LeaseRequest, LeaseState, LeaseVersion, OpenRequest, OpenSlot,
-    Sharing, Trigger,
+    BreakWait, FileRef, Granted, LeaseId, LeaseRequest, LeaseState, LeaseVersion, OpenRequest,
+    OpenSlot, Refused, Sharing, Trigger,
 };
 use crate::handlers::shared::lookup_session_tree;
+use crate::handlers::{Outcome, Pending};
 use crate::info_class::VOLUME_SERIAL_NUMBER;
 use crate::ntstatus;
 use crate::path::SmbPath;
@@ -90,7 +92,7 @@ const FILE_OVERWRITTEN: u32 = 0x0000_0003;
 const RESPONSE_CONTEXTS_OFFSET: u32 = 0x98;
 
 /// Caching the server grants in a lease.
-const GRANTABLE_LEASE: LeaseState = LeaseState::R;
+const GRANTABLE_LEASE: LeaseState = LeaseState::RH;
 
 /// Create contexts of a request that the response answers (MS-SMB2
 /// 3.3.5.9.5, 3.3.5.9.9) or that fail it. Other contexts are ignored.
@@ -205,14 +207,17 @@ fn lease_request(
 /// (MS-SMB2 2.2.14.2.10, 2.2.14.2.11).
 fn lease_response(granted: &Granted) -> CreateContext {
     let v2 = granted.version == LeaseVersion::V2;
+    let mut flags = 0;
+    if granted.breaking {
+        flags |= LeaseContext::FLAG_BREAK_IN_PROGRESS;
+    }
+    if v2 && granted.parent.is_some() {
+        flags |= LeaseContext::FLAG_PARENT_LEASE_KEY_SET;
+    }
     let ctx = LeaseContext {
         key: granted.id.key,
         state: granted.state.bits(),
-        flags: if v2 && granted.parent.is_some() {
-            LeaseContext::FLAG_PARENT_LEASE_KEY_SET
-        } else {
-            0
-        },
+        flags,
         parent_key: granted.parent.unwrap_or_default(),
         epoch: if v2 { granted.epoch } else { 0 },
         v2,
@@ -223,157 +228,267 @@ fn lease_response(granted: &Granted) -> CreateContext {
     }
 }
 
+/// Most attempts an asynchronous CREATE makes; each follows a change on the
+/// file while a lease break is in progress.
+const MAX_WAIT_ATTEMPTS: u32 = 64;
+
+/// A validated CREATE request: what each attempt to open needs.
+struct CreateArgs {
+    path: SmbPath,
+    intent: OpenIntent,
+    options: u32,
+    create_disposition: u32,
+    open_access: u32,
+    maximal: u32,
+    delete_on_close: bool,
+    /// Attributes for a file this CREATE makes or overwrites.
+    new_attributes: u32,
+    opts: OpenOptions,
+    sharing: Sharing,
+    queries: ContextQueries,
+    lease: Option<LeaseRequest>,
+}
+
+impl CreateArgs {
+    /// Checks the request against the tree it targets (MS-SMB2 3.3.5.9).
+    async fn parse(conn: &Arc<Connection>, hdr: &Smb2Header, body: &[u8]) -> Result<Self, u32> {
+        let req = CreateRequest::parse(body).map_err(|_| ntstatus::STATUS_INVALID_PARAMETER)?;
+        let tree_arc = lookup_session_tree(conn, hdr).await?;
+        let tree = tree_arc.read().await;
+        let tree_access = tree.granted_access;
+        let share = Arc::clone(&tree.share);
+        drop(tree);
+
+        // Decode path.
+        let units = utf16le_to_units(&req.name).ok_or(ntstatus::STATUS_INVALID_PARAMETER)?;
+        let path = SmbPath::from_utf16(&units).map_err(|_| ntstatus::STATUS_OBJECT_NAME_INVALID)?;
+
+        // Translate disposition.
+        let intent = match req.create_disposition {
+            FILE_SUPERSEDE | FILE_OVERWRITE_IF => OpenIntent::OverwriteOrCreate,
+            FILE_OPEN => OpenIntent::Open,
+            FILE_CREATE => OpenIntent::Create,
+            FILE_OPEN_IF => OpenIntent::OpenOrCreate,
+            FILE_OVERWRITE => OpenIntent::Truncate,
+            _ => return Err(ntstatus::STATUS_INVALID_PARAMETER),
+        };
+
+        let options = req.create_options;
+        if options & (FILE_OPEN_BY_FILE_ID | FILE_RESERVE_OPFILTER) != 0 {
+            return Err(ntstatus::STATUS_NOT_SUPPORTED);
+        }
+        let directory = options & FILE_DIRECTORY_FILE != 0;
+        let non_directory = options & FILE_NON_DIRECTORY_FILE != 0;
+        if directory
+            && (options & !DIRECTORY_OPTIONS != 0
+                || !matches!(
+                    intent,
+                    OpenIntent::Create | OpenIntent::OpenOrCreate | OpenIntent::Open
+                ))
+        {
+            return Err(ntstatus::STATUS_INVALID_PARAMETER);
+        }
+
+        let queries = ContextQueries::parse(&req.create_contexts)
+            .ok_or(ntstatus::STATUS_INVALID_PARAMETER)?;
+        if queries.timewarp {
+            // There are no snapshots, so none matches the token.
+            return Err(ntstatus::STATUS_OBJECT_NAME_NOT_FOUND);
+        }
+        if queries.ea_buffer {
+            return Err(ntstatus::STATUS_EAS_NOT_SUPPORTED);
+        }
+        // Directories get no lease, and neither do shares that turn leases off.
+        let lease = if req.requested_oplock_level == OplockLevel::Lease as u8 && share.leases {
+            let dialect = *conn.dialect.read().await;
+            let client = *conn.client_guid.read().await;
+            lease_request(queries.lease.as_deref(), dialect, client)?.filter(|_| !directory)
+        } else {
+            None
+        };
+
+        let maximal = maximal_access(tree_access);
+        let delete_on_close = options & FILE_DELETE_ON_CLOSE != 0;
+        // MS-SMB2 3.3.5.9: the tree must allow DELETE.
+        if delete_on_close && maximal & DELETE == 0 {
+            warn!(path = %path, "delete-on-close open on read-only tree");
+            return Err(ntstatus::STATUS_ACCESS_DENIED);
+        }
+        if req.desired_access == 0 {
+            return Err(ntstatus::STATUS_ACCESS_DENIED);
+        }
+        let Some(mut open_access) = granted_access(req.desired_access, maximal) else {
+            warn!(path = %path, "requested access exceeds tree access");
+            return Err(ntstatus::STATUS_ACCESS_DENIED);
+        };
+        if options & FILE_NO_INTERMEDIATE_BUFFERING != 0 {
+            open_access &= !FILE_APPEND_DATA;
+        }
+        // Disposition that creates: requires write permission.
+        if !tree_access.allows_write()
+            && matches!(
+                intent,
+                OpenIntent::Create
+                    | OpenIntent::OpenOrCreate
+                    | OpenIntent::OverwriteOrCreate
+                    | OpenIntent::Truncate
+            )
+        {
+            return Err(ntstatus::STATUS_ACCESS_DENIED);
+        }
+
+        let new_attributes = req.file_attributes & VALID_SET_ATTRIBUTES;
+        if delete_on_close {
+            // MS-FSA 2.1.5.1: the open itself must request DELETE.
+            if open_access & DELETE == 0 {
+                return Err(ntstatus::STATUS_INVALID_PARAMETER);
+            }
+            // MS-FSA 2.1.5.1: a file created read-only cannot be deleted.
+            if intent != OpenIntent::Open && new_attributes & FILE_ATTRIBUTE_READONLY != 0 {
+                return Err(ntstatus::STATUS_CANNOT_DELETE);
+            }
+        }
+
+        let write = open_access & (FILE_WRITE_DATA | FILE_APPEND_DATA) != 0;
+        let opts = OpenOptions {
+            read: open_access & FILE_READ_DATA != 0 || !write,
+            write,
+            write_attributes: open_access & FILE_WRITE_ATTRIBUTES != 0,
+            intent,
+            directory,
+            non_directory,
+            delete_on_close,
+        };
+        Ok(Self {
+            path,
+            intent,
+            options,
+            create_disposition: req.create_disposition,
+            open_access,
+            maximal,
+            delete_on_close,
+            new_attributes,
+            opts,
+            sharing: Sharing {
+                access: open_access,
+                share: req.share_access,
+            },
+            queries,
+            lease,
+        })
+    }
+}
+
+/// Where an attempt to open stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stage {
+    Start,
+    /// A sharing violation broke handle caching. Another violation waits
+    /// while that break is in progress and fails the CREATE once it is
+    /// over (MS-FSA 2.1.5.1.2).
+    AfterHandleBreak,
+}
+
+/// How an attempt ended.
+enum Step {
+    Done(HandlerResponse),
+    /// A lease break has to complete first; nothing stays open meanwhile.
+    Wait(BreakWait),
+}
+
 pub async fn handle(
     server: &Arc<ServerState>,
     conn: &Arc<Connection>,
     hdr: &Smb2Header,
     body: &[u8],
-) -> HandlerResponse {
-    let req = match CreateRequest::parse(body) {
-        Ok(r) => r,
-        Err(_) => return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER),
+    retained: usize,
+) -> Outcome {
+    let args = match CreateArgs::parse(conn, hdr, body).await {
+        Ok(args) => args,
+        Err(status) => return Outcome::Done(HandlerResponse::err(status)),
     };
+    let wait = match attempt(server, conn, hdr, &args, Stage::Start).await {
+        Step::Done(response) => return Outcome::Done(response),
+        Step::Wait(wait) => wait,
+    };
+    // MS-SMB2 3.3.4.2: past its limits the connection gets no more
+    // asynchronous requests.
+    let Some((op, mut stop)) = conn.pending.reserve(hdr, None, retained) else {
+        warn!("too many waiting requests on the connection");
+        return Outcome::Done(HandlerResponse::err(
+            ntstatus::STATUS_INSUFFICIENT_RESOURCES,
+        ));
+    };
+    let (server, conn, hdr) = (Arc::clone(server), Arc::clone(conn), *hdr);
+    // The wait ends when the break completes, at the latest when its
+    // acknowledgment times out. A wait that runs out with nothing changed
+    // fails the CREATE as a sharing violation.
+    let work = async move {
+        let mut wait = wait;
+        for _ in 0..MAX_WAIT_ATTEMPTS {
+            let changed = tokio::select! {
+                biased;
+                why = stopped(&mut stop) => {
+                    if why == Stop::Cancelled {
+                        return HandlerResponse::err(ntstatus::STATUS_CANCELLED);
+                    }
+                    true
+                }
+                changed = wait.changed() => changed,
+            };
+            match attempt(&server, &conn, &hdr, &args, Stage::AfterHandleBreak).await {
+                Step::Done(response) => return response,
+                Step::Wait(_) if !changed => break,
+                Step::Wait(next) => wait = next,
+            }
+        }
+        HandlerResponse::err(ntstatus::STATUS_SHARING_VIOLATION)
+    };
+    Outcome::Pending(Pending {
+        op,
+        work: Box::pin(work),
+    })
+}
 
+/// One try at opening the file. Runs the session and tree checks again, so
+/// a CREATE that waited fails once its session or tree is gone.
+async fn attempt(
+    server: &Arc<ServerState>,
+    conn: &Arc<Connection>,
+    hdr: &Smb2Header,
+    args: &CreateArgs,
+    stage: Stage,
+) -> Step {
+    let fail = |status| Step::Done(HandlerResponse::err(status));
     let tree_arc = match lookup_session_tree(conn, hdr).await {
         Ok(t) => t,
-        Err(s) => return HandlerResponse::err(s),
+        Err(s) => return fail(s),
     };
-    let tree = tree_arc.read().await;
-    let tree_access = tree.granted_access;
-    let share = Arc::clone(&tree.share);
-    drop(tree);
+    let share = Arc::clone(&tree_arc.read().await.share);
     let backend = Arc::clone(&share.backend);
-
-    // Decode path.
-    let Some(units) = utf16le_to_units(&req.name) else {
-        return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
-    };
-    let path = match SmbPath::from_utf16(&units) {
-        Ok(p) => p,
-        Err(_) => return HandlerResponse::err(ntstatus::STATUS_OBJECT_NAME_INVALID),
-    };
-
-    // Translate disposition.
-    let intent = match req.create_disposition {
-        FILE_SUPERSEDE | FILE_OVERWRITE_IF => OpenIntent::OverwriteOrCreate,
-        FILE_OPEN => OpenIntent::Open,
-        FILE_CREATE => OpenIntent::Create,
-        FILE_OPEN_IF => OpenIntent::OpenOrCreate,
-        FILE_OVERWRITE => OpenIntent::Truncate,
-        _ => return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER),
-    };
-
-    let options = req.create_options;
-    if options & (FILE_OPEN_BY_FILE_ID | FILE_RESERVE_OPFILTER) != 0 {
-        return HandlerResponse::err(ntstatus::STATUS_NOT_SUPPORTED);
-    }
-    let directory = options & FILE_DIRECTORY_FILE != 0;
-    let non_directory = options & FILE_NON_DIRECTORY_FILE != 0;
-    if directory
-        && (options & !DIRECTORY_OPTIONS != 0
-            || !matches!(
-                intent,
-                OpenIntent::Create | OpenIntent::OpenOrCreate | OpenIntent::Open
-            ))
-    {
-        return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
-    }
-
-    let Some(queries) = ContextQueries::parse(&req.create_contexts) else {
-        return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
-    };
-    if queries.timewarp {
-        // There are no snapshots, so none matches the token.
-        return HandlerResponse::err(ntstatus::STATUS_OBJECT_NAME_NOT_FOUND);
-    }
-    if queries.ea_buffer {
-        return HandlerResponse::err(ntstatus::STATUS_EAS_NOT_SUPPORTED);
-    }
-    // Directories get no lease, and neither do shares that turn leases off.
-    let lease = if req.requested_oplock_level == OplockLevel::Lease as u8 && share.leases {
-        let dialect = *conn.dialect.read().await;
-        let client = *conn.client_guid.read().await;
-        match lease_request(queries.lease.as_deref(), dialect, client) {
-            Ok(lease) => lease.filter(|_| !directory),
-            Err(status) => return HandlerResponse::err(status),
-        }
-    } else {
-        None
-    };
-
-    let maximal = maximal_access(tree_access);
-    let delete_on_close = options & FILE_DELETE_ON_CLOSE != 0;
-    // MS-SMB2 3.3.5.9: the tree must allow DELETE.
-    if delete_on_close && maximal & DELETE == 0 {
-        warn!(path = %path, "delete-on-close open on read-only tree");
-        return HandlerResponse::err(ntstatus::STATUS_ACCESS_DENIED);
-    }
-    if req.desired_access == 0 {
-        return HandlerResponse::err(ntstatus::STATUS_ACCESS_DENIED);
-    }
-    let Some(mut open_access) = granted_access(req.desired_access, maximal) else {
-        warn!(path = %path, "requested access exceeds tree access");
-        return HandlerResponse::err(ntstatus::STATUS_ACCESS_DENIED);
-    };
-    if options & FILE_NO_INTERMEDIATE_BUFFERING != 0 {
-        open_access &= !FILE_APPEND_DATA;
-    }
-    // Disposition that creates: requires write permission.
-    if !tree_access.allows_write()
-        && matches!(
-            intent,
-            OpenIntent::Create
-                | OpenIntent::OpenOrCreate
-                | OpenIntent::OverwriteOrCreate
-                | OpenIntent::Truncate
-        )
-    {
-        return HandlerResponse::err(ntstatus::STATUS_ACCESS_DENIED);
-    }
-
-    // Attributes for a file this CREATE makes or overwrites.
-    let new_attributes = req.file_attributes & VALID_SET_ATTRIBUTES;
-    if delete_on_close {
-        // MS-FSA 2.1.5.1: the open itself must request DELETE.
-        if open_access & DELETE == 0 {
-            return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
-        }
-        // MS-FSA 2.1.5.1: a file created read-only cannot be deleted.
-        if intent != OpenIntent::Open && new_attributes & FILE_ATTRIBUTE_READONLY != 0 {
-            return HandlerResponse::err(ntstatus::STATUS_CANNOT_DELETE);
-        }
-    }
+    let path = &args.path;
 
     let limit = server.max_opens_per_connection.load(Ordering::Relaxed);
     let Some(slot) = OpenSlot::acquire(&conn.open_count, limit) else {
         warn!(limit, "open limit reached");
-        return HandlerResponse::err(ntstatus::STATUS_INSUFFICIENT_RESOURCES);
+        return fail(ntstatus::STATUS_INSUFFICIENT_RESOURCES);
     };
 
-    let write = open_access & (FILE_WRITE_DATA | FILE_APPEND_DATA) != 0;
-    let opts = OpenOptions {
-        read: open_access & FILE_READ_DATA != 0 || !write,
-        write,
-        write_attributes: open_access & FILE_WRITE_ATTRIBUTES != 0,
-        intent,
-        directory,
-        non_directory,
-        delete_on_close,
-    };
-    let sharing = Sharing {
-        access: open_access,
-        share: req.share_access,
-    };
     let open_request = |overwrite| OpenRequest {
-        sharing,
+        sharing: args.sharing,
         owner: Arc::downgrade(&conn.outbound),
-        lease: lease.map(|l| l.id),
+        lease: args.lease.map(|l| l.id),
         overwrite,
+        break_handles: stage == Stage::Start,
     };
-    let lease_ref = match &lease {
-        Some(l) => match server.leases.acquire(l.id, &share, &path) {
+    let refused = |refused: Refused| match refused.wait {
+        Some(wait) => Step::Wait(wait),
+        None => fail(refused.status),
+    };
+    let lease_ref = match &args.lease {
+        Some(l) => match server.leases.acquire(l.id, &share, path) {
             Ok(lease_ref) => Some(lease_ref),
-            Err(status) => return HandlerResponse::err(status),
+            Err(status) => return fail(status),
         },
         None => None,
     };
@@ -381,25 +496,28 @@ pub async fn handle(
     // An open that truncates checks the file and takes its place in the
     // table first, so a refused open leaves the file as it was and no other
     // open slips in while the backend truncates.
-    let reserved = if matches!(intent, OpenIntent::Truncate | OpenIntent::OverwriteOrCreate) {
-        match reserve_existing(&share, &path, opts, open_request(true)).await {
+    let reserved = if matches!(
+        args.intent,
+        OpenIntent::Truncate | OpenIntent::OverwriteOrCreate
+    ) {
+        match reserve_existing(&share, path, args.opts, open_request(true)).await {
             Ok(reserved) => reserved,
-            Err(status) => return HandlerResponse::err(status),
+            Err(r) => return refused(r),
         }
     } else {
         None
     };
 
-    let (handle, action) = match backend.open(&path, opts).await {
+    let (handle, action) = match backend.open(path, args.opts).await {
         Ok(opened) => opened,
         Err(e) => {
             debug!(error = %e, path = %path, "backend open failed");
             let case_sensitive = backend.capabilities().case_sensitive;
-            if matches!(e, SmbError::Exists) && share.files.delete_pending_at(&path, case_sensitive)
+            if matches!(e, SmbError::Exists) && share.files.delete_pending_at(path, case_sensitive)
             {
-                return HandlerResponse::err(ntstatus::STATUS_DELETE_PENDING);
+                return fail(ntstatus::STATUS_DELETE_PENDING);
             }
-            return HandlerResponse::err(e.to_nt_status());
+            return fail(e.to_nt_status());
         }
     };
 
@@ -408,32 +526,32 @@ pub async fn handle(
         Ok(i) => i,
         Err(e) => {
             let _ = handle.close().await;
-            return HandlerResponse::err(e.to_nt_status());
+            return fail(e.to_nt_status());
         }
     };
     // MS-FSA 2.1.5.1.2.1: a read-only file cannot be opened for deletion.
-    if delete_on_close && info.read_only {
+    if args.delete_on_close && info.read_only {
         let _ = handle.close().await;
-        return HandlerResponse::err(ntstatus::STATUS_CANNOT_DELETE);
+        return fail(ntstatus::STATUS_CANNOT_DELETE);
     }
     let mut file = match reserved {
-        Some(file) if file.is_for(&info, &path) => file,
+        Some(file) if file.is_for(&info, path) => file,
         // The file was replaced between the two opens, or did not exist.
         reserved => {
             drop(reserved);
             let overwrite = action == OpenAction::Overwritten;
-            match FileRef::register(&share, &info, &path, open_request(overwrite)) {
+            match FileRef::register(&share, &info, path, open_request(overwrite)) {
                 Ok(f) => f,
-                Err(status) => {
+                Err(r) => {
                     let _ = handle.close().await;
-                    return HandlerResponse::err(status);
+                    return refused(r);
                 }
             }
         }
     };
     let mut granted = None;
     let mut after_send = None;
-    if let (Some(lease), Some(lease_ref)) = (lease, lease_ref)
+    if let (Some(lease), Some(lease_ref)) = (args.lease, lease_ref)
         && !info.is_directory
     {
         match server
@@ -447,7 +565,7 @@ pub async fn handle(
             Err(status) => {
                 drop(file);
                 let _ = handle.close().await;
-                return HandlerResponse::err(status);
+                return fail(status);
             }
         }
     }
@@ -459,10 +577,10 @@ pub async fn handle(
     }
 
     if action != OpenAction::Opened
-        && new_attributes != 0
-        && new_attributes != info.attributes() & VALID_SET_ATTRIBUTES
+        && args.new_attributes != 0
+        && args.new_attributes != info.attributes() & VALID_SET_ATTRIBUTES
     {
-        apply_attributes(handle.as_ref(), new_attributes, &path).await;
+        apply_attributes(handle.as_ref(), args.new_attributes, path).await;
         if let Ok(updated) = handle.stat().await {
             info = updated;
         }
@@ -470,7 +588,7 @@ pub async fn handle(
 
     // The on-disk id carries the serial number FileFsVolumeInformation
     // reports.
-    let volume_serial = if queries.query_on_disk_id {
+    let volume_serial = if args.queries.query_on_disk_id {
         backend
             .volume_info()
             .await
@@ -489,18 +607,18 @@ pub async fn handle(
         drop(file);
         drop(after_send);
         let _ = handle.close().await;
-        return HandlerResponse::err(ntstatus::STATUS_NETWORK_NAME_DELETED);
+        return fail(ntstatus::STATUS_NETWORK_NAME_DELETED);
     }
     let file_id = tree.alloc_file_id();
     let open = Open {
         file_id,
         handle: Some(handle),
-        granted_access: open_access,
+        granted_access: args.open_access,
         is_directory: info.is_directory,
-        delete_on_close,
+        delete_on_close: args.delete_on_close,
         search_state: None,
         fixed_times: FileTimes::default(),
-        create_options: options,
+        create_options: args.options,
         file: Some(file),
         slot: Some(slot),
     };
@@ -511,10 +629,10 @@ pub async fn handle(
     let create_action = match action {
         OpenAction::Opened => FILE_OPENED,
         OpenAction::Created => FILE_CREATED,
-        OpenAction::Overwritten if req.create_disposition == FILE_SUPERSEDE => FILE_SUPERSEDED,
+        OpenAction::Overwritten if args.create_disposition == FILE_SUPERSEDE => FILE_SUPERSEDED,
         OpenAction::Overwritten => FILE_OVERWRITTEN,
     };
-    let mut answers = queries.answer(&info, maximal, volume_serial);
+    let mut answers = args.queries.answer(&info, args.maximal, volume_serial);
     if let Some(granted) = &granted {
         answers.push(lease_response(granted));
     }
@@ -549,8 +667,10 @@ pub async fn handle(
     let mut buf = Vec::new();
     resp.write_to(&mut buf).expect("encode");
     let mut response = HandlerResponse::ok(buf);
-    response.after_send = after_send;
-    response
+    if let Some(guard) = after_send {
+        response.after_send.push(Box::new(guard));
+    }
+    Step::Done(response)
 }
 
 /// Before a CREATE that truncates the file at `path`, checks the existing
@@ -563,7 +683,7 @@ async fn reserve_existing(
     path: &SmbPath,
     opts: OpenOptions,
     req: OpenRequest,
-) -> Result<Option<FileRef>, u32> {
+) -> Result<Option<FileRef>, Refused> {
     let probe = OpenOptions {
         read: true,
         write: false,
@@ -576,7 +696,9 @@ async fn reserve_existing(
         return Ok(None);
     };
     let result = match handle.stat().await {
-        Ok(info) if opts.delete_on_close && info.read_only => Err(ntstatus::STATUS_CANNOT_DELETE),
+        Ok(info) if opts.delete_on_close && info.read_only => {
+            Err(ntstatus::STATUS_CANNOT_DELETE.into())
+        }
         Ok(info) => FileRef::register(share, &info, path, req).map(Some),
         Err(_) => Ok(None),
     };
@@ -720,7 +842,12 @@ mod tests {
         let truncating = tokio::spawn({
             let state = Arc::clone(&state);
             let conn = Arc::clone(&conn);
-            async move { handle(&state, &conn, &hdr, &body).await }
+            async move {
+                match handle(&state, &conn, &hdr, &body, 0).await {
+                    Outcome::Done(response) => response.status,
+                    Outcome::Pending(_) => panic!("the CREATE waits"),
+                }
+            }
         });
         waiting.notified().await;
 
@@ -743,11 +870,13 @@ mod tests {
             }
             .into(),
         );
-        assert_eq!(exclusive.err(), Some(ntstatus::STATUS_SHARING_VIOLATION));
+        assert_eq!(
+            exclusive.err().map(|r| r.status),
+            Some(ntstatus::STATUS_SHARING_VIOLATION)
+        );
 
         go.add_permits(1);
-        let response = truncating.await.unwrap();
-        assert_eq!(response.status, ntstatus::STATUS_SUCCESS);
+        assert_eq!(truncating.await.unwrap(), ntstatus::STATUS_SUCCESS);
         assert_eq!(probe.stat().await.unwrap().end_of_file, 0);
     }
 }

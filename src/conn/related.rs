@@ -2,7 +2,9 @@
 
 use crate::dispatch::{read_u32, read_u64};
 use crate::ntstatus;
-use crate::proto::header::{Command, HeaderTail, SMB2_HEADER_LEN, Smb2Header};
+use crate::proto::header::{
+    Command, HeaderTail, SMB2_FLAGS_ASYNC_COMMAND, SMB2_HEADER_LEN, Smb2Header,
+};
 
 /// What a related request takes from the request before it in the chain.
 #[derive(Default)]
@@ -86,7 +88,13 @@ impl RelatedContext {
         let status = read_u32(response, 0x08);
         let failed = status >> 30 == 3 && status != ntstatus::STATUS_MORE_PROCESSING_REQUIRED;
         self.session_id = read_u64(response, 0x28);
-        self.tree_id = read_u32(response, 0x24);
+        // An asynchronous response carries its AsyncId where the TreeId
+        // would be; the request has the TreeId then.
+        self.tree_id = if read_u32(response, 0x10) & SMB2_FLAGS_ASYNC_COMMAND != 0 {
+            read_u32(request, 0x24)
+        } else {
+            read_u32(response, 0x24)
+        };
         self.failed = match command {
             Command::SessionSetup if failed => Failed::SessionSetup,
             Command::TreeConnect if failed => Failed::TreeConnect,

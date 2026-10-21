@@ -9,15 +9,19 @@ use crate::access_mask::{DELETE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA};
 use crate::backend::{
     FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_TEMPORARY, FileTimes, VALID_SET_ATTRIBUTES,
 };
+use crate::conn::pending::{Stop, stopped};
 use crate::conn::state::{Connection, Open};
 use crate::dispatch::HandlerResponse;
-use crate::files::Trigger;
+use crate::files::{BreakWait, Trigger};
 use crate::handlers::shared::{lookup_open, lookup_session_tree, restore_fixed_times};
+use crate::handlers::{Outcome, Pending};
 use crate::info_class as ic;
 use crate::ntstatus;
 use crate::path::{SmbPath, same_path};
+use crate::proto::messages::FileId;
 use crate::server::ServerState;
 use crate::utils::utf16le_to_units;
+use tracing::warn;
 
 /// Classes MS-FSCC 2.4 lists as settable: Basic, Rename, Link, Disposition,
 /// Position, FullEa, Mode, Allocation, EndOfFile, Pipe, Quota,
@@ -38,28 +42,42 @@ pub async fn handle(
     conn: &Arc<Connection>,
     hdr: &Smb2Header,
     body: &[u8],
-) -> HandlerResponse {
+    retained: usize,
+) -> Outcome {
+    match set(conn, hdr, body).await {
+        Ok(response) => Outcome::Done(response),
+        Err((wait, rename)) => wait_for_rename(conn, hdr, wait, rename, retained),
+    }
+}
+
+/// Applies the SET_INFO request, or returns the rename that has to wait for
+/// a lease break first.
+async fn set(
+    conn: &Arc<Connection>,
+    hdr: &Smb2Header,
+    body: &[u8],
+) -> Result<HandlerResponse, (BreakWait, Rename)> {
     let req = match SetInfoRequest::parse(body) {
         Ok(r) => r,
-        Err(_) => return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER),
+        Err(_) => return Ok(HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER)),
     };
     let tree_arc = match lookup_session_tree(conn, hdr).await {
         Ok(t) => t,
-        Err(s) => return HandlerResponse::err(s),
+        Err(s) => return Ok(HandlerResponse::err(s)),
     };
     let open_arc = match lookup_open(&tree_arc, req.file_id).await {
         Some(o) => o,
-        None => return HandlerResponse::err(ntstatus::STATUS_FILE_CLOSED),
+        None => return Ok(HandlerResponse::err(ntstatus::STATUS_FILE_CLOSED)),
     };
     if req.buffer_length == 0 {
-        return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
+        return Ok(HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER));
     }
     let info_type = match InfoType::from_u8(req.info_type) {
         Some(t) => t,
-        None => return HandlerResponse::err(ntstatus::STATUS_INVALID_INFO_CLASS),
+        None => return Ok(HandlerResponse::err(ntstatus::STATUS_INVALID_INFO_CLASS)),
     };
     if !matches!(info_type, InfoType::File) {
-        return HandlerResponse::err(ntstatus::STATUS_NOT_SUPPORTED);
+        return Ok(HandlerResponse::err(ntstatus::STATUS_NOT_SUPPORTED));
     }
 
     // MS-SMB2 3.3.5.21.1: access each class needs from Open.GrantedAccess.
@@ -72,20 +90,18 @@ pub async fn handle(
         ic::FILE_END_OF_FILE_INFORMATION => (Class::EndOfFile, FILE_WRITE_DATA),
         ic::FILE_ALLOCATION_INFORMATION => (Class::Allocation, FILE_WRITE_DATA),
         class if SETTABLE_CLASSES.contains(&class) => {
-            return HandlerResponse::err(ntstatus::STATUS_NOT_SUPPORTED);
+            return Ok(HandlerResponse::err(ntstatus::STATUS_NOT_SUPPORTED));
         }
-        _ => return HandlerResponse::err(ntstatus::STATUS_INVALID_INFO_CLASS),
+        _ => return Ok(HandlerResponse::err(ntstatus::STATUS_INVALID_INFO_CLASS)),
     };
     if open_arc.read().await.granted_access & required != required {
-        return HandlerResponse::err(ntstatus::STATUS_ACCESS_DENIED);
+        return Ok(HandlerResponse::err(ntstatus::STATUS_ACCESS_DENIED));
     }
     let buffer = req.buffer;
-    let share = tree_arc.read().await.share.clone();
-
     let result = match class {
         Class::Basic => {
             if buffer.len() < 36 {
-                return HandlerResponse::err(ntstatus::STATUS_INFO_LENGTH_MISMATCH);
+                return Ok(HandlerResponse::err(ntstatus::STATUS_INFO_LENGTH_MISMATCH));
             }
             let time = |at: usize| i64::from_le_bytes(buffer[at..at + 8].try_into().unwrap());
             let times = [time(0), time(8), time(16), time(24)];
@@ -95,7 +111,7 @@ pub async fn handle(
         }
         Class::EndOfFile => {
             if buffer.len() < 8 {
-                return HandlerResponse::err(ntstatus::STATUS_INFO_LENGTH_MISMATCH);
+                return Ok(HandlerResponse::err(ntstatus::STATUS_INFO_LENGTH_MISMATCH));
             }
             let new_len = u64::from_le_bytes(buffer[0..8].try_into().unwrap());
             let open = open_arc.read().await;
@@ -103,7 +119,7 @@ pub async fn handle(
         }
         Class::Allocation => {
             if buffer.len() < 8 {
-                return HandlerResponse::err(ntstatus::STATUS_INFO_LENGTH_MISMATCH);
+                return Ok(HandlerResponse::err(ntstatus::STATUS_INFO_LENGTH_MISMATCH));
             }
             let size = u64::from_le_bytes(buffer[0..8].try_into().unwrap());
             let open = open_arc.read().await;
@@ -111,7 +127,7 @@ pub async fn handle(
         }
         Class::Disposition => {
             if buffer.is_empty() {
-                return HandlerResponse::err(ntstatus::STATUS_INFO_LENGTH_MISMATCH);
+                return Ok(HandlerResponse::err(ntstatus::STATUS_INFO_LENGTH_MISMATCH));
             }
             let open = open_arc.read().await;
             set_disposition(&open, buffer[0] != 0).await
@@ -120,10 +136,10 @@ pub async fn handle(
             // FILE_RENAME_INFORMATION layout (MS-FSCC §2.4.37):
             //   ReplaceIfExists (1) | Reserved (7) | RootDirectory (8) | FileNameLength (4) | FileName...
             if buffer.len() < 20 {
-                return HandlerResponse::err(ntstatus::STATUS_INFO_LENGTH_MISMATCH);
+                return Ok(HandlerResponse::err(ntstatus::STATUS_INFO_LENGTH_MISMATCH));
             }
             if buffer[8..16] != [0; 8] {
-                return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
+                return Ok(HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER));
             }
             let name_len = u32::from_le_bytes(
                 buffer[16..20]
@@ -134,52 +150,171 @@ pub async fn handle(
                 .ok()
                 .and_then(|len| buffer.get(20..)?.get(..len))
             else {
-                return HandlerResponse::err(ntstatus::STATUS_INFO_LENGTH_MISMATCH);
+                return Ok(HandlerResponse::err(ntstatus::STATUS_INFO_LENGTH_MISMATCH));
             };
             let units = match utf16le_to_units(name_bytes) {
                 Some(u) => u,
-                None => return HandlerResponse::err(ntstatus::STATUS_OBJECT_NAME_INVALID),
+                None => return Ok(HandlerResponse::err(ntstatus::STATUS_OBJECT_NAME_INVALID)),
             };
             let new_path = match SmbPath::from_utf16(&units) {
                 Ok(p) => p,
-                Err(_) => return HandlerResponse::err(ntstatus::STATUS_OBJECT_NAME_INVALID),
+                Err(_) => return Ok(HandlerResponse::err(ntstatus::STATUS_OBJECT_NAME_INVALID)),
             };
-            let replace_if_exists = buffer[0] != 0;
-            let case_sensitive = share.backend.capabilities().case_sensitive;
-            let _renames = share.files.rename_lock().await;
-            let Some(from) = open_arc.read().await.path() else {
-                return HandlerResponse::err(ntstatus::STATUS_FILE_CLOSED);
+            let rename = Rename {
+                file_id: req.file_id,
+                to: new_path,
+                replace: buffer[0] != 0,
             };
-            // MS-FSA 2.1.5.15.12: an open target is not replaced. A target
-            // that names the source itself is the same file and skips this.
-            if replace_if_exists
-                && !same_path(&from, &new_path, case_sensitive)
-                && share.files.path_is_open(&new_path, case_sensitive)
-            {
-                return HandlerResponse::err(ntstatus::STATUS_ACCESS_DENIED);
-            }
-            match share
-                .backend
-                .rename(&from, &new_path, replace_if_exists)
-                .await
-            {
-                Ok(()) => {
-                    share.files.rename_paths(&from, &new_path, case_sensitive);
-                    Ok(())
-                }
-                Err(e) => Err(e.to_nt_status()),
+            match rename_attempt(conn, hdr, &rename, Stage::Start).await {
+                Renamed::Done(result) => result,
+                Renamed::Wait(wait) => return Err((wait, rename)),
             }
         }
     };
 
     if let Err(status) = result {
-        return HandlerResponse::err(status);
+        return Ok(HandlerResponse::err(status));
     }
+    Ok(set_info_ok())
+}
+
+/// Most attempts a waiting rename makes; each follows a change on the
+/// target while a lease break is in progress.
+const MAX_WAIT_ATTEMPTS: u32 = 64;
+
+/// A FileRenameInformation request.
+struct Rename {
+    file_id: FileId,
+    to: SmbPath,
+    replace: bool,
+}
+
+/// Where a rename stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stage {
+    Start,
+    /// The handle caching of an open target was broken. A target still
+    /// open waits while that break is in progress and fails the rename
+    /// once it is over.
+    AfterHandleBreak,
+}
+
+/// How a rename attempt ended.
+enum Renamed {
+    Done(Result<(), u32>),
+    Wait(BreakWait),
+}
+
+/// Answers a rename asynchronously while the clients caching handles to
+/// its target give them up. Closing the renamed open ends the wait.
+fn wait_for_rename(
+    conn: &Arc<Connection>,
+    hdr: &Smb2Header,
+    wait: BreakWait,
+    rename: Rename,
+    retained: usize,
+) -> Outcome {
+    let Some((op, mut stop)) = conn.pending.reserve(hdr, Some(rename.file_id), retained) else {
+        warn!("too many waiting requests on the connection");
+        return Outcome::Done(HandlerResponse::err(
+            ntstatus::STATUS_INSUFFICIENT_RESOURCES,
+        ));
+    };
+    let (conn, hdr) = (Arc::clone(conn), *hdr);
+    // The wait ends when the break completes, at the latest when its
+    // acknowledgment times out. A wait that runs out with nothing changed
+    // fails the rename.
+    let work = async move {
+        let mut wait = wait;
+        for _ in 0..MAX_WAIT_ATTEMPTS {
+            let changed = tokio::select! {
+                biased;
+                why = stopped(&mut stop) => {
+                    if why == Stop::Cancelled {
+                        return HandlerResponse::err(ntstatus::STATUS_CANCELLED);
+                    }
+                    true
+                }
+                changed = wait.changed() => changed,
+            };
+            match rename_attempt(&conn, &hdr, &rename, Stage::AfterHandleBreak).await {
+                Renamed::Done(Ok(())) => return set_info_ok(),
+                Renamed::Done(Err(status)) => return HandlerResponse::err(status),
+                Renamed::Wait(_) if !changed => break,
+                Renamed::Wait(next) => wait = next,
+            }
+        }
+        HandlerResponse::err(ntstatus::STATUS_ACCESS_DENIED)
+    };
+    Outcome::Pending(Pending {
+        op,
+        work: Box::pin(work),
+    })
+}
+
+fn set_info_ok() -> HandlerResponse {
     let mut buf = Vec::new();
     SetInfoResponse::default()
         .write_to(&mut buf)
         .expect("encode");
     HandlerResponse::ok(buf)
+}
+
+/// FileRenameInformation (MS-FSA 2.1.5.15.12). An open target is not
+/// replaced; when it is open only because clients cache their handles, the
+/// first attempt breaks that caching and waits. The leases on the renamed
+/// file give up handle caching, as do those on files open below a renamed
+/// directory.
+async fn rename_attempt(
+    conn: &Arc<Connection>,
+    hdr: &Smb2Header,
+    rename: &Rename,
+    stage: Stage,
+) -> Renamed {
+    let tree_arc = match lookup_session_tree(conn, hdr).await {
+        Ok(t) => t,
+        Err(s) => return Renamed::Done(Err(s)),
+    };
+    let Some(open_arc) = lookup_open(&tree_arc, rename.file_id).await else {
+        return Renamed::Done(Err(ntstatus::STATUS_FILE_CLOSED));
+    };
+    let share = tree_arc.read().await.share.clone();
+    let case_sensitive = share.backend.capabilities().case_sensitive;
+    let _renames = share.files.rename_lock().await;
+    let open = open_arc.read().await;
+    let Some(file) = open.file.as_ref() else {
+        return Renamed::Done(Err(ntstatus::STATUS_FILE_CLOSED));
+    };
+    let from = file.path();
+    let to = &rename.to;
+    // A target that names the source itself is the same file and skips
+    // this.
+    if rename.replace
+        && !same_path(&from, to, case_sensitive)
+        && share.files.path_is_open(to, case_sensitive)
+    {
+        let start = stage == Stage::Start;
+        if let Some(wait) = share
+            .files
+            .break_handles_at(to, case_sensitive, file.lease_id(), start)
+        {
+            return Renamed::Wait(wait);
+        }
+        return Renamed::Done(Err(ntstatus::STATUS_ACCESS_DENIED));
+    }
+    file.break_leases(Trigger::Handle);
+    if open.is_directory {
+        share.files.break_handles_below(&from, case_sensitive);
+    }
+    drop(open);
+    let result = match share.backend.rename(&from, to, rename.replace).await {
+        Ok(()) => {
+            share.files.rename_paths(&from, to, case_sensitive);
+            Ok(())
+        }
+        Err(e) => Err(e.to_nt_status()),
+    };
+    Renamed::Done(result)
 }
 
 /// FileBasicInformation (MS-FSA 2.1.5.15.2, MS-FSCC 2.4.7). A time of 0
@@ -446,7 +581,12 @@ mod tests {
             let state = Arc::clone(&state);
             let conn = Arc::clone(&conn);
             let body = rename_body(file_id, to);
-            tokio::spawn(async move { handle(&state, &conn, &hdr, &body).await })
+            tokio::spawn(async move {
+                match handle(&state, &conn, &hdr, &body, 0).await {
+                    Outcome::Done(response) => response.status,
+                    Outcome::Pending(_) => panic!("the rename waits"),
+                }
+            })
         };
         let file = rename(file_ids[0], "d\\g");
         waiting.notified().await;
@@ -461,8 +601,8 @@ mod tests {
         );
 
         go.add_permits(1);
-        assert_eq!(file.await.unwrap().status, ntstatus::STATUS_SUCCESS);
-        assert_eq!(parent.await.unwrap().status, ntstatus::STATUS_SUCCESS);
+        assert_eq!(file.await.unwrap(), ntstatus::STATUS_SUCCESS);
+        assert_eq!(parent.await.unwrap(), ntstatus::STATUS_SUCCESS);
         assert!(share.files.path_is_open(&"e\\g".parse().unwrap(), false));
     }
 }

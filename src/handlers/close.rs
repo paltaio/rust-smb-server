@@ -5,6 +5,7 @@ use std::sync::Arc;
 use crate::proto::header::Smb2Header;
 use crate::proto::messages::{CloseRequest, CloseResponse};
 
+use crate::conn::pending::Stop;
 use crate::conn::state::Connection;
 use crate::dispatch::HandlerResponse;
 use crate::files::close_open;
@@ -37,6 +38,9 @@ pub async fn handle(
         Some(o) => o,
         None => return HandlerResponse::err(ntstatus::STATUS_FILE_CLOSED),
     };
+    // MS-SMB2 3.3.4.17: requests waiting on the open end with it.
+    conn.pending
+        .stop_where(Stop::Retry, |op| op.file_id == Some(req.file_id));
 
     let want_attrs = req.flags & FLAG_POSTQUERY_ATTRIB != 0;
     let info = close_open(&open_arc, want_attrs).await;

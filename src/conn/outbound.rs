@@ -41,6 +41,20 @@ impl Outbound {
         }
     }
 
+    /// Queues a response to a request completed after its interim
+    /// response, waiting while the queue is full.
+    pub(crate) async fn send(&self, bytes: Vec<u8>) -> Result<(), ()> {
+        let queue = self
+            .queue
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        match queue {
+            Some(queue) => queue.send(bytes).await,
+            None => Err(()),
+        }
+    }
+
     /// Ends the connection: its reader stops at the next frame boundary.
     pub(crate) fn kill(&self) {
         self.is_killed.store(true, Ordering::Release);

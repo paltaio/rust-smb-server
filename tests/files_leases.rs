@@ -1,5 +1,5 @@
-//! Read leases: the LEASING capability, lease create contexts, sharing a
-//! lease between opens, and what breaks a lease.
+//! Leases: the LEASING capability, lease create contexts, sharing a lease
+//! between opens, and what breaks a read lease.
 
 #![cfg(feature = "localfs")]
 
@@ -40,10 +40,10 @@ async fn open_leased(c: &mut Client, name: &str, contexts: Vec<u8>) -> CreateRes
     c.create(leased(name, contexts)).await.expect("create")
 }
 
-/// Opens `f.txt` asking for RWH under `key` with a version 1 context, and
+/// Opens `f.txt` asking for R under `key` with a version 1 context, and
 /// checks that R is granted.
 async fn hold_read_lease(c: &mut Client, key: [u8; 16]) -> FileId {
-    let resp = open_leased(c, "f.txt", rqls_v1(key, RWH)).await;
+    let resp = open_leased(c, "f.txt", rqls_v1(key, LEASE_READ_CACHING)).await;
     assert_eq!(resp.oplock_level, OPLOCK_LEVEL_LEASE);
     let lease = lease_reply(&resp).expect("lease context");
     assert_eq!((lease.key, lease.state), (key, LEASE_READ_CACHING));
@@ -80,7 +80,7 @@ async fn leasing_is_advertised_from_smb_2_1_on() {
 }
 
 #[tokio::test]
-async fn a_sole_opener_gets_a_read_lease_in_the_version_it_asked_for() {
+async fn opens_get_read_and_handle_caching_in_the_version_they_asked_for() {
     let (server, _td) = server().await;
     let mut c = server.client().await;
     let resp = open_leased(&mut c, "f.txt", rqls_v1(KEY_A, RWH)).await;
@@ -90,7 +90,7 @@ async fn a_sole_opener_gets_a_read_lease_in_the_version_it_asked_for() {
     let lease = LeaseContext::parse(&data).unwrap();
     assert_eq!(
         (lease.key, lease.state, lease.flags),
-        (KEY_A, LEASE_READ_CACHING, 0)
+        (KEY_A, LEASE_READ_CACHING | LEASE_HANDLE_CACHING, 0)
     );
 
     let mut c = server.client_at(0x0302).await;
@@ -100,7 +100,7 @@ async fn a_sole_opener_gets_a_read_lease_in_the_version_it_asked_for() {
     let data = lease_data(&resp).expect("lease context");
     assert_eq!(data.len(), 52);
     let lease = LeaseContext::parse(&data).unwrap();
-    assert_eq!(lease.state, LEASE_READ_CACHING);
+    assert_eq!(lease.state, LEASE_READ_CACHING | LEASE_HANDLE_CACHING);
     assert_eq!(lease.epoch, 5);
     assert_eq!(lease.flags, LeaseContext::FLAG_PARENT_LEASE_KEY_SET);
     assert_eq!(lease.parent_key, parent);
@@ -330,7 +330,7 @@ async fn opens_break_read_leases_only_when_they_overwrite() {
 
     for disposition in [FILE_OVERWRITE_IF, FILE_OVERWRITE, FILE_SUPERSEDE] {
         let resp = holder
-            .create(leased("f.txt", rqls_v1(KEY_B, RWH)))
+            .create(leased("f.txt", rqls_v1(KEY_B, LEASE_READ_CACHING)))
             .await
             .unwrap();
         assert_eq!(lease_reply(&resp).unwrap().state, LEASE_READ_CACHING);
@@ -379,7 +379,12 @@ async fn version_2_epochs_count_grants_and_breaks() {
     let (server, _td) = server().await;
     let mut holder = server.client_at(0x0300).await;
     let mut other = server.client_at(0x0300).await;
-    let resp = open_leased(&mut holder, "f.txt", rqls_v2(KEY_A, RWH, None, 0)).await;
+    let resp = open_leased(
+        &mut holder,
+        "f.txt",
+        rqls_v2(KEY_A, LEASE_READ_CACHING, None, 0),
+    )
+    .await;
     assert_eq!(lease_reply(&resp).unwrap().epoch, 1);
     let fo = other.open("f.txt", RW, SHARE_ALL).await.unwrap();
     other.write(fo, 0, b"x").await.unwrap();
@@ -387,14 +392,24 @@ async fn version_2_epochs_count_grants_and_breaks() {
     assert_broken_to_none(&n, KEY_A);
     assert_eq!(n.new_epoch, 2);
     // Another open with the key promotes the lease from NONE back to R.
-    let again = open_leased(&mut holder, "f.txt", rqls_v2(KEY_A, RWH, None, 0)).await;
+    let again = open_leased(
+        &mut holder,
+        "f.txt",
+        rqls_v2(KEY_A, LEASE_READ_CACHING, None, 0),
+    )
+    .await;
     let lease = lease_reply(&again).unwrap();
     assert_eq!((lease.state, lease.epoch), (LEASE_READ_CACHING, 3));
     // A byte-range lock on the file keeps new leases from being granted.
     assert_eq!(other.lock(fo, &[(0, 1, LOCK_EXCLUSIVE)]).await, 0);
     let n = holder.next_break(WAIT).await.expect("break");
     assert_eq!(n.new_epoch, 4);
-    let locked = open_leased(&mut holder, "f.txt", rqls_v2(KEY_B, RWH, None, 7)).await;
+    let locked = open_leased(
+        &mut holder,
+        "f.txt",
+        rqls_v2(KEY_B, LEASE_READ_CACHING, None, 7),
+    )
+    .await;
     let lease = lease_reply(&locked).unwrap();
     assert_eq!((lease.state, lease.epoch), (0, 7));
 }
@@ -422,7 +437,7 @@ async fn breaks_on_an_encrypted_session_are_plain_frames() {
     let resp = holder
         .send_encrypted(
             Command::Create,
-            &leased("f.txt", rqls_v2(KEY_A, RWH, None, 0)).body(),
+            &leased("f.txt", rqls_v2(KEY_A, LEASE_READ_CACHING, None, 0)).body(),
         )
         .await;
     assert_eq!(status(&resp), 0);
@@ -504,7 +519,7 @@ async fn a_lease_ended_and_granted_again_in_one_compound_still_breaks() {
     let mut c = server.client().await;
     // Keeps the file in the table between the two leases.
     let plain = c.open("f.txt", RW, SHARE_ALL).await.unwrap();
-    let create = leased("f.txt", rqls_v1(KEY_A, RWH)).body();
+    let create = leased("f.txt", rqls_v1(KEY_A, LEASE_READ_CACHING)).body();
     let replies = c
         .send_compound(&[
             (Command::Create, create.clone(), false),
@@ -534,7 +549,7 @@ async fn a_lease_broken_later_in_its_compound_breaks_after_the_response() {
         .send_compound(&[
             (
                 Command::Create,
-                leased("f.txt", rqls_v1(KEY_A, RWH)).body(),
+                leased("f.txt", rqls_v1(KEY_A, LEASE_READ_CACHING)).body(),
                 false,
             ),
             (Command::Write, write_body(plain, b"x"), false),
@@ -561,7 +576,7 @@ async fn a_held_back_break_follows_the_grant_on_its_connection() {
         .send_compound(&[
             (
                 Command::Create,
-                leased("f.txt", rqls_v1(KEY_A, RWH)).body(),
+                leased("f.txt", rqls_v1(KEY_A, LEASE_READ_CACHING)).body(),
                 false,
             ),
             (Command::Write, write_body(plain, b"x"), false),
@@ -589,7 +604,7 @@ async fn a_lease_granted_during_a_write_breaks_once_the_write_lands() {
     let mut writer = server.client().await;
     let mut reader = server.client().await;
     let fw = writer.open("f.txt", RW, SHARE_ALL).await.unwrap();
-    writer
+    let mid = writer
         .send_no_wait(Command::Write, &write_body(fw, b"new"))
         .await;
     assert!(eventually(|| Counters::get(&counters.writes) == 1).await);
@@ -598,7 +613,7 @@ async fn a_lease_granted_during_a_write_breaks_once_the_write_lands() {
     // backend; a lease granted now would cache the old contents.
     hold_read_lease(&mut reader, KEY_A).await;
     counters.write_gate.as_ref().unwrap().add_permits(1);
-    assert_eq!(writer.recv(Command::Write).await.0, 0);
+    assert_eq!(writer.recv(mid, Command::Write).await.0, 0);
     let n = reader
         .next_break(WAIT)
         .await

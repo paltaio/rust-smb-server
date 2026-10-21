@@ -1,12 +1,12 @@
-//! OPLOCK_BREAK handler (MS-SMB2 3.3.5.22). The server grants no oplocks,
-//! and the read leases it grants break without an acknowledgment, so no
-//! acknowledgment matches a break in progress.
+//! OPLOCK_BREAK handler (MS-SMB2 3.3.5.22): lease break acknowledgments.
+//! The server grants no oplocks, so no oplock acknowledgment matches a
+//! break in progress.
 
 use std::sync::Arc;
 
 use crate::proto::header::Smb2Header;
 use crate::proto::messages::oplock_break::OplockBreakAck;
-use crate::proto::messages::{Dialect, LeaseBreakAck};
+use crate::proto::messages::{Dialect, LeaseBreakAck, LeaseBreakResponse};
 
 use crate::conn::state::Connection;
 use crate::dispatch::HandlerResponse;
@@ -33,8 +33,7 @@ pub async fn handle(
     let structure_size = body.get(..2).map(|b| u16::from_le_bytes([b[0], b[1]]));
     let dialect = *conn.dialect.read().await;
     match structure_size {
-        // MS-SMB2 3.3.5.22.2: the lease is not found, or no break of it is
-        // in progress.
+        // MS-SMB2 3.3.5.22.2.
         Some(LEASE_ACK_SIZE) if dialect != Some(Dialect::Smb202) => {
             let Ok(ack) = LeaseBreakAck::parse(body) else {
                 return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
@@ -43,10 +42,25 @@ pub async fn handle(
                 client: *conn.client_guid.read().await,
                 key: ack.lease_key,
             };
-            if server.leases.exists(id) {
-                HandlerResponse::err(ntstatus::STATUS_UNSUCCESSFUL)
-            } else {
-                HandlerResponse::err(ntstatus::STATUS_OBJECT_NAME_NOT_FOUND)
+            match server.leases.acknowledge(id, ack.lease_state) {
+                Ok((state, breaks)) => {
+                    let mut buf = Vec::new();
+                    LeaseBreakResponse {
+                        structure_size: LEASE_ACK_SIZE,
+                        reserved: 0,
+                        flags: 0,
+                        lease_key: ack.lease_key,
+                        lease_state: state.bits(),
+                        lease_duration: 0,
+                    }
+                    .write_to(&mut buf)
+                    .expect("encoding into a Vec cannot fail");
+                    // A further break follows the response.
+                    let mut response = HandlerResponse::ok(buf);
+                    response.after_send.push(Box::new(breaks));
+                    response
+                }
+                Err(status) => HandlerResponse::err(status),
             }
         }
         // MS-SMB2 3.3.5.22.1: no open, or an open with no break pending.

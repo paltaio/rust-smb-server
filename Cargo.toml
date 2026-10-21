@@ -79,7 +79,7 @@ default = ["localfs"]
 localfs = ["dep:cap-std", "dep:cap-primitives", "dep:rustix", "dep:windows-sys"]
 
 [dev-dependencies]
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = "0.3"
 tempfile = "3"
 hex = "0.4"

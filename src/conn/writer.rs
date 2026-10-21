@@ -148,6 +148,11 @@ impl ResponseReceiver {
     pub(crate) fn try_recv(&mut self) -> Option<Vec<u8>> {
         self.rx.try_recv().ok().map(|payload| payload.bytes.clone())
     }
+
+    /// The next queued message, waiting for one.
+    pub(crate) async fn recv(&mut self) -> Option<Vec<u8>> {
+        self.rx.recv().await.map(|payload| payload.bytes.clone())
+    }
 }
 
 impl Drop for ResponseReceiver {

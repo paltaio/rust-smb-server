@@ -7,6 +7,10 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
+use std::time::Duration;
+
+use tokio::sync::watch;
+use tokio::time::Instant;
 
 use tracing::debug;
 
@@ -20,6 +24,14 @@ use crate::server::ShareBindings;
 
 use super::lease::{FileLease, Granted, LeaseId, LeaseRequest, LeaseState, LeaseVersion};
 use super::table::{FileNode, FileRef};
+
+/// How long a client has to acknowledge a lease break before the lease
+/// drops to NONE (MS-SMB2 3.3.2.5; Windows servers wait 35 seconds).
+pub(crate) const LEASE_BREAK_TIMEOUT: Duration = Duration::from_secs(35);
+
+/// Extra time an operation waiting for a break allows past
+/// [`LEASE_BREAK_TIMEOUT`] before it gives up, in case a timer was lost.
+const WAIT_SLACK: Duration = Duration::from_secs(5);
 
 /// Every lease on the server, by client and key.
 #[derive(Default)]
@@ -119,7 +131,20 @@ impl LeaseTable {
         }
     }
 
+    /// MS-SMB2 3.3.5.22.2: completes a break of the lease `id` with the
+    /// state `bits` the client acknowledged; see [`FileNode::acknowledge`].
+    /// A further break it starts is returned to send after the response.
+    pub(crate) fn acknowledge(&self, id: LeaseId, bits: u32) -> Result<(LeaseState, Notices), u32> {
+        let node = self
+            .bindings()
+            .get(&id)
+            .and_then(|b| b.node.clone())
+            .ok_or(ntstatus::STATUS_OBJECT_NAME_NOT_FOUND)?;
+        node.acknowledge(id, bits)
+    }
+
     /// Whether the lease `id` is held on a file.
+    #[cfg(test)]
     pub(crate) fn exists(&self, id: LeaseId) -> bool {
         self.bindings()
             .get(&id)
@@ -139,6 +164,11 @@ impl Drop for LeaseRef {
         }
     }
 }
+
+/// Something held until a response is queued: a [`GrantGuard`] or
+/// [`Notices`]. Dropping it sends the lease breaks that have to follow the
+/// response on the wire.
+pub(crate) type AfterSend = Box<dyn Send + Sync>;
 
 /// Holds back break notifications for a lease until the CREATE response
 /// that granted it is queued; dropping it sends what was held back.
@@ -173,24 +203,75 @@ impl Drop for GrantGuard {
     }
 }
 
+/// A break the client has to acknowledge: the lease and which break.
+#[derive(Debug)]
+pub(crate) struct AckWait {
+    pub node: Weak<FileNode>,
+    pub id: LeaseId,
+    pub seq: u64,
+}
+
+/// A wait for a file's leases or opens to change, bounded by the
+/// acknowledgment timeout and some slack in case a timer was lost.
+#[derive(Debug)]
+pub(crate) struct BreakWait {
+    rx: watch::Receiver<u64>,
+    deadline: Instant,
+}
+
+impl BreakWait {
+    pub(super) fn new(rx: watch::Receiver<u64>) -> Self {
+        Self {
+            rx,
+            deadline: Instant::now() + LEASE_BREAK_TIMEOUT + WAIT_SLACK,
+        }
+    }
+
+    /// Resolves at the next change or once the file is gone, returning
+    /// true, or at the deadline, returning false. Starting a break's
+    /// acknowledgment timer counts as a change, so a wait begun before then
+    /// outlasts the timer.
+    pub(crate) async fn changed(&mut self) -> bool {
+        tokio::select! {
+            _ = self.rx.changed() => true,
+            () = tokio::time::sleep_until(self.deadline) => false,
+        }
+    }
+}
+
 /// Lease break notifications to send, each with the connections it may go
 /// to. Dropping it sends them, so it is dropped only after every file lock
 /// is released.
 #[derive(Default)]
-pub(crate) struct Notices(Vec<(Vec<u8>, Vec<Weak<Outbound>>)>);
+pub(crate) struct Notices(Vec<Notice>);
+
+/// One break notification, the connections it may go to in order, and the
+/// acknowledgment it needs.
+struct Notice {
+    bytes: Vec<u8>,
+    owners: Vec<Weak<Outbound>>,
+    ack: Option<AckWait>,
+}
 
 impl Notices {
-    pub(super) fn push(&mut self, bytes: Vec<u8>, owners: Vec<Weak<Outbound>>) {
-        self.0.push((bytes, owners));
+    pub(super) fn push(
+        &mut self,
+        bytes: Vec<u8>,
+        owners: Vec<Weak<Outbound>>,
+        ack: Option<AckWait>,
+    ) {
+        self.0.push(Notice { bytes, owners, ack });
     }
 }
 
 impl Drop for Notices {
     /// Sends each notification on the first connection that takes it
     /// (MS-SMB2 3.3.4.7). A connection whose queue of unsolicited messages
-    /// is full has not read for a long time and is closed.
+    /// is full has not read for a long time and is closed. A sent break that
+    /// needs an acknowledgment starts its timer; one no connection took
+    /// drops the lease to NONE.
     fn drop(&mut self) {
-        for (bytes, owners) in self.0.drain(..) {
+        for Notice { bytes, owners, ack } in self.0.drain(..) {
             let delivered = owners
                 .iter()
                 .filter_map(Weak::upgrade)
@@ -207,15 +288,49 @@ impl Drop for Notices {
             } else {
                 debug!("lease break not delivered; no connection took it");
             }
+            match ack {
+                Some(ack) if delivered => start_timer(ack),
+                Some(ack) => {
+                    if let Some(node) = ack.node.upgrade() {
+                        node.drop_break(ack.id, ack.seq);
+                    }
+                }
+                None => {}
+            }
         }
     }
 }
 
-/// Lease Break Notification for `lease`, just moved from `from` to its
-/// current state (MS-SMB2 2.2.23.2, 3.3.4.7): unsigned, SessionId and
-/// TreeId 0, MessageId all ones, no credits. A read lease needs no
-/// acknowledgment.
-pub(super) fn break_notification(lease: &FileLease, from: LeaseState) -> Vec<u8> {
+/// Starts the acknowledgment timer of a sent break (MS-SMB2 3.3.6.5).
+fn start_timer(ack: AckWait) {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let AckWait { node, id, seq } = ack;
+    let timer = runtime.spawn({
+        let node = node.clone();
+        async move {
+            tokio::time::sleep(LEASE_BREAK_TIMEOUT).await;
+            if let Some(node) = node.upgrade() {
+                node.drop_break(id, seq);
+            }
+        }
+    });
+    match node.upgrade() {
+        Some(node) => node.set_timer(id, seq, timer.abort_handle()),
+        None => timer.abort(),
+    }
+}
+
+/// Lease Break Notification for `lease` breaking from `from` to `to`
+/// (MS-SMB2 2.2.23.2, 3.3.4.7): unsigned, SessionId and TreeId 0,
+/// MessageId all ones, no credits.
+pub(super) fn break_notification(
+    lease: &FileLease,
+    from: LeaseState,
+    to: LeaseState,
+    ack: bool,
+) -> Vec<u8> {
     let hdr = Smb2Header {
         command: Command::OplockBreak,
         flags: SMB2_FLAGS_SERVER_TO_REDIR,
@@ -229,10 +344,14 @@ pub(super) fn break_notification(lease: &FileLease, from: LeaseState) -> Vec<u8>
             LeaseVersion::V1 => 0,
             LeaseVersion::V2 => lease.epoch,
         },
-        flags: 0,
+        flags: if ack {
+            LeaseBreakNotification::FLAG_ACK_REQUIRED
+        } else {
+            0
+        },
         lease_key: lease.id.key,
         current_lease_state: from.bits(),
-        new_lease_state: lease.state.bits(),
+        new_lease_state: to.bits(),
         break_reason: 0,
         access_mask_hint: 0,
         share_mask_hint: 0,
@@ -256,7 +375,7 @@ mod tests {
     use crate::backend::FileInfo;
     use crate::conn::writer::{ResponseReceiver, response_queue};
     use crate::files::lease::Trigger;
-    use crate::files::table::{OpenRequest, Sharing};
+    use crate::files::table::{OpenRequest, Refused, Sharing};
     use crate::server::ShareMode;
     use crate::tests::memfs::MemFsBackend;
 
@@ -319,6 +438,7 @@ mod tests {
             owner: Arc::downgrade(owner),
             lease,
             overwrite: false,
+            break_handles: false,
         };
         FileRef::register(share, &info, &p(name), req).unwrap()
     }
@@ -336,6 +456,197 @@ mod tests {
         let mut file = open(share, index, name, owner, Some(id(n)));
         let (granted, guard) = table.grant(lease_ref, &mut file, &req(n), LeaseState::R)?;
         Ok((file, granted, guard))
+    }
+
+    /// Opens file 7 as `f` holding RH under the lease `n`, sharing read and
+    /// write only.
+    fn hold_rh(
+        table: &Arc<LeaseTable>,
+        share: &Arc<ShareBindings>,
+        owner: &Arc<Outbound>,
+        n: u8,
+    ) -> FileRef {
+        let lease_ref = table.acquire(id(n), share, &p("f")).unwrap();
+        let mut info = FileInfo::new("");
+        info.file_index = 7;
+        let req = OpenRequest {
+            sharing: Sharing {
+                access: FILE_READ_DATA | FILE_WRITE_DATA,
+                share: 3,
+            },
+            owner: Arc::downgrade(owner),
+            lease: Some(id(n)),
+            overwrite: false,
+            break_handles: true,
+        };
+        let mut file = FileRef::register(share, &info, &p("f"), req).unwrap();
+        let (granted, _) = table
+            .grant(lease_ref, &mut file, &req_state(n, 7), LeaseState::RH)
+            .unwrap();
+        assert_eq!(granted.state, LeaseState::RH);
+        file
+    }
+
+    fn req_state(n: u8, bits: u32) -> LeaseRequest {
+        LeaseRequest {
+            state: LeaseState::requested(bits),
+            ..req(n)
+        }
+    }
+
+    /// A DELETE open of file 7 that the RH holder's sharing refuses.
+    fn conflicting(share: &Arc<ShareBindings>, owner: &Arc<Outbound>) -> Refused {
+        let mut info = FileInfo::new("");
+        info.file_index = 7;
+        let req = OpenRequest {
+            sharing: Sharing {
+                access: crate::access_mask::DELETE,
+                share: ALL,
+            },
+            owner: Arc::downgrade(owner),
+            lease: None,
+            overwrite: false,
+            break_handles: true,
+        };
+        FileRef::register(share, &info, &p("f"), req).err().unwrap()
+    }
+
+    fn ack(table: &LeaseTable, id: LeaseId, bits: u32) -> Result<LeaseState, u32> {
+        table.acknowledge(id, bits).map(|(state, _)| state)
+    }
+
+    fn notification(frame: &[u8]) -> LeaseBreakNotification {
+        LeaseBreakNotification::parse(&frame[64..]).unwrap()
+    }
+
+    #[test]
+    fn acknowledgments_are_checked_and_settle_the_lease() {
+        let table = Arc::new(LeaseTable::default());
+        let s = share();
+        let (holder, mut rx) = connection();
+        let _held = hold_rh(&table, &s, &holder, 1);
+        let writer = open(&s, 7, "f", &holder, None);
+        writer.break_leases(Trigger::Write);
+        let n = notification(&rx.try_recv().unwrap());
+        assert_eq!(n.flags, LeaseBreakNotification::FLAG_ACK_REQUIRED);
+        assert_eq!((n.current_lease_state, n.new_lease_state), (3, 0));
+        assert_eq!(n.new_epoch, 2);
+
+        assert_eq!(
+            ack(&table, id(1), 1),
+            Err(ntstatus::STATUS_REQUEST_NOT_ACCEPTED)
+        );
+        assert_eq!(
+            ack(&table, id(2), 0),
+            Err(ntstatus::STATUS_OBJECT_NAME_NOT_FOUND)
+        );
+        assert_eq!(ack(&table, id(1), 0), Ok(LeaseState::NONE));
+        assert_eq!(ack(&table, id(1), 0), Err(ntstatus::STATUS_UNSUCCESSFUL));
+        assert!(rx.try_recv().is_none());
+    }
+
+    #[test]
+    fn a_later_trigger_lowers_what_the_acknowledgment_settles_on() {
+        let table = Arc::new(LeaseTable::default());
+        let s = share();
+        let (holder, mut rx) = connection();
+        let _held = hold_rh(&table, &s, &holder, 1);
+        let refused = conflicting(&s, &holder);
+        assert_eq!(refused.status, ntstatus::STATUS_SHARING_VIOLATION);
+        assert!(refused.wait.is_some());
+        let n = notification(&rx.try_recv().unwrap());
+        assert_eq!((n.current_lease_state, n.new_lease_state), (3, 1));
+
+        // A second violation during the break waits without a notification.
+        assert!(conflicting(&s, &holder).wait.is_some());
+        let writer = open(&s, 7, "f", &holder, None);
+        writer.break_leases(Trigger::Write);
+        assert!(rx.try_recv().is_none());
+
+        let (state, breaks) = table.acknowledge(id(1), 1).unwrap();
+        assert_eq!(state, LeaseState::R);
+        assert!(
+            rx.try_recv().is_none(),
+            "the further break waits for the response"
+        );
+        drop(breaks);
+        let n = notification(&rx.try_recv().unwrap());
+        assert_eq!(n.flags, 0);
+        assert_eq!((n.current_lease_state, n.new_lease_state), (1, 0));
+        // Over now: a violation fails without waiting.
+        drop(writer);
+        assert!(conflicting(&s, &holder).wait.is_none());
+    }
+
+    #[test]
+    fn a_stale_timer_changes_nothing() {
+        let table = Arc::new(LeaseTable::default());
+        let s = share();
+        let (holder, _rx) = connection();
+        let held = hold_rh(&table, &s, &holder, 1);
+        open(&s, 7, "f", &holder, None).break_leases(Trigger::Write);
+        // Break sequence numbers start at 1.
+        held.node().drop_break(id(1), 0);
+        assert_eq!(ack(&table, id(1), 0), Ok(LeaseState::NONE));
+    }
+
+    #[test]
+    fn a_break_no_connection_takes_drops_the_lease_to_none() {
+        let table = Arc::new(LeaseTable::default());
+        let s = share();
+        let (holder, rx) = connection();
+        let _held = hold_rh(&table, &s, &holder, 1);
+        drop(rx);
+        let refused = conflicting(&s, &holder);
+        assert!(refused.wait.is_some());
+        assert_eq!(ack(&table, id(1), 1), Err(ntstatus::STATUS_UNSUCCESSFUL));
+    }
+
+    #[test]
+    fn handle_caching_is_refused_on_a_delete_pending_file() {
+        let table = Arc::new(LeaseTable::default());
+        let s = share();
+        let (owner, _rx) = connection();
+        // The file turns delete-pending between the open and its grant.
+        let lease_ref = table.acquire(id(1), &s, &p("f")).unwrap();
+        let mut file = open(&s, 7, "f", &owner, Some(id(1)));
+        open(&s, 7, "f", &owner, None).set_delete_pending(true);
+        let (granted, _) = table
+            .grant(lease_ref, &mut file, &req(1), LeaseState::RH)
+            .unwrap();
+        assert_eq!(granted.state, LeaseState::R);
+    }
+
+    #[test]
+    fn marking_a_file_delete_pending_breaks_handle_caching() {
+        let table = Arc::new(LeaseTable::default());
+        let s = share();
+        let (holder, mut rx) = connection();
+        let _held = hold_rh(&table, &s, &holder, 1);
+        let deleter = open(&s, 7, "f", &holder, None);
+        deleter.set_delete_pending(true);
+        let n = notification(&rx.try_recv().unwrap());
+        assert_eq!((n.current_lease_state, n.new_lease_state), (3, 1));
+        assert!(deleter.delete_pending());
+    }
+
+    #[tokio::test]
+    async fn a_waiting_open_wakes_when_the_holder_closes() {
+        let table = Arc::new(LeaseTable::default());
+        let s = share();
+        let (holder, _rx) = connection();
+        let held = hold_rh(&table, &s, &holder, 1);
+        // The first refusal starts the break, whose timer counts as a
+        // change; the second waits on the break in progress.
+        let mut started = conflicting(&s, &holder).wait.unwrap();
+        assert!(started.changed().await);
+        let mut wait = conflicting(&s, &holder).wait.unwrap();
+        let woke = tokio::spawn(async move { wait.changed().await });
+        tokio::task::yield_now().await;
+        assert!(!woke.is_finished());
+        drop(held);
+        woke.await.unwrap();
+        assert!(!table.exists(id(1)));
     }
 
     #[test]

@@ -134,6 +134,10 @@ impl LeaseBreakAck {
     }
 }
 
+/// Lease Break Response (MS-SMB2 2.2.25.2): same wire shape as the
+/// acknowledgment.
+pub type LeaseBreakResponse = LeaseBreakAck;
+
 #[cfg(test)]
 mod tests {
     use super::*;

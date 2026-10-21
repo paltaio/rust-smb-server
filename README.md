@@ -102,7 +102,7 @@ Where encryption is required, clients that cannot encrypt are refused: SMB 2.x, 
 Not supported:
 
 - Kerberos; authentication is NTLM only
-- oplocks, handle and write caching leases, directory leases, and durable handles
+- oplocks, write caching leases, directory leases, and durable handles
 - change notifications
 - named pipes and RPC, so clients can't list a server's shares
 - DFS

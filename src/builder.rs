@@ -93,11 +93,16 @@ impl Share {
         self
     }
 
-    /// Grant read leases on this share's files. A client holding one caches
-    /// what it reads, and the server tells it to drop the cache before a
-    /// write, a size change, a byte-range lock or an overwriting open made
-    /// on the share through an open that does not hold that lease. On by
-    /// default.
+    /// Grant read and handle caching leases on this share's files. A client
+    /// holding one caches what it reads and keeps files open after its
+    /// applications close them. The server tells it to drop the cached data
+    /// before a write, a size change, a byte-range lock or an overwriting
+    /// open made on the share through an open that does not hold that
+    /// lease, and to close the handles it keeps before an open they block,
+    /// a rename or delete of the file, or a rename over it. An open or
+    /// rename that needs those handles closed waits until the client
+    /// acknowledges the break or closes them, or until the break times out
+    /// 35 seconds after the server sent it. On by default.
     ///
     /// Changes made outside the server, or through another share over the
     /// same directory, break no lease: clients keep serving the old data.

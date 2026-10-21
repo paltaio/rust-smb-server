@@ -119,6 +119,7 @@ mod proto;
 mod server;
 #[cfg(test)]
 mod tests {
+    mod async_requests;
     mod dynamic_config;
     pub(crate) mod memfs;
 }

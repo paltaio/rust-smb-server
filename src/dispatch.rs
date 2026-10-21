@@ -1,5 +1,6 @@
 //! Per-frame dispatch: parse header, route to handler, sign response, encode.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use crate::proto::auth::ntlm::Identity;
@@ -10,7 +11,7 @@ use crate::proto::header::{
     Command, HeaderTail, SMB2_FLAGS_ASYNC_COMMAND, SMB2_FLAGS_RELATED_OPERATIONS,
     SMB2_FLAGS_SERVER_TO_REDIR, SMB2_FLAGS_SIGNED, SMB2_HEADER_LEN, Smb2Header,
 };
-use crate::proto::messages::{Dialect, ErrorResponse};
+use crate::proto::messages::{Dialect, ErrorResponse, FileId};
 use tracing::{Instrument, debug, debug_span, error, warn};
 
 use crate::conn::chain;
@@ -18,8 +19,8 @@ use crate::conn::credits::{CreditWindow, charge_covers};
 use crate::conn::limits::supports_multi_credit;
 use crate::conn::related::{RelatedContext, needs_session, needs_tree};
 use crate::conn::state::{Connection, Session};
-use crate::files::GrantGuard;
-use crate::handlers;
+use crate::files::AfterSend;
+use crate::handlers::{self, Outcome, Pending};
 use crate::ntstatus;
 use crate::server::ServerState;
 
@@ -47,7 +48,7 @@ pub struct HandlerResponse {
     /// session's KDF context can use the snapshot.
     pub take_preauth_snapshot_for_session: Option<u64>,
     /// Lease breaks held back until this response is queued.
-    pub(crate) after_send: Option<GrantGuard>,
+    pub(crate) after_send: Vec<AfterSend>,
 }
 
 impl HandlerResponse {
@@ -59,7 +60,7 @@ impl HandlerResponse {
             override_session_id: None,
             skip_signing: false,
             take_preauth_snapshot_for_session: None,
-            after_send: None,
+            after_send: Vec::new(),
         }
     }
 
@@ -74,7 +75,7 @@ impl HandlerResponse {
             override_session_id: None,
             skip_signing: false,
             take_preauth_snapshot_for_session: None,
-            after_send: None,
+            after_send: Vec::new(),
         }
     }
 }
@@ -87,7 +88,70 @@ struct Reply {
     /// The session the response is encrypted for and its keys, when it
     /// must be encrypted.
     cipher: Option<(u64, Arc<SessionCipher>)>,
-    after_send: Option<GrantGuard>,
+    after_send: Vec<AfterSend>,
+    form: ReplyForm,
+}
+
+/// How a response header is formed: a response sent at once, the interim
+/// response of a request that completes later (MS-SMB2 3.3.4.2), or that
+/// request's final response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplyForm {
+    Sync,
+    Interim(u64),
+    Final(u64),
+}
+
+/// What answering a request needs from it, kept so a request completed
+/// later is answered as it would have been at once: signed with the key of
+/// the session it came on even after a LOGOFF, and encrypted the same way.
+#[derive(Clone)]
+pub(crate) struct ReplyCtx {
+    hdr: Smb2Header,
+    session: Option<Arc<tokio::sync::RwLock<Session>>>,
+    cipher: Option<Arc<SessionCipher>>,
+    encrypted: bool,
+}
+
+impl ReplyCtx {
+    async fn new(conn: &Connection, hdr: &Smb2Header, encrypted: bool) -> Self {
+        let session = conn.sessions.read().await.get(&hdr.session_id).cloned();
+        let cipher = response_cipher(hdr, encrypted, session.as_ref()).await;
+        Self {
+            hdr: *hdr,
+            session,
+            cipher,
+            encrypted,
+        }
+    }
+
+    /// The response `resp` in `form`. Credits go with the interim response
+    /// of an asynchronous request, so its final response grants none
+    /// (MS-SMB2 3.3.4.1.2, 3.3.4.4); an interim response is never signed
+    /// (MS-SMB2 3.3.4.2).
+    async fn build(
+        &self,
+        conn: &Arc<Connection>,
+        mut resp: HandlerResponse,
+        form: ReplyForm,
+    ) -> Reply {
+        resp.skip_signing |=
+            self.cipher.is_some() || self.encrypted || matches!(form, ReplyForm::Interim(_));
+        let after_send = std::mem::take(&mut resp.after_send);
+        let granted = match form {
+            ReplyForm::Final(_) => 0,
+            ReplyForm::Sync | ReplyForm::Interim(_) => grant_credits(conn, &self.hdr),
+        };
+        let (bytes, signing_key) =
+            build_response_bytes(conn, &self.hdr, resp, self.session.as_ref(), granted, form).await;
+        Reply {
+            bytes,
+            signing_key,
+            cipher: self.cipher.clone().map(|c| (self.hdr.session_id, c)),
+            after_send,
+            form,
+        }
+    }
 }
 
 /// The frame answering a request frame.
@@ -95,7 +159,10 @@ pub(crate) struct Outgoing {
     pub bytes: Vec<u8>,
     /// Dropped once `bytes` is queued, which sends the lease breaks held
     /// back until then.
-    pub after_send: Vec<GrantGuard>,
+    pub after_send: Vec<AfterSend>,
+    /// The rest of the chain, after a request that went asynchronous; runs
+    /// once `bytes`, which ends with its interim response, is queued.
+    pub continuation: Option<Continuation>,
 }
 
 impl Outgoing {
@@ -103,6 +170,131 @@ impl Outgoing {
         Self {
             bytes,
             after_send: Vec::new(),
+            continuation: None,
+        }
+    }
+}
+
+/// The requests of one frame and how far they have run.
+struct Chain<'a> {
+    frame: Cow<'a, [u8]>,
+    requests: Vec<chain::Request>,
+    next: usize,
+    /// Requests already run out of order: CANCELs taken ahead of the
+    /// request they follow, once it went asynchronous.
+    handled: Vec<bool>,
+    related: RelatedContext,
+    chain_failure: Option<u32>,
+    encrypted: bool,
+    /// The chain runs after an asynchronous request, beside the reader.
+    continued: bool,
+}
+
+impl Chain<'_> {
+    /// The requests not yet run, without the bytes of those that have, for
+    /// a continuation to keep.
+    fn rest(self) -> Chain<'static> {
+        let done = self.next.min(self.requests.len());
+        let cut = self.requests[..done]
+            .last()
+            .map_or(0, |request| request.range.end);
+        let requests = self.requests[done..]
+            .iter()
+            .map(|request| chain::Request {
+                header: request.header,
+                range: request.range.start - cut..request.range.end - cut,
+            })
+            .collect();
+        Chain {
+            frame: Cow::Owned(self.frame[cut..].to_vec()),
+            requests,
+            next: 0,
+            handled: self.handled[done..].to_vec(),
+            related: self.related,
+            chain_failure: self.chain_failure,
+            encrypted: self.encrypted,
+            continued: true,
+        }
+    }
+}
+
+/// A request that went asynchronous, with what its final response needs.
+struct Suspended {
+    pending: Pending,
+    ctx: ReplyCtx,
+    /// The request as it ran, related ids filled in.
+    request: Vec<u8>,
+}
+
+/// The part of a compound frame that runs after a request in it went
+/// asynchronous (MS-SMB2 3.3.5.2.7.2): that request's final response and
+/// the responses of the requests after it go out in a frame of their own.
+pub(crate) struct Continuation {
+    chain: Chain<'static>,
+    transform: Option<(u64, Arc<SessionCipher>)>,
+    suspended: Suspended,
+}
+
+impl Continuation {
+    /// Waits for the asynchronous request, then runs the rest of the chain
+    /// and sends what it answers. Another request that goes asynchronous
+    /// ends that frame with its interim response and is waited for in turn.
+    pub(crate) async fn run(self, server: Arc<ServerState>, conn: Arc<Connection>) {
+        let Continuation {
+            mut chain,
+            transform,
+            mut suspended,
+        } = self;
+        loop {
+            let Suspended {
+                pending,
+                ctx,
+                request,
+            } = suspended;
+            let async_id = pending.op.async_id;
+            let resp = pending.work.await;
+            conn.pending.finish(async_id);
+            let mut reply = ctx.build(&conn, resp, ReplyForm::Final(async_id)).await;
+            // The first response of a frame relates to nothing before it in
+            // that frame. Signatures are computed when the frame is joined.
+            if let Some(flags) = reply.bytes.get_mut(0x10..0x14) {
+                let value = u32::from_le_bytes(flags.try_into().expect("4 bytes"))
+                    & !SMB2_FLAGS_RELATED_OPERATIONS;
+                flags.copy_from_slice(&value.to_le_bytes());
+            }
+            let mut replies = Vec::new();
+            let remaining = chain.requests.len() - chain.next;
+            push_reply(
+                &conn,
+                &mut replies,
+                reply,
+                &ctx.hdr,
+                remaining,
+                chain.encrypted,
+            )
+            .await;
+            let pushed = &replies.last().expect("just pushed").bytes;
+            chain.related.update(ctx.hdr.command, &request, pushed);
+            let next = run_chain(&server, &conn, &mut chain, &mut replies).await;
+            match finish_frame(&conn, replies, transform.clone()).await {
+                Some((bytes, after_send)) => {
+                    if conn.outbound.send(bytes).await.is_err() {
+                        return;
+                    }
+                    drop(after_send);
+                }
+                None => {
+                    conn.outbound.kill();
+                    return;
+                }
+            }
+            match next {
+                Some(next) => {
+                    chain = chain.rest();
+                    suspended = next;
+                }
+                None => return,
+            }
         }
     }
 }
@@ -131,13 +323,9 @@ pub(crate) async fn dispatch_frame(
         }
         return reply.map(Outgoing::plain);
     }
-    let decrypted;
     let (frame, transform) = if is_transform(frame) {
         match decrypt_frame(conn, frame).await {
-            Ok((message, session_id, cipher)) => {
-                decrypted = message;
-                (&decrypted[..], Some((session_id, cipher)))
-            }
+            Ok((message, session_id, cipher)) => (Cow::Owned(message), Some((session_id, cipher))),
             Err(reason) => {
                 warn!(%reason, "encrypted message refused; closing connection");
                 conn.request_disconnect();
@@ -145,11 +333,10 @@ pub(crate) async fn dispatch_frame(
             }
         }
     } else {
-        (frame, None)
+        (Cow::Borrowed(frame), None)
     };
-    let encrypted = transform.is_some();
     let dialect = *conn.dialect.read().await;
-    let requests = match chain::split(frame, dialect).and_then(|requests| match &transform {
+    let requests = match chain::split(&frame, dialect).and_then(|requests| match &transform {
         Some((session_id, _)) => chain::check_encrypted(&requests, *session_id).map(|()| requests),
         None => Ok(requests),
     }) {
@@ -169,113 +356,274 @@ pub(crate) async fn dispatch_frame(
         return None;
     }
 
-    let mut responses = Vec::new();
-    let mut related = RelatedContext::default();
-    let mut response_len = 0;
     // A chain whose first request is marked related fails as a whole
     // (MS-SMB2 3.3.5.2.7.2).
-    let mut chain_failure = (requests[0].header.flags & SMB2_FLAGS_RELATED_OPERATIONS != 0)
+    let chain_failure = (requests[0].header.flags & SMB2_FLAGS_RELATED_OPERATIONS != 0)
         .then_some(ntstatus::STATUS_INVALID_PARAMETER);
+    let mut chain = Chain {
+        frame,
+        handled: vec![false; requests.len()],
+        requests,
+        next: 0,
+        related: RelatedContext::default(),
+        chain_failure,
+        encrypted: transform.is_some(),
+        continued: false,
+    };
+    let mut replies = Vec::new();
+    let suspended = run_chain(server, conn, &mut chain, &mut replies).await;
+    let (bytes, after_send) = finish_frame(conn, replies, transform.clone()).await?;
+    let continuation = suspended.map(|suspended| Continuation {
+        chain: chain.rest(),
+        transform,
+        suspended,
+    });
+    Some(Outgoing {
+        bytes,
+        after_send,
+        continuation,
+    })
+}
 
-    let request_count = requests.len();
-    for (index, request) in requests.into_iter().enumerate() {
+/// Runs the chain's requests from where it stopped, adding their responses
+/// to `replies`, until it ends or a request goes asynchronous; that one's
+/// interim response is the last reply then.
+async fn run_chain(
+    server: &Arc<ServerState>,
+    conn: &Arc<Connection>,
+    chain: &mut Chain<'_>,
+    replies: &mut Vec<Reply>,
+) -> Option<Suspended> {
+    while chain.next < chain.requests.len() {
+        let index = chain.next;
+        chain.next += 1;
+        if chain.handled[index] {
+            continue;
+        }
+        let request = &chain.requests[index];
         let mut req_hdr = request.header;
-        let received = &frame[request.range];
+        let range = request.range.clone();
+        let remaining = chain.requests.len() - chain.next;
+        let received = &chain.frame[range.clone()];
         let mut sub_frame = received.to_vec();
-        let mut failure = chain_failure;
+        let mut failure = chain.chain_failure;
         if failure.is_none()
             && req_hdr.flags & SMB2_FLAGS_RELATED_OPERATIONS != 0
-            && let Err(f) = related.apply(&mut sub_frame, &mut req_hdr)
+            && let Err(f) = chain.related.apply(&mut sub_frame, &mut req_hdr)
         {
             failure = Some(f.status);
             if f.rest_of_chain {
-                chain_failure = Some(f.status);
+                chain.chain_failure = Some(f.status);
             }
         }
+        // The rest of a chain runs beside the reader once a request in it
+        // went asynchronous, so nothing that has to run in order with the
+        // connection's other frames, as the 3.1.1 preauth hash does, runs
+        // there.
+        if failure.is_none()
+            && chain.continued
+            && matches!(req_hdr.command, Command::Negotiate | Command::SessionSetup)
+        {
+            failure = Some(ntstatus::STATUS_INVALID_PARAMETER);
+        }
 
-        let response = match failure {
-            Some(_) if req_hdr.command == Command::Cancel => None,
+        match failure {
+            Some(_) if req_hdr.command == Command::Cancel => {}
             Some(status) => {
                 debug!(
                     command = ?req_hdr.command,
                     status,
                     "related request fails without running"
                 );
-                let session = conn.sessions.read().await.get(&req_hdr.session_id).cloned();
-                let cipher = response_cipher(&req_hdr, encrypted, session.as_ref()).await;
-                let granted = grant_credits(conn, &req_hdr);
-                let mut error = HandlerResponse::err(status);
-                error.skip_signing = encrypted || cipher.is_some();
-                let (bytes, signing_key) =
-                    build_response_bytes(conn, &req_hdr, error, None, granted).await;
-                Some(Reply {
-                    bytes,
-                    signing_key,
-                    cipher: cipher.map(|c| (req_hdr.session_id, c)),
-                    after_send: None,
-                })
+                let ctx = ReplyCtx::new(conn, &req_hdr, chain.encrypted).await;
+                let reply = ctx
+                    .build(conn, HandlerResponse::err(status), ReplyForm::Sync)
+                    .await;
+                push_reply(conn, replies, reply, &req_hdr, remaining, chain.encrypted).await;
             }
             None => {
-                let response = dispatch_one(server, conn, &sub_frame, received, encrypted).await;
-                if let Some(reply) = &response {
-                    related.update(req_hdr.command, &sub_frame, &reply.bytes);
-                }
-                response
+                // The request and the rest of the frame stay in memory while
+                // this request waits.
+                let retained = chain.frame.len() - range.start;
+                let dispatched = dispatch_one(
+                    server,
+                    conn,
+                    &sub_frame,
+                    received,
+                    chain.encrypted,
+                    retained,
+                )
+                .await;
+                let reply = match dispatched {
+                    None => continue,
+                    Some(Dispatched::Done(reply)) => reply,
+                    Some(Dispatched::Pending(pending, ctx)) => {
+                        let async_id = pending.op.async_id;
+                        if fits(replies, ERROR_RESPONSE_ROOM, remaining) {
+                            let interim = ctx
+                                .build(
+                                    conn,
+                                    HandlerResponse::err(ntstatus::STATUS_PENDING),
+                                    ReplyForm::Interim(async_id),
+                                )
+                                .await;
+                            push_reply(
+                                conn,
+                                replies,
+                                interim,
+                                &req_hdr,
+                                remaining,
+                                chain.encrypted,
+                            )
+                            .await;
+                            take_cancels(server, conn, chain).await;
+                            return Some(Suspended {
+                                pending,
+                                ctx,
+                                request: sub_frame,
+                            });
+                        }
+                        // No room for an interim response: the request
+                        // fails at once.
+                        conn.pending.finish(async_id);
+                        drop(pending);
+                        let error = HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
+                        ctx.build(conn, error, ReplyForm::Sync).await
+                    }
+                };
+                push_reply(conn, replies, reply, &req_hdr, remaining, chain.encrypted).await;
+                let pushed = &replies.last().expect("just pushed").bytes;
+                chain.related.update(req_hdr.command, &sub_frame, pushed);
             }
-        };
-        if let Some(mut response) = response {
-            // Keep room for an error response to each request after this one.
-            let reserved = (request_count - index - 1) * ERROR_RESPONSE_ROOM;
-            if align_8(response_len) + response.bytes.len() + reserved + TRANSFORM_HEADER_LEN
-                > MAX_FRAME_PAYLOAD as usize
-            {
-                warn!(
-                    len = response.bytes.len(),
-                    "response does not fit in one frame"
-                );
-                let mut error = HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
-                error.skip_signing = encrypted || response.cipher.is_some();
-                let granted = read_u16(&response.bytes, 0x0E);
-                let (bytes, signing_key) =
-                    build_response_bytes(conn, &req_hdr, error, None, granted).await;
-                response.bytes = bytes;
-                response.signing_key = signing_key;
-            }
-            response_len = align_8(response_len) + response.bytes.len();
-            responses.push(response);
         }
     }
+    None
+}
 
-    if responses.is_empty() {
+/// Runs the CANCELs compounded after a request that just went
+/// asynchronous, so they can reach it (MS-SMB2 3.3.5.16). A CANCEL marked
+/// related, or one that fails its checks, runs in its turn instead.
+async fn take_cancels(server: &Arc<ServerState>, conn: &Arc<Connection>, chain: &mut Chain<'_>) {
+    for index in chain.next..chain.requests.len() {
+        let request = &chain.requests[index];
+        if request.header.command != Command::Cancel
+            || request.header.flags & SMB2_FLAGS_RELATED_OPERATIONS != 0
+        {
+            continue;
+        }
+        let received = &chain.frame[request.range.clone()];
+        if dispatch_one(server, conn, received, received, chain.encrypted, 0)
+            .await
+            .is_none()
+        {
+            chain.handled[index] = true;
+        }
+    }
+}
+
+/// Whether a response of `len` bytes fits in the frame after `replies`,
+/// with room kept for an error response to each of the `remaining`
+/// requests after it.
+fn fits(replies: &[Reply], len: usize, remaining: usize) -> bool {
+    let response_len = replies
+        .iter()
+        .fold(0, |sum, r| align_8(sum) + r.bytes.len());
+    align_8(response_len) + len + remaining * ERROR_RESPONSE_ROOM + TRANSFORM_HEADER_LEN
+        <= MAX_FRAME_PAYLOAD as usize
+}
+
+/// Adds `reply` to the replies of a frame. A response that does not fit is
+/// replaced by an error response. A CREATE replaced that way closes the
+/// open it made first, so the client is left with no open or lease it was
+/// not told about.
+async fn push_reply(
+    conn: &Arc<Connection>,
+    replies: &mut Vec<Reply>,
+    mut reply: Reply,
+    req_hdr: &Smb2Header,
+    remaining: usize,
+    encrypted: bool,
+) {
+    if !fits(replies, reply.bytes.len(), remaining) {
+        warn!(
+            len = reply.bytes.len(),
+            "response does not fit in one frame"
+        );
+        if req_hdr.command == Command::Create
+            && read_u32(&reply.bytes, 0x08) == ntstatus::STATUS_SUCCESS
+            && let Some(file_id) = created_file_id(&reply.bytes)
+        {
+            discard_open(conn, req_hdr, file_id).await;
+        }
+        drop(std::mem::take(&mut reply.after_send));
+        let mut error = HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
+        error.skip_signing = encrypted || reply.cipher.is_some();
+        let granted = read_u16(&reply.bytes, 0x0E);
+        let (bytes, signing_key) =
+            build_response_bytes(conn, req_hdr, error, None, granted, reply.form).await;
+        reply.bytes = bytes;
+        reply.signing_key = signing_key;
+    }
+    replies.push(reply);
+}
+
+/// FileId of a CREATE response.
+fn created_file_id(response: &[u8]) -> Option<FileId> {
+    let at = SMB2_HEADER_LEN + 64;
+    let bytes = response.get(at..at + 16)?;
+    Some(FileId::new(read_u64(bytes, 0), read_u64(bytes, 8)))
+}
+
+/// Closes the open `file_id` that the CREATE `req_hdr` made.
+async fn discard_open(conn: &Arc<Connection>, req_hdr: &Smb2Header, file_id: FileId) {
+    let Ok(tree) = handlers::shared::lookup_session_tree(conn, req_hdr).await else {
+        return;
+    };
+    let removed = tree.read().await.opens.write().await.remove(&file_id);
+    if let Some(open) = removed {
+        crate::files::close_open(&open, false).await;
+    }
+}
+
+/// Joins the replies of a frame and encrypts the frame when it must be.
+/// Returns the frame and the guards to drop once it is queued, or `None`
+/// for no replies or a frame that cannot be encrypted, which also closes
+/// the connection.
+async fn finish_frame(
+    conn: &Connection,
+    mut replies: Vec<Reply>,
+    transform: Option<(u64, Arc<SessionCipher>)>,
+) -> Option<(Vec<u8>, Vec<AfterSend>)> {
+    if replies.is_empty() {
         return None;
     }
-
     // A reply to an encrypted message is encrypted with the keys it came
     // with; otherwise the frame is encrypted when one of its responses must
     // be (MS-SMB2 3.3.4.1.4).
-    let cipher = transform.or_else(|| responses.iter().find_map(|r| r.cipher.clone()));
-    let after_send = responses
+    let cipher = transform.or_else(|| replies.iter().find_map(|r| r.cipher.clone()));
+    let after_send = replies
         .iter_mut()
-        .filter_map(|r| r.after_send.take())
+        .flat_map(|r| std::mem::take(&mut r.after_send))
         .collect();
-    let out = stitch_responses(conn, responses).await;
+    let out = stitch_responses(conn, replies).await;
     let Some((session_id, cipher)) = cipher else {
-        return Some(Outgoing {
-            bytes: out,
-            after_send,
-        });
+        return Some((out, after_send));
     };
     match cipher.encrypt(session_id, &out) {
-        Ok(encrypted) => Some(Outgoing {
-            bytes: encrypted,
-            after_send,
-        }),
+        Ok(encrypted) => Some((encrypted, after_send)),
         Err(e) => {
             error!(error = %e, "cannot encrypt response; closing connection");
             conn.request_disconnect();
             None
         }
     }
+}
+
+/// What handling one request produced.
+enum Dispatched {
+    Done(Reply),
+    /// The request completes later; the context builds its responses.
+    Pending(Pending, ReplyCtx),
 }
 
 /// Decrypts an encrypted message (MS-SMB2 3.3.5.2.1.1) and returns the SMB2
@@ -349,7 +697,7 @@ fn grant_credits(conn: &Connection, req_hdr: &Smb2Header) -> u16 {
 
 /// Joins compound responses into one frame. Each response but the last is
 /// padded to 8 bytes and signed over its padding (MS-SMB2 3.1.4.1).
-async fn stitch_responses(conn: &Arc<Connection>, responses: Vec<Reply>) -> Vec<u8> {
+async fn stitch_responses(conn: &Connection, responses: Vec<Reply>) -> Vec<u8> {
     let mut out = Vec::new();
     let mut signed = Vec::with_capacity(responses.len());
     let response_count = responses.len();
@@ -402,14 +750,16 @@ pub(crate) fn read_u64(buf: &[u8], offset: usize) -> u64 {
 /// Handles one request. `frame` is the request with related-operation ids
 /// filled in; `received` is the same request as it arrived, which is what
 /// the client signed and hashed; `encrypted` tells whether it arrived
-/// encrypted.
+/// encrypted; `retained` is the size of the request and the requests
+/// compounded after it.
 async fn dispatch_one(
     server: &Arc<ServerState>,
     conn: &Arc<Connection>,
     frame: &[u8],
     received: &[u8],
     encrypted: bool,
-) -> Option<Reply> {
+    retained: usize,
+) -> Option<Dispatched> {
     let (req_hdr, body_bytes) = match Smb2Header::parse(frame) {
         Ok(p) => p,
         Err(e) => {
@@ -429,37 +779,26 @@ async fn dispatch_one(
 
         // The request's session, kept so LOGOFF's response can still be
         // signed with its key after the handler removes it.
-        let request_session = conn.sessions.read().await.get(&sid).cloned();
-        let cipher = response_cipher(&req_hdr, encrypted, request_session.as_ref()).await;
-        let reply = async |mut resp: HandlerResponse| {
-            resp.skip_signing |= cipher.is_some() || encrypted;
-            let after_send = resp.after_send.take();
-            let granted = grant_credits(conn, &req_hdr);
-            let (bytes, signing_key) =
-                build_response_bytes(conn, &req_hdr, resp, request_session.as_ref(), granted).await;
-            Reply {
-                bytes,
-                signing_key,
-                cipher: cipher.clone().map(|c| (req_hdr.session_id, c)),
-                after_send,
-            }
-        };
+        let ctx = ReplyCtx::new(conn, &req_hdr, encrypted).await;
+        let request_session = ctx.session.clone();
+        let reply = async |resp: HandlerResponse| ctx.build(conn, resp, ReplyForm::Sync).await;
 
         // An encrypted request is not signed; its decryption checked it.
         if !encrypted
             && let Err(status) = verify_request_signature(server, conn, &req_hdr, received).await
         {
-            return Some(reply(HandlerResponse::err(status)).await);
+            return Some(Dispatched::Done(reply(HandlerResponse::err(status)).await));
         }
         if let Err(status) =
             check_encryption(server, conn, &req_hdr, encrypted, request_session.as_ref()).await
         {
-            return Some(reply(HandlerResponse::err(status)).await);
+            return Some(Dispatched::Done(reply(HandlerResponse::err(status)).await));
         }
 
         // CANCEL is fire-and-forget - no response.
         if cmd == Command::Cancel {
             debug!("CANCEL received; no response");
+            conn.pending.cancel(&req_hdr);
             return None;
         }
 
@@ -477,7 +816,9 @@ async fn dispatch_one(
             );
         }
         if malformed || undercharged {
-            return Some(reply(HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER)).await);
+            return Some(Dispatched::Done(
+                reply(HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER)).await,
+            ));
         }
 
         let mut session_preauth = None;
@@ -501,7 +842,17 @@ async fn dispatch_one(
         if cmd == Command::SessionSetup {
             drop_stale_auths(conn, server.config.limits.handshake_timeout).await;
         }
-        let resp = handlers::dispatch_command(server, conn, &req_hdr, body_bytes, encrypted).await;
+        let resp = match handlers::dispatch_command(
+            server, conn, &req_hdr, body_bytes, encrypted, retained,
+        )
+        .await
+        {
+            Outcome::Done(resp) => resp,
+            Outcome::Pending(pending) => {
+                debug!(async_id = pending.op.async_id, "request pending");
+                return Some(Dispatched::Pending(pending, ctx.clone()));
+            }
+        };
         if cmd == Command::SessionSetup {
             track_pending_auth(conn, &req_hdr, &resp);
         }
@@ -561,7 +912,7 @@ async fn dispatch_one(
             }
         }
 
-        Some(response)
+        Some(Dispatched::Done(response))
     }
     .instrument(span)
     .await
@@ -761,23 +1112,32 @@ async fn verify_request_signature(
 /// `request_session` is used when LOGOFF has already removed the session
 /// from the table. Returns the bytes and the signing key used.
 async fn build_response_bytes(
-    conn: &Arc<Connection>,
+    conn: &Connection,
     req_hdr: &Smb2Header,
     handler_resp: HandlerResponse,
     request_session: Option<&Arc<tokio::sync::RwLock<crate::conn::state::Session>>>,
     granted: u16,
+    form: ReplyForm,
 ) -> (Vec<u8>, Option<[u8; 16]>) {
     let mut hdr = *req_hdr;
     hdr.credit_request_response = granted;
     hdr.flags |= SMB2_FLAGS_SERVER_TO_REDIR;
-    hdr.flags &= !SMB2_FLAGS_ASYNC_COMMAND;
     hdr.next_command = 0;
     hdr.channel_sequence_status = handler_resp.status;
-    hdr.tail = HeaderTail::sync(
-        handler_resp
-            .override_tree_id
-            .unwrap_or_else(|| req_hdr.tree_id().unwrap_or(0)),
-    );
+    match form {
+        ReplyForm::Sync => {
+            hdr.flags &= !SMB2_FLAGS_ASYNC_COMMAND;
+            hdr.tail = HeaderTail::sync(
+                handler_resp
+                    .override_tree_id
+                    .unwrap_or_else(|| req_hdr.tree_id().unwrap_or(0)),
+            );
+        }
+        ReplyForm::Interim(async_id) | ReplyForm::Final(async_id) => {
+            hdr.flags |= SMB2_FLAGS_ASYNC_COMMAND;
+            hdr.tail = HeaderTail::async_(async_id);
+        }
+    }
     if let Some(sid) = handler_resp.override_session_id {
         hdr.session_id = sid;
     }
@@ -909,7 +1269,7 @@ async fn handle_smb1_multi_protocol(
     }
     let granted = grant_credits(conn, &req_hdr);
     Some(
-        build_response_bytes(conn, &req_hdr, resp, None, granted)
+        build_response_bytes(conn, &req_hdr, resp, None, granted, ReplyForm::Sync)
             .await
             .0,
     )

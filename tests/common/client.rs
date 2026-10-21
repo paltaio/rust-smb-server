@@ -1,14 +1,16 @@
 //! SMB2 client and backends for the file and query tests.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use smb_server::ntstatus::STATUS_SUCCESS;
-use smb_server::wire::header::{Command, SMB2_FLAGS_RELATED_OPERATIONS};
+use smb_server::ntstatus::{STATUS_PENDING, STATUS_SUCCESS};
+use smb_server::wire::header::{
+    Command, HeaderTail, SMB2_FLAGS_ASYNC_COMMAND, SMB2_FLAGS_RELATED_OPERATIONS,
+};
 use smb_server::wire::messages::{
     CloseRequest, CloseResponse, CreateRequest, CreateResponse, FileId, FileInfoClass,
     FlushRequest, InfoType, LockElement, LockRequest, LogoffRequest, QueryDirectoryRequest,
@@ -144,6 +146,37 @@ impl Drop for Server {
 /// Status and body of a response.
 pub type Reply = (u32, Vec<u8>);
 
+/// Header and body of each response in a compound frame.
+pub fn split_compound(frame: &[u8]) -> Vec<(smb_server::wire::header::Smb2Header, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut rest = frame;
+    loop {
+        let (hdr, _) = parse_response_header(rest);
+        let len = match hdr.next_command as usize {
+            0 => rest.len(),
+            next => next,
+        };
+        out.push((hdr, rest[64..len].to_vec()));
+        if len == rest.len() {
+            return out;
+        }
+        rest = &rest[len..];
+    }
+}
+
+/// MessageId of the first response in `frame`.
+fn first_mid(frame: &[u8]) -> u64 {
+    parse_response_header(frame).0.message_id
+}
+
+/// MessageId and AsyncId of an interim response (MS-SMB2 3.3.4.2).
+pub fn interim(frame: &[u8]) -> Option<(u64, u64)> {
+    let (hdr, _) = parse_response_header(frame);
+    (hdr.channel_sequence_status == STATUS_PENDING && hdr.next_command == 0)
+        .then(|| Some((hdr.message_id, hdr.async_id()?)))
+        .flatten()
+}
+
 /// A connected client with one session and one tree.
 pub struct Client {
     pub s: TcpStream,
@@ -151,6 +184,11 @@ pub struct Client {
     pub tree_id: u32,
     /// Lease break notifications that arrived while waiting for a response.
     pub breaks: VecDeque<Vec<u8>>,
+    /// Response frames that arrived while waiting for another response.
+    pub frames: VecDeque<Vec<u8>>,
+    /// AsyncId of each request answered with an interim response, by
+    /// MessageId.
+    pub interims: HashMap<u64, u64>,
     next_mid: u64,
 }
 
@@ -249,27 +287,50 @@ impl Client {
             session_id,
             tree_id,
             breaks: VecDeque::new(),
+            frames: VecDeque::new(),
+            interims: HashMap::new(),
             next_mid: 4,
         }
     }
 
     /// Sends a request on this client's session and tree. Lease breaks
-    /// that arrive first are kept in [`Client::breaks`].
+    /// that arrive first are kept in [`Client::breaks`], other responses
+    /// for later, and an interim response is skipped.
     pub async fn send(&mut self, command: Command, body: &[u8]) -> Reply {
-        self.send_no_wait(command, body).await;
-        self.recv(command).await
+        let mid = self.send_no_wait(command, body).await;
+        self.recv(mid, command).await
     }
 
-    /// Sends a request without reading its response.
-    pub async fn send_no_wait(&mut self, command: Command, body: &[u8]) {
-        let hdr = build_header(command, self.next_mid, self.session_id, self.tree_id);
+    /// Takes the next MessageId, for a request built by hand.
+    pub fn take_mid(&mut self) -> u64 {
+        self.next_mid += 1;
+        self.next_mid - 1
+    }
+
+    /// Sends a request without reading its response; returns its
+    /// MessageId.
+    pub async fn send_no_wait(&mut self, command: Command, body: &[u8]) -> u64 {
+        let mid = self.next_mid;
+        let hdr = build_header(command, mid, self.session_id, self.tree_id);
         self.next_mid += 1;
         write_frame(&mut self.s, &hdr, body).await;
+        mid
+    }
+
+    /// Sends a CANCEL for the request `mid`, naming it by `async_id` when
+    /// given.
+    pub async fn cancel(&mut self, mid: u64, async_id: Option<u64>) {
+        let mut hdr = build_header(Command::Cancel, mid, self.session_id, self.tree_id);
+        if let Some(async_id) = async_id {
+            hdr.flags |= SMB2_FLAGS_ASYNC_COMMAND;
+            hdr.tail = HeaderTail::async_(async_id);
+        }
+        write_frame(&mut self.s, &hdr, &[4, 0, 0, 0]).await;
     }
 
     /// Reads the next frame that is not a lease break, keeping breaks in
     /// [`Client::breaks`].
-    async fn next_response(&mut self) -> Vec<u8> {
+    pub async fn next_frame(&mut self) -> Vec<u8> {
         loop {
             let frame = read_frame(&mut self.s).await;
             if !is_break(&frame) {
@@ -279,9 +340,66 @@ impl Client {
         }
     }
 
-    /// Reads the response to a `command` request.
-    pub async fn recv(&mut self, command: Command) -> Reply {
-        let resp = self.next_response().await;
+    /// Reads frames until the final response to the request `mid` arrives
+    /// and returns it. Interim responses are noted in
+    /// [`Client::interims`]; other responses are kept for later.
+    pub async fn recv_frame(&mut self, mid: u64) -> Vec<u8> {
+        if let Some(at) = self.frames.iter().position(|f| first_mid(f) == mid) {
+            return self.frames.remove(at).expect("position is in range");
+        }
+        loop {
+            let frame = self.next_frame().await;
+            if let Some((frame_mid, async_id)) = interim(&frame) {
+                self.interims.insert(frame_mid, async_id);
+                continue;
+            }
+            if first_mid(&frame) == mid {
+                return frame;
+            }
+            self.frames.push_back(frame);
+        }
+    }
+
+    /// Reads frames until a lease break arrives and returns it, keeping
+    /// the responses read meanwhile.
+    pub async fn read_break(&mut self) -> Vec<u8> {
+        if let Some(frame) = self.breaks.pop_front() {
+            return frame;
+        }
+        loop {
+            let frame = read_frame(&mut self.s).await;
+            if is_break(&frame) {
+                return frame;
+            }
+            match interim(&frame) {
+                Some((mid, async_id)) => {
+                    self.interims.insert(mid, async_id);
+                }
+                None => self.frames.push_back(frame),
+            }
+        }
+    }
+
+    /// Reads frames until the request `mid` has an interim response and
+    /// returns its AsyncId.
+    pub async fn recv_interim(&mut self, mid: u64) -> u64 {
+        loop {
+            if let Some(async_id) = self.interims.get(&mid) {
+                return *async_id;
+            }
+            let frame = self.next_frame().await;
+            match interim(&frame) {
+                Some((frame_mid, async_id)) => {
+                    self.interims.insert(frame_mid, async_id);
+                }
+                None => self.frames.push_back(frame),
+            }
+        }
+    }
+
+    /// Reads the final response to the `command` request `mid`.
+    pub async fn recv(&mut self, mid: u64, command: Command) -> Reply {
+        let resp = self.recv_frame(mid).await;
         let (rh, rb) = parse_response_header(&resp);
         assert_eq!(rh.command, command);
         (rh.channel_sequence_status, rb.to_vec())
@@ -290,6 +408,22 @@ impl Client {
     /// Sends `requests` as one compound frame, each marked related when
     /// its flag is set, and returns the status and body of each response.
     pub async fn send_compound(&mut self, requests: &[(Command, Vec<u8>, bool)]) -> Vec<Reply> {
+        let first = self.send_compound_no_wait(requests).await;
+        let frame = self.recv_frame(first).await;
+        split_compound(&frame)
+            .into_iter()
+            .zip(requests)
+            .map(|((hdr, body), (command, _, _))| {
+                assert_eq!(hdr.command, *command);
+                (hdr.channel_sequence_status, body)
+            })
+            .collect()
+    }
+
+    /// Sends `requests` as one compound frame without reading the response;
+    /// returns the MessageId of the first.
+    pub async fn send_compound_no_wait(&mut self, requests: &[(Command, Vec<u8>, bool)]) -> u64 {
+        let first = self.next_mid;
         let messages: Vec<Vec<u8>> = requests
             .iter()
             .map(|(command, body, related)| {
@@ -302,20 +436,7 @@ impl Client {
             })
             .collect();
         self.s.write_all(&compound(&messages)).await.expect("write");
-        let frame = self.next_response().await;
-        let mut replies = Vec::new();
-        let mut rest = &frame[..];
-        for (command, _, _) in requests {
-            let (rh, _) = parse_response_header(rest);
-            assert_eq!(rh.command, *command);
-            let len = match rh.next_command as usize {
-                0 => rest.len(),
-                next => next,
-            };
-            replies.push((rh.channel_sequence_status, rest[64..len].to_vec()));
-            rest = &rest[len..];
-        }
-        replies
+        first
     }
 
     /// CREATE; returns the status and the raw response body.
