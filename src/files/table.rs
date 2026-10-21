@@ -17,6 +17,7 @@ use crate::ntstatus;
 use crate::path::{SmbPath, rebase, same_path};
 use crate::server::ShareBindings;
 
+use super::durable::DurableTable;
 use super::lease::{
     Breaking, Current, FileLease, FileView, Granted, LeaseId, LeaseRequest, LeaseState, OpenView,
     Trigger, break_to, grant, needs_ack, stat_only,
@@ -132,6 +133,19 @@ struct OpenEntry {
     /// (MS-FSA 2.1.5.1 checks for oplock breaks before the open joins the
     /// file's opens).
     waiting: bool,
+    /// Set on a durable open.
+    durable: Option<DurableMark>,
+}
+
+/// The durable side of an open's entry: where the open is registered,
+/// whether it is kept without a connection, and whether a lease break
+/// already decided to close it.
+#[derive(Debug, Clone)]
+pub(crate) struct DurableMark {
+    pub table: Weak<DurableTable>,
+    pub id: u64,
+    pub detached: bool,
+    pub doomed: bool,
 }
 
 /// A new open, as [`FileRef::register`] enters it.
@@ -244,26 +258,34 @@ impl FileNode {
         if !required.contains(acked) {
             state.start_break(at, acked.and(required), &mut notices);
         }
+        let doomed = state.doom_uncovered(id);
+        notices.close(doomed);
         state.bump();
         Ok((acked, notices))
     }
 
     /// Ends the break `seq` of the lease `id` with NONE, when it is still in
     /// progress: the client did not acknowledge in time (MS-SMB2 3.3.6.5),
-    /// or no connection took the notification (MS-SMB2 3.3.4.7).
-    pub(super) fn drop_break(&self, id: LeaseId, seq: u64) {
+    /// or no connection took the notification (MS-SMB2 3.3.4.7). Returns the
+    /// closes of the opens kept for reconnect under the lease, which can no
+    /// longer be taken back.
+    pub(super) fn drop_break(&self, id: LeaseId, seq: u64) -> Notices {
         let mut state = self.state();
+        let mut notices = Notices::default();
         let Some(lease) = state
             .leases
             .iter_mut()
             .find(|l| l.id == id && l.breaking.as_ref().is_some_and(|b| b.seq == seq))
         else {
-            return;
+            return notices;
         };
         lease.breaking = None;
         lease.state = LeaseState::NONE;
         debug!(key = ?id.key, "lease break not acknowledged; lease dropped to none");
+        let doomed = state.doom_uncovered(id);
+        notices.close(doomed);
         state.bump();
+        notices
     }
 
     /// Keeps `timer` as the acknowledgment timer of the break `seq` of the
@@ -310,6 +332,11 @@ impl FileNode {
                 id,
                 seq: b.seq,
             });
+            if state.held_only_detached(id) {
+                let doomed = state.doom_detached(id, |_| true);
+                notices.close(doomed);
+                return notices;
+            }
             let mut owners = state.owners(id);
             if let Some(at) = owners.iter().position(|o| o.ptr_eq(sender)) {
                 owners[..=at].rotate_right(1);
@@ -384,7 +411,15 @@ impl FileState {
     /// caching more keeps its state until the client acknowledges, the
     /// acknowledgment times out, or no connection takes the notification.
     /// A notification for a lease whose grant is not yet sent waits for it.
+    ///
+    /// A lease held only by opens kept for reconnect has no connection to
+    /// take the notification: those opens are closed instead (MS-SMB2
+    /// 3.3.4.7), and the break completes when the last of them leaves the
+    /// file. That includes a break that keeps handle caching, for which no
+    /// other connection of the same client is tried.
     fn start_break(&mut self, at: usize, to: LeaseState, notices: &mut Notices) {
+        let id = self.leases[at].id;
+        let orphaned = self.held_only_detached(id);
         let lease = &mut self.leases[at];
         let from = lease.state;
         let ack = needs_ack(from);
@@ -407,13 +442,61 @@ impl FileState {
             lease.set_state(to);
         }
         debug!(key = ?lease.id.key, ?from, ?to, ack, "lease broken");
+        if orphaned && lease.grants_in_flight == 0 {
+            let doomed = self.doom_detached(id, |_| true);
+            notices.close(doomed);
+            return;
+        }
         let bytes = break_notification(lease, from, to, ack);
         if lease.grants_in_flight > 0 {
             lease.unsent = Some(bytes);
         } else {
-            let id = lease.id;
             notices.push(bytes, self.owners(id), wait);
         }
+    }
+
+    /// Whether the lease `id` is held, and only by opens kept for reconnect.
+    fn held_only_detached(&self, id: LeaseId) -> bool {
+        let mut holders = self.opens.iter().filter(|e| e.lease == Some(id)).peekable();
+        holders.peek().is_some() && holders.all(|e| e.durable.as_ref().is_some_and(|d| d.detached))
+    }
+
+    /// Marks the opens kept for reconnect under the lease `id` that the
+    /// lease no longer covers to be closed: every one once it stops caching
+    /// handles, and the ones holding byte-range locks once it stops caching
+    /// writes. MS-SMB2 3.3.7.1 keeps no others, and a lock left behind would
+    /// block other clients' reads and writes, which break nothing.
+    fn doom_uncovered(&mut self, id: LeaseId) -> Vec<DurableMark> {
+        let state = self
+            .leases
+            .iter()
+            .find(|l| l.id == id)
+            .map_or(LeaseState::NONE, |l| l.state);
+        if !state.contains(LeaseState::H) {
+            return self.doom_detached(id, |_| true);
+        }
+        if state.contains(LeaseState::W) {
+            return Vec::new();
+        }
+        let locked: Vec<u64> = self.locks.iter().map(|l| l.owner).collect();
+        self.doom_detached(id, |open| locked.contains(&open))
+    }
+
+    /// Marks the opens kept for reconnect under the lease `id` that `pick`
+    /// accepts, by entry id, to be closed, and returns the ones not marked
+    /// before.
+    fn doom_detached(&mut self, id: LeaseId, pick: impl Fn(u64) -> bool) -> Vec<DurableMark> {
+        let mut doomed = Vec::new();
+        for entry in self.opens.iter_mut().filter(|e| e.lease == Some(id)) {
+            if !pick(entry.id) {
+                continue;
+            }
+            if let Some(mark) = entry.durable.as_mut().filter(|d| d.detached && !d.doomed) {
+                mark.doomed = true;
+                doomed.push(mark.clone());
+            }
+        }
+        doomed
     }
 
     /// Whether a lease other than `exempt` still caches handles while a
@@ -703,6 +786,7 @@ impl FileRef {
             lease: req.lease,
             owner: req.owner,
             waiting: false,
+            durable: None,
         });
         let (notices, wait) = if stat_only(req.sharing.access) {
             (Notices::default(), None)
@@ -831,6 +915,56 @@ impl FileRef {
     /// Keeps the lease binding for as long as this open lasts.
     pub(super) fn keep_lease(&mut self, lease: LeaseRef) {
         self.lease = Some(lease);
+    }
+
+    /// Marks the open durable, registered as `id` in `table`.
+    pub(crate) fn mark_durable(&self, table: &Arc<DurableTable>, id: u64) {
+        let mut state = self.node.state();
+        if let Some(entry) = state.opens.iter_mut().find(|e| e.id == self.id) {
+            entry.durable = Some(DurableMark {
+                table: Arc::downgrade(table),
+                id,
+                detached: false,
+                doomed: false,
+            });
+        }
+    }
+
+    /// Takes a durable open off its connection to keep it for reconnect
+    /// (MS-SMB2 3.3.7.1): only while its lease caches handles with no break
+    /// in progress (Open.OplockState Held), and while its byte-range locks,
+    /// if it holds any, are covered by write caching. From then on breaks of
+    /// the lease close it instead of going to a client. Returns whether the
+    /// open is kept.
+    pub(crate) fn try_detach(&self) -> bool {
+        let mut state = self.node.state();
+        let Some(at) = state.opens.iter().position(|e| e.id == self.id) else {
+            return false;
+        };
+        let entry = &state.opens[at];
+        let Some(lease) = entry
+            .lease
+            .and_then(|id| state.leases.iter().find(|l| l.id == id))
+        else {
+            return false;
+        };
+        let has_locks = state.locks.iter().any(|l| l.owner == self.id);
+        let keeps = entry
+            .durable
+            .as_ref()
+            .is_some_and(|d| !d.detached && !d.doomed)
+            && lease.state.contains(LeaseState::H)
+            && lease.breaking.is_none()
+            && (!has_locks || lease.state.contains(LeaseState::W));
+        if !keeps {
+            return false;
+        }
+        let entry = &mut state.opens[at];
+        entry.owner = Weak::new();
+        if let Some(mark) = entry.durable.as_mut() {
+            mark.detached = true;
+        }
+        true
     }
 
     /// Breaks the leases on the file that `trigger` through this open
@@ -1119,6 +1253,7 @@ mod tests {
             ShareMode::Public,
             HashMap::new(),
             false,
+            true,
             true,
         )
     }

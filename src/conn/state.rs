@@ -15,7 +15,9 @@ use crate::backend::{FileTimes, Handle};
 use crate::builder::Access;
 use crate::conn::outbound::Outbound;
 use crate::conn::pending::{PendingOps, Stop};
-use crate::files::{FileRef, OpenSlot, close_opens, finish_close};
+use crate::files::{
+    DurableReg, DurableTable, FileRef, OpenSlot, close_opens, end_opens, finish_close,
+};
 use crate::path::SmbPath;
 use crate::server::ShareBindings;
 
@@ -126,14 +128,18 @@ impl Connection {
         self.disconnect.load(Ordering::Acquire)
     }
 
-    pub async fn close_session(&self, session_id: u64) -> bool {
+    /// Removes the session `session_id` and ends its opens; with `keep`,
+    /// the durable opens that qualify stay in that table. Returns false
+    /// when the connection has no such session.
+    pub async fn close_session(&self, session_id: u64, keep: Option<&Arc<DurableTable>>) -> bool {
+        let keep = keep.map(|table| (table, table.sweeps()));
         let removed = self.sessions.write().await.remove(&session_id);
         let Some(sess_arc) = removed else {
             return false;
         };
         self.pending
             .stop_where(Stop::Retry, |op| op.session_id == session_id);
-        close_opens(detach_session(&sess_arc).await).await;
+        end_opens(detach_session(&sess_arc).await, keep).await;
         true
     }
 
@@ -248,15 +254,17 @@ impl Connection {
         opens
     }
 
-    /// Closes every session, tree and open of the connection. Runs when the
-    /// connection ends.
-    pub async fn close_all(&self) {
+    /// Closes every session and tree of the connection and ends their
+    /// opens; with `keep`, the durable opens that qualify stay in that
+    /// table. Runs when the connection ends.
+    pub async fn close_all(&self, keep: Option<&Arc<DurableTable>>) {
+        let keep = keep.map(|table| (table, table.sweeps()));
         let sessions: Vec<_> = self.sessions.write().await.drain().collect();
         let mut opens = Vec::new();
         for (_, sess_arc) in sessions {
             opens.extend(detach_session(&sess_arc).await);
         }
-        close_opens(opens).await;
+        end_opens(opens, keep).await;
     }
 }
 
@@ -367,8 +375,13 @@ impl TreeConnect {
     }
 
     pub fn alloc_file_id(&self) -> FileId {
-        let v = NEXT_FILE_ID.fetch_add(1, Ordering::Relaxed);
+        let v = self.alloc_volatile();
         FileId::new(v, v)
+    }
+
+    /// A volatile FileId part no other open of the process has.
+    pub fn alloc_volatile(&self) -> u64 {
+        NEXT_FILE_ID.fetch_add(1, Ordering::Relaxed)
     }
 }
 
@@ -397,6 +410,8 @@ pub struct Open {
     pub(crate) file: Option<FileRef>,
     /// Counts the open against its connection's limit.
     pub(crate) slot: Option<OpenSlot>,
+    /// Set on a durable open (Open.IsDurable).
+    pub(crate) durable: Option<DurableReg>,
 }
 
 impl Open {

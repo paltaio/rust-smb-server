@@ -1,9 +1,9 @@
 //! Leases across the server: which file each lease is bound to (MS-SMB2
 //! 3.3.1.11), and delivery of lease break notifications (MS-SMB2 3.3.4.7).
 //!
-//! Lock order: `LeaseTable` bindings, then a share's file table, then a
-//! file, then a connection's outbound queue. Notifications are delivered
-//! after every file lock is released.
+//! Lock order: the durable table, then `LeaseTable` bindings, then a
+//! share's file table, then a file, then a connection's outbound queue.
+//! Notifications are delivered after every file lock is released.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
@@ -23,7 +23,7 @@ use crate::proto::messages::LeaseBreakNotification;
 use crate::server::ShareBindings;
 
 use super::lease::{FileLease, Granted, LeaseId, LeaseRequest, LeaseState, LeaseVersion};
-use super::table::{FileNode, FileRef};
+use super::table::{DurableMark, FileNode, FileRef};
 
 /// How long a client has to acknowledge a lease break before the lease
 /// drops to NONE (MS-SMB2 3.3.2.5; Windows servers wait 35 seconds).
@@ -245,17 +245,21 @@ impl BreakWait {
 }
 
 /// Lease break notifications to send, each with the connections it may go
-/// to. Dropping it sends them, so it is dropped only after every file lock
-/// is released.
+/// to, and opens kept for reconnect that a break closes. Dropping it sends
+/// and closes them, so it is dropped only after every file lock is released.
 #[derive(Default)]
 pub(crate) struct Notices(Vec<Notice>);
 
-/// One break notification, the connections it may go to in order, and the
-/// acknowledgment it needs.
-struct Notice {
-    bytes: Vec<u8>,
-    owners: Vec<Weak<Outbound>>,
-    ack: Option<AckWait>,
+enum Notice {
+    /// One break notification, the connections it may go to in order, and
+    /// the acknowledgment it needs.
+    Send {
+        bytes: Vec<u8>,
+        owners: Vec<Weak<Outbound>>,
+        ack: Option<AckWait>,
+    },
+    /// Opens kept for reconnect that no client can take back any more.
+    Close(Vec<DurableMark>),
 }
 
 impl Notices {
@@ -265,7 +269,13 @@ impl Notices {
         owners: Vec<Weak<Outbound>>,
         ack: Option<AckWait>,
     ) {
-        self.0.push(Notice { bytes, owners, ack });
+        self.0.push(Notice::Send { bytes, owners, ack });
+    }
+
+    pub(super) fn close(&mut self, opens: Vec<DurableMark>) {
+        if !opens.is_empty() {
+            self.0.push(Notice::Close(opens));
+        }
     }
 }
 
@@ -274,9 +284,21 @@ impl Drop for Notices {
     /// (MS-SMB2 3.3.4.7). A connection whose queue of unsolicited messages
     /// is full has not read for a long time and is closed. A sent break that
     /// needs an acknowledgment starts its timer; one no connection took
-    /// drops the lease to NONE.
+    /// drops the lease to NONE. Kept opens to close are closed on tasks of
+    /// the current runtime.
     fn drop(&mut self) {
-        for Notice { bytes, owners, ack } in self.0.drain(..) {
+        for notice in self.0.drain(..) {
+            let (bytes, owners, ack) = match notice {
+                Notice::Send { bytes, owners, ack } => (bytes, owners, ack),
+                Notice::Close(opens) => {
+                    for mark in opens {
+                        if let Some(table) = mark.table.upgrade() {
+                            table.purge(mark.id);
+                        }
+                    }
+                    continue;
+                }
+            };
             let delivered = owners
                 .iter()
                 .filter_map(Weak::upgrade)
@@ -297,7 +319,7 @@ impl Drop for Notices {
                 Some(ack) if delivered => start_timer(ack),
                 Some(ack) => {
                     if let Some(node) = ack.node.upgrade() {
-                        node.drop_break(ack.id, ack.seq);
+                        drop(node.drop_break(ack.id, ack.seq));
                     }
                 }
                 None => {}
@@ -317,7 +339,7 @@ fn start_timer(ack: AckWait) {
         async move {
             tokio::time::sleep(LEASE_BREAK_TIMEOUT).await;
             if let Some(node) = node.upgrade() {
-                node.drop_break(id, seq);
+                drop(node.drop_break(id, seq));
             }
         }
     });
@@ -379,6 +401,7 @@ mod tests {
     use crate::access_mask::{FILE_READ_DATA, FILE_WRITE_DATA};
     use crate::backend::FileInfo;
     use crate::conn::writer::{ResponseReceiver, response_queue};
+    use crate::files::durable::DurableTable;
     use crate::files::lease::Trigger;
     use crate::files::table::{OpenRequest, Refused, Sharing};
     use crate::server::ShareMode;
@@ -393,6 +416,7 @@ mod tests {
             ShareMode::Public,
             HashMap::new(),
             false,
+            true,
             true,
         )
     }
@@ -591,7 +615,7 @@ mod tests {
         let held = hold_rh(&table, &s, &holder, 1);
         open(&s, 7, "f", &holder, None).break_leases(Trigger::Write);
         // Break sequence numbers start at 1.
-        held.node().drop_break(id(1), 0);
+        drop(held.node().drop_break(id(1), 0));
         assert_eq!(ack(&table, id(1), 0), Ok(LeaseState::NONE));
     }
 
@@ -841,6 +865,101 @@ mod tests {
         a.break_leases(Trigger::Write);
         b.break_leases(Trigger::Open { overwrite: true });
         assert!(rx.try_recv().is_none());
+    }
+
+    /// Opens file `index` as `name` holding the lease `n` with what `bits`
+    /// asks for, sharing everything.
+    fn lease_state(
+        table: &Arc<LeaseTable>,
+        share: &Arc<ShareBindings>,
+        index: u64,
+        name: &str,
+        owner: &Arc<Outbound>,
+        n: u8,
+        bits: u32,
+    ) -> FileRef {
+        let lease_ref = table.acquire(id(n), share, &p(name)).unwrap();
+        let mut file = open(share, index, name, owner, Some(id(n)));
+        let (granted, _) = table
+            .grant(lease_ref, &mut file, &req_state(n, bits), LeaseState::RWH)
+            .unwrap();
+        assert_eq!(granted.state, LeaseState::requested(bits));
+        file
+    }
+
+    fn durable_table() -> Arc<DurableTable> {
+        Arc::new(DurableTable::new(Duration::from_secs(60), 8))
+    }
+
+    #[test]
+    fn only_a_durable_open_whose_lease_quietly_caches_handles_is_kept() {
+        let table = Arc::new(LeaseTable::default());
+        let durable = durable_table();
+        let s = share();
+        let (holder, _rx) = connection();
+
+        let plain = lease_state(&table, &s, 1, "a", &holder, 1, 3);
+        assert!(!plain.try_detach(), "not durable");
+
+        let read = lease_state(&table, &s, 2, "b", &holder, 2, 1);
+        read.mark_durable(&durable, 2);
+        assert!(!read.try_detach(), "no handle caching");
+
+        let locked = lease_state(&table, &s, 3, "c", &holder, 3, 3);
+        locked.lock_range(0, 10, true, 8).unwrap();
+        locked.mark_durable(&durable, 3);
+        assert!(!locked.try_detach(), "locks without write caching");
+
+        let writing = lease_state(&table, &s, 4, "d", &holder, 4, 7);
+        writing.lock_range(0, 10, true, 8).unwrap();
+        writing.mark_durable(&durable, 4);
+        assert!(writing.try_detach(), "locks under write caching");
+        assert!(!writing.try_detach(), "kept once");
+
+        let breaking = lease_state(&table, &s, 5, "e", &holder, 5, 3);
+        breaking.mark_durable(&durable, 5);
+        open(&s, 5, "e", &holder, None).break_leases(Trigger::Write);
+        assert!(!breaking.try_detach(), "break in progress");
+    }
+
+    #[test]
+    fn a_break_of_a_lease_only_kept_opens_hold_sends_nothing() {
+        let table = Arc::new(LeaseTable::default());
+        let durable = durable_table();
+        let s = share();
+        let (holder, mut rx) = connection();
+        let held = hold_rh(&table, &s, &holder, 1);
+        held.mark_durable(&durable, 1);
+        assert!(held.try_detach());
+
+        let refused = conflicting(&s, &holder);
+        assert_eq!(refused.status, ntstatus::STATUS_SHARING_VIOLATION);
+        assert!(refused.wait.is_some(), "the break completes once it closes");
+        assert!(rx.try_recv().is_none());
+        // Nothing more goes out while the break is in progress.
+        let writer = open(&s, 7, "f", &holder, None);
+        writer.break_leases(Trigger::Write);
+        assert!(rx.try_recv().is_none());
+        drop(writer);
+        drop(held);
+        assert!(!table.exists(id(1)));
+    }
+
+    #[test]
+    fn a_break_of_a_lease_with_an_attached_holder_goes_to_it() {
+        let table = Arc::new(LeaseTable::default());
+        let durable = durable_table();
+        let s = share();
+        let (first, mut first_rx) = connection();
+        let (second, mut second_rx) = connection();
+        let kept = hold_rh(&table, &s, &first, 1);
+        let _attached = hold_rh(&table, &s, &second, 1);
+        kept.mark_durable(&durable, 1);
+        assert!(kept.try_detach());
+        assert!(conflicting(&s, &second).wait.is_some());
+        assert!(first_rx.try_recv().is_none());
+        let n = notification(&second_rx.try_recv().expect("break"));
+        assert_eq!((n.current_lease_state, n.new_lease_state), (3, 1));
     }
 
     #[test]

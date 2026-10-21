@@ -103,12 +103,19 @@ Files on every share get SMB2 leases with read, handle and write caching: a clie
 
 Changes made outside the server, or through another share over the same directory, break no lease, so clients keep serving their cached copies. Call `.leases(false)` on such a `Share` to turn leases off there.
 
+## Durable handles
+
+A file opened with a durable handle request and a lease that caches handles stays open, for 2 minutes by default, after the client's connection drops or it logs off, with its share mode, byte-range locks and lease. An open, write, lock, rename or delete that needs what the lease caches closes it at once. Clients can't reconnect to a kept file: the reconnect fails, closing the kept file when it comes from the same user and client, and the client opens the file again.
+
+`durable_handle_timeout` and `max_disconnected_opens` on the builder set the time and the most files kept at once. Call `.durable_handles(false)` on a `Share` to turn them off there.
+
 ## Limitations
 
 Not supported:
 
 - Kerberos; authentication is NTLM only
-- oplocks, directory leases and durable handles
+- oplocks and directory leases
+- reconnecting to durable handles, version 2 durable handles, and persistent and resilient handles
 - change notifications
 - named pipes and RPC, so clients can't list a server's shares
 - DFS

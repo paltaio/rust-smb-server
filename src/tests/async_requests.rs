@@ -5,145 +5,27 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::RwLock;
-
 use crate::ShareBackend;
-use crate::conn::state::{Connection, Session, TreeConnect};
-use crate::conn::writer::{ResponseReceiver, response_queue};
-use crate::dispatch::{Outgoing, dispatch_frame, read_u32};
+use crate::dispatch::dispatch_frame;
 use crate::files::LEASE_BREAK_TIMEOUT;
 use crate::ntstatus;
-use crate::proto::auth::ntlm::Identity;
-use crate::proto::crypto::{SigningAlgo, sign, verify};
-use crate::proto::header::{
-    Command, HeaderTail, SMB2_FLAGS_ASYNC_COMMAND, SMB2_FLAGS_SIGNED, SMB2_HEADER_LEN, Smb2Header,
-};
+use crate::proto::crypto::{SigningAlgo, verify};
+use crate::proto::header::{Command, SMB2_FLAGS_ASYNC_COMMAND, SMB2_FLAGS_SIGNED, SMB2_HEADER_LEN};
 use crate::proto::messages::{
-    CloseRequest, CreateContext, CreateRequest, CreateResponse, Dialect, FileId, LeaseBreakAck,
+    CloseRequest, CreateContext, CreateRequest, CreateResponse, FileId, LeaseBreakAck,
     LeaseBreakNotification, LeaseContext, WriteRequest,
 };
 use crate::server::ServerState;
 use crate::tests::memfs::MemFsBackend;
-use crate::{Access, Share, SmbServer};
+use crate::tests::peer::{KEY, Peer, header, status};
+use crate::{Share, SmbServer};
 
-const KEY: [u8; 16] = [0x5A; 16];
 const LEASE_KEY: [u8; 16] = [0xA1; 16];
 const READ_WRITE: u32 = 0x3;
 const DELETE: u32 = 0x0001_0000;
 const READ_ATTRIBUTES: u32 = 0x80;
 const SHARE_READ_WRITE: u32 = 0x3;
 const RH: u32 = 0x3;
-
-/// One connection with session 1 on tree 1 of `home`, and the queue its
-/// unsolicited messages and late responses go to.
-struct Peer {
-    conn: Arc<Connection>,
-    rx: ResponseReceiver,
-    next_mid: u64,
-    signed: bool,
-}
-
-impl Peer {
-    async fn new(state: &Arc<ServerState>, signed: bool) -> Self {
-        let conn = Arc::new(Connection::new(state.config.server_guid, 1 << 20, 1 << 20));
-        *conn.dialect.write().await = Some(Dialect::Smb300);
-        *conn.signing_algo.write().await = SigningAlgo::AesCmac;
-        {
-            let mut credits = conn.credits.lock().expect("credits");
-            assert!(credits.consume(0, 1));
-            credits.grant(64, false);
-        }
-        let identity = if signed {
-            Identity::User {
-                user: "alice".to_string(),
-                domain: String::new(),
-            }
-        } else {
-            Identity::Anonymous
-        };
-        let session = Session::new(identity, [0; 16], KEY, false, None);
-        let share = state.find_share("home").await.expect("share");
-        let tree = TreeConnect::new(1, share, Access::ReadWrite);
-        session
-            .trees
-            .write()
-            .await
-            .insert(1, Arc::new(RwLock::new(tree)));
-        conn.sessions
-            .write()
-            .await
-            .insert(1, Arc::new(RwLock::new(session)));
-        let (tx, rx) = response_queue();
-        conn.outbound.attach(tx);
-        Self {
-            conn,
-            rx,
-            next_mid: 1,
-            signed,
-        }
-    }
-
-    /// A request on session 1 and tree 1 with the next MessageId.
-    fn message(&mut self, command: Command, body: &[u8]) -> (u64, Vec<u8>) {
-        let mid = self.next_mid;
-        self.next_mid += 1;
-        (mid, self.message_with(command, mid, 1, body))
-    }
-
-    fn message_with(&self, command: Command, mid: u64, session_id: u64, body: &[u8]) -> Vec<u8> {
-        let hdr = Smb2Header {
-            credit_charge: 1,
-            command,
-            credit_request_response: 1,
-            flags: if self.signed { SMB2_FLAGS_SIGNED } else { 0 },
-            message_id: mid,
-            tail: HeaderTail::sync(1),
-            session_id,
-            ..Smb2Header::default()
-        };
-        let mut msg = Vec::new();
-        hdr.write(&mut msg).expect("header");
-        msg.extend_from_slice(body);
-        if self.signed {
-            sign(&mut msg, &KEY, SigningAlgo::AesCmac).expect("sign");
-        }
-        msg
-    }
-
-    /// Dispatches `frame` as the reader would: the frame it answers with is
-    /// returned, and a continuation runs on the connection's task set.
-    async fn dispatch(&self, state: &Arc<ServerState>, frame: &[u8]) -> Option<Vec<u8>> {
-        let Outgoing {
-            bytes,
-            after_send,
-            continuation,
-        } = dispatch_frame(state, &self.conn, frame).await?;
-        drop(after_send);
-        if let Some(continuation) = continuation {
-            self.conn
-                .pending
-                .spawn(continuation.run(Arc::clone(state), Arc::clone(&self.conn)));
-        }
-        Some(bytes)
-    }
-
-    /// Sends one request; returns its MessageId and the frame answering it.
-    async fn request(
-        &mut self,
-        state: &Arc<ServerState>,
-        command: Command,
-        body: &[u8],
-    ) -> (u64, Vec<u8>) {
-        let (mid, msg) = self.message(command, body);
-        let reply = self.dispatch(state, &msg).await.expect("a response");
-        (mid, reply)
-    }
-
-    /// The next message queued for the connection outside the reader.
-    async fn next(&mut self) -> Vec<u8> {
-        self.rx.recv().await.expect("a queued message")
-    }
-}
 
 fn create_body(access: u32, share: u32, lease: bool) -> Vec<u8> {
     create_body_with(access, share, lease.then_some(RH))
@@ -230,14 +112,6 @@ fn ack_body(state: u32) -> Vec<u8> {
     .write_to(&mut body)
     .expect("ack");
     body
-}
-
-fn status(frame: &[u8]) -> u32 {
-    read_u32(frame, 0x08)
-}
-
-fn header(frame: &[u8]) -> Smb2Header {
-    Smb2Header::parse(frame).expect("header").0
 }
 
 async fn server() -> Arc<ServerState> {
@@ -748,7 +622,7 @@ async fn a_cancelled_open_waiting_in_the_table_leaves_it() {
     assert!(waiter.dispatch(&state, &cancel).await.is_none());
     assert_eq!(status(&waiter.next().await), ntstatus::STATUS_CANCELLED);
     // Only the holder's open is left on the file.
-    holder.conn.close_all().await;
+    holder.conn.close_all(None).await;
     assert!(!share.files.path_is_open(&"f.txt".parse().unwrap(), false));
 }
 
@@ -764,7 +638,7 @@ async fn teardown_ends_an_open_waiting_in_the_table() {
         1,
         "the waiting open's handle is closed"
     );
-    holder.conn.close_all().await;
+    holder.conn.close_all(None).await;
     assert!(!f_is_open(&state).await, "and its table entry is gone");
 }
 
@@ -788,7 +662,7 @@ async fn logoff_and_tree_disconnect_end_an_open_waiting_in_the_table() {
 async fn a_holder_that_closes_instead_of_acknowledging_lets_the_open_go_ahead() {
     let (state, files) = server_with_files().await;
     let (holder, mut waiter) = waiting_for_write_caching(&state).await;
-    holder.conn.close_all().await;
+    holder.conn.close_all(None).await;
     assert_eq!(status(&waiter.next().await), 0);
     assert_eq!(files.open_handles(), 1);
 }

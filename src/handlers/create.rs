@@ -5,7 +5,8 @@ use std::sync::atomic::Ordering;
 
 use crate::proto::header::Smb2Header;
 use crate::proto::messages::{
-    CreateContext, CreateRequest, CreateResponse, Dialect, LeaseContext, OplockLevel,
+    CreateContext, CreateRequest, CreateResponse, Dialect, DurableReconnect, DurableReconnectV2,
+    DurableRequest, DurableRequestV2, DurableResponse, FileId, LeaseContext, OplockLevel,
 };
 use tokio::time::Instant;
 use tracing::{debug, warn};
@@ -24,14 +25,15 @@ use crate::conn::state::{Connection, Open};
 use crate::dispatch::HandlerResponse;
 use crate::error::SmbError;
 use crate::files::{
-    BreakWait, FileRef, Granted, LeaseId, LeaseRef, LeaseRequest, LeaseState, LeaseVersion,
-    MAX_BREAK_WAIT, OpenRequest, OpenSlot, Refused, Sharing, Trigger,
+    BreakWait, Claim, FileRef, Granted, LeaseId, LeaseRef, LeaseRequest, LeaseState, LeaseVersion,
+    MAX_BREAK_WAIT, OpenRequest, OpenSlot, Refused, Sharing, Trigger, close_open,
 };
-use crate::handlers::shared::lookup_session_tree;
+use crate::handlers::shared::{lookup_session, lookup_session_tree};
 use crate::handlers::{Outcome, Pending};
 use crate::info_class::VOLUME_SERIAL_NUMBER;
 use crate::ntstatus;
 use crate::path::SmbPath;
+use crate::proto::auth::ntlm::Identity;
 use crate::server::{ServerState, ShareBindings};
 use crate::utils::utf16le_to_units;
 
@@ -107,11 +109,73 @@ struct ContextQueries {
     timewarp: bool,
     /// Data of a lease request.
     lease: Option<Vec<u8>>,
+    durable: DurableAsk,
+}
+
+/// The durable handle a CREATE asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DurableAsk {
+    None,
+    /// DHnQ (MS-SMB2 3.3.5.9.6).
+    V1,
+    /// DH2Q, on SMB 3.x (MS-SMB2 3.3.5.9.10).
+    V2,
+    /// DHnC: reconnect the open named (MS-SMB2 3.3.5.9.7).
+    Reconnect(DurableReconnect),
+    /// DH2C, on SMB 3.x (MS-SMB2 3.3.5.9.12).
+    ReconnectV2(DurableReconnectV2),
+}
+
+/// Reads the durable handle contexts of a CREATE on `dialect`. The version
+/// 2 contexts count on SMB 3.x only (MS-SMB2 2.2.13.2.11, 2.2.13.2.12). A
+/// reconnect ignores a DHnQ next to it (MS-SMB2 3.3.5.9.7); any other two
+/// of them together, or one of the wrong size, fail the CREATE with
+/// STATUS_INVALID_PARAMETER (MS-SMB2 3.3.5.9.6, 3.3.5.9.7, 3.3.5.9.10).
+pub(crate) fn durable_ask(
+    contexts: &[CreateContext],
+    dialect: Option<Dialect>,
+) -> Result<DurableAsk, u32> {
+    let v3 = matches!(
+        dialect,
+        Some(Dialect::Smb300 | Dialect::Smb302 | Dialect::Smb311)
+    );
+    let find = |name: &[u8; 4], counts: bool| {
+        contexts
+            .iter()
+            .find(|c| counts && c.name == name)
+            .map(|c| c.data.as_slice())
+    };
+    let invalid = |_| ntstatus::STATUS_INVALID_PARAMETER;
+    let dhnq = find(CreateContext::NAME_DHNQ, true)
+        .map(DurableRequest::parse)
+        .transpose()
+        .map_err(invalid)?;
+    let dhnc = find(CreateContext::NAME_DHNC, true)
+        .map(DurableReconnect::parse)
+        .transpose()
+        .map_err(invalid)?;
+    let dh2q = find(CreateContext::NAME_DH2Q, v3)
+        .map(DurableRequestV2::parse)
+        .transpose()
+        .map_err(invalid)?;
+    let dh2c = find(CreateContext::NAME_DH2C, v3)
+        .map(DurableReconnectV2::parse)
+        .transpose()
+        .map_err(invalid)?;
+    Ok(match (dhnq, dhnc, dh2q, dh2c) {
+        (None, None, None, None) => DurableAsk::None,
+        (Some(_), None, None, None) => DurableAsk::V1,
+        (_, Some(reconnect), None, None) => DurableAsk::Reconnect(reconnect),
+        (None, None, Some(_), None) => DurableAsk::V2,
+        (None, None, None, Some(reconnect)) => DurableAsk::ReconnectV2(reconnect),
+        _ => return Err(ntstatus::STATUS_INVALID_PARAMETER),
+    })
 }
 
 impl ContextQueries {
-    /// `None` if a context is malformed.
-    fn parse(chain: &[u8]) -> Option<Self> {
+    /// `None` if a context is malformed or the durable handle contexts do
+    /// not go together.
+    fn parse(chain: &[u8], dialect: Option<Dialect>) -> Option<Self> {
         let contexts = CreateContext::parse_chain(chain).ok()?;
         let find = |name: &[u8; 4]| contexts.iter().find(|c| c.name == name);
         // The data is empty or one FILETIME (MS-SMB2 2.2.13.2.5).
@@ -130,6 +194,7 @@ impl ContextQueries {
             ea_buffer: find(CreateContext::NAME_EXTA).is_some(),
             timewarp: find(CreateContext::NAME_TWRP).is_some(),
             lease: find(CreateContext::NAME_RQLS).map(|c| c.data.clone()),
+            durable: durable_ask(&contexts, dialect).ok()?,
         })
     }
 
@@ -250,17 +315,69 @@ struct CreateArgs {
     sharing: Sharing,
     queries: ContextQueries,
     lease: Option<LeaseRequest>,
+    /// The configured name of the session's user; `None` for anonymous.
+    owner: Option<String>,
+}
+
+/// What a CREATE asks for.
+enum Request {
+    Open(CreateArgs),
+    Reconnect(Reconnect),
+}
+
+/// A request to reconnect a durable open.
+struct Reconnect {
+    /// The FileId the request names.
+    file_id: FileId,
+    /// DH2C rather than DHnC.
+    v2: bool,
+    share: Arc<ShareBindings>,
+    owner: Option<String>,
+    client: Uuid,
+    lease: Option<LeaseId>,
 }
 
 impl CreateArgs {
     /// Checks the request against the tree it targets (MS-SMB2 3.3.5.9).
-    async fn parse(conn: &Arc<Connection>, hdr: &Smb2Header, body: &[u8]) -> Result<Self, u32> {
+    async fn parse(conn: &Arc<Connection>, hdr: &Smb2Header, body: &[u8]) -> Result<Request, u32> {
         let req = CreateRequest::parse(body).map_err(|_| ntstatus::STATUS_INVALID_PARAMETER)?;
         let tree_arc = lookup_session_tree(conn, hdr).await?;
         let tree = tree_arc.read().await;
         let tree_access = tree.granted_access;
         let share = Arc::clone(&tree.share);
         drop(tree);
+        let owner = match &lookup_session(conn, hdr.session_id)
+            .await?
+            .read()
+            .await
+            .identity
+        {
+            Identity::User { user, .. } => Some(user.clone()),
+            Identity::Anonymous => None,
+        };
+        let dialect = *conn.dialect.read().await;
+        let client = *conn.client_guid.read().await;
+
+        let queries = ContextQueries::parse(&req.create_contexts, dialect)
+            .ok_or(ntstatus::STATUS_INVALID_PARAMETER)?;
+        // A reconnect skips the checks of the name and of the open itself
+        // (MS-SMB2 3.3.5.9.7, 3.3.5.9.12).
+        let reconnect = match queries.durable {
+            DurableAsk::Reconnect(r) => Some((r.file_id, false)),
+            DurableAsk::ReconnectV2(r) => Some((r.file_id, true)),
+            _ => None,
+        };
+        if let Some((file_id, v2)) = reconnect {
+            let lease = lease_request(queries.lease.as_deref(), dialect, client, 0)?;
+            return Ok(Request::Reconnect(Reconnect {
+                file_id,
+                v2,
+                share,
+                owner,
+                client,
+                lease: lease.map(|l| l.id),
+            }));
+        }
 
         // Decode path.
         let units = utf16le_to_units(&req.name).ok_or(ntstatus::STATUS_INVALID_PARAMETER)?;
@@ -292,8 +409,6 @@ impl CreateArgs {
             return Err(ntstatus::STATUS_INVALID_PARAMETER);
         }
 
-        let queries = ContextQueries::parse(&req.create_contexts)
-            .ok_or(ntstatus::STATUS_INVALID_PARAMETER)?;
         if queries.timewarp {
             // There are no snapshots, so none matches the token.
             return Err(ntstatus::STATUS_OBJECT_NAME_NOT_FOUND);
@@ -303,8 +418,6 @@ impl CreateArgs {
         }
         // Directories get no lease, and neither do shares that turn leases off.
         let lease = if req.requested_oplock_level == OplockLevel::Lease as u8 && share.leases {
-            let dialect = *conn.dialect.read().await;
-            let client = *conn.client_guid.read().await;
             lease_request(
                 queries.lease.as_deref(),
                 dialect,
@@ -368,7 +481,7 @@ impl CreateArgs {
             non_directory,
             delete_on_close,
         };
-        Ok(Self {
+        Ok(Request::Open(Self {
             path,
             intent,
             options,
@@ -384,7 +497,8 @@ impl CreateArgs {
             },
             queries,
             lease,
-        })
+            owner,
+        }))
     }
 }
 
@@ -468,7 +582,10 @@ pub async fn handle(
     retained: usize,
 ) -> Outcome {
     let args = match CreateArgs::parse(conn, hdr, body).await {
-        Ok(args) => args,
+        Ok(Request::Open(args)) => args,
+        Ok(Request::Reconnect(r)) => {
+            return Outcome::Done(HandlerResponse::err(refuse_reconnect(server, r).await));
+        }
         Err(status) => return Outcome::Done(HandlerResponse::err(status)),
     };
     let (wait, stage) = match attempt(server, conn, hdr, &args, Stage::Start).await {
@@ -523,6 +640,35 @@ pub async fn handle(
         op,
         work: Box::pin(work),
     })
+}
+
+/// MS-SMB2 3.3.5.9.7 and 3.3.5.9.12 on a server that hands no durable open
+/// back: every reconnect fails. A DHnC from the owner of a kept open, with
+/// its client and lease key, closes that open first, as
+/// `DurableTable::give_up` describes. No durable open on this server has a
+/// CreateGuid, so a DH2C names none (MS-SMB2 3.3.5.9.12).
+async fn refuse_reconnect(server: &ServerState, r: Reconnect) -> u32 {
+    let id = r.file_id.persistent;
+    if r.v2 {
+        debug!(id, "durable reconnect refused");
+        return ntstatus::STATUS_OBJECT_NAME_NOT_FOUND;
+    }
+    let claim = Claim {
+        share: &r.share,
+        user: r.owner.as_deref(),
+        client: r.client,
+        lease: r.lease,
+    };
+    match server.durable.give_up(id, &claim) {
+        Ok(open) => {
+            close_open(&open, false).await;
+            ntstatus::STATUS_OBJECT_NAME_NOT_FOUND
+        }
+        Err(status) => {
+            debug!(id, status, "durable reconnect refused");
+            status
+        }
+    }
 }
 
 /// One try at opening the file. Runs the session and tree checks again, so
@@ -716,6 +862,23 @@ async fn attempt(
             }
         }
     }
+    // MS-SMB2 3.3.5.9.6: an open asking for a durable handle gets one when
+    // its lease caches handles. Anonymous sessions get none, since they all
+    // count as one user, and neither does a client without a ClientGuid.
+    let durable = match (&granted, &args.owner) {
+        (Some(lease), Some(owner))
+            if args.queries.durable == DurableAsk::V1
+                && lease.state.contains(LeaseState::H)
+                && share.durable_handles
+                && !lease.id.client.is_nil() =>
+        {
+            server.durable.register(owner, &share, lease.id)
+        }
+        _ => None,
+    };
+    if let Some(reg) = &durable {
+        file.mark_durable(&server.durable, reg.id());
+    }
     // An overwrite that took the file's place in the table before the
     // backend truncated it broke the leases then; one granted since breaks
     // now, so it does not keep the old contents cached.
@@ -756,7 +919,11 @@ async fn attempt(
         let _ = handle.close().await;
         return fail(ntstatus::STATUS_NETWORK_NAME_DELETED);
     }
-    let file_id = tree.alloc_file_id();
+    let file_id = match &durable {
+        Some(reg) => FileId::new(reg.id(), tree.alloc_volatile()),
+        None => tree.alloc_file_id(),
+    };
+    let durable_granted = durable.is_some();
     let open = Open {
         file_id,
         handle: Some(handle),
@@ -768,6 +935,7 @@ async fn attempt(
         create_options: args.options,
         file: Some(file),
         slot: Some(slot),
+        durable,
     };
     let open_arc = Arc::new(tokio::sync::RwLock::new(open));
     tree.opens.get_mut().insert(file_id, open_arc);
@@ -782,6 +950,17 @@ async fn attempt(
     let mut answers = args.queries.answer(&info, args.maximal, volume_serial);
     if let Some(granted) = &granted {
         answers.push(lease_response(granted));
+    }
+    if durable_granted {
+        debug!(
+            id = file_id.persistent,
+            timeout = ?server.durable.timeout,
+            "durable open granted"
+        );
+        answers.push(CreateContext {
+            name: CreateContext::NAME_DHNQ.to_vec(),
+            data: DurableResponse.encode(),
+        });
     }
     let mut contexts = Vec::new();
     CreateContext::encode_chain(&answers, &mut contexts).expect("encoding into a Vec cannot fail");
@@ -995,6 +1174,61 @@ mod tests {
         assert_eq!(state(true, FILE_ATTRIBUTE_DIRECTORY), LeaseState::RH);
         assert_eq!(state(true, 0), LeaseState::RWH);
         assert_eq!(state(false, FILE_ATTRIBUTE_DIRECTORY), LeaseState::RWH);
+    }
+
+    fn ctx(name: &[u8; 4], len: usize) -> CreateContext {
+        CreateContext {
+            name: name.to_vec(),
+            data: vec![0; len],
+        }
+    }
+
+    #[test]
+    fn durable_contexts_are_read_by_dialect_and_combination() {
+        use DurableAsk as A;
+        let q = || ctx(CreateContext::NAME_DHNQ, 16);
+        let c = || ctx(CreateContext::NAME_DHNC, 16);
+        let q2 = || ctx(CreateContext::NAME_DH2Q, 32);
+        let c2 = || ctx(CreateContext::NAME_DH2C, 36);
+        let invalid = Err(ntstatus::STATUS_INVALID_PARAMETER);
+        let reconnect = Ok(A::Reconnect(DurableReconnect::default()));
+        let reconnect_v2 = Ok(A::ReconnectV2(DurableReconnectV2::default()));
+        for dialect in [
+            Dialect::Smb202,
+            Dialect::Smb210,
+            Dialect::Smb300,
+            Dialect::Smb302,
+            Dialect::Smb311,
+        ] {
+            let v3 = !matches!(dialect, Dialect::Smb202 | Dialect::Smb210);
+            let ask = |list: Vec<CreateContext>| durable_ask(&list, Some(dialect));
+            assert_eq!(ask(vec![]), Ok(A::None));
+            assert_eq!(ask(vec![q()]), Ok(A::V1));
+            assert_eq!(ask(vec![c()]), reconnect);
+            assert_eq!(ask(vec![c(), q()]), reconnect, "{dialect:?}");
+            assert_eq!(ask(vec![ctx(CreateContext::NAME_DHNQ, 15)]), invalid);
+            assert_eq!(ask(vec![ctx(CreateContext::NAME_DHNC, 17)]), invalid);
+            if v3 {
+                assert_eq!(ask(vec![q2()]), Ok(A::V2));
+                assert_eq!(ask(vec![c2()]), reconnect_v2);
+                for pair in [
+                    vec![c(), q2()],
+                    vec![c(), c2()],
+                    vec![c2(), q()],
+                    vec![c2(), q2()],
+                    vec![q2(), q()],
+                    vec![ctx(CreateContext::NAME_DH2Q, 31)],
+                    vec![ctx(CreateContext::NAME_DH2C, 35)],
+                ] {
+                    assert_eq!(ask(pair), invalid, "{dialect:?}");
+                }
+            } else {
+                // The version 2 contexts do not exist before SMB 3.x.
+                assert_eq!(ask(vec![q2()]), Ok(A::None));
+                assert_eq!(ask(vec![c2(), q()]), Ok(A::V1));
+                assert_eq!(ask(vec![c(), ctx(CreateContext::NAME_DH2Q, 31)]), reconnect);
+            }
+        }
     }
 
     #[tokio::test]

@@ -56,9 +56,11 @@
 //!   handle again.
 //! - [`Handle::close`] runs on every path that ends an open: CLOSE,
 //!   TREE_DISCONNECT, LOGOFF, the end of a session or connection, and
-//!   [`ConfigHandle`] changes that end sessions or trees. Before it,
-//!   [`Handle::set_times`] puts back access and write times that
-//!   FileBasicInformation froze or set through that open.
+//!   [`ConfigHandle`] changes that end sessions or trees. A durable open,
+//!   described below, outlives LOGOFF and the end of its connection or
+//!   session for a while. Before `close`, [`Handle::set_times`] puts back
+//!   access and write times that FileBasicInformation froze or set through
+//!   that open.
 //! - Delete-on-close: [`OpenOptions::delete_on_close`] and
 //!   FileDispositionInformation make the file delete-pending. When its last
 //!   open ends, on any of the paths above, the protocol layer calls
@@ -110,6 +112,29 @@
 //!   Changes made outside the server, including through another share over
 //!   the same directory, break nothing: clients keep serving stale cached
 //!   data. Turn leases off on such shares.
+//! - Durable handles: on a share with leases, unless
+//!   [`Share::durable_handles`] turns them off, a file opened with a
+//!   durable handle request (DHnQ) and a lease that caches handles stays
+//!   open when the client's connection drops, when it logs off, when its
+//!   session's reauthentication fails, or when a new session names its
+//!   session as the previous one. Its backend handle stays open, and it
+//!   keeps its share mode, byte-range locks and lease, for
+//!   [`SmbServerBuilder::durable_handle_timeout`]. A file whose lease is
+//!   being broken, or that holds byte-range locks under a lease that does
+//!   not cache writes, closes with its session instead. [`Handle::close`]
+//!   runs when that time runs out; at once when an open, write, size
+//!   change, byte-range lock, rename or delete through an open that does
+//!   not hold the lease needs what the lease caches, or when the lease
+//!   stops caching handles; on [`ConfigHandle`] changes that end the user's
+//!   sessions or the share's trees; and at shutdown. A client cannot take
+//!   a kept file back: its reconnect request fails, closing the file when
+//!   it comes from the same user and client with the same lease key, and
+//!   the client opens the file again. At most
+//!   [`SmbServerBuilder::max_disconnected_opens`] files are kept at once,
+//!   and a quarter of that, rounded up, for one user; past that, files
+//!   close with their session. Anonymous sessions, clients that send a nil
+//!   ClientGuid, and version 2 durable handle requests (DH2Q) get no
+//!   durable handle.
 //! - READ and WRITE lengths are bounded by the negotiated maximum sizes.
 //! - Each [`SmbError`] maps to one NTSTATUS for the client; see
 //!   [`SmbError::to_nt_status`].
@@ -144,8 +169,10 @@ mod server;
 #[cfg(test)]
 mod tests {
     mod async_requests;
+    mod durable;
     mod dynamic_config;
     pub(crate) mod memfs;
+    pub(crate) mod peer;
 }
 mod utils;
 mod wildcard;
@@ -157,7 +184,10 @@ pub use backend::{
 pub use builder::{Access, BuildError, Share, SmbServerBuilder};
 pub use bytes::Bytes;
 pub use error::{SmbError, SmbResult};
-pub use files::{DEFAULT_MAX_LOCKS_PER_OPEN, DEFAULT_MAX_OPENS_PER_CONNECTION};
+pub use files::{
+    DEFAULT_DURABLE_HANDLE_TIMEOUT, DEFAULT_MAX_DISCONNECTED_OPENS, DEFAULT_MAX_LOCKS_PER_OPEN,
+    DEFAULT_MAX_OPENS_PER_CONNECTION,
+};
 #[cfg(feature = "localfs")]
 pub use fs::LocalFsBackend;
 pub use path::SmbPath;
@@ -213,6 +243,37 @@ pub mod fuzzing {
     /// Parses `data` as a lease break acknowledgment.
     pub fn lease_ack(data: &[u8]) {
         let _ = crate::proto::messages::LeaseBreakAck::parse(data);
+    }
+
+    /// Parses `data` as the data of each durable handle create context.
+    pub fn durable_context(data: &[u8]) {
+        use crate::proto::messages::{
+            DurableReconnect, DurableReconnectV2, DurableRequest, DurableRequestV2,
+        };
+        let _ = DurableRequest::parse(data);
+        let _ = DurableReconnect::parse(data);
+        let _ = DurableRequestV2::parse(data);
+        let _ = DurableReconnectV2::parse(data);
+    }
+
+    /// Parses `data` as a create context chain and reads its durable handle
+    /// contexts on each dialect.
+    pub fn durable_ask(data: &[u8]) {
+        use crate::proto::messages::{CreateContext, Dialect};
+        let Ok(contexts) = CreateContext::parse_chain(data) else {
+            return;
+        };
+        for dialect in [
+            None,
+            Some(Dialect::Smb202),
+            Some(Dialect::Smb210),
+            Some(Dialect::Smb300),
+            Some(Dialect::Smb302),
+            Some(Dialect::Smb311),
+            Some(Dialect::Smb2Wildcard),
+        ] {
+            let _ = crate::handlers::create::durable_ask(&contexts, dialect);
+        }
     }
 
     /// Dispatches one frame payload on a fresh connection to `server`.

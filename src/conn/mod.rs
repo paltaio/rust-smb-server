@@ -14,6 +14,7 @@ pub mod writer;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use tokio::net::TcpStream;
 use tracing::{debug, info};
@@ -55,7 +56,9 @@ pub async fn connection_loop(
     conn.pending.shutdown(server.config.limits.io_timeout).await;
     conn.outbound.close();
     let _ = writer_handle.await;
-    conn.close_all().await;
+    // Durable opens outlive a lost connection, but not a shutdown.
+    let keep = (!server.shutting_down.load(Ordering::Acquire)).then_some(&server.durable);
+    conn.close_all(keep).await;
     server.active_connections.unregister(conn_id).await;
     info!("connection closed");
     reader_result

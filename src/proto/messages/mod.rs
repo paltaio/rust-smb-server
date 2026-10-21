@@ -12,6 +12,7 @@ pub mod cancel;
 pub mod change_notify;
 pub mod close;
 pub mod create;
+pub mod durable;
 pub mod echo;
 pub mod error_response;
 pub mod flush;
@@ -35,6 +36,10 @@ pub use change_notify::{ChangeNotifyRequest, ChangeNotifyResponse};
 pub use close::{CloseRequest, CloseResponse};
 pub use create::{
     CreateContext, CreateRequest, CreateResponse, FileId, ImpersonationLevel, OplockLevel,
+};
+pub use durable::{
+    DurableReconnect, DurableReconnectV2, DurableRequest, DurableRequestV2, DurableResponse,
+    DurableResponseV2,
 };
 pub use echo::{EchoRequest, EchoResponse};
 pub use error_response::{ErrorContext, ErrorResponse};

@@ -555,6 +555,7 @@ mod tests {
                 create_options: 0,
                 file: Some(file),
                 slot: None,
+                durable: None,
             };
             tree.opens
                 .write()

@@ -60,6 +60,10 @@ pub struct Limits {
     /// Idle time before TCP keepalive probes start; `None` leaves keepalive
     /// off.
     pub tcp_keepalive: Option<Duration>,
+    /// How long a durable open is kept after its session ends.
+    pub durable_handle_timeout: Duration,
+    /// Most durable opens kept at once, counting every client together.
+    pub max_disconnected_opens: usize,
 }
 
 impl Default for Limits {
@@ -70,6 +74,8 @@ impl Default for Limits {
             idle_timeout: Duration::from_mins(15),
             io_timeout: Duration::from_secs(60),
             tcp_keepalive: Some(Duration::from_secs(60)),
+            durable_handle_timeout: crate::files::DEFAULT_DURABLE_HANDLE_TIMEOUT,
+            max_disconnected_opens: crate::files::DEFAULT_MAX_DISCONNECTED_OPENS,
         }
     }
 }

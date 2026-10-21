@@ -1,5 +1,6 @@
 //! State of open files shared by every connection, and closing an open.
 
+mod durable;
 mod lease;
 mod leases;
 mod table;
@@ -14,6 +15,8 @@ use crate::backend::{FileInfo, Handle};
 use crate::conn::state::Open;
 use crate::handlers::shared::restore_fixed_times;
 
+pub(crate) use durable::{Claim, DurableReg, DurableTable};
+pub use durable::{DEFAULT_DURABLE_HANDLE_TIMEOUT, DEFAULT_MAX_DISCONNECTED_OPENS};
 pub(crate) use lease::{Granted, LeaseId, LeaseRequest, LeaseState, LeaseVersion, Trigger};
 #[cfg(test)]
 pub(crate) use leases::LEASE_BREAK_TIMEOUT;
@@ -101,11 +104,30 @@ pub(crate) async fn finish_close(
 /// for a slow request does not hold up the others. Returns once all are
 /// closed; the tasks finish even if the caller stops waiting.
 pub(crate) async fn close_opens(opens: Vec<Arc<RwLock<Open>>>) {
+    end_opens(opens, None).await;
+}
+
+/// Ends the opens of a session that is going away, each on its own task as
+/// [`close_opens`] does. With `keep`, a durable open that qualifies stays
+/// in that table for its client (MS-SMB2 3.3.7.1, 3.3.5.6); every other
+/// open is closed. `keep` carries the table's [`DurableTable::sweeps`]
+/// from before the session left its connection.
+pub(crate) async fn end_opens(
+    opens: Vec<Arc<RwLock<Open>>>,
+    keep: Option<(&Arc<DurableTable>, u64)>,
+) {
     let tasks: Vec<_> = opens
         .into_iter()
         .map(|open| {
+            let keep = keep.map(|(table, since)| (Arc::clone(table), since));
             tokio::spawn(async move {
-                close_open(&open, false).await;
+                let open = match keep {
+                    Some((table, since)) => table.preserve(open, since).await,
+                    None => Some(open),
+                };
+                if let Some(open) = open {
+                    close_open(&open, false).await;
+                }
             })
         })
         .collect();
@@ -141,6 +163,7 @@ mod tests {
             ShareMode::Public,
             HashMap::new(),
             false,
+            true,
             true,
         )
     }
@@ -178,6 +201,7 @@ mod tests {
             create_options: 0,
             file: Some(file),
             slot: None,
+            durable: None,
         });
         let in_table = || {
             share.files.path_is_open(&path, false) || share.files.delete_pending_at(&path, false)

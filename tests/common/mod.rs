@@ -5,6 +5,7 @@
 pub mod auth;
 pub mod client;
 pub mod crypto;
+pub mod durable;
 pub mod lease;
 pub mod transport;
 

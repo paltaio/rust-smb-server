@@ -50,6 +50,7 @@ pub struct Share {
     pub(crate) users: HashMap<String, Access>,
     pub(crate) encrypt_data: bool,
     pub(crate) leases: bool,
+    pub(crate) durable_handles: bool,
 }
 
 impl Share {
@@ -62,6 +63,7 @@ impl Share {
             users: HashMap::new(),
             encrypt_data: false,
             leases: true,
+            durable_handles: true,
         }
     }
 
@@ -116,6 +118,24 @@ impl Share {
     /// Turn leases off for such a share.
     pub fn leases(mut self, enabled: bool) -> Self {
         self.leases = enabled;
+        self
+    }
+
+    /// Keep a client's open files for a while after its connection drops or
+    /// it logs off, with their share modes, byte-range locks and leases.
+    /// Only files opened with a durable handle request and a lease that
+    /// caches handles are kept, so this does nothing when leases are off.
+    /// The backend handle stays open until
+    /// [`SmbServerBuilder::durable_handle_timeout`] runs out, or until an
+    /// open, write, size change, byte-range lock, rename or delete through
+    /// an open that does not hold the lease needs what the lease caches,
+    /// which closes the file at once. A client cannot take a kept file back:
+    /// a request to reconnect it fails, with STATUS_ACCESS_DENIED when it
+    /// comes from another user and STATUS_OBJECT_NAME_NOT_FOUND otherwise,
+    /// and closes the file when it comes from the same user and client with
+    /// the same lease key. On by default.
+    pub fn durable_handles(mut self, enabled: bool) -> Self {
+        self.durable_handles = enabled;
         self
     }
 }
@@ -372,6 +392,27 @@ impl SmbServerBuilder {
         self
     }
 
+    /// How long the server keeps an open file for a client whose
+    /// connection dropped or that logged off; see
+    /// [`Share::durable_handles`]. Defaults to
+    /// [`DEFAULT_DURABLE_HANDLE_TIMEOUT`](crate::DEFAULT_DURABLE_HANDLE_TIMEOUT),
+    /// 2 minutes.
+    pub fn durable_handle_timeout(mut self, timeout: Duration) -> Self {
+        self.limits.durable_handle_timeout = timeout;
+        self
+    }
+
+    /// Most open files the server keeps for clients whose connection
+    /// dropped or that logged off, counting every client together; one user
+    /// gets at most a quarter of them, rounded up. Past the limit, such a
+    /// client's files are closed. Defaults to
+    /// [`DEFAULT_MAX_DISCONNECTED_OPENS`](crate::DEFAULT_MAX_DISCONNECTED_OPENS),
+    /// 4096.
+    pub fn max_disconnected_opens(mut self, opens: usize) -> Self {
+        self.limits.max_disconnected_opens = opens;
+        self
+    }
+
     pub fn build(self) -> Result<SmbServer, BuildError> {
         let limits = &self.limits;
         if limits.max_connections == 0 {
@@ -396,6 +437,10 @@ impl SmbServerBuilder {
             ("idle_timeout", Some(limits.idle_timeout)),
             ("io_timeout", Some(limits.io_timeout)),
             ("tcp_keepalive", limits.tcp_keepalive),
+            (
+                "durable_handle_timeout",
+                Some(limits.durable_handle_timeout),
+            ),
         ] {
             if timeout == Some(Duration::ZERO) {
                 return Err(BuildError::OutOfRange {
@@ -581,6 +626,21 @@ mod tests {
                 Err(BuildError::OutOfRange { setting: s, .. }) if s == setting
             ));
         }
+    }
+
+    #[test]
+    fn a_zero_durable_handle_timeout_is_refused() {
+        let built = SmbServer::builder()
+            .listen("127.0.0.1:0".parse().unwrap())
+            .durable_handle_timeout(Duration::ZERO)
+            .build();
+        assert!(matches!(
+            built,
+            Err(BuildError::OutOfRange {
+                setting: "durable_handle_timeout",
+                ..
+            })
+        ));
     }
 
     #[cfg(target_os = "linux")]

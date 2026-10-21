@@ -21,7 +21,7 @@ use crate::conn::connection_loop;
 use crate::conn::limits::Limits;
 use crate::conn::listener::{AcceptBackoff, configure_socket};
 use crate::conn::state::Connection;
-use crate::files::close_opens;
+use crate::files::{DurableTable, close_opens};
 
 // ---------------------------------------------------------------------------
 // ShareMode / ShareBindings
@@ -52,6 +52,8 @@ pub struct ShareBindings {
     pub encrypt_data: bool,
     /// Leases are granted on the share's files.
     pub(crate) leases: bool,
+    /// Opens asking for a durable handle get one.
+    pub(crate) durable_handles: bool,
     /// Every file on the share that has an open, on any connection.
     pub(crate) files: crate::files::FileTable,
 }
@@ -64,6 +66,7 @@ impl ShareBindings {
         users: HashMap<String, Access>,
         is_ipc: bool,
         leases: bool,
+        durable_handles: bool,
     ) -> Arc<Self> {
         Arc::new(Self {
             name,
@@ -72,6 +75,7 @@ impl ShareBindings {
             is_ipc,
             encrypt_data: false,
             leases,
+            durable_handles,
             files: crate::files::FileTable::default(),
         })
     }
@@ -87,6 +91,7 @@ impl ShareBindings {
             is_ipc: false,
             encrypt_data: share.encrypt_data,
             leases: share.leases,
+            durable_handles: share.durable_handles,
             files: crate::files::FileTable::default(),
         })
     }
@@ -99,6 +104,7 @@ impl ShareBindings {
             ShareMode::PublicReadOnly,
             HashMap::new(),
             true,
+            false,
             false,
         )
     }
@@ -233,10 +239,16 @@ pub struct ServerState {
     pub max_locks_per_open: std::sync::atomic::AtomicUsize,
     /// Every lease held on a file of any share.
     pub(crate) leases: Arc<crate::files::LeaseTable>,
+    /// Every durable open, and the ones kept after their session ended.
+    pub(crate) durable: Arc<DurableTable>,
 }
 
 impl ServerState {
     pub fn new(config: ServerConfig, users: ServerUsers, shares: Vec<Arc<ShareBindings>>) -> Self {
+        let durable = Arc::new(DurableTable::new(
+            config.limits.durable_handle_timeout,
+            config.limits.max_disconnected_opens,
+        ));
         Self {
             config,
             users,
@@ -252,6 +264,7 @@ impl ServerState {
                 crate::files::DEFAULT_MAX_LOCKS_PER_OPEN,
             ),
             leases: Arc::default(),
+            durable,
         }
     }
 
@@ -304,7 +317,8 @@ pub struct ConfigHandle {
 
 impl ConfigHandle {
     /// Add a user, or replace the password of an existing one. Replacing a
-    /// password ends the user's sessions.
+    /// password ends the user's sessions and closes the user's durable
+    /// opens kept after their session ended.
     pub async fn add_user(
         &self,
         name: impl Into<String>,
@@ -372,7 +386,9 @@ impl ConfigHandle {
     }
 
     /// Grant `user` `access` to a share. Lowering a user's access ends the
-    /// user's trees on the share, so it applies to open connections too.
+    /// user's trees on the share, so it applies to open connections too, and
+    /// closes the user's durable opens on the share kept after their session
+    /// ended.
     pub async fn grant_share_user(
         &self,
         share_name: &str,
@@ -453,7 +469,8 @@ impl ConfigHandle {
             .store(limit, Ordering::Relaxed);
     }
 
-    /// Ends every session of `user` on every connection. All of them are
+    /// Ends every session of `user` on every connection, and closes the
+    /// user's durable opens kept after their session ended. All of them are
     /// cut off before any open is closed, and closing waits for requests
     /// still using an open.
     async fn close_user_sessions(&self, user: &str) {
@@ -461,11 +478,13 @@ impl ConfigHandle {
         for conn in self.state.active_connections.live().await {
             opens.extend(conn.detach_sessions_for_user(user).await);
         }
+        opens.extend(self.state.durable.take_for(None, Some(user)));
         close_opens(opens).await;
     }
 
     /// Ends the trees on `share`, only those of `user` when given, on every
-    /// connection, cutting all of them off before closing any open.
+    /// connection, and closes the matching durable opens kept after their
+    /// session ended, cutting all of them off before closing any open.
     async fn close_share_trees(&self, share: &Arc<ShareBindings>, user: Option<&str>) {
         let mut opens = Vec::new();
         for conn in self.state.active_connections.live().await {
@@ -474,6 +493,7 @@ impl ConfigHandle {
                 None => conn.detach_trees_for_share(share).await,
             });
         }
+        opens.extend(self.state.durable.take_for(Some(share), user));
         close_opens(opens).await;
     }
 }
@@ -576,7 +596,9 @@ impl SmbServer {
     }
 
     /// Run the accept loop until `shutdown()` is called. Returns once every
-    /// connection has closed.
+    /// connection has closed and every durable open kept after its session
+    /// ended is closed, including closes that expiry or a lease break had
+    /// already started.
     pub async fn serve(self) -> io::Result<()> {
         if self.bound.lock().await.is_none() {
             self.bind().await?;
@@ -677,6 +699,8 @@ impl SmbServer {
                 info!(open = connections.len(), "waiting for connections to close");
             }
             while connections.join_next().await.is_some() {}
+            close_opens(state.durable.take_for(None, None)).await;
+            state.durable.closed().await;
             info!("server stopped");
             Ok::<(), io::Error>(())
         }

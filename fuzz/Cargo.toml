@@ -72,3 +72,17 @@ path = "fuzz_targets/lease_ack.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "durable_context"
+path = "fuzz_targets/durable_context.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "durable_ask"
+path = "fuzz_targets/durable_ask.rs"
+test = false
+doc = false
+bench = false

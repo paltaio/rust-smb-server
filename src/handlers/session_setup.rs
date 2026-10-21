@@ -496,7 +496,8 @@ fn session_limit_reached<T>(server: &ServerState, sessions: &HashMap<u64, T>) ->
 /// Ends a logon that failed with `status`: counts it against the connection
 /// and, with `user` set, against that name and the client's address. Closes
 /// the connection once it has failed too often, and removes a session that
-/// was being reauthenticated (MS-SMB2 3.3.5.5.3).
+/// was being reauthenticated (MS-SMB2 3.3.5.5.3), keeping its durable opens
+/// as LOGOFF does.
 async fn logon_failed(
     server: &ServerState,
     conn: &Connection,
@@ -516,7 +517,7 @@ async fn logon_failed(
         conn.request_disconnect();
     }
     if reauth {
-        conn.close_session(sid).await;
+        conn.close_session(sid, Some(&server.durable)).await;
     }
     HandlerResponse::err(status)
 }
@@ -532,7 +533,8 @@ fn same_user(a: &Identity, b: &Identity) -> bool {
 }
 
 /// MS-SMB2 3.3.5.5.3: a logon that names a PreviousSessionId of the same
-/// user ends that session, on whichever connection holds it.
+/// user ends that session, on whichever connection holds it, as if that
+/// connection were lost (MS-SMB2 3.3.7.1): its durable opens are kept.
 async fn close_previous_session(server: &ServerState, previous: u64, identity: &Identity) {
     if matches!(identity, Identity::Anonymous) {
         return;
@@ -544,7 +546,7 @@ async fn close_previous_session(server: &ServerState, previous: u64, identity: &
         };
         if same_user(&old.read().await.identity, identity) {
             info!(previous, "closing the session the client reconnected from");
-            conn.close_session(previous).await;
+            conn.close_session(previous, Some(&server.durable)).await;
         }
         return;
     }

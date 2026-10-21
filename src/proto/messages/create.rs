@@ -12,7 +12,8 @@ use crate::proto::error::{ProtoError, ProtoResult};
 
 /// SMB2 FileId - opaque 16 bytes (volatile + persistent).
 ///
-/// MS-SMB2 §2.2.14.1. The server sets both halves to the same value.
+/// MS-SMB2 2.2.14.1. The server sets both halves to the same value, except
+/// for durable opens, whose persistent half is random.
 #[binrw]
 #[brw(little)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
