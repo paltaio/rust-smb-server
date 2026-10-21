@@ -3,17 +3,18 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use crate::proto::header::Smb2Header;
+use crate::proto::header::{SMB2_FLAGS_REPLAY_OPERATION, Smb2Header};
 use crate::proto::messages::{
     CreateContext, CreateRequest, CreateResponse, Dialect, DurableReconnect, DurableReconnectV2,
-    DurableRequest, DurableRequestV2, DurableResponse, FileId, LeaseContext, OplockLevel,
+    DurableRequest, DurableRequestV2, DurableResponse, DurableResponseV2, FileId, LeaseContext,
+    OplockLevel,
 };
 use tokio::time::Instant;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::access_mask::{
-    DELETE, FILE_APPEND_DATA, FILE_READ_DATA, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA,
+    DELETE, FILE_APPEND_DATA, FILE_EXECUTE, FILE_READ_DATA, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA,
     granted_access, maximal_access,
 };
 use crate::backend::{
@@ -25,8 +26,8 @@ use crate::conn::state::{Connection, Open};
 use crate::dispatch::HandlerResponse;
 use crate::error::SmbError;
 use crate::files::{
-    BreakWait, FileRef, Granted, LeaseId, LeaseRef, LeaseRequest, LeaseState, LeaseVersion,
-    MAX_BREAK_WAIT, OpenRequest, OpenSlot, Refused, Sharing, Trigger,
+    BreakWait, Durability, FileRef, Granted, LeaseId, LeaseRef, LeaseRequest, LeaseState,
+    LeaseVersion, MAX_BREAK_WAIT, OpenRequest, OpenSlot, Refused, Sharing, Trigger, v2_timeout,
 };
 use crate::handlers::reconnect::{self, Reconnect};
 use crate::handlers::shared::{lookup_session, lookup_session_tree};
@@ -95,6 +96,11 @@ const FILE_OVERWRITTEN: u32 = 0x0000_0003;
 /// header: 64 + 88.
 const RESPONSE_CONTEXTS_OFFSET: u32 = 0x98;
 
+/// Access that makes a version 2 durable open one a replayed CREATE may
+/// name (MS-SMB2 3.3.5.9.10, Open.IsReplayEligible).
+const REPLAYABLE_ACCESS: u32 =
+    FILE_READ_DATA | FILE_EXECUTE | FILE_WRITE_DATA | FILE_APPEND_DATA | DELETE;
+
 /// Caching the server grants in a lease.
 const GRANTABLE_LEASE: LeaseState = LeaseState::RWH;
 
@@ -120,7 +126,7 @@ pub(crate) enum DurableAsk {
     /// DHnQ (MS-SMB2 3.3.5.9.6).
     V1,
     /// DH2Q, on SMB 3.x (MS-SMB2 3.3.5.9.10).
-    V2,
+    V2(DurableRequestV2),
     /// DHnC: reconnect the open named (MS-SMB2 3.3.5.9.7).
     Reconnect(DurableReconnect),
     /// DH2C, on SMB 3.x (MS-SMB2 3.3.5.9.12).
@@ -167,7 +173,7 @@ pub(crate) fn durable_ask(
         (None, None, None, None) => DurableAsk::None,
         (Some(_), None, None, None) => DurableAsk::V1,
         (_, Some(reconnect), None, None) => DurableAsk::Reconnect(reconnect),
-        (None, None, Some(_), None) => DurableAsk::V2,
+        (None, None, Some(request), None) => DurableAsk::V2(request),
         (None, None, None, Some(reconnect)) => DurableAsk::ReconnectV2(reconnect),
         _ => return Err(ntstatus::STATUS_INVALID_PARAMETER),
     })
@@ -357,16 +363,16 @@ impl CreateArgs {
         // A reconnect skips the checks of the name and of the open itself
         // (MS-SMB2 3.3.5.9.7, 3.3.5.9.12).
         let reconnect = match queries.durable {
-            DurableAsk::Reconnect(r) => Some((r.file_id, false)),
-            DurableAsk::ReconnectV2(r) => Some((r.file_id, true)),
+            DurableAsk::Reconnect(r) => Some((r.file_id, None)),
+            DurableAsk::ReconnectV2(r) => Some((r.file_id, Some(r.create_guid))),
             _ => None,
         };
-        if let Some((file_id, v2)) = reconnect {
+        if let Some((file_id, create_guid)) = reconnect {
             let lease = lease_request(queries.lease.as_deref(), dialect, client, 0)?;
             let name = utf16le_to_units(&req.name).and_then(|u| SmbPath::from_utf16(&u).ok());
             return Ok(Request::Reconnect(Reconnect {
                 file_id,
-                v2,
+                create_guid,
                 name,
                 owner,
                 client,
@@ -584,6 +590,21 @@ pub async fn handle(
         }
         Err(status) => return Outcome::Done(HandlerResponse::err(status)),
     };
+    // MS-SMB2 3.3.5.9.10: a version 2 request that repeats the CreateGuid of
+    // a live durable open of the same client fails unless it is marked as a
+    // replay. A request marked as one is not answered from that open; it
+    // opens the file anew.
+    if let DurableAsk::V2(request) = args.queries.durable
+        && hdr.flags & SMB2_FLAGS_REPLAY_OPERATION == 0
+    {
+        let client = *conn.client_guid.read().await;
+        if server
+            .durable
+            .create_guid_in_use(client, request.create_guid)
+        {
+            return Outcome::Done(HandlerResponse::err(ntstatus::STATUS_DUPLICATE_OBJECTID));
+        }
+    }
     let (wait, stage) = match attempt(server, conn, hdr, &args, Stage::Start).await {
         Step::Done(response) => return Outcome::Done(response),
         Step::Wait(wait, stage) => (wait, stage),
@@ -829,23 +850,40 @@ async fn attempt(
             }
         }
     }
-    // MS-SMB2 3.3.5.9.6: an open asking for a durable handle gets one when
-    // its lease caches handles. Anonymous sessions get none, since they all
-    // count as one user, and neither does a client without a ClientGuid.
-    let durable = match (&granted, &args.owner) {
-        (Some(lease), Some(owner))
-            if args.queries.durable == DurableAsk::V1
-                && lease.state.contains(LeaseState::H)
+    // MS-SMB2 3.3.5.9.6, 3.3.5.9.10: an open asking for a durable handle
+    // gets one when its lease caches handles; any other open gets none and
+    // no durable context in the response. Anonymous sessions get none,
+    // since they all count as one user, and neither does a client without a
+    // ClientGuid. The PERSISTENT flag of a version 2 request is ignored:
+    // no share is continuously available.
+    let durability = match args.queries.durable {
+        DurableAsk::V1 => Some(Durability {
+            create_guid: None,
+            timeout: server.durable.timeout,
+            replay_eligible: false,
+        }),
+        DurableAsk::V2(request) => Some(Durability {
+            create_guid: Some(request.create_guid),
+            timeout: v2_timeout(request.timeout_ms, server.durable.timeout),
+            replay_eligible: args.open_access & REPLAYABLE_ACCESS != 0,
+        }),
+        _ => None,
+    };
+    let durable = match (&granted, &args.owner, durability) {
+        (Some(lease), Some(owner), Some(durability))
+            if lease.state.contains(LeaseState::H)
                 && share.durable_handles
                 && !lease.id.client.is_nil() =>
         {
+            let lease = (lease.id, lease.version);
             server
                 .durable
-                .register(owner, &share, (lease.id, lease.version), conn)
+                .register(owner, &share, lease, durability, conn)
+                .map(|reg| (reg, durability))
         }
         _ => None,
     };
-    if let Some(reg) = &durable {
+    if let Some((reg, _)) = &durable {
         file.mark_durable(&server.durable, reg.id());
     }
     // An overwrite that took the file's place in the table before the
@@ -889,10 +927,10 @@ async fn attempt(
         return fail(ntstatus::STATUS_NETWORK_NAME_DELETED);
     }
     let file_id = match &durable {
-        Some(reg) => FileId::new(reg.id(), tree.alloc_volatile()),
+        Some((reg, _)) => FileId::new(reg.id(), tree.alloc_volatile()),
         None => tree.alloc_file_id(),
     };
-    let durable_granted = durable.is_some();
+    let (durable, durability) = durable.unzip();
     let open = Open {
         file_id,
         handle: Some(handle),
@@ -920,15 +958,26 @@ async fn attempt(
     if let Some(granted) = &granted {
         answers.push(lease_response(granted));
     }
-    if durable_granted {
+    if let Some(durability) = durability {
         debug!(
             id = file_id.persistent,
-            timeout = ?server.durable.timeout,
+            timeout = ?durability.timeout,
+            v2 = durability.create_guid.is_some(),
             "durable open granted"
         );
-        answers.push(CreateContext {
-            name: CreateContext::NAME_DHNQ.to_vec(),
-            data: DurableResponse.encode(),
+        answers.push(match durability.create_guid {
+            None => CreateContext {
+                name: CreateContext::NAME_DHNQ.to_vec(),
+                data: DurableResponse.encode(),
+            },
+            Some(_) => CreateContext {
+                name: CreateContext::NAME_DH2Q.to_vec(),
+                data: DurableResponseV2 {
+                    timeout_ms: u32::try_from(durability.timeout.as_millis()).unwrap_or(u32::MAX),
+                    flags: 0,
+                }
+                .encode(),
+            },
         });
     }
     let buf = encode_response(&info, file_id, granted.is_some(), create_action, &answers);
@@ -1191,7 +1240,7 @@ mod tests {
             assert_eq!(ask(vec![ctx(CreateContext::NAME_DHNQ, 15)]), invalid);
             assert_eq!(ask(vec![ctx(CreateContext::NAME_DHNC, 17)]), invalid);
             if v3 {
-                assert_eq!(ask(vec![q2()]), Ok(A::V2));
+                assert_eq!(ask(vec![q2()]), Ok(A::V2(DurableRequestV2::default())));
                 assert_eq!(ask(vec![c2()]), reconnect_v2);
                 for pair in [
                     vec![c(), q2()],

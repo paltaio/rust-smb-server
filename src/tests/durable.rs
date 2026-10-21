@@ -17,6 +17,8 @@ use crate::dispatch::dispatch_frame;
 use crate::error::SmbError;
 use crate::files::{LEASE_BREAK_TIMEOUT, LeaseId};
 use crate::ntstatus;
+use crate::proto::crypto::{SigningAlgo, sign};
+use crate::proto::header::SMB2_FLAGS_REPLAY_OPERATION;
 use crate::proto::header::{Command, SMB2_HEADER_LEN};
 use crate::proto::messages::{
     CreateContext, CreateRequest, CreateResponse, FileId, LeaseBreakAck, LeaseBreakNotification,
@@ -24,7 +26,7 @@ use crate::proto::messages::{
 };
 use crate::server::ServerState;
 use crate::tests::memfs::MemFsBackend;
-use crate::tests::peer::{Peer, header, status};
+use crate::tests::peer::{KEY, Peer, header, status};
 use crate::{
     BackendCapabilities, DirEntry, FileInfo, FileTimes, Handle, OpenAction, OpenOptions, Share,
     ShareBackend, SmbPath, SmbResult, SmbServer,
@@ -67,6 +69,11 @@ struct Open {
     options: u32,
     /// The kept open to reconnect.
     reconnect: Option<FileId>,
+    /// Ask for a version 2 durable handle, or reconnect one, with this
+    /// CreateGuid and, for a request, this timeout in milliseconds.
+    v2: Option<([u8; 16], u32)>,
+    /// The name to open, when not f.txt.
+    name: Option<&'static str>,
 }
 
 impl Default for Open {
@@ -78,6 +85,8 @@ impl Default for Open {
             durable: false,
             options: 0,
             reconnect: None,
+            v2: None,
+            name: None,
         }
     }
 }
@@ -102,7 +111,7 @@ impl Open {
     }
 
     fn body(self) -> Vec<u8> {
-        let name = crate::utils::utf16le("f.txt");
+        let name = crate::utils::utf16le(self.name.unwrap_or("f.txt"));
         let mut list = Vec::new();
         if let Some(state) = self.lease {
             list.push(CreateContext {
@@ -115,17 +124,35 @@ impl Open {
                 .encode(),
             });
         }
-        if self.durable {
-            list.push(CreateContext {
+        match (self.durable, self.v2) {
+            (true, None) => list.push(CreateContext {
                 name: CreateContext::NAME_DHNQ.to_vec(),
                 data: vec![0; 16],
-            });
+            }),
+            (true, Some((guid, timeout))) => {
+                let mut data = timeout.to_le_bytes().to_vec();
+                data.extend_from_slice(&[0; 12]);
+                data.extend_from_slice(&guid);
+                list.push(CreateContext {
+                    name: CreateContext::NAME_DH2Q.to_vec(),
+                    data,
+                });
+            }
+            (false, _) => {}
         }
         if let Some(file_id) = self.reconnect {
             let mut data = file_id.persistent.to_le_bytes().to_vec();
             data.extend_from_slice(&file_id.volatile.to_le_bytes());
+            let name = match self.v2 {
+                Some((guid, _)) => {
+                    data.extend_from_slice(&guid);
+                    data.extend_from_slice(&0u32.to_le_bytes());
+                    CreateContext::NAME_DH2C
+                }
+                None => CreateContext::NAME_DHNC,
+            };
             list.push(CreateContext {
-                name: CreateContext::NAME_DHNC.to_vec(),
+                name: name.to_vec(),
                 data,
             });
         }
@@ -1060,4 +1087,173 @@ async fn a_kept_open_comes_back_after_its_sibling_acknowledged_rh() {
         .expect("lease context");
     assert_eq!((lease.key, lease.state), (LEASE_KEY, RH));
     assert_eq!(files.open_handles(), 3);
+}
+
+const CREATE_GUID: [u8; 16] = [0xE1; 16];
+
+/// A version 2 durable open asking for `lease` and `timeout_ms`.
+fn durable_v2(lease: u32, timeout_ms: u32) -> Open {
+    Open {
+        v2: Some((CREATE_GUID, timeout_ms)),
+        ..Open::durable(lease)
+    }
+}
+
+/// The Timeout of the DH2Q response context.
+fn granted_timeout(resp: &CreateResponse) -> Option<u32> {
+    CreateContext::parse_chain(&resp.create_contexts)
+        .expect("contexts")
+        .into_iter()
+        .find(|c| c.name == CreateContext::NAME_DH2Q)
+        .map(|c| {
+            assert_eq!(c.data.len(), 8);
+            assert_eq!(c.data[4..], [0; 4], "never persistent");
+            u32::from_le_bytes(c.data[..4].try_into().unwrap())
+        })
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_version_2_open_is_kept_for_the_time_it_was_granted() {
+    for (asked, granted) in [(0, 60_000), (1_000, 1_000), (600_000, 300_000)] {
+        let (state, files) = server().await;
+        let mut peer = Peer::from_client(&state, true, CLIENT).await;
+        let resp = create(&mut peer, &state, durable_v2(RWH, asked)).await;
+        assert_eq!(granted_timeout(&resp), Some(granted), "asked {asked}");
+        peer.drop_connection(&state).await;
+        let granted = Duration::from_millis(u64::from(granted));
+        tokio::time::sleep(granted - Duration::from_millis(1)).await;
+        settle().await;
+        assert_eq!(files.open_handles(), 1, "kept, asked {asked}");
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        settle().await;
+        assert_eq!(files.open_handles(), 0, "expired, asked {asked}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_version_2_reconnect_is_bound_by_the_granted_time() {
+    let (state, files) = server().await;
+    let mut old = Peer::from_client(&state, true, CLIENT).await;
+    let held = create(&mut old, &state, durable_v2(RWH, 2_000)).await;
+    old.drop_connection(&state).await;
+    let reconnect = Open {
+        v2: Some((CREATE_GUID, 0)),
+        ..Open::reconnect(held.file_id, RWH)
+    };
+    tokio::time::sleep(Duration::from_millis(2_001)).await;
+    settle().await;
+    let mut new = Peer::from_client(&state, true, CLIENT).await;
+    let (_, reply) = new
+        .request(&state, Command::Create, &reconnect.body())
+        .await;
+    assert_eq!(status(&reply), ntstatus::STATUS_OBJECT_NAME_NOT_FOUND);
+    assert_eq!(files.open_handles(), 0);
+}
+
+/// `body` as a CREATE on `peer` marked as a replay.
+async fn replayed(peer: &mut Peer, state: &Arc<ServerState>, body: &[u8]) -> Vec<u8> {
+    let (_, mut msg) = peer.message(Command::Create, body);
+    let flags = u32::from_le_bytes(msg[16..20].try_into().unwrap()) | SMB2_FLAGS_REPLAY_OPERATION;
+    msg[16..20].copy_from_slice(&flags.to_le_bytes());
+    msg[48..64].fill(0);
+    sign(&mut msg, &KEY, SigningAlgo::AesCmac).expect("sign");
+    peer.dispatch(state, &msg).await.expect("a response")
+}
+
+#[tokio::test]
+async fn a_create_guid_of_a_live_open_is_refused_unless_replayed() {
+    let (state, files) = server().await;
+    let mut peer = Peer::from_client(&state, true, CLIENT).await;
+    create(&mut peer, &state, durable_v2(RH, 0)).await;
+    let body = durable_v2(RH, 0).body();
+    let (_, reply) = peer.request(&state, Command::Create, &body).await;
+    assert_eq!(status(&reply), ntstatus::STATUS_DUPLICATE_OBJECTID);
+    // Another client may use the same CreateGuid.
+    let mut other = Peer::from_client(&state, true, Uuid::from_bytes([0xC2; 16])).await;
+    let (_, reply) = other.request(&state, Command::Create, &body).await;
+    assert_eq!(status(&reply), 0);
+    // A replay opens the file anew.
+    assert_eq!(status(&replayed(&mut peer, &state, &body).await), 0);
+    assert_eq!(files.open_handles(), 3);
+    // Kept, the open still holds its CreateGuid; once closed it does not.
+    peer.drop_connection(&state).await;
+    let mut again = Peer::from_client(&state, true, CLIENT).await;
+    let (_, reply) = again.request(&state, Command::Create, &body).await;
+    assert_eq!(status(&reply), ntstatus::STATUS_DUPLICATE_OBJECTID);
+    assert_eq!(state.durable.take_for(None, None).len(), 2);
+    let (_, reply) = again.request(&state, Command::Create, &body).await;
+    assert_eq!(status(&reply), 0);
+}
+
+#[tokio::test]
+async fn a_wrong_name_is_refused_before_lowered_access_closes_the_open() {
+    let (state, files) = server().await;
+    let (_old, file_id) = kept(&state, Open::durable(RWH)).await;
+    let mut new = Peer::from_client(&state, true, CLIENT).await;
+    set_tree_access(&new, Access::Read).await;
+    let renamed = Open {
+        name: Some("g.txt"),
+        ..Open::reconnect(file_id, RWH)
+    };
+    let (_, reply) = new.request(&state, Command::Create, &renamed.body()).await;
+    assert_eq!(status(&reply), ntstatus::STATUS_INVALID_PARAMETER);
+    assert_eq!(files.open_handles(), 1, "still kept");
+    let (_, reply) = new
+        .request(
+            &state,
+            Command::Create,
+            &Open::reconnect(file_id, RWH).body(),
+        )
+        .await;
+    assert_eq!(status(&reply), ntstatus::STATUS_OBJECT_NAME_NOT_FOUND);
+    assert_eq!(files.open_handles(), 0, "closed for the access it lost");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_version_2_open_comes_back_by_either_reconnect_and_keeps_its_time() {
+    let (state, files) = server().await;
+    let mut peer = Peer::from_client(&state, true, CLIENT).await;
+    let held = create(&mut peer, &state, durable_v2(RWH, 2_000)).await;
+    peer.drop_connection(&state).await;
+    let mut peer = Peer::from_client(&state, true, CLIENT).await;
+    let resp = create(&mut peer, &state, Open::reconnect(held.file_id, RWH)).await;
+    assert_eq!(resp.file_id.persistent, held.file_id.persistent);
+    peer.drop_connection(&state).await;
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    let mut peer = Peer::from_client(&state, true, CLIENT).await;
+    let by_guid = Open {
+        v2: Some((CREATE_GUID, 0)),
+        ..Open::reconnect(held.file_id, RWH)
+    };
+    create(&mut peer, &state, by_guid).await;
+    peer.drop_connection(&state).await;
+    tokio::time::sleep(Duration::from_millis(1_999)).await;
+    settle().await;
+    assert_eq!(files.open_handles(), 1);
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    settle().await;
+    assert_eq!(files.open_handles(), 0, "kept for its 2 seconds each time");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_version_2_open_put_back_keeps_its_own_deadline() {
+    let (state, files) = server().await;
+    let mut peer = Peer::from_client(&state, true, CLIENT).await;
+    let held = create(&mut peer, &state, durable_v2(RWH, 2_000)).await;
+    peer.drop_connection(&state).await;
+    tokio::time::sleep(Duration::from_millis(1_000)).await;
+    let mut new = Peer::from_client(&state, true, CLIENT).await;
+    let by_guid = Open {
+        v2: Some((CREATE_GUID, 0)),
+        ..Open::reconnect(held.file_id, RWH)
+    };
+    state.max_opens_per_connection.store(0, Ordering::Relaxed);
+    let (_, reply) = new.request(&state, Command::Create, &by_guid.body()).await;
+    assert_eq!(status(&reply), ntstatus::STATUS_INSUFFICIENT_RESOURCES);
+    tokio::time::sleep(Duration::from_millis(999)).await;
+    settle().await;
+    assert_eq!(files.open_handles(), 1);
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    settle().await;
+    assert_eq!(files.open_handles(), 0);
 }

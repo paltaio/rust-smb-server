@@ -1,6 +1,7 @@
-//! CREATE with a durable handle reconnect context (MS-SMB2 3.3.5.9.7,
-//! 3.3.5.9.12): hands an open kept after its session ended back to its
-//! client, in the client's new session and tree.
+//! CREATE with a durable handle reconnect context, DHnC or DH2C (MS-SMB2
+//! 3.3.5.9.7, 3.3.5.9.12): hands an open kept after its session ended back
+//! to its client, in the client's new session and tree. The PERSISTENT
+//! flag of a DH2C is ignored: no open here is persistent.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -22,10 +23,10 @@ use crate::handlers::shared::lookup_session_tree;
 use crate::handlers::{Outcome, Pending};
 use crate::info_class::VOLUME_SERIAL_NUMBER;
 use crate::ntstatus;
-use crate::path::{SmbPath, same_path};
+use crate::path::SmbPath;
 use crate::proto::header::Smb2Header;
 use crate::proto::messages::FileId;
-use crate::server::{ServerState, ShareBindings};
+use crate::server::ServerState;
 
 /// How long a reconnect waits for the connection that still holds the
 /// open to finish closing.
@@ -35,8 +36,8 @@ const TEARDOWN_WAIT: Duration = Duration::from_secs(5);
 pub(super) struct Reconnect {
     /// The FileId the request names.
     pub file_id: FileId,
-    /// DH2C rather than DHnC.
-    pub v2: bool,
+    /// The CreateGuid of a DH2C; `None` for a DHnC.
+    pub create_guid: Option<[u8; 16]>,
     /// The name in the request; `None` when it is not a valid name, which
     /// matches no open.
     pub name: Option<SmbPath>,
@@ -57,12 +58,6 @@ pub(super) async fn handle(
     retained: usize,
 ) -> Outcome {
     let id = r.file_id.persistent;
-    // No durable open on this server has a CreateGuid, so a DH2C names none
-    // (MS-SMB2 3.3.5.9.12).
-    if r.v2 {
-        debug!(id, "durable reconnect refused");
-        return Outcome::Done(HandlerResponse::err(ntstatus::STATUS_OBJECT_NAME_NOT_FOUND));
-    }
     let wait = match attempt(server, conn, hdr, &r).await {
         Ok(response) => return Outcome::Done(response),
         Err(Unclaimed::Status(status)) => {
@@ -143,11 +138,12 @@ async fn attempt(
         user: r.owner.as_deref(),
         client: r.client,
         lease: r.lease.map(|l| (l.id, l.version)),
+        create_guid: r.create_guid,
+        name: r.name.as_ref(),
     };
     let open = server.durable.claim(id, &claim)?;
     let tree = Tree {
         arc: &tree_arc,
-        share: &share,
         access,
         session_id: hdr.session_id,
         since,
@@ -160,7 +156,6 @@ async fn attempt(
 /// The tree a reconnect came on.
 struct Tree<'a> {
     arc: &'a Arc<RwLock<TreeConnect>>,
-    share: &'a Arc<ShareBindings>,
     /// The access the tree grants now.
     access: Access,
     /// The session the tree belongs to.
@@ -171,7 +166,8 @@ struct Tree<'a> {
 }
 
 /// Puts the claimed open `open_arc` in `tree` under `file_id`, on `conn`
-/// (MS-SMB2 3.3.5.9.7), and answers the CREATE. A check that fails puts the
+/// (MS-SMB2 3.3.5.9.7), and answers the CREATE. The claim already checked
+/// the request, name and owner included. A check that fails here puts the
 /// open back for a later reconnect, except that an open whose rights now
 /// exceed what the tree grants is closed, and so is one a lease break
 /// decided to close meanwhile.
@@ -194,19 +190,6 @@ async fn take_back(
         debug!(id, "durable open closed: access no longer granted");
         close_open(&open_arc, false).await;
         return Err(not_found);
-    }
-    let case_sensitive = tree.share.backend.capabilities().case_sensitive;
-    let name_matches = open.file.as_ref().is_some_and(|f| {
-        open.delete_on_close
-            || f.delete_pending()
-            || r.name
-                .as_ref()
-                .is_some_and(|name| same_path(&f.path(), name, case_sensitive))
-    });
-    if !name_matches {
-        drop(open);
-        server.durable.release_claim(id, open_arc).await;
-        return Err(ntstatus::STATUS_INVALID_PARAMETER);
     }
     let limit = server.max_opens_per_connection.load(Ordering::Relaxed);
     let Some(slot) = OpenSlot::acquire(&conn.open_count, limit) else {

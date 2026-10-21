@@ -126,16 +126,18 @@ impl Share {
     /// the client can take them back when it reconnects. Only files opened
     /// with a durable handle request and a lease that caches handles are
     /// kept, so this does nothing when leases are off. The backend handle
-    /// stays open until [`SmbServerBuilder::durable_handle_timeout`] runs
-    /// out, or until an open, write, size change, byte-range lock, rename or
+    /// stays open for [`SmbServerBuilder::durable_handle_timeout`], or the
+    /// time a version 2 request was granted, or until an open, write, size change, byte-range lock, rename or
     /// delete through an open that does not hold the lease needs what the
     /// lease caches, which closes the file at once. The same user, from the
     /// same client, on this share, takes a kept file back with a durable
-    /// handle reconnect that names the file and its lease. Another user gets
-    /// STATUS_ACCESS_DENIED; another client, share or lease gets
+    /// handle reconnect that names the file and its lease, and for a version
+    /// 2 open its CreateGuid. Another user gets STATUS_ACCESS_DENIED;
+    /// another client, share, lease or CreateGuid gets
     /// STATUS_OBJECT_NAME_NOT_FOUND. A kept file whose rights exceed what
     /// the user's tree on the share grants at the reconnect is closed
-    /// instead. On by default.
+    /// instead. Version 1 and version 2 requests are both served; the
+    /// PERSISTENT flag is ignored. On by default.
     pub fn durable_handles(mut self, enabled: bool) -> Self {
         self.durable_handles = enabled;
         self
@@ -396,7 +398,10 @@ impl SmbServerBuilder {
 
     /// How long the server keeps an open file for a client whose
     /// connection dropped or that logged off; see
-    /// [`Share::durable_handles`]. Defaults to
+    /// [`Share::durable_handles`]. A client that asks for a time in a
+    /// version 2 durable handle request gets it, up to this timeout or 5
+    /// minutes, whichever is longer. Must be between 1 millisecond and 49
+    /// days. Defaults to
     /// [`DEFAULT_DURABLE_HANDLE_TIMEOUT`](crate::DEFAULT_DURABLE_HANDLE_TIMEOUT),
     /// 2 minutes.
     pub fn durable_handle_timeout(mut self, timeout: Duration) -> Self {
@@ -439,10 +444,6 @@ impl SmbServerBuilder {
             ("idle_timeout", Some(limits.idle_timeout)),
             ("io_timeout", Some(limits.io_timeout)),
             ("tcp_keepalive", limits.tcp_keepalive),
-            (
-                "durable_handle_timeout",
-                Some(limits.durable_handle_timeout),
-            ),
         ] {
             if timeout == Some(Duration::ZERO) {
                 return Err(BuildError::OutOfRange {
@@ -450,6 +451,14 @@ impl SmbServerBuilder {
                     expected: "greater than zero",
                 });
             }
+        }
+        if !(MIN_DURABLE_HANDLE_TIMEOUT..=MAX_DURABLE_HANDLE_TIMEOUT)
+            .contains(&limits.durable_handle_timeout)
+        {
+            return Err(BuildError::OutOfRange {
+                setting: "durable_handle_timeout",
+                expected: "between 1 millisecond and 49 days",
+            });
         }
 
         for name in &self.user_order {
@@ -532,6 +541,11 @@ impl SmbServerBuilder {
         Ok(SmbServer::from_state(state))
     }
 }
+
+/// Shortest and longest accepted `durable_handle_timeout`. Version 2
+/// responses carry the timeout in whole milliseconds, in 32 bits.
+const MIN_DURABLE_HANDLE_TIMEOUT: Duration = Duration::from_millis(1);
+const MAX_DURABLE_HANDLE_TIMEOUT: Duration = Duration::from_secs(49 * 24 * 60 * 60);
 
 /// Smallest and largest accepted `max_read_size` and `max_write_size`.
 const MIN_IO_SIZE: u32 = 64 * 1024;
@@ -631,18 +645,33 @@ mod tests {
     }
 
     #[test]
-    fn a_zero_durable_handle_timeout_is_refused() {
-        let built = SmbServer::builder()
-            .listen("127.0.0.1:0".parse().unwrap())
-            .durable_handle_timeout(Duration::ZERO)
-            .build();
-        assert!(matches!(
-            built,
-            Err(BuildError::OutOfRange {
-                setting: "durable_handle_timeout",
-                ..
-            })
-        ));
+    fn the_durable_handle_timeout_is_bounded() {
+        let build = |timeout| {
+            SmbServer::builder()
+                .listen("127.0.0.1:0".parse().unwrap())
+                .durable_handle_timeout(timeout)
+                .build()
+        };
+        for timeout in [
+            Duration::ZERO,
+            Duration::from_micros(999),
+            MAX_DURABLE_HANDLE_TIMEOUT + Duration::from_nanos(1),
+            Duration::MAX,
+        ] {
+            assert!(
+                matches!(
+                    build(timeout),
+                    Err(BuildError::OutOfRange {
+                        setting: "durable_handle_timeout",
+                        ..
+                    })
+                ),
+                "{timeout:?}"
+            );
+        }
+        for timeout in [MIN_DURABLE_HANDLE_TIMEOUT, MAX_DURABLE_HANDLE_TIMEOUT] {
+            assert!(build(timeout).is_ok(), "{timeout:?}");
+        }
     }
 
     #[cfg(target_os = "linux")]

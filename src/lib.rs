@@ -114,38 +114,46 @@
 //!   data. Turn leases off on such shares.
 //! - Durable handles: on a share with leases, unless
 //!   [`Share::durable_handles`] turns them off, a file opened with a
-//!   durable handle request (DHnQ) and a lease that caches handles stays
-//!   open when the client's connection drops, when it logs off, when its
-//!   session's reauthentication fails, or when a new session names its
-//!   session as the previous one. Its backend handle stays open, and it
-//!   keeps its share mode, byte-range locks and lease, for
-//!   [`SmbServerBuilder::durable_handle_timeout`]. A file whose lease is
-//!   being broken, or that holds byte-range locks under a lease that does
-//!   not cache writes, closes with its session instead. Meanwhile the same
-//!   user, from the same client, takes the file back with a durable handle
-//!   reconnect (DHnC) on a tree of the same share that names the file and
-//!   its lease; the backend handle, share mode, byte-range locks and lease
-//!   carry on, and later lease breaks go to the new connection. A
-//!   reconnect fails with STATUS_ACCESS_DENIED from another user,
-//!   STATUS_INVALID_PARAMETER for another file name, and
+//!   durable handle request (DHnQ, or DH2Q on SMB 3.x) and a lease that
+//!   caches handles stays open when the client's connection drops, when it
+//!   logs off, when its session's reauthentication fails, or when a new
+//!   session names its session as the previous one. A request without such
+//!   a lease gets an open that is not durable and no durable context in the
+//!   response. The backend handle stays open, and the file keeps its share
+//!   mode, byte-range locks and lease, for
+//!   [`SmbServerBuilder::durable_handle_timeout`], or for the time a DH2Q
+//!   asked for, up to that timeout or 5 minutes, whichever is longer; the
+//!   DH2Q response carries the time granted. The PERSISTENT flag is
+//!   ignored. A file whose lease is being broken, or that holds byte-range
+//!   locks under a lease that does not cache writes, closes with its
+//!   session instead. Meanwhile the same user, from the same client, takes
+//!   the file back with a durable handle reconnect (DHnC, or DH2C naming
+//!   the CreateGuid of a DH2Q open) on a tree of the same share that names
+//!   the file and its lease; the backend handle, share mode, byte-range
+//!   locks and lease carry on, and later lease breaks go to the new
+//!   connection. A reconnect fails with STATUS_ACCESS_DENIED from another
+//!   user, STATUS_INVALID_PARAMETER for a DHnC naming another file, and
 //!   STATUS_INSUFFICIENT_RESOURCES past the connection's open limit; from
-//!   another client, on another share, naming another lease or lease
-//!   version, or for a file that is not kept, with
-//!   STATUS_OBJECT_NAME_NOT_FOUND. The file stays kept after a failed
-//!   reconnect. One that comes while the connection holding the file is
-//!   still closing waits up to 5 seconds for it. A file whose rights exceed
-//!   what the user's tree on the share grants now is closed instead of
-//!   reconnected. [`Handle::close`] runs when the time runs out;
-//!   at once when an open, write, size change, byte-range lock, rename or
-//!   delete through an open that does not hold the lease needs what the
-//!   lease caches, or when the lease stops caching handles; on
-//!   [`ConfigHandle`] changes that end the user's sessions or the share's
-//!   trees; and at shutdown. At most
-//!   [`SmbServerBuilder::max_disconnected_opens`] files are kept at once,
-//!   and a quarter of that, rounded up, for one user; past that, files
-//!   close with their session. Anonymous sessions, clients that send a nil
-//!   ClientGuid, and version 2 durable handle requests (DH2Q, DH2C) get no
-//!   durable handle.
+//!   another client, on another share, naming another lease, lease version
+//!   or CreateGuid, a DH2C naming another file, or for a file that is not
+//!   kept, with STATUS_OBJECT_NAME_NOT_FOUND. The file stays kept after a
+//!   failed reconnect. One that comes while the connection holding the file
+//!   is still closing waits up to 5 seconds for it. A file whose rights
+//!   exceed what the user's tree on the share grants now is closed instead
+//!   of reconnected. [`Handle::close`] runs when the time runs out; at once
+//!   when an open, write, size change, byte-range lock, rename or delete
+//!   through an open that does not hold the lease needs what the lease
+//!   caches, or when the lease stops caching handles; on [`ConfigHandle`]
+//!   changes that end the user's sessions or the share's trees; and at
+//!   shutdown. At most [`SmbServerBuilder::max_disconnected_opens`] files
+//!   are kept at once, and a quarter of that, rounded up, for one user;
+//!   past that, files close with their session. Anonymous sessions and
+//!   clients that send a nil ClientGuid get no durable handle. A DH2Q that
+//!   repeats the CreateGuid of a live version 2 open of the same client,
+//!   with access to its data or to delete it, fails with
+//!   STATUS_DUPLICATE_OBJECTID unless it is marked as a replay; one marked
+//!   as a replay opens the file anew rather than answering with that
+//!   open.
 //! - READ and WRITE lengths are bounded by the negotiated maximum sizes.
 //! - Each [`SmbError`] maps to one NTSTATUS for the client; see
 //!   [`SmbError::to_nt_status`].

@@ -105,7 +105,7 @@ Changes made outside the server, or through another share over the same director
 
 ## Durable handles
 
-A file opened with a durable handle request and a lease that caches handles stays open, for 2 minutes by default, after the client's connection drops or it logs off, with its share mode, byte-range locks and lease. When the same user reconnects from the same client, it takes the file back and carries on with the same handle, locks and lease. An open, write, lock, rename or delete that needs what the lease caches closes a kept file at once, and so do `ConfigHandle` calls that remove the user or the share, revoke the user's access or lower it to read-only, change the share's mode, or change the user's password.
+A file opened with a durable handle request, version 1 or 2, and a lease that caches handles stays open, for 2 minutes by default or the time a version 2 request asks for, up to 5 minutes or the configured time if that is longer, after the client's connection drops or it logs off, with its share mode, byte-range locks and lease. When the same user reconnects from the same client, it takes the file back and carries on with the same handle, locks and lease. An open, write, lock, rename or delete that needs what the lease caches closes a kept file at once, and so do `ConfigHandle` calls that remove the user or the share, revoke the user's access or lower it to read-only, change the share's mode, or change the user's password.
 
 `durable_handle_timeout` and `max_disconnected_opens` on the builder set the time and the most files kept at once. Call `.durable_handles(false)` on a `Share` to turn them off there.
 
@@ -115,7 +115,7 @@ Not supported:
 
 - Kerberos; authentication is NTLM only
 - oplocks and directory leases
-- version 2 durable handles, detection of replayed CREATEs, and persistent and resilient handles
+- answering a replayed CREATE with the open it repeats, and persistent and resilient handles
 - change notifications
 - named pipes and RPC, so clients can't list a server's shares
 - DFS

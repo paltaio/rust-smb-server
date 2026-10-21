@@ -76,6 +76,44 @@ async fn open_durable(
     resp
 }
 
+const CREATE_GUID: [u8; 16] = [0xC5; 16];
+
+/// SMB2_DHANDLE_FLAG_PERSISTENT.
+const PERSISTENT: u32 = 0x2;
+
+/// A DH2C for `file_id` with `create_guid` on `name`, with `lease` as its
+/// lease context.
+fn reconnect_v2(
+    name: &str,
+    file_id: FileId,
+    create_guid: [u8; 16],
+    lease: CreateContext,
+) -> Create<'_> {
+    Create {
+        disposition: FILE_OPEN,
+        ..create_with(name, &[lease, dh2c(file_id, create_guid, 0)])
+    }
+}
+
+/// The Timeout and Flags of a DH2Q response context.
+fn granted_v2(resp: &CreateResponse) -> Option<(u32, u32)> {
+    let data = CreateContext::parse_chain(&resp.create_contexts)
+        .unwrap()
+        .into_iter()
+        .find(|c| c.name == CreateContext::NAME_DH2Q)?
+        .data;
+    assert_eq!(data.len(), 8);
+    Some((u32_at(&data, 0), u32_at(&data, 4)))
+}
+
+/// alice at SMB 3.0.2.
+fn v3() -> SignIn<'static> {
+    SignIn {
+        dialect: SMB302,
+        ..SignIn::default()
+    }
+}
+
 /// A DHnC for `file_id` on `name`, with `lease` as its lease context.
 fn reconnect(name: &str, file_id: FileId, lease: CreateContext) -> Create<'_> {
     Create {
@@ -131,7 +169,6 @@ async fn a_durable_handle_needs_a_lease_that_caches_handles() {
             options: FILE_DIRECTORY_FILE,
             ..create_with("dir", &[lease(RH), dhnq()])
         };
-        let v2_only = create_with("f.txt", &[lease(RWH), dh2q(0, 0, [7; 16])]);
         for (what, create) in [
             (
                 "read caching only",
@@ -140,12 +177,22 @@ async fn a_durable_handle_needs_a_lease_that_caches_handles() {
             ("no lease", create_with("f.txt", &[dhnq()])),
             ("batch oplock", batch),
             ("directory", directory),
-            ("version 2 request", v2_only),
         ] {
             let resp = c.create(create).await.expect(what);
             assert_eq!(durable_reply(&resp), None, "{what} at {dialect:#x}");
             c.close(resp.file_id).await;
         }
+
+        // SMB 2.1 has no version 2 contexts; SMB 3.x grants one.
+        let v2_only = create_with("f.txt", &[lease(RWH), dh2q(0, 0, [7; 16])]);
+        let resp = c.create(v2_only).await.expect("version 2 request");
+        let expected = (dialect == SMB302).then(|| [120_000u32.to_le_bytes(), [0; 4]].concat());
+        assert_eq!(
+            durable_reply(&resp),
+            expected,
+            "version 2 request at {dialect:#x}"
+        );
+        c.close(resp.file_id).await;
 
         let both = create_with("f.txt", &[lease(RWH), dhnq(), dh2q(0, 0, [7; 16])]);
         match dialect {
@@ -741,6 +788,13 @@ async fn only_the_owner_on_the_same_client_lease_name_and_share_gets_it_back() {
     );
     let renamed = c.create(reconnect("g.txt", k.file_id, lease())).await;
     assert_eq!(renamed.err(), Some(ntstatus::STATUS_INVALID_PARAMETER));
+    let (mut b, _) = k.reclaim(bob, lease()).await;
+    let renamed = b.create(reconnect("g.txt", k.file_id, lease())).await;
+    assert_eq!(
+        renamed.err(),
+        Some(ntstatus::STATUS_INVALID_PARAMETER),
+        "the name before the owner"
+    );
     assert_eq!(handles(&k.counters), 1, "refusals leave the open kept");
 
     let (mut a, resp) = k.reclaim(alice, lease()).await;
@@ -975,5 +1029,393 @@ async fn an_encrypted_session_reconnects_and_gets_encrypted_answers() {
         }
         frame = common::read_frame(&mut b.stream).await;
     }
+    assert_eq!(Counters::get(&counters.opens), 2, "the kept handle");
+}
+
+#[tokio::test]
+async fn a_version_2_durable_handle_negotiates_its_timeout() {
+    let td = tempdir().unwrap();
+    let server = Server::start(users(local(td.path()))).await;
+    let mut c = user_client(server.addr, v3()).await;
+    let lease = || lease_v2(KEY_A, RWH);
+    for (asked, flags, granted) in [
+        (0, 0, 120_000),
+        (10_000, 0, 10_000),
+        (600_000, 0, 300_000),
+        (0, PERSISTENT, 120_000),
+    ] {
+        let resp = c
+            .create(create_with(
+                "f.txt",
+                &[lease(), dh2q(asked, flags, CREATE_GUID)],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            granted_v2(&resp),
+            Some((granted, 0)),
+            "asked {asked}, flags {flags}"
+        );
+        assert_ne!(resp.file_id.persistent, resp.file_id.volatile);
+        c.close(resp.file_id).await;
+    }
+    // Without a lease that caches handles the open is not durable, and the
+    // response carries no durable context.
+    for (what, list) in [
+        (
+            "read caching only",
+            vec![lease_v2(KEY_A, R), dh2q(0, 0, CREATE_GUID)],
+        ),
+        ("no lease", vec![dh2q(0, 0, CREATE_GUID)]),
+    ] {
+        let resp = c.create(create_with("f.txt", &list)).await.expect(what);
+        assert_eq!(durable_reply(&resp), None, "{what}");
+        c.close(resp.file_id).await;
+    }
+    for (what, list) in [
+        ("with DHnQ", vec![lease(), dh2q(0, 0, CREATE_GUID), dhnq()]),
+        (
+            "with DH2C",
+            vec![
+                lease(),
+                dh2q(0, 0, CREATE_GUID),
+                dh2c(FileId::new(1, 1), CREATE_GUID, 0),
+            ],
+        ),
+        (
+            "with DHnC",
+            vec![lease(), dh2q(0, 0, CREATE_GUID), dhnc(FileId::new(1, 1))],
+        ),
+        (
+            "DH2C with DHnQ",
+            vec![lease(), dh2c(FileId::new(1, 1), CREATE_GUID, 0), dhnq()],
+        ),
+    ] {
+        let status = c.create(create_with("f.txt", &list)).await.err();
+        assert_eq!(status, Some(ntstatus::STATUS_INVALID_PARAMETER), "{what}");
+    }
+    // SMB 2.1 has no version 2 contexts: the request is a plain open.
+    let mut old = user_client(server.addr, SignIn::default()).await;
+    let resp = old
+        .create(create_with(
+            "f.txt",
+            &[lease_v1(KEY_B, RWH), dh2q(0, 0, CREATE_GUID)],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(durable_reply(&resp), None);
+}
+
+/// [`Kept`] for a version 2 open with a version 2 lease, made at SMB 3.0.2.
+async fn kept_v2(lock: bool) -> Kept {
+    let td = tempdir().unwrap();
+    std::fs::write(td.path().join("f.txt"), b"0123456789").unwrap();
+    let (backend, counters) = Probe::new(td.path(), Counters::default());
+    let other = Share::new("other", local(td.path()))
+        .user("alice", Access::ReadWrite)
+        .user("bob", Access::ReadWrite);
+    let server = Server::start(users(backend).share(other)).await;
+    let mut a = user_client(server.addr, v3()).await;
+    let resp = a
+        .create(create_with(
+            "f.txt",
+            &[lease_v2(KEY_A, RWH), dh2q(0, PERSISTENT, CREATE_GUID)],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(granted_v2(&resp), Some((120_000, 0)));
+    if lock {
+        assert_eq!(
+            a.lock(
+                resp.file_id,
+                &[(0, 10, LOCK_EXCLUSIVE | LOCK_FAIL_IMMEDIATELY)]
+            )
+            .await,
+            0
+        );
+    }
+    assert_eq!(a.logoff().await, 0);
+    assert_eq!(handles(&counters), 1, "kept after LOGOFF");
+    Kept {
+        server,
+        counters,
+        file_id: resp.file_id,
+        _td: td,
+    }
+}
+
+#[tokio::test]
+async fn a_dropped_version_2_open_comes_back_by_dh2c_with_its_lease_and_lock() {
+    for reset_it in [false, true] {
+        let td = tempdir().unwrap();
+        let (backend, counters) = Probe::new(td.path(), Counters::default());
+        let server = Server::start(users(backend)).await;
+        let mut a = user_client(server.addr, v3()).await;
+        let resp = a
+            .create(create_with(
+                "f.txt",
+                &[lease_v2(KEY_A, RWH), dh2q(0, 0, CREATE_GUID)],
+            ))
+            .await
+            .unwrap();
+        let f = resp.file_id;
+        let held_epoch = lease_reply(&resp).expect("lease").epoch;
+        assert_eq!(a.write(f, 0, b"0123456789").await, Ok(10));
+        assert_eq!(
+            a.lock(f, &[(0, 10, LOCK_EXCLUSIVE | LOCK_FAIL_IMMEDIATELY)])
+                .await,
+            0
+        );
+        let plain = Create {
+            name: "plain.txt",
+            disposition: FILE_OPEN_IF,
+            ..Create::default()
+        };
+        a.create(plain).await.expect("plain open");
+        if reset_it {
+            reset(a);
+        } else {
+            drop(a);
+        }
+        assert!(eventually(|| Counters::get(&counters.closes) == 1).await);
+
+        let mut a = user_client(server.addr, v3()).await;
+        let resp = a
+            .create(reconnect_v2("f.txt", f, CREATE_GUID, lease_v2(KEY_A, RWH)))
+            .await
+            .expect("reconnected");
+        assert_eq!(resp.file_id.persistent, f.persistent);
+        assert_eq!(durable_reply(&resp), None);
+        let lease = lease_reply(&resp).expect("lease");
+        assert_eq!((lease.state, lease.epoch), (RWH, held_epoch));
+        let f = resp.file_id;
+        assert_eq!(a.read(f, 0, 10).await.unwrap(), b"0123456789");
+
+        let mut b = user_client(
+            server.addr,
+            SignIn {
+                client_guid: GUID_B,
+                user: "bob",
+                ..v3()
+            },
+        )
+        .await;
+        let mid = b
+            .send_no_wait(
+                Command::Create,
+                &Create {
+                    name: "f.txt",
+                    ..Create::default()
+                }
+                .body(),
+            )
+            .await;
+        let n = a.next_break(Duration::from_secs(5)).await.expect("break");
+        assert_eq!(n.lease_key, KEY_A);
+        assert_eq!((n.current_lease_state, n.new_lease_state), (RWH, RH));
+        assert_eq!(a.ack(KEY_A, RH).await, 0);
+        let (status, body) = b.recv(mid, Command::Create).await;
+        assert_eq!(status, 0, "reset {reset_it}");
+        let g = CreateResponse::parse(&body).unwrap().file_id;
+        assert_eq!(
+            b.lock(g, &[(0, 10, LOCK_EXCLUSIVE | LOCK_FAIL_IMMEDIATELY)])
+                .await,
+            ntstatus::STATUS_LOCK_NOT_GRANTED
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_dh2c_names_the_create_guid_owner_share_and_file() {
+    let k = kept_v2(true).await;
+    let lease = || lease_v2(KEY_A, RWH);
+    let not_found = Some(ntstatus::STATUS_OBJECT_NAME_NOT_FOUND);
+    let mut c = user_client(k.server.addr, v3()).await;
+    let wrong_guid = reconnect_v2("f.txt", k.file_id, [9; 16], lease());
+    assert_eq!(
+        c.create(wrong_guid).await.err(),
+        not_found,
+        "another CreateGuid"
+    );
+    let renamed = reconnect_v2("g.txt", k.file_id, CREATE_GUID, lease());
+    assert_eq!(c.create(renamed).await.err(), not_found, "another name");
+    let v1_lease = reconnect_v2("f.txt", k.file_id, CREATE_GUID, lease_v1(KEY_A, RWH));
+    assert_eq!(
+        c.create(v1_lease).await.err(),
+        not_found,
+        "another lease version"
+    );
+    let mut bob = user_client(
+        k.server.addr,
+        SignIn {
+            user: "bob",
+            ..v3()
+        },
+    )
+    .await;
+    let theirs = reconnect_v2("f.txt", k.file_id, CREATE_GUID, lease());
+    assert_eq!(
+        bob.create(theirs).await.err(),
+        Some(ntstatus::STATUS_ACCESS_DENIED)
+    );
+    let mut elsewhere = user_client(
+        k.server.addr,
+        SignIn {
+            share: "other",
+            ..v3()
+        },
+    )
+    .await;
+    let there = reconnect_v2("f.txt", k.file_id, CREATE_GUID, lease());
+    assert_eq!(
+        elsewhere.create(there).await.err(),
+        not_found,
+        "another share"
+    );
+    let mut other_client = user_client(
+        k.server.addr,
+        SignIn {
+            client_guid: GUID_B,
+            ..v3()
+        },
+    )
+    .await;
+    let theirs = reconnect_v2("f.txt", k.file_id, CREATE_GUID, lease());
+    assert_eq!(
+        other_client.create(theirs).await.err(),
+        not_found,
+        "another client"
+    );
+    let other_key = reconnect_v2("f.txt", k.file_id, CREATE_GUID, lease_v2(KEY_B, RWH));
+    assert_eq!(
+        c.create(other_key).await.err(),
+        not_found,
+        "another lease key"
+    );
+    let no_lease = Create {
+        disposition: FILE_OPEN,
+        ..create_with("f.txt", &[dh2c(k.file_id, CREATE_GUID, 0)])
+    };
+    assert_eq!(c.create(no_lease).await.err(), not_found, "no lease");
+    assert_eq!(handles(&k.counters), 1, "refusals leave the open kept");
+
+    // The PERSISTENT flag is ignored.
+    let persistent = Create {
+        disposition: FILE_OPEN,
+        ..create_with(
+            "f.txt",
+            &[lease(), dh2c(k.file_id, CREATE_GUID, PERSISTENT)],
+        )
+    };
+    let resp = c.create(persistent).await.expect("reconnected");
+    assert_eq!(c.read(resp.file_id, 0, 10).await.unwrap(), b"0123456789");
+}
+
+#[tokio::test]
+async fn a_dhnc_takes_a_version_2_open_back_but_a_dh2c_finds_no_version_1_open() {
+    let k = kept_v2(false).await;
+    let mut c = user_client(k.server.addr, v3()).await;
+    let resp = c
+        .create(reconnect("f.txt", k.file_id, lease_v2(KEY_A, RWH)))
+        .await
+        .expect("a version 1 reconnect checks no CreateGuid");
+    assert_eq!(resp.file_id.persistent, k.file_id.persistent);
+
+    let k = kept(RWH, SHARE_ALL, false).await;
+    let mut c = user_client(k.server.addr, v3()).await;
+    let status = c
+        .create(reconnect_v2(
+            "f.txt",
+            k.file_id,
+            CREATE_GUID,
+            lease_v1(KEY_A, RWH),
+        ))
+        .await;
+    assert_eq!(status.err(), Some(ntstatus::STATUS_OBJECT_NAME_NOT_FOUND));
+    assert_eq!(handles(&k.counters), 1);
+    let resp = c
+        .create(reconnect("f.txt", k.file_id, lease_v1(KEY_A, RWH)))
+        .await
+        .expect("the version 1 open is still kept");
+    assert_eq!(resp.file_id.persistent, k.file_id.persistent);
+}
+
+#[tokio::test]
+async fn a_session_named_as_previous_hands_its_version_2_opens_over() {
+    let td = tempdir().unwrap();
+    let server = Server::start(users(local(td.path()))).await;
+    let mut a = user_client(server.addr, v3()).await;
+    let resp = a
+        .create(create_with(
+            "f.txt",
+            &[lease_v2(KEY_A, RWH), dh2q(0, 0, CREATE_GUID)],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(a.write(resp.file_id, 0, b"kept").await, Ok(4));
+    let mut again = user_client(
+        server.addr,
+        SignIn {
+            previous: a.session_id,
+            ..v3()
+        },
+    )
+    .await;
+    let back = again
+        .create(reconnect_v2(
+            "f.txt",
+            resp.file_id,
+            CREATE_GUID,
+            lease_v2(KEY_A, RWH),
+        ))
+        .await
+        .expect("reconnected");
+    assert_eq!(again.read(back.file_id, 0, 4).await.unwrap(), b"kept");
+}
+
+#[tokio::test]
+async fn an_encrypted_311_session_reconnects_a_version_2_open() {
+    let td = tempdir().unwrap();
+    let (backend, counters) = Probe::new(td.path(), Counters::default());
+    let server = Server::start(users(backend).encrypt_data(true)).await;
+    let path = "\\\\127.0.0.1\\share";
+    let gcm = [common::crypto::Cipher::Aes128Gcm];
+    let mut a = EncryptedSession::smb311(server.addr, &gcm, "alice", "password").await;
+    assert_eq!(auth::status(&a.tree_connect(path).await), 0);
+    let open = create_with("f.txt", &[lease_v2(KEY_A, RWH), dh2q(0, 0, CREATE_GUID)]);
+    let reply = a.send_encrypted(Command::Create, &open.body()).await;
+    assert_eq!(auth::status(&reply), 0);
+    let held = CreateResponse::parse(&reply[64..]).unwrap();
+    assert_eq!(granted_v2(&held), Some((120_000, 0)));
+    // An open that is not durable, closed once the connection is closing.
+    let plain = Create {
+        name: "plain.txt",
+        disposition: FILE_OPEN_IF,
+        ..Create::default()
+    };
+    assert_eq!(
+        auth::status(&a.send_encrypted(Command::Create, &plain.body()).await),
+        0
+    );
+    drop(a);
+    assert!(eventually(|| Counters::get(&counters.closes) == 1).await);
+
+    let mut b = EncryptedSession::smb311(server.addr, &gcm, "alice", "password").await;
+    assert_eq!(auth::status(&b.tree_connect(path).await), 0);
+    let body = reconnect_v2("f.txt", held.file_id, CREATE_GUID, lease_v2(KEY_A, RWH)).body();
+    let hdr = b.header(Command::Create);
+    let sealed = b.seal(&common::message(&hdr, &body));
+    let mut frame = b.exchange(&sealed).await;
+    let reply = loop {
+        assert!(is_transform(&frame), "answers are encrypted");
+        let reply = b.open(&frame).expect("decrypts");
+        if auth::status(&reply) != ntstatus::STATUS_PENDING {
+            break reply;
+        }
+        frame = common::read_frame(&mut b.stream).await;
+    };
+    assert_eq!(auth::status(&reply), 0);
+    let resp = CreateResponse::parse(&reply[64..]).unwrap();
+    assert_eq!(resp.file_id.persistent, held.file_id.persistent);
     assert_eq!(Counters::get(&counters.opens), 2, "the kept handle");
 }

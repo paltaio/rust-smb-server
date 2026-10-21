@@ -20,6 +20,7 @@ use uuid::Uuid;
 
 use crate::conn::state::{Connection, Open};
 use crate::ntstatus;
+use crate::path::{SmbPath, same_path};
 use crate::server::ShareBindings;
 use crate::utils::fill_random;
 
@@ -35,12 +36,41 @@ pub const DEFAULT_DURABLE_HANDLE_TIMEOUT: Duration = Duration::from_secs(2 * 60)
 /// [`SmbServerBuilder::max_disconnected_opens`](crate::SmbServerBuilder::max_disconnected_opens).
 pub const DEFAULT_MAX_DISCONNECTED_OPENS: usize = 4096;
 
+/// The time a version 2 request may ask for at most, unless the server's
+/// default is longer (MS-SMB2 3.3.5.9.10).
+const MAX_REQUESTED_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Open.DurableOpenTimeout of a version 2 open whose request asked for
+/// `requested_ms` milliseconds, with `default` the server's timeout: the
+/// default for 0, otherwise the request up to 300 seconds or the default,
+/// whichever is longer (MS-SMB2 3.3.5.9.10).
+pub(crate) fn v2_timeout(requested_ms: u32, default: Duration) -> Duration {
+    match requested_ms {
+        0 => default,
+        ms => Duration::from_millis(u64::from(ms)).min(MAX_REQUESTED_TIMEOUT.max(default)),
+    }
+}
+
+/// What a durable open is granted with.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Durability {
+    /// Open.CreateGuid, which a version 2 request carries.
+    pub create_guid: Option<[u8; 16]>,
+    /// Open.DurableOpenTimeout.
+    pub timeout: Duration,
+    /// Open.IsReplayEligible: a version 2 open with access to the file's
+    /// data or to delete it (MS-SMB2 3.3.5.9.10). It stays set for the
+    /// open's life.
+    pub replay_eligible: bool,
+}
+
 /// Every durable open on the server, by DurableFileId (MS-SMB2 3.3.1.5
 /// GlobalOpenTable): the ones still in a session, so ids stay unique, and
 /// the ones kept after their session ended.
 pub(crate) struct DurableTable {
     inner: Mutex<Inner>,
-    /// Open.DurableOpenTimeout of every durable open.
+    /// Open.DurableOpenTimeout of version 1 opens, and of version 2 opens
+    /// whose request asked for none.
     pub(crate) timeout: Duration,
     /// Most opens kept at once, counting every user together.
     max_detached: usize,
@@ -87,6 +117,7 @@ struct Entry {
     /// The lease the open holds. Its key never changes.
     lease: LeaseId,
     lease_version: LeaseVersion,
+    durability: Durability,
     state: State,
 }
 
@@ -163,6 +194,10 @@ pub(crate) struct Claim<'a> {
     pub client: Uuid,
     /// The lease the request names, and the version of its context.
     pub lease: Option<(LeaseId, LeaseVersion)>,
+    /// The CreateGuid of a version 2 request.
+    pub create_guid: Option<[u8; 16]>,
+    /// The name in the request; `None` when it is not a valid name.
+    pub name: Option<&'a SmbPath>,
 }
 
 /// Why [`DurableTable::claim`] gave no open.
@@ -265,14 +300,15 @@ impl DurableTable {
     }
 
     /// Registers a durable open of `owner` on `share` holding `lease` of
-    /// `lease_version`, in a session on `conn`, under a random
-    /// DurableFileId that is neither 0 nor all ones and that no other
-    /// durable open has. `None` when the system has no randomness.
+    /// `lease_version`, granted with `durability`, in a session on `conn`,
+    /// under a random DurableFileId that is neither 0 nor all ones and that
+    /// no other durable open has. `None` when the system has no randomness.
     pub(crate) fn register(
         self: &Arc<Self>,
         owner: &str,
         share: &Arc<ShareBindings>,
         (lease, lease_version): (LeaseId, LeaseVersion),
+        durability: Durability,
         conn: &Arc<Connection>,
     ) -> Option<DurableReg> {
         let mut inner = self.inner();
@@ -291,6 +327,7 @@ impl DurableTable {
                 share: Arc::downgrade(share),
                 lease,
                 lease_version,
+                durability,
                 state: State::Attached {
                     conn: Arc::downgrade(conn),
                 },
@@ -306,7 +343,7 @@ impl DurableTable {
     /// is durable, its lease caches handles with no break in progress, its
     /// byte-range locks, if any, are covered by write caching, and fewer
     /// than the limits are kept already (3.3.2.2 "resource constraints").
-    /// A kept open is closed [`DurableTable::timeout`] later unless
+    /// A kept open is closed its Open.DurableOpenTimeout later unless
     /// something closes it first. Returns the open when it is not kept, for
     /// the caller to close. Waits for requests still using the open.
     ///
@@ -323,7 +360,8 @@ impl DurableTable {
             drop(guard);
             return Some(open);
         };
-        let deadline = Instant::now() + self.timeout;
+        let now = Instant::now();
+        let mut deadline = now;
         let generation = {
             let mut inner = self.inner();
             let Inner {
@@ -344,6 +382,7 @@ impl DurableTable {
                         debug!(id, "durable open closed: limit");
                         None
                     } else if guard.file.as_ref().is_some_and(|f| f.try_detach()) {
+                        deadline = now + entry.durability.timeout;
                         *detached += 1;
                         *detached_by_user.entry(entry.owner.clone()).or_default() += 1;
                         *next_generation += 1;
@@ -370,7 +409,7 @@ impl DurableTable {
         drop(guard);
         drop(open);
         self.bump();
-        debug!(id, timeout = ?self.timeout, "durable open kept");
+        debug!(id, timeout = ?(deadline - now), "durable open kept");
         self.start_timer(id, generation, deadline);
         None
     }
@@ -461,10 +500,11 @@ impl DurableTable {
         opens
     }
 
-    /// MS-SMB2 3.3.5.9.7: checks a request to reconnect the open `id` in
-    /// the order the spec gives, and hands the open over when it is kept
-    /// and the request comes from its owner, on the same share, from the
-    /// same client, naming its lease with the same key and version. The
+    /// MS-SMB2 3.3.5.9.7, 3.3.5.9.12: checks a request to reconnect the
+    /// open `id` in the order the spec gives, and hands the open over when
+    /// it is kept and the request comes from its owner, on the same share,
+    /// from the same client, naming its lease with the same key and version
+    /// and, for a version 2 request, its CreateGuid. The
     /// entry stays [`State::Reattaching`] until [`DurableTable::attached`]
     /// or [`DurableTable::release_claim`]; meanwhile neither its timer nor a
     /// break closes it. A refused request changes nothing.
@@ -476,8 +516,30 @@ impl DurableTable {
         let not_found = || Unclaimed::Status(ntstatus::STATUS_OBJECT_NAME_NOT_FOUND);
         let mut inner = self.inner();
         let entry = inner.entries.get(&id).ok_or_else(not_found)?;
-        let Some((lease, version)) = claim.lease.filter(|_| entry.lease.client == claim.client)
-        else {
+        if entry.lease.client != claim.client {
+            return Err(not_found());
+        }
+        // MS-SMB2 3.3.5.9.12: a version 2 reconnect names the CreateGuid of
+        // a version 2 open. A version 1 reconnect checks none.
+        let v2 = claim.create_guid.is_some();
+        if claim
+            .create_guid
+            .is_some_and(|guid| entry.durability.create_guid != Some(guid))
+        {
+            return Err(not_found());
+        }
+        // The name is known only for a kept open; one in a session is
+        // refused, or waited on, before its name is compared. 3.3.5.9.7
+        // compares the name next, with a status of its own; 3.3.5.9.12 just
+        // before the owner.
+        let name_matches = match &entry.state {
+            State::Detached { open, .. } => Some(self.name_matches(open, claim)?),
+            _ => None,
+        };
+        if !v2 && name_matches == Some(false) {
+            return Err(Unclaimed::Status(ntstatus::STATUS_INVALID_PARAMETER));
+        }
+        let Some((lease, version)) = claim.lease else {
             return Err(not_found());
         };
         let closing = match &entry.state {
@@ -488,6 +550,7 @@ impl DurableTable {
         if lease != entry.lease
             || version != entry.lease_version
             || !std::ptr::eq(entry.share.as_ptr(), Arc::as_ptr(claim.share))
+            || name_matches == Some(false)
         {
             return Err(not_found());
         }
@@ -515,6 +578,35 @@ impl DurableTable {
         drop(timer);
         debug!(id, "durable open claimed");
         Ok(open)
+    }
+
+    /// Whether the kept open `open` has the name `claim` gives, which a
+    /// delete-on-close or delete-pending file always has (MS-SMB2
+    /// 3.3.5.9.7 "Open.Lease.FileDeleteOnClose"). An open that is still
+    /// being put in the table gives a wait, which ends once it is.
+    fn name_matches(&self, open: &Arc<RwLock<Open>>, claim: &Claim<'_>) -> Result<bool, Unclaimed> {
+        let Ok(open) = open.try_read() else {
+            return Err(Unclaimed::Wait(self.changed.subscribe()));
+        };
+        let case_sensitive = claim.share.backend.capabilities().case_sensitive;
+        Ok(open.file.as_ref().is_some_and(|f| {
+            open.delete_on_close
+                || f.delete_pending()
+                || claim
+                    .name
+                    .is_some_and(|name| same_path(&f.path(), name, case_sensitive))
+        }))
+    }
+
+    /// Whether a durable open of `client` that a replayed CREATE could
+    /// name has `create_guid` (MS-SMB2 3.3.5.9.10, Open.IsReplayEligible).
+    pub(crate) fn create_guid_in_use(&self, client: Uuid, create_guid: [u8; 16]) -> bool {
+        self.inner().entries.values().any(|e| {
+            e.lease.client == client
+                && e.durability.replay_eligible
+                && e.durability.create_guid == Some(create_guid)
+                && !matches!(e.state, State::Closing)
+        })
     }
 
     /// Puts back the open of a reconnect that failed after
@@ -660,6 +752,15 @@ mod tests {
         }
     }
 
+    const V1: Durability = Durability {
+        create_guid: None,
+        timeout: Duration::from_secs(60),
+        replay_eligible: false,
+    };
+
+    /// The name of the fixture's first open.
+    static A: std::sync::LazyLock<SmbPath> = std::sync::LazyLock::new(|| "a".parse().unwrap());
+
     fn lease(n: u8) -> LeaseId {
         LeaseId {
             client: Uuid::from_bytes([1; 16]),
@@ -712,7 +813,7 @@ mod tests {
             let leased = (lease(n), LeaseVersion::V2);
             let reg = self
                 .table
-                .register(owner, &self.share, leased, &self.conn)
+                .register(owner, &self.share, leased, V1, &self.conn)
                 .unwrap();
             file.mark_durable(&self.table, reg.id());
             Arc::new(RwLock::new(Open {
@@ -758,7 +859,7 @@ mod tests {
             .map(|n| {
                 let leased = (lease(n), LeaseVersion::V2);
                 f.table
-                    .register("alice", &f.share, leased, &f.conn)
+                    .register("alice", &f.share, leased, V1, &f.conn)
                     .unwrap()
             })
             .collect();
@@ -879,7 +980,131 @@ mod tests {
             user,
             client,
             lease,
+            create_guid: None,
+            name: Some(&A),
         }
+    }
+
+    #[test]
+    fn a_version_2_timeout_is_the_request_up_to_a_cap() {
+        let s = Duration::from_secs;
+        let ms = Duration::from_millis;
+        assert_eq!(v2_timeout(0, s(120)), s(120));
+        assert_eq!(v2_timeout(1, s(120)), ms(1));
+        assert_eq!(v2_timeout(300_000, s(120)), s(300));
+        assert_eq!(v2_timeout(300_001, s(120)), s(300));
+        assert_eq!(v2_timeout(u32::MAX, s(120)), s(300));
+        // A longer server default raises the cap.
+        assert_eq!(v2_timeout(400_000, s(600)), s(400));
+        assert_eq!(v2_timeout(900_000, s(600)), s(600));
+    }
+
+    #[tokio::test]
+    async fn a_version_2_claim_names_the_create_guid() {
+        let f = fixture(8);
+        let guid = [7; 16];
+        let v1 = f.open("a", "alice", 1, LeaseState::RH).await;
+        let v1_id = id_of(&v1).await;
+        let v2 = f.open("b", "alice", 2, LeaseState::RH).await;
+        let v2_id = id_of(&v2).await;
+        // Turn the second into a version 2 open.
+        f.table
+            .inner()
+            .entries
+            .get_mut(&v2_id)
+            .unwrap()
+            .durability
+            .create_guid = Some(guid);
+        for open in [v1, v2] {
+            assert!(f.table.preserve(open, f.table.sweeps()).await.is_none());
+        }
+        let me = lease(1).client;
+        let b: SmbPath = "b".parse().unwrap();
+        let with = |n, create_guid| Claim {
+            create_guid,
+            name: Some(if n == 1 { &*A } else { &b }),
+            ..claim(
+                &f.share,
+                Some("alice"),
+                me,
+                Some((lease(n), LeaseVersion::V2)),
+            )
+        };
+        let not_found = ntstatus::STATUS_OBJECT_NAME_NOT_FOUND;
+        assert_eq!(
+            status(f.table.claim(v1_id, &with(1, Some(guid)))),
+            not_found
+        );
+        assert_eq!(
+            status(f.table.claim(v2_id, &with(2, Some([8; 16])))),
+            not_found
+        );
+        assert_eq!(status(f.table.claim(v2_id, &with(2, Some(guid)))), 0);
+        // A version 1 reconnect of a version 1 open checks no CreateGuid.
+        assert_eq!(status(f.table.claim(v1_id, &with(1, None))), 0);
+    }
+
+    #[tokio::test]
+    async fn the_name_is_compared_before_the_owner() {
+        let f = fixture(8);
+        let open = f.open("a", "alice", 1, LeaseState::RH).await;
+        let id = id_of(&open).await;
+        assert!(f.table.preserve(open, f.table.sweeps()).await.is_none());
+        let other: SmbPath = "other".parse().unwrap();
+        let bob = |create_guid, name| Claim {
+            create_guid,
+            name,
+            ..claim(
+                &f.share,
+                Some("bob"),
+                lease(1).client,
+                Some((lease(1), LeaseVersion::V2)),
+            )
+        };
+        assert_eq!(
+            status(f.table.claim(id, &bob(None, Some(&other)))),
+            ntstatus::STATUS_INVALID_PARAMETER
+        );
+        assert_eq!(
+            status(f.table.claim(id, &bob(None, None))),
+            ntstatus::STATUS_INVALID_PARAMETER,
+            "a name that is not valid matches nothing"
+        );
+        assert_eq!(
+            status(f.table.claim(id, &bob(None, Some(&A)))),
+            ntstatus::STATUS_ACCESS_DENIED
+        );
+        assert_eq!(f.counts().1, 1, "refusals change nothing");
+    }
+
+    #[tokio::test]
+    async fn a_create_guid_in_use_is_one_of_a_live_replay_eligible_open() {
+        let f = fixture(8);
+        let guid = [7; 16];
+        let open = f.open("a", "alice", 1, LeaseState::RH).await;
+        let id = id_of(&open).await;
+        let me = lease(1).client;
+        assert!(!f.table.create_guid_in_use(me, guid));
+        let set = |eligible| {
+            let mut inner = f.table.inner();
+            let durability = &mut inner.entries.get_mut(&id).unwrap().durability;
+            durability.create_guid = Some(guid);
+            durability.replay_eligible = eligible;
+        };
+        set(false);
+        assert!(!f.table.create_guid_in_use(me, guid), "not eligible");
+        set(true);
+        assert!(f.table.create_guid_in_use(me, guid));
+        assert!(
+            !f.table.create_guid_in_use(Uuid::nil(), guid),
+            "another client"
+        );
+        assert!(!f.table.create_guid_in_use(me, [8; 16]));
+        // Kept opens count as well.
+        assert!(f.table.preserve(open, f.table.sweeps()).await.is_none());
+        assert!(f.table.create_guid_in_use(me, guid));
+        assert_eq!(f.table.take_for(None, None).len(), 1);
+        assert!(!f.table.create_guid_in_use(me, guid), "closing");
     }
 
     /// The status a claim fails with, 0 for success and `u32::MAX` for a
