@@ -161,7 +161,8 @@ pub async fn handle(
 /// Lists the directory of `open` from the start with `pattern` (`None`
 /// matches every name) and stores the listing as its search state. On the
 /// first query and every restart the listing starts with "." and "..",
-/// when the pattern matches them and the directory is not the share root.
+/// when the pattern matches them. At the share root, ".." describes the
+/// share root itself, with file id 0.
 async fn start_scan(
     open: &mut Open,
     backend: &dyn ShareBackend,
@@ -174,24 +175,22 @@ async fn start_scan(
         .map_err(|e| e.to_nt_status())?;
 
     let mut entries = Vec::with_capacity(listed.len() + 2);
-    if open.path().is_some_and(|path| !path.is_root()) {
-        let matcher = pattern.as_deref().map(|p| Pattern::new(p, true));
-        let matches = |name: &str| matcher.as_ref().is_none_or(|m| m.matches(name));
-        if matches(".") || matches("..") {
-            let mut this = handle.stat().await.map_err(|e| e.to_nt_status())?;
-            this.name = ".".to_string();
-            let mut parent = parent_info(backend, open).await.unwrap_or_else(|| {
-                let mut info = this.clone();
-                info.file_index = 0;
-                info
-            });
-            parent.name = "..".to_string();
-            if matches(".") {
-                entries.push(DirEntry { info: this });
-            }
-            if matches("..") {
-                entries.push(DirEntry { info: parent });
-            }
+    let matcher = pattern.as_deref().map(|p| Pattern::new(p, true));
+    let matches = |name: &str| matcher.as_ref().is_none_or(|m| m.matches(name));
+    if matches(".") || matches("..") {
+        let mut this = handle.stat().await.map_err(|e| e.to_nt_status())?;
+        this.name = ".".to_string();
+        let mut parent = parent_info(backend, open).await.unwrap_or_else(|| {
+            let mut info = this.clone();
+            info.file_index = 0;
+            info
+        });
+        parent.name = "..".to_string();
+        if matches(".") {
+            entries.push(DirEntry { info: this });
+        }
+        if matches("..") {
+            entries.push(DirEntry { info: parent });
         }
     }
     entries.extend(
@@ -208,8 +207,8 @@ async fn start_scan(
     Ok(())
 }
 
-/// File info of the parent directory of `open`, or `None` if it cannot be
-/// opened.
+/// File info of the parent directory of `open`, or `None` at the share root
+/// or if the parent cannot be opened.
 async fn parent_info(backend: &dyn ShareBackend, open: &Open) -> Option<FileInfo> {
     let parent = open.path()?.parent()?;
     let opts = OpenOptions {

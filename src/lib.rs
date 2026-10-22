@@ -86,8 +86,9 @@
 //!   [`Handle::truncate`] is never called on a directory.
 //! - QUERY_DIRECTORY calls [`Handle::list_dir`] with the search pattern on
 //!   the first query and on a restart, then pages through the returned
-//!   entries itself. Below the share root it adds `.` and `..`, and opens
-//!   the parent directory to describe `..`.
+//!   entries itself. It adds `.` and `..` when the pattern matches them,
+//!   and opens the parent directory to describe `..`; at the share root,
+//!   `..` describes the root itself, with file id 0.
 //! - FileStandardInformation and FileAllInformation report
 //!   [`Handle::link_count`] as NumberOfLinks, and DeletePending when the
 //!   file is delete-pending or has no links left. The filesystem
