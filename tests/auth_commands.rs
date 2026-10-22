@@ -7,12 +7,14 @@ mod common;
 use common::auth::*;
 use common::client::{Create, FILE_DIRECTORY_FILE, FILE_READ_ATTRIBUTES};
 use common::{anonymous_session_setup, negotiate, start_server, tree_connect};
+use std::time::Duration;
+
 use smb_server::ntstatus::{
-    STATUS_ACCESS_DENIED, STATUS_FILE_CLOSED, STATUS_INVALID_DEVICE_STATE,
-    STATUS_INVALID_PARAMETER, STATUS_NETWORK_NAME_DELETED, STATUS_NOT_SUPPORTED,
+    STATUS_ACCESS_DENIED, STATUS_CANCELLED, STATUS_FILE_CLOSED, STATUS_INVALID_DEVICE_STATE,
+    STATUS_INVALID_PARAMETER, STATUS_NETWORK_NAME_DELETED, STATUS_NOT_SUPPORTED, STATUS_PENDING,
     STATUS_USER_SESSION_DELETED,
 };
-use smb_server::wire::header::Command;
+use smb_server::wire::header::{Command, HeaderTail, SMB2_FLAGS_ASYNC_COMMAND};
 use smb_server::wire::messages::FileId;
 use smb_server::{LocalFsBackend, Share, SmbServer};
 use tokio::net::TcpStream;
@@ -27,12 +29,17 @@ struct Conn {
 }
 
 async fn connect() -> Conn {
+    connect_to(|share| share).await
+}
+
+/// A connection to the share `pub`, as `configure` sets it up.
+async fn connect_to(configure: impl FnOnce(Share) -> Share) -> Conn {
     let td = tempfile::tempdir().expect("tempdir");
     std::fs::write(td.path().join("f.txt"), b"x").unwrap();
     std::fs::create_dir(td.path().join("d")).unwrap();
     let backend = LocalFsBackend::new(td.path()).expect("open root");
-    let (addr, handle) =
-        start_server(SmbServer::builder().share(Share::new("pub", backend).public())).await;
+    let share = configure(Share::new("pub", backend).public());
+    let (addr, handle) = start_server(SmbServer::builder().share(share)).await;
     let mut s = TcpStream::connect(addr).await.expect("connect");
     negotiate(&mut s).await;
     let sid = anonymous_session_setup(&mut s).await;
@@ -148,7 +155,7 @@ async fn oplock_break_ack_needs_a_breaking_open() {
 }
 
 #[tokio::test]
-async fn change_notify_checks_come_before_not_supported() {
+async fn change_notify_checks_come_before_waiting() {
     let mut c = connect().await;
     let (sid, tid) = (c.sid, c.tid);
     let any = change_notify(FileId::any());
@@ -166,6 +173,39 @@ async fn change_notify_checks_come_before_not_supported() {
             .await,
         STATUS_INVALID_PARAMETER
     );
+    let dir = c.open("d", FILE_READ_ATTRIBUTES, FILE_DIRECTORY_FILE).await;
+    assert_eq!(
+        c.send(Command::ChangeNotify, sid, tid, &change_notify(dir))
+            .await,
+        STATUS_ACCESS_DENIED
+    );
+    let dir = c.open("d", 0x0012_0089, FILE_DIRECTORY_FILE).await;
+    c.mid += 1;
+    let interim = request(
+        &mut c.s,
+        Command::ChangeNotify,
+        c.mid,
+        sid,
+        tid,
+        &change_notify(dir),
+    )
+    .await;
+    assert_eq!(status(&interim), STATUS_PENDING);
+    let (hdr, _) = smb_server::wire::header::Smb2Header::parse(&interim).unwrap();
+    let mut cancel = common::build_header(Command::Cancel, c.mid, sid, tid);
+    cancel.flags |= SMB2_FLAGS_ASYNC_COMMAND;
+    cancel.tail = HeaderTail::async_(hdr.async_id().expect("an AsyncId"));
+    common::write_frame(&mut c.s, &cancel, &[4, 0, 0, 0]).await;
+    let last = tokio::time::timeout(Duration::from_secs(5), common::read_frame(&mut c.s))
+        .await
+        .expect("an answer to the CANCEL in time");
+    assert_eq!(status(&last), STATUS_CANCELLED);
+}
+
+#[tokio::test]
+async fn change_notify_off_answers_not_supported_after_the_checks() {
+    let mut c = connect_to(|share| share.change_notify(false)).await;
+    let (sid, tid) = (c.sid, c.tid);
     let dir = c.open("d", FILE_READ_ATTRIBUTES, FILE_DIRECTORY_FILE).await;
     assert_eq!(
         c.send(Command::ChangeNotify, sid, tid, &change_notify(dir))

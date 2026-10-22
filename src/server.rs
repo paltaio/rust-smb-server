@@ -95,6 +95,10 @@ pub struct ShareBindings {
     pub(crate) remark: String,
     /// Every file on the share that has an open, on any connection.
     pub(crate) files: crate::files::FileTable,
+    /// CHANGE_NOTIFY is answered on the share.
+    pub(crate) change_notify: bool,
+    /// The directories clients watch for changes, on any connection.
+    pub(crate) watches: crate::files::WatchTable,
 }
 
 impl ShareBindings {
@@ -107,6 +111,7 @@ impl ShareBindings {
         leases: bool,
         durable_handles: bool,
     ) -> Arc<Self> {
+        let watches = crate::files::WatchTable::new(backend.capabilities().case_sensitive);
         Arc::new(Self {
             name,
             backend,
@@ -118,10 +123,13 @@ impl ShareBindings {
             listed: true,
             remark: String::new(),
             files: crate::files::FileTable::default(),
+            change_notify: !is_ipc,
+            watches,
         })
     }
 
     pub(crate) fn from_share(share: Share) -> Arc<Self> {
+        let watches = crate::files::WatchTable::new(share.backend.capabilities().case_sensitive);
         Arc::new(Self {
             name: share.name,
             backend: share.backend,
@@ -136,6 +144,8 @@ impl ShareBindings {
             listed: share.listed,
             remark: share.remark,
             files: crate::files::FileTable::default(),
+            change_notify: share.change_notify,
+            watches,
         })
     }
 

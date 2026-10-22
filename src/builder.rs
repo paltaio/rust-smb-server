@@ -51,6 +51,7 @@ pub struct Share {
     pub(crate) encrypt_data: bool,
     pub(crate) leases: bool,
     pub(crate) durable_handles: bool,
+    pub(crate) change_notify: bool,
     pub(crate) listed: bool,
     pub(crate) remark: String,
 }
@@ -66,6 +67,7 @@ impl Share {
             encrypt_data: false,
             leases: true,
             durable_handles: true,
+            change_notify: true,
             listed: true,
             remark: String::new(),
         }
@@ -144,6 +146,18 @@ impl Share {
     /// PERSISTENT flag is ignored. On by default.
     pub fn durable_handles(mut self, enabled: bool) -> Self {
         self.durable_handles = enabled;
+        self
+    }
+
+    /// Answer change notification requests: a client watching a folder, as
+    /// Explorer and Finder do for an open window, hears when a file or
+    /// folder in it is created or deleted through any connection to this
+    /// share. Renames, overwrites, writes, and attribute, time and size
+    /// changes are not reported, and neither are changes made outside the
+    /// server or through another share over the same directory. When off,
+    /// such requests fail with STATUS_NOT_SUPPORTED. On by default.
+    pub fn change_notify(mut self, enabled: bool) -> Self {
+        self.change_notify = enabled;
         self
     }
 

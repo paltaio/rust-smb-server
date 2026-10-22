@@ -4,6 +4,7 @@ mod durable;
 mod lease;
 mod leases;
 mod table;
+mod watch;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -22,6 +23,9 @@ pub(crate) use lease::{Granted, LeaseId, LeaseRequest, LeaseState, LeaseVersion,
 pub(crate) use leases::LEASE_BREAK_TIMEOUT;
 pub(crate) use leases::{AfterSend, BreakWait, LeaseRef, LeaseTable, MAX_BREAK_WAIT};
 pub(crate) use table::{FileRef, FileTable, OpenRequest, Refused, Sharing};
+#[cfg(test)]
+pub(crate) use watch::MAX_WATCHES_PER_CONNECTION;
+pub(crate) use watch::{Answer, Change, NotifyBudget, WatchReg, WatchTable};
 
 /// Default for
 /// [`SmbServerBuilder::max_opens_per_connection`](crate::SmbServerBuilder::max_opens_per_connection)
@@ -55,13 +59,16 @@ impl Drop for OpenSlot {
 }
 
 /// Closes an open that is no longer reachable by FileId (MS-SMB2 3.3.4.17,
-/// MS-FSA 2.1.5.5): restores the times it fixed, closes the backend handle,
-/// drops its byte-range locks and removes the file when this was the last
-/// open of a delete-pending file. With `want_attrs`, returns the file's
-/// attributes as they were before the handle closed. Waits for requests
-/// still using the open.
+/// MS-FSA 2.1.5.5): ends its change notification watch, restores the times
+/// it fixed, closes the backend handle, drops its byte-range locks and
+/// removes the file when this was the last open of a delete-pending file.
+/// With `want_attrs`, returns the file's attributes as they were before the
+/// handle closed. Waits for requests still using the open.
 pub(crate) async fn close_open(open_arc: &Arc<RwLock<Open>>, want_attrs: bool) -> Option<FileInfo> {
     let mut open = open_arc.write().await;
+    // Requests waiting on the watch end with STATUS_NOTIFY_CLEANUP before
+    // the close reports anything (MS-SMB2 3.3.5.10).
+    drop(open.watch.take());
     restore_fixed_times(&open).await;
     let handle = open.handle.take()?;
     let info = if want_attrs {
@@ -202,6 +209,7 @@ mod tests {
             file: Some(file),
             slot: None,
             durable: None,
+            watch: None,
         });
         let in_table = || {
             share.files.path_is_open(&path, false) || share.files.delete_pending_at(&path, false)

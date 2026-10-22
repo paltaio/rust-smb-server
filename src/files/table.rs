@@ -15,6 +15,9 @@ use crate::conn::outbound::Outbound;
 use crate::error::SmbError;
 use crate::ntstatus;
 use crate::path::{SmbPath, rebase, same_path};
+use crate::proto::messages::change_notify::{
+    FILE_ACTION_REMOVED, FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME,
+};
 use crate::server::ShareBindings;
 
 use super::durable::DurableTable;
@@ -23,6 +26,7 @@ use super::lease::{
     Trigger, break_to, grant, needs_ack, stat_only,
 };
 use super::leases::{AckWait, BreakWait, GrantGuard, LeaseRef, Notices, break_notification};
+use super::watch::Change;
 
 // ShareAccess (MS-SMB2 2.2.13)
 pub(crate) const FILE_SHARE_READ: u32 = 0x0000_0001;
@@ -107,6 +111,7 @@ struct FileState {
     /// The node holding this state.
     me: Weak<FileNode>,
     key: FileKey,
+    is_directory: bool,
     opens: Vec<OpenEntry>,
     /// The name to remove once the last open closes, while the file is
     /// delete-pending.
@@ -751,6 +756,7 @@ impl FileRef {
                     state: Mutex::new(FileState {
                         me: me.clone(),
                         key,
+                        is_directory: info.is_directory,
                         opens: Vec::new(),
                         delete_pending: None,
                         locks: Vec::new(),
@@ -1216,12 +1222,14 @@ impl FileRef {
             return None;
         }
         if let Some(path) = state.delete_pending.clone() {
+            let is_directory = state.is_directory;
             drop(state);
             drop(files);
             return Some(PendingDelete {
                 share: Arc::clone(&self.share),
                 node: Arc::clone(&self.node),
                 path,
+                is_directory,
             });
         }
         let key = state.key.clone();
@@ -1257,15 +1265,28 @@ pub(crate) struct PendingDelete {
     share: Arc<ShareBindings>,
     node: Arc<FileNode>,
     path: SmbPath,
+    is_directory: bool,
 }
 
 impl PendingDelete {
-    /// Removes the file from the share, then frees its name in the table. A
+    /// Removes the file from the share, reports the removal to the share's
+    /// watchers (MS-FSA 2.1.5.5), then frees its name in the table. A
     /// failed delete does not fail the close (MS-SMB2 3.3.4.17); a
     /// directory that gained entries stays (MS-FSA 2.1.5.5).
     pub(crate) async fn run(self) {
         match self.share.backend.unlink(&self.path).await {
-            Ok(()) => {}
+            Ok(()) => {
+                let filter = if self.is_directory {
+                    FILE_NOTIFY_CHANGE_DIR_NAME
+                } else {
+                    FILE_NOTIFY_CHANGE_FILE_NAME
+                };
+                self.share.watches.report(&[Change {
+                    path: &self.path,
+                    action: FILE_ACTION_REMOVED,
+                    filter,
+                }]);
+            }
             Err(SmbError::NotEmpty) => {
                 debug!(path = %self.path, "delete-on-close skipped a non-empty directory");
             }

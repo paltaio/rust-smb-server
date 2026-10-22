@@ -828,6 +828,7 @@ mod tests {
                 file: Some(file),
                 slot: None,
                 durable: Some(reg),
+                watch: None,
             }))
         }
 

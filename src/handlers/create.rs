@@ -4,6 +4,9 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use crate::proto::header::{SMB2_FLAGS_REPLAY_OPERATION, Smb2Header};
+use crate::proto::messages::change_notify::{
+    FILE_ACTION_ADDED, FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME,
+};
 use crate::proto::messages::{
     CreateContext, CreateRequest, CreateResponse, Dialect, DurableReconnect, DurableReconnectV2,
     DurableRequest, DurableRequestV2, DurableResponse, DurableResponseV2, FileId, LeaseContext,
@@ -26,7 +29,7 @@ use crate::conn::state::{Connection, Open};
 use crate::dispatch::HandlerResponse;
 use crate::error::SmbError;
 use crate::files::{
-    BreakWait, Durability, FileRef, Granted, LeaseId, LeaseRef, LeaseRequest, LeaseState,
+    BreakWait, Change, Durability, FileRef, Granted, LeaseId, LeaseRef, LeaseRequest, LeaseState,
     LeaseVersion, MAX_BREAK_WAIT, OpenRequest, OpenSlot, Refused, Sharing, Trigger, v2_timeout,
 };
 use crate::handlers::reconnect::{self, Reconnect};
@@ -772,7 +775,10 @@ async fn attempt(
                             ..args.opts
                         };
                         match backend.open(path, create).await {
-                            Ok(opened) => break (None, Some(opened)),
+                            Ok(opened) => {
+                                report_created(&share, path, args.opts.directory, opened.1);
+                                break (None, Some(opened));
+                            }
                             Err(SmbError::Exists) if tries < 2 => tries += 1,
                             Err(e) => return open_failed(e),
                         }
@@ -788,7 +794,10 @@ async fn attempt(
     let (handle, action) = match opened {
         Some(opened) => opened,
         None => match backend.open(path, args.opts).await {
-            Ok(opened) => opened,
+            Ok(opened) => {
+                report_created(&share, path, args.opts.directory, opened.1);
+                opened
+            }
             Err(e) => return open_failed(e),
         },
     };
@@ -943,6 +952,7 @@ async fn attempt(
         file: Some(file),
         slot: Some(slot),
         durable,
+        watch: None,
     };
     let open_arc = Arc::new(tokio::sync::RwLock::new(open));
     tree.opens.get_mut().insert(file_id, open_arc);
@@ -986,6 +996,25 @@ async fn attempt(
         response.after_send.push(Box::new(guard));
     }
     Step::Done(response)
+}
+
+/// Tells the watchers of `share` that the backend created `path` (MS-FSA
+/// 2.1.5.1.1). This runs right after the backend call, so a CREATE that then
+/// waits for a lease break, or fails, reports the file it created once.
+fn report_created(share: &ShareBindings, path: &SmbPath, directory: bool, action: OpenAction) {
+    if action != OpenAction::Created {
+        return;
+    }
+    let filter = if directory {
+        FILE_NOTIFY_CHANGE_DIR_NAME
+    } else {
+        FILE_NOTIFY_CHANGE_FILE_NAME
+    };
+    share.watches.report(&[Change {
+        path,
+        action: FILE_ACTION_ADDED,
+        filter,
+    }]);
 }
 
 /// The CREATE response body for an open of a file with `info`, holding a

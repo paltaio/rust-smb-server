@@ -459,7 +459,16 @@ async fn run_chain(
                     Some(Dispatched::Done(reply)) => reply,
                     Some(Dispatched::Pending(pending, ctx)) => {
                         let async_id = pending.op.async_id;
-                        if fits(replies, ERROR_RESPONSE_ROOM, remaining) {
+                        // A CHANGE_NOTIFY can wait indefinitely, and the
+                        // requests after it would wait with it: it fails
+                        // unless it is last (MS-SMB2 3.3.5.2.7). Its watch
+                        // stays armed.
+                        if req_hdr.command == Command::ChangeNotify && remaining > 0 {
+                            conn.pending.finish(async_id);
+                            drop(pending);
+                            let error = HandlerResponse::err(ntstatus::STATUS_INTERNAL_ERROR);
+                            ctx.build(conn, error, ReplyForm::Sync).await
+                        } else if fits(replies, ERROR_RESPONSE_ROOM, remaining) {
                             let interim = ctx
                                 .build(
                                     conn,
@@ -482,13 +491,14 @@ async fn run_chain(
                                 ctx,
                                 request: sub_frame,
                             });
+                        } else {
+                            // No room for an interim response: the request
+                            // fails at once.
+                            conn.pending.finish(async_id);
+                            drop(pending);
+                            let error = HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
+                            ctx.build(conn, error, ReplyForm::Sync).await
                         }
-                        // No room for an interim response: the request
-                        // fails at once.
-                        conn.pending.finish(async_id);
-                        drop(pending);
-                        let error = HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
-                        ctx.build(conn, error, ReplyForm::Sync).await
                     }
                 };
                 push_reply(conn, replies, reply, &req_hdr, remaining, chain.encrypted).await;

@@ -155,6 +155,20 @@
 //!   STATUS_DUPLICATE_OBJECTID unless it is marked as a replay; one marked
 //!   as a replay opens the file anew rather than answering with that
 //!   open.
+//! - Change notifications: on every share unless [`Share::change_notify`]
+//!   turns them off, a CHANGE_NOTIFY on a directory waits until a file or
+//!   directory in it, or below it when the client asks for the whole tree,
+//!   is created or deleted through any connection to the share. Changes
+//!   are buffered on the directory handle between requests, up to the
+//!   buffer size of its first request and at most 64 KiB; when more arrive,
+//!   or they do not fit the request being answered, the answer is
+//!   STATUS_NOTIFY_ENUM_DIR. Renames, overwrites, writes, and attribute,
+//!   time and size changes are not reported, and neither are changes made
+//!   outside the server or through another share over the same directory.
+//!   Watches follow paths: a change made through a symlink inside the share
+//!   reaches the watchers of the path it was made through, and names are
+//!   spelled as the client that made the change spelled them. Backends are
+//!   not called.
 //! - Share listing: unless [`SmbServerBuilder::share_listing`] turns it
 //!   off, IPC$ serves the `srvsvc` pipe, so clients can list the server's
 //!   shares. A session sees the shares it may connect to, in the order
@@ -204,6 +218,7 @@ mod tests {
     mod durable;
     mod dynamic_config;
     pub(crate) mod memfs;
+    mod notify;
     pub(crate) mod peer;
     mod pipes;
 }

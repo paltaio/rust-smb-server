@@ -73,6 +73,9 @@ pub(crate) async fn dispatch_command(
     let response = match hdr.command {
         Command::Create => return create::handle(server, conn, hdr, body, retained).await,
         Command::SetInfo => return set_info::handle(server, conn, hdr, body, retained).await,
+        Command::ChangeNotify => {
+            return change_notify::handle(server, conn, hdr, body, retained).await;
+        }
         Command::Negotiate => negotiate::handle(server, conn, hdr, body).await,
         Command::SessionSetup => session_setup::handle(server, conn, hdr, body).await,
         Command::Logoff => logoff::handle(server, conn, hdr, body).await,
@@ -86,7 +89,6 @@ pub(crate) async fn dispatch_command(
         Command::Ioctl => ioctl::handle(server, conn, hdr, body).await,
         Command::Echo => echo::handle(server, conn, hdr, body).await,
         Command::QueryDirectory => query_directory::handle(server, conn, hdr, body).await,
-        Command::ChangeNotify => change_notify::handle(server, conn, hdr, body).await,
         Command::QueryInfo => query_info::handle(server, conn, hdr, body).await,
         Command::OplockBreak => oplock_break::handle(server, conn, hdr, body).await,
         Command::Cancel => HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER),

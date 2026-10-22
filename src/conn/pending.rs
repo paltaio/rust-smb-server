@@ -15,8 +15,9 @@ use crate::proto::header::Smb2Header;
 use crate::proto::messages::FileId;
 
 /// Most requests one connection may have waiting at once; the default
-/// blocking-operation credit of Windows clients (MS-SMB2 3.3.4.2).
-pub(crate) const MAX_PENDING_REQUESTS: usize = 64;
+/// blocking-operation credit of Windows servers (MS-SMB2 3.3.4.2). Each
+/// waiting CHANGE_NOTIFY holds one for as long as it waits.
+pub(crate) const MAX_PENDING_REQUESTS: usize = 512;
 
 /// Most bytes of request frames the waiting requests of one connection may
 /// hold on to: each keeps itself and the requests compounded after it.

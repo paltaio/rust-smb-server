@@ -556,6 +556,7 @@ mod tests {
                 file: Some(file),
                 slot: None,
                 durable: None,
+                watch: None,
             };
             tree.opens
                 .write()

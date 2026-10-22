@@ -141,7 +141,7 @@ Not supported:
 - Kerberos; authentication is NTLM only
 - oplocks and directory leases
 - answering a replayed CREATE with the open it repeats, and persistent and resilient handles
-- change notifications
+- change notifications for renames, overwrites, writes and attribute, time or size changes, and for changes made outside the server or through another share over the same directory
 - named pipes other than `srvsvc`, and RPC calls other than listing shares and describing the server
 - DFS
 - multichannel and compression

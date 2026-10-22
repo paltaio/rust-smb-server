@@ -16,7 +16,8 @@ use crate::builder::Access;
 use crate::conn::outbound::Outbound;
 use crate::conn::pending::{PendingOps, Stop};
 use crate::files::{
-    DurableReg, DurableTable, FileRef, OpenSlot, close_opens, end_opens, finish_close,
+    DurableReg, DurableTable, FileRef, NotifyBudget, OpenSlot, WatchReg, close_opens, end_opens,
+    finish_close,
 };
 use crate::path::SmbPath;
 use crate::rpc::pipe::{Pipe, PipeBudget};
@@ -97,6 +98,10 @@ pub struct Connection {
 
     /// The named pipes open on this connection and the bytes they hold.
     pub(crate) pipe_budget: Arc<PipeBudget>,
+
+    /// The change notification watches of this connection's opens and the
+    /// bytes they buffer.
+    pub(crate) notify_budget: Arc<NotifyBudget>,
 }
 
 impl Connection {
@@ -124,6 +129,7 @@ impl Connection {
             outbound: Arc::default(),
             pending: PendingOps::default(),
             pipe_budget: Arc::default(),
+            notify_budget: Arc::default(),
         }
     }
 
@@ -440,6 +446,9 @@ pub struct Open {
     pub(crate) slot: Option<OpenSlot>,
     /// Set on a durable open (Open.IsDurable).
     pub(crate) durable: Option<DurableReg>,
+    /// The change notification watch the first CHANGE_NOTIFY on the open
+    /// armed.
+    pub(crate) watch: Option<WatchReg>,
 }
 
 impl Open {
