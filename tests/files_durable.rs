@@ -446,6 +446,41 @@ async fn a_rename_closes_a_kept_open() {
 }
 
 #[tokio::test]
+async fn a_directory_rename_closes_a_kept_open_below_it() {
+    let td = tempdir().unwrap();
+    std::fs::create_dir(td.path().join("d")).unwrap();
+    std::fs::write(td.path().join("d").join("f.txt"), b"data").unwrap();
+    let (backend, counters) = Probe::new(td.path(), Counters::default());
+    let server = Server::start(users(backend)).await;
+    let mut a = user_client(server.addr, SignIn::default()).await;
+    open_durable(&mut a, "d\\f.txt", KEY_A, RH, SHARE_ALL).await;
+    assert_eq!(a.logoff().await, 0);
+    assert_eq!(handles(&counters), 1, "kept after LOGOFF");
+
+    let mut b = user_client(
+        server.addr,
+        SignIn {
+            client_guid: GUID_B,
+            user: "bob",
+            ..SignIn::default()
+        },
+    )
+    .await;
+    let dir = b
+        .open_with_options("d", DELETE | FILE_READ_ATTRIBUTES, FILE_DIRECTORY_FILE)
+        .await
+        .unwrap();
+    let name = utf16le("e");
+    let mut info = vec![0u8; 16];
+    info.extend_from_slice(&(name.len() as u32).to_le_bytes());
+    info.extend_from_slice(&name);
+    assert_eq!(b.set_info(dir, FILE_RENAME_INFORMATION, info).await, 0);
+    b.close(dir).await;
+    assert!(td.path().join("e").join("f.txt").exists());
+    assert!(eventually(|| handles(&counters) == 0).await);
+}
+
+#[tokio::test]
 async fn an_open_beside_a_kept_lock_closes_it_and_the_range_is_free() {
     let k = kept(RWH, SHARE_ALL, true).await;
     let mut b = k.bob().await;

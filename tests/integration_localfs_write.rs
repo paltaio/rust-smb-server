@@ -578,7 +578,7 @@ async fn rename_moves_other_opens_of_the_file() {
 }
 
 #[tokio::test]
-async fn rename_of_a_directory_moves_opens_below_it() {
+async fn a_directory_with_an_open_file_below_is_not_renamed() {
     let td = tempdir().expect("tempdir");
     let root = td.path();
     std::fs::create_dir_all(root.join("d").join("sub")).expect("mkdir");
@@ -602,29 +602,17 @@ async fn rename_of_a_directory_moves_opens_below_it() {
     let status = c
         .set_info(dir, FILE_RENAME_INFORMATION, rename_info("e", false))
         .await;
-    c.close(dir).await;
-
-    // NTFS refuses to rename a directory while a file below it is open, as
-    // MS-FSA 2.1.5.15.12 specifies; other hosts rename it and the open moves
-    // along.
-    if cfg!(windows) {
-        assert_eq!(status, ntstatus::STATUS_ACCESS_DENIED);
-        c.close(child).await;
-        assert!(!root.join("d").join("sub").join("f.txt").exists());
-        assert!(!root.join("e").exists());
-        return;
-    }
-    assert_eq!(status, STATUS_SUCCESS);
-
-    std::fs::create_dir_all(root.join("d").join("sub")).expect("mkdir");
-    std::fs::write(root.join("d").join("sub").join("f.txt"), b"new").expect("write file");
+    assert_eq!(status, ntstatus::STATUS_ACCESS_DENIED);
     c.close(child).await;
-    assert!(!root.join("e").join("sub").join("f.txt").exists());
+    assert!(!root.join("d").join("sub").join("f.txt").exists());
+    assert!(!root.join("e").exists());
+
+    let status = c
+        .set_info(dir, FILE_RENAME_INFORMATION, rename_info("e", false))
+        .await;
+    assert_eq!(status, STATUS_SUCCESS);
+    c.close(dir).await;
     assert!(root.join("e").join("sub").is_dir());
-    assert_eq!(
-        std::fs::read(root.join("d").join("sub").join("f.txt")).unwrap(),
-        b"new"
-    );
 }
 
 #[tokio::test]

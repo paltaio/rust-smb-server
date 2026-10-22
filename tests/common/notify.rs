@@ -9,8 +9,8 @@ use smb_server::wire::messages::{ChangeNotifyRequest, ChangeNotifyResponse, File
 use super::client::Client;
 
 pub use smb_server::wire::messages::change_notify::{
-    FILE_ACTION_ADDED, FILE_ACTION_REMOVED, FILE_NOTIFY_CHANGE_DIR_NAME,
-    FILE_NOTIFY_CHANGE_FILE_NAME,
+    FILE_ACTION_ADDED, FILE_ACTION_REMOVED, FILE_ACTION_RENAMED_NEW_NAME,
+    FILE_ACTION_RENAMED_OLD_NAME, FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME,
 };
 
 /// How long a test waits for an answer before it fails.
@@ -122,4 +122,12 @@ pub fn added(name: &str) -> (u32, String) {
 
 pub fn removed(name: &str) -> (u32, String) {
     (FILE_ACTION_REMOVED, name.to_string())
+}
+
+pub fn old_name(name: &str) -> (u32, String) {
+    (FILE_ACTION_RENAMED_OLD_NAME, name.to_string())
+}
+
+pub fn new_name(name: &str) -> (u32, String) {
+    (FILE_ACTION_RENAMED_NEW_NAME, name.to_string())
 }

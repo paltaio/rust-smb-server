@@ -682,6 +682,10 @@ async fn attempt(
     let share = Arc::clone(&tree_arc.read().await.share);
     let backend = Arc::clone(&share.backend);
     let path = &args.path;
+    // No rename runs from the first backend call until the open is in the
+    // file table under `path`, so the open, and the change it reports,
+    // carry the name the file had.
+    let names = share.files.names_lock().await;
 
     let open_request = |overwrite, break_handles| OpenRequest {
         sharing: args.sharing,
@@ -839,6 +843,7 @@ async fn attempt(
             }
         }
     };
+    drop(names);
     let mut granted = None;
     let mut after_send = None;
     if let (Some(lease), Some(lease_ref)) = (args.lease, lease_ref)

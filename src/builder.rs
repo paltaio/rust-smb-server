@@ -111,13 +111,13 @@ impl Share {
     /// the client writes back and stops caching writes before such an
     /// open, drops cached data before a write, a size change, a byte-range
     /// lock or an overwrite through it, and closes the handles it keeps
-    /// before an open they block, a rename or delete of the file, or a
-    /// rename over it. Attribute-only opens and opens holding the same lease
-    /// break nothing. An open or rename that needs the client to write back
-    /// or close first waits until the client acknowledges the break or
-    /// closes, or until the break times out 35 seconds after the server
-    /// sent it; a byte-range lock is refused instead until the client has
-    /// written back. On by default.
+    /// before an open they block, a rename or delete of the file, a rename
+    /// over it, or a rename of a directory above it. Attribute-only opens
+    /// and opens holding the same lease break nothing. An open or rename
+    /// that needs the client to write back or close first waits until the
+    /// client acknowledges the break or closes, or until the break times
+    /// out 35 seconds after the server sent it; a byte-range lock is refused
+    /// instead until the client has written back. On by default.
     ///
     /// Changes made outside the server, or through another share over the
     /// same directory, break no lease: clients keep serving the old data.
@@ -151,11 +151,12 @@ impl Share {
 
     /// Answer change notification requests: a client watching a folder, as
     /// Explorer and Finder do for an open window, hears when a file or
-    /// folder in it is created or deleted through any connection to this
-    /// share. Renames, overwrites, writes, and attribute, time and size
-    /// changes are not reported, and neither are changes made outside the
-    /// server or through another share over the same directory. When off,
-    /// such requests fail with STATUS_NOT_SUPPORTED. On by default.
+    /// folder in it is created, deleted or renamed through any connection to
+    /// this share. Writes, truncation, attribute and time changes, and
+    /// overwrites by CREATE are not reported, and neither are changes made
+    /// outside the server or through another share over the same directory.
+    /// When off, such requests fail with STATUS_NOT_SUPPORTED. On by
+    /// default.
     pub fn change_notify(mut self, enabled: bool) -> Self {
         self.change_notify = enabled;
         self

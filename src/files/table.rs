@@ -100,7 +100,7 @@ static NEXT_BREAK_SEQ: AtomicU64 = AtomicU64::new(1);
 pub(crate) struct FileTable {
     files: Mutex<HashMap<FileKey, Arc<FileNode>>>,
     next_open: AtomicU64,
-    renames: tokio::sync::Mutex<()>,
+    renames: tokio::sync::RwLock<()>,
 }
 
 pub(super) struct FileNode {
@@ -578,9 +578,18 @@ impl FileTable {
     }
 
     /// Serializes renames on the share: a rename holds this while it checks
-    /// the target, renames in the backend and moves the open names.
-    pub(crate) async fn rename_lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
-        self.renames.lock().await
+    /// the target, renames in the backend, moves the open names and the
+    /// change notification watches, and reports the rename.
+    pub(crate) async fn rename_lock(&self) -> tokio::sync::RwLockWriteGuard<'_, ()> {
+        self.renames.write().await
+    }
+
+    /// Keeps renames out while a CREATE runs from its first backend call
+    /// until its open is in the table, while a delete calls the backend and
+    /// reports the removal, and while a CHANGE_NOTIFY arms a watch. Each
+    /// then uses, and reports, the path the entry has on the share.
+    pub(crate) async fn names_lock(&self) -> tokio::sync::RwLockReadGuard<'_, ()> {
+        self.renames.read().await
     }
 
     /// True if an open on the share currently has `path` as its name.
@@ -646,24 +655,53 @@ impl FileTable {
         wait
     }
 
+    /// True if an open on the share has a name below the directory `dir`
+    /// (MS-FSA 2.1.4.2).
+    pub(crate) fn open_below(&self, dir: &SmbPath, case_sensitive: bool) -> bool {
+        self.files().values().any(|node| {
+            node.state()
+                .opens
+                .iter()
+                .any(|e| is_below(&e.path, dir, case_sensitive))
+        })
+    }
+
     /// Breaks the handle caching of every lease on a file open below the
-    /// directory `dir`, which is being renamed (MS-SMB2 3.3.1.4). Nothing
-    /// waits for these breaks: the opens stay valid under the new name.
-    pub(crate) fn break_handles_below(&self, dir: &SmbPath, case_sensitive: bool) {
+    /// directory `dir`, which is being renamed, when `start` (MS-FSA 2.1.4.2,
+    /// MS-SMB2 3.3.1.4). Returns a wait for a break to complete while one is
+    /// in progress.
+    pub(crate) fn break_handles_below(
+        &self,
+        dir: &SmbPath,
+        case_sensitive: bool,
+        start: bool,
+    ) -> Option<BreakWait> {
         let mut all = Vec::new();
+        let mut wait = None;
         let files = self.files();
         for node in files.values() {
             let mut state = node.state();
-            let below = state.opens.iter().any(|e| {
-                e.path.components().len() > dir.components().len()
-                    && rebase(&e.path, dir, dir, case_sensitive).is_some()
-            });
-            if below {
-                all.push(state.break_for(Trigger::Handle, None).0);
+            if !state
+                .opens
+                .iter()
+                .any(|e| is_below(&e.path, dir, case_sensitive))
+            {
+                continue;
+            }
+            let waits = if start {
+                let (notices, waits) = state.break_for(Trigger::Handle, None);
+                all.push(notices);
+                waits
+            } else {
+                state.handle_break_pending(None)
+            };
+            if waits && wait.is_none() {
+                wait = Some(state.wait());
             }
         }
         drop(files);
         drop(all);
+        wait
     }
 
     /// Stops every acknowledgment timer on the share, as if they were lost.
@@ -1253,6 +1291,12 @@ impl Drop for FileRef {
     }
 }
 
+/// True if `path` lies below the directory `dir`.
+fn is_below(path: &SmbPath, dir: &SmbPath, case_sensitive: bool) -> bool {
+    path.components().len() > dir.components().len()
+        && rebase(path, dir, dir, case_sensitive).is_some()
+}
+
 fn remove_node(files: &mut HashMap<FileKey, Arc<FileNode>>, key: &FileKey, node: &Arc<FileNode>) {
     if files.get(key).is_some_and(|n| Arc::ptr_eq(n, node)) {
         files.remove(key);
@@ -1274,7 +1318,15 @@ impl PendingDelete {
     /// failed delete does not fail the close (MS-SMB2 3.3.4.17); a
     /// directory that gained entries stays (MS-FSA 2.1.5.5).
     pub(crate) async fn run(self) {
-        match self.share.backend.unlink(&self.path).await {
+        let _names = self.share.files.names_lock().await;
+        // A rename that ran while this waited moved the name.
+        let path = self
+            .node
+            .state()
+            .delete_pending
+            .clone()
+            .unwrap_or_else(|| self.path.clone());
+        match self.share.backend.unlink(&path).await {
             Ok(()) => {
                 let filter = if self.is_directory {
                     FILE_NOTIFY_CHANGE_DIR_NAME
@@ -1282,15 +1334,15 @@ impl PendingDelete {
                     FILE_NOTIFY_CHANGE_FILE_NAME
                 };
                 self.share.watches.report(&[Change {
-                    path: &self.path,
+                    path: &path,
                     action: FILE_ACTION_REMOVED,
                     filter,
                 }]);
             }
             Err(SmbError::NotEmpty) => {
-                debug!(path = %self.path, "delete-on-close skipped a non-empty directory");
+                debug!(path = %path, "delete-on-close skipped a non-empty directory");
             }
-            Err(e) => warn!(error = %e, path = %self.path, "delete-on-close failed"),
+            Err(e) => warn!(error = %e, path = %path, "delete-on-close failed"),
         }
     }
 }

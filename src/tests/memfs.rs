@@ -169,6 +169,22 @@ impl ShareBackend for MemFsBackend {
             return Ok(());
         }
         if g.dirs.remove(&kf).is_some() {
+            // Everything below the directory moves with it.
+            let below = format!("{kf}\\");
+            let moved = |key: &String| {
+                key.strip_prefix(&below)
+                    .map(|rest| (key.clone(), format!("{kt}\\{rest}")))
+            };
+            let files: Vec<_> = g.files.keys().filter_map(moved).collect();
+            for (old, new) in files {
+                let data = g.files.remove(&old).expect("listed");
+                g.files.insert(new, data);
+            }
+            let dirs: Vec<_> = g.dirs.keys().filter_map(moved).collect();
+            for (old, new) in dirs {
+                g.dirs.remove(&old);
+                g.dirs.insert(new, ());
+            }
             g.dirs.insert(kt, ());
             return Ok(());
         }

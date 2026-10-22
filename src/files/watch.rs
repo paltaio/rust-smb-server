@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::ntstatus;
-use crate::path::SmbPath;
+use crate::path::{SmbPath, rebase};
 use crate::proto::messages::change_notify::{entries_len, push_entry};
 use crate::server::ShareBindings;
 
@@ -435,6 +435,57 @@ impl WatchTable {
         }
     }
 
+    /// Whether a change at `path` would reach a watch, whatever its
+    /// filter.
+    pub(crate) fn watching(&self, path: &SmbPath) -> bool {
+        if self.count.load(Ordering::Acquire) == 0 {
+            return false;
+        }
+        let components = path.components();
+        let Some(parent) = components.len().checked_sub(1) else {
+            return false;
+        };
+        let top = if self.tree_count.load(Ordering::Acquire) > 0 {
+            0
+        } else {
+            parent
+        };
+        let dirs = lock(&self.dirs);
+        (top..=parent).any(|depth| {
+            dirs.get(&dir_key(&components[..depth], self.case_sensitive))
+                .is_some_and(|watches| depth == parent || watches.iter().any(|w| w.tree))
+        })
+    }
+
+    /// Moves every watch of `from`, or of a directory below it, to the
+    /// matching directory under `to`, which `from` was renamed to. What the
+    /// watches buffered stays.
+    pub(crate) fn rename(&self, from: &SmbPath, to: &SmbPath) {
+        if self.count.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let mut dirs = lock(&self.dirs);
+        let mut moved = Vec::new();
+        dirs.retain(|_, watches| {
+            watches.retain(|watch| {
+                let mut state = watch.state();
+                match rebase(&state.dir, from, to, self.case_sensitive) {
+                    Some(dir) => {
+                        state.dir = dir;
+                        moved.push(Arc::clone(watch));
+                        false
+                    }
+                    None => true,
+                }
+            });
+            !watches.is_empty()
+        });
+        for watch in moved {
+            let key = dir_key(watch.state().dir.components(), self.case_sensitive);
+            dirs.entry(key).or_default().push(watch);
+        }
+    }
+
     /// Watches on the share.
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
@@ -486,8 +537,8 @@ impl Drop for WatchReg {
 mod tests {
     use super::*;
     use crate::proto::messages::change_notify::{
-        FILE_ACTION_ADDED, FILE_ACTION_REMOVED, FILE_NOTIFY_CHANGE_DIR_NAME,
-        FILE_NOTIFY_CHANGE_FILE_NAME,
+        FILE_ACTION_ADDED, FILE_ACTION_REMOVED, FILE_ACTION_RENAMED_NEW_NAME,
+        FILE_ACTION_RENAMED_OLD_NAME, FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME,
     };
     use crate::server::ShareMode;
     use crate::tests::memfs::MemFsBackend;
@@ -793,6 +844,74 @@ mod tests {
         assert_eq!(budget.bytes(), 16);
         drop(reg);
         assert_eq!((budget.watches(), budget.bytes()), (0, 0));
+    }
+
+    #[test]
+    fn renames_move_watches_at_and_below_the_renamed_directory() {
+        let budget = Arc::default();
+        let table = WatchTable::new(false);
+        let renamed = watch_on(&table, "a", NAMES, false, 4096, &budget);
+        let below = watch_on(&table, "a\\b", NAMES, true, 4096, &budget);
+        let sibling = watch_on(&table, "ab", NAMES, false, 4096, &budget);
+        added(&table, "a\\early");
+        table.rename(&p("A"), &p("z"));
+        added(&table, "z\\late");
+        added(&table, "z\\b\\c\\deep");
+        added(&table, "ab\\s");
+        assert_eq!(names(&renamed).unwrap(), ["early", "late"]);
+        assert_eq!(names(&below).unwrap(), ["c\\deep"]);
+        assert_eq!(names(&sibling).unwrap(), ["s"]);
+        // The old names match nothing.
+        added(&table, "a\\gone");
+        added(&table, "a\\b\\gone");
+        assert_eq!(names(&renamed), None);
+        assert_eq!(names(&below), None);
+        assert_eq!(renamed.state().dir, p("z"));
+        assert_eq!(below.state().dir, p("z\\b"));
+    }
+
+    #[test]
+    fn watching_looks_at_the_parent_and_tree_watches_above() {
+        let budget = Arc::default();
+        let table = WatchTable::new(false);
+        assert!(!table.watching(&p("a\\b\\c")));
+        let _plain = watch_on(&table, "a\\b", 0, false, 4096, &budget);
+        assert!(table.watching(&p("A\\b\\c")));
+        assert!(!table.watching(&p("a\\b\\c\\d")));
+        let _tree = watch_on(&table, "a", 0, true, 4096, &budget);
+        assert!(table.watching(&p("a\\b\\c\\d")));
+        assert!(!table.watching(&p("a")));
+    }
+
+    #[test]
+    fn a_rename_pair_is_buffered_whole_or_not_at_all() {
+        let budget = Arc::default();
+        let table = WatchTable::new(false);
+        // Each one-letter entry is 14 bytes, 16 padded: the pair takes 30,
+        // the first half alone 14.
+        let fits = watch_on(&table, "", NAMES, false, 30, &budget);
+        let half = watch_on(&table, "", NAMES, false, 16, &budget);
+        let mut fits_changed = fits.subscribe();
+        let mut half_changed = half.subscribe();
+        let (from, to) = (p("c"), p("e"));
+        table.report(&[
+            Change {
+                path: &from,
+                action: FILE_ACTION_RENAMED_OLD_NAME,
+                filter: FILE_NOTIFY_CHANGE_FILE_NAME,
+            },
+            Change {
+                path: &to,
+                action: FILE_ACTION_RENAMED_NEW_NAME,
+                filter: FILE_NOTIFY_CHANGE_FILE_NAME,
+            },
+        ]);
+        // One push each: a request woken in between could not take half.
+        assert_eq!(*fits_changed.borrow_and_update(), 1);
+        assert_eq!(*half_changed.borrow_and_update(), 1);
+        assert_eq!(names(&fits).unwrap(), ["c", "e"]);
+        let ticket = half.enqueue(4096, true);
+        assert_eq!(half.take(&ticket), Some(Answer::EnumDir));
     }
 
     #[tokio::test]

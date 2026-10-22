@@ -70,10 +70,16 @@
 //!   that [`Handle::dir_is_empty`] reports as not empty. `unlink` returns
 //!   [`SmbError::NotEmpty`] for a directory that has entries; the directory
 //!   then stays.
-//! - A rename through SET_INFO calls [`ShareBackend::rename`] and then moves
-//!   the path of every open at or below the old name. Renames on one share
-//!   run one at a time. The backend keeps those handles working on the
-//!   renamed file.
+//! - A rename through SET_INFO of a directory with a file or directory open
+//!   below it first asks the clients caching handles to those files to
+//!   close them, and waits until they answer or the break times out; files
+//!   kept open for a client to reconnect are closed. If an open below
+//!   remains, the rename fails with STATUS_ACCESS_DENIED, and so does a
+//!   rename of the share root. Otherwise the rename calls
+//!   [`ShareBackend::rename`] and then moves the path of every open of the
+//!   old name. Renames on one share run
+//!   one at a time, and a CREATE or a delete waits for a rename in
+//!   progress. The backend keeps those handles working on the renamed file.
 //! - A CREATE that makes or overwrites a file passes the attributes it asks
 //!   for to [`Handle::set_attributes`] when they differ from what
 //!   [`Handle::stat`] reports. If that returns [`SmbError::NotSupported`],
@@ -158,17 +164,27 @@
 //! - Change notifications: on every share unless [`Share::change_notify`]
 //!   turns them off, a CHANGE_NOTIFY on a directory waits until a file or
 //!   directory in it, or below it when the client asks for the whole tree,
-//!   is created or deleted through any connection to the share. Changes
-//!   are buffered on the directory handle between requests, up to the
-//!   buffer size of its first request and at most 64 KiB; when more arrive,
-//!   or they do not fit the request being answered, the answer is
-//!   STATUS_NOTIFY_ENUM_DIR. Renames, overwrites, writes, and attribute,
-//!   time and size changes are not reported, and neither are changes made
-//!   outside the server or through another share over the same directory.
-//!   Watches follow paths: a change made through a symlink inside the share
-//!   reaches the watchers of the path it was made through, and names are
-//!   spelled as the client that made the change spelled them. Backends are
-//!   not called.
+//!   is created, deleted or renamed through any connection to the share. A
+//!   rename within one directory is reported as its old and new name
+//!   together, a move to another directory as a removal from one and an
+//!   addition to the other. An entry the rename replaces, or the renamed
+//!   entry itself when only the case of its name changes, is first reported
+//!   removed under its name as stored. A watched directory can be renamed,
+//!   and its watches follow it. Changes are buffered on the directory
+//!   handle between requests, up to the buffer size of its first request
+//!   and at most 64 KiB; when more arrive, or they do not fit the request
+//!   being answered, the answer is STATUS_NOTIFY_ENUM_DIR. Writes,
+//!   truncation, attribute and time changes, and overwrites by CREATE are
+//!   not reported, and neither are changes made outside the server or
+//!   through another share over the same directory. Watches follow paths: a
+//!   change made through a symlink inside the share reaches the watchers of
+//!   the path it was made through. Names are spelled as the client that
+//!   made the change spelled them, but for the stored names above. The
+//!   backend is called only for a rename into a watched directory that may
+//!   replace an entry or changes the case of a name: on a case-sensitive
+//!   backend [`ShareBackend::open`] of the target and [`Handle::stat`],
+//!   otherwise `open` of the target's directory and [`Handle::list_dir`]
+//!   with the target's name.
 //! - Share listing: unless [`SmbServerBuilder::share_listing`] turns it
 //!   off, IPC$ serves the `srvsvc` pipe, so clients can list the server's
 //!   shares. A session sees the shares it may connect to, in the order

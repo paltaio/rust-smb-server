@@ -7,18 +7,23 @@ use crate::proto::messages::{InfoType, SetInfoRequest, SetInfoResponse};
 
 use crate::access_mask::{DELETE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA};
 use crate::backend::{
-    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_TEMPORARY, FileTimes, VALID_SET_ATTRIBUTES,
+    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_TEMPORARY, FileTimes, OpenOptions, ShareBackend,
+    VALID_SET_ATTRIBUTES,
 };
 use crate::conn::pending::{Stop, stopped};
 use crate::conn::state::{Connection, Open};
 use crate::dispatch::HandlerResponse;
-use crate::files::{BreakWait, MAX_BREAK_WAIT, Trigger};
+use crate::files::{BreakWait, Change, MAX_BREAK_WAIT, Trigger};
 use crate::handlers::shared::{lookup_open, lookup_session_tree, restore_fixed_times};
 use crate::handlers::{Outcome, Pending};
 use crate::info_class as ic;
 use crate::ntstatus;
 use crate::path::{SmbPath, same_path};
 use crate::proto::messages::FileId;
+use crate::proto::messages::change_notify::{
+    FILE_ACTION_ADDED, FILE_ACTION_REMOVED, FILE_ACTION_RENAMED_NEW_NAME,
+    FILE_ACTION_RENAMED_OLD_NAME, FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME,
+};
 use crate::server::ServerState;
 use crate::utils::utf16le_to_units;
 use tracing::warn;
@@ -259,11 +264,11 @@ fn set_info_ok() -> HandlerResponse {
     HandlerResponse::ok(buf)
 }
 
-/// FileRenameInformation (MS-FSA 2.1.5.15.12). An open target is not
-/// replaced; when it is open only because clients cache their handles, the
-/// first attempt breaks that caching and waits. The leases on the renamed
-/// file give up handle caching, as do those on files open below a renamed
-/// directory.
+/// FileRenameInformation (MS-FSA 2.1.5.15.12). A directory with a file or
+/// directory open below it is not renamed, and neither is an open target
+/// replaced; when they are open only because clients cache their handles,
+/// the first attempt breaks that caching and waits. The leases on the
+/// renamed file give up handle caching.
 async fn rename_attempt(
     conn: &Arc<Connection>,
     hdr: &Smb2Header,
@@ -279,19 +284,47 @@ async fn rename_attempt(
     };
     let share = tree_arc.read().await.share.clone();
     let case_sensitive = share.backend.capabilities().case_sensitive;
+    let to = &rename.to;
+    // An entry already at the new name, the renamed one itself when only
+    // the case changes, is reported by its name as stored. It is looked up
+    // only when someone watches it, and before the rename lock, so CREATEs
+    // and deletes on the share do not wait for it; one that changes
+    // meanwhile is reported as it was.
+    let may_exist = |from: &SmbPath| {
+        (rename.replace || same_path(from, to, case_sensitive))
+            && !same_name(from, to, case_sensitive)
+    };
+    let named = open_arc.read().await.path();
+    let replaced = match named {
+        Some(from) if may_exist(&from) && share.watches.watching(to) => {
+            stored_entry(share.backend.as_ref(), to, case_sensitive).await
+        }
+        _ => None,
+    };
     let _renames = share.files.rename_lock().await;
     let open = open_arc.read().await;
     let Some(file) = open.file.as_ref() else {
         return Renamed::Done(Err(ntstatus::STATUS_FILE_CLOSED));
     };
     let from = file.path();
-    let to = &rename.to;
+    let is_directory = open.is_directory;
+    if from.is_root() {
+        return Renamed::Done(Err(ntstatus::STATUS_ACCESS_DENIED));
+    }
+    if is_directory && share.files.open_below(&from, case_sensitive) {
+        let start = stage == Stage::Start;
+        if let Some(wait) = share
+            .files
+            .break_handles_below(&from, case_sensitive, start)
+        {
+            return Renamed::Wait(wait);
+        }
+        return Renamed::Done(Err(ntstatus::STATUS_ACCESS_DENIED));
+    }
     // A target that names the source itself is the same file and skips
     // this.
-    if rename.replace
-        && !same_path(&from, to, case_sensitive)
-        && share.files.path_is_open(to, case_sensitive)
-    {
+    let replaces = rename.replace && !same_path(&from, to, case_sensitive);
+    if replaces && share.files.path_is_open(to, case_sensitive) {
         let start = stage == Stage::Start;
         if let Some(wait) = share
             .files
@@ -302,18 +335,132 @@ async fn rename_attempt(
         return Renamed::Done(Err(ntstatus::STATUS_ACCESS_DENIED));
     }
     file.break_leases(Trigger::Handle);
-    if open.is_directory {
-        share.files.break_handles_below(&from, case_sensitive);
-    }
     drop(open);
+    let replaced = replaced.filter(|_| may_exist(&from));
     let result = match share.backend.rename(&from, to, rename.replace).await {
         Ok(()) => {
             share.files.rename_paths(&from, to, case_sensitive);
+            if is_directory {
+                share.watches.rename(&from, to);
+            }
+            let changes = rename_changes(&from, to, is_directory, replaced, case_sensitive);
+            let changes: Vec<Change<'_>> = changes
+                .iter()
+                .map(|(path, action, filter)| Change {
+                    path,
+                    action: *action,
+                    filter: *filter,
+                })
+                .collect();
+            share.watches.report(&changes);
             Ok(())
         }
         Err(e) => Err(e.to_nt_status()),
     };
     Renamed::Done(result)
+}
+
+/// An entry as its directory lists it: its name as stored, and whether it
+/// is a directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StoredEntry {
+    name: String,
+    is_directory: bool,
+}
+
+/// The entry `path` names: on a case-sensitive backend, found by opening
+/// it, so it is stored as `path` spells it; otherwise looked up in a
+/// listing of its directory.
+async fn stored_entry(
+    backend: &dyn ShareBackend,
+    path: &SmbPath,
+    case_sensitive: bool,
+) -> Option<StoredEntry> {
+    let name = path.file_name()?;
+    if case_sensitive {
+        let (handle, _) = backend.open(path, OpenOptions::default()).await.ok()?;
+        let info = handle.stat().await;
+        let _ = handle.close().await;
+        return Some(StoredEntry {
+            name: name.to_string(),
+            is_directory: info.ok()?.is_directory,
+        });
+    }
+    let opts = OpenOptions {
+        directory: true,
+        ..OpenOptions::default()
+    };
+    let (handle, _) = backend.open(&path.parent()?, opts).await.ok()?;
+    let entries = handle.list_dir(Some(name)).await;
+    let _ = handle.close().await;
+    entries
+        .ok()?
+        .into_iter()
+        .find(|e| e.info.name.to_lowercase() == name.to_lowercase())
+        .map(|e| StoredEntry {
+            name: e.info.name,
+            is_directory: e.info.is_directory,
+        })
+}
+
+/// True if renaming `from` to `to` keeps the directory and spells the name
+/// exactly as before.
+fn same_name(from: &SmbPath, to: &SmbPath, case_sensitive: bool) -> bool {
+    let parent = |path: &SmbPath| path.parent().unwrap_or_default();
+    same_path(&parent(from), &parent(to), case_sensitive) && from.file_name() == to.file_name()
+}
+
+/// The changes renaming `from` to `to` reports, as (path, action, filter)
+/// in order (MS-FSA 2.1.5.15.12). An entry already at the new name, which
+/// the rename replaced, or the renamed entry itself when only the case of
+/// its name changes, is REMOVED first under its name as stored (`stored`).
+/// This follows Windows; MS-FSA instead reports a replaced target spelled
+/// as stored as MODIFIED. Then a rename within one directory is
+/// RENAMED_OLD_NAME and RENAMED_NEW_NAME, one into another directory
+/// REMOVED and ADDED. A rename to the same name, or to the stored name of
+/// the renamed entry, reports nothing.
+fn rename_changes(
+    from: &SmbPath,
+    to: &SmbPath,
+    is_directory: bool,
+    stored: Option<StoredEntry>,
+    case_sensitive: bool,
+) -> Vec<(SmbPath, u32, u32)> {
+    if same_name(from, to, case_sensitive) {
+        return Vec::new();
+    }
+    // Renaming an entry to its own name as stored changes nothing, however
+    // the open spelled it.
+    if same_path(from, to, case_sensitive)
+        && stored
+            .as_ref()
+            .is_some_and(|entry| to.file_name() == Some(entry.name.as_str()))
+    {
+        return Vec::new();
+    }
+    let kind = |directory| {
+        if directory {
+            FILE_NOTIFY_CHANGE_DIR_NAME
+        } else {
+            FILE_NOTIFY_CHANGE_FILE_NAME
+        }
+    };
+    let parent = |path: &SmbPath| path.parent().unwrap_or_default();
+    let mut changes = Vec::with_capacity(3);
+    if let Some(entry) = stored
+        && let Ok(path) = parent(to).join(&entry.name)
+    {
+        changes.push((path, FILE_ACTION_REMOVED, kind(entry.is_directory)));
+    }
+    let (old, new) = if same_path(&parent(from), &parent(to), case_sensitive) {
+        (FILE_ACTION_RENAMED_OLD_NAME, FILE_ACTION_RENAMED_NEW_NAME)
+    } else {
+        (FILE_ACTION_REMOVED, FILE_ACTION_ADDED)
+    };
+    let filter = kind(is_directory);
+    changes.push((from.clone(), old, filter));
+    changes.push((to.clone(), new, filter));
+    changes
 }
 
 /// FileBasicInformation (MS-FSA 2.1.5.15.2, MS-FSCC 2.4.7). A time of 0
@@ -507,7 +654,9 @@ mod tests {
         let waiting = Arc::new(Notify::new());
         let go = Arc::new(Semaphore::new(0));
         let backend = HoldRename {
-            inner: MemFsBackend::new().with_file("d\\f", b"x"),
+            inner: MemFsBackend::new()
+                .with_file("d\\f", b"x")
+                .with_file("h", b"y"),
             renames: Arc::clone(&renames),
             waiting: Arc::clone(&waiting),
             go: Arc::clone(&go),
@@ -527,7 +676,7 @@ mod tests {
         let session = Session::new(Identity::Anonymous, [0; 16], [0; 16], false, None);
         let tree = TreeConnect::new(1, Arc::clone(&share), Access::ReadWrite);
         let mut file_ids = Vec::new();
-        for (path, directory) in [("d\\f", false), ("d", true)] {
+        for (path, directory) in [("d\\f", false), ("h", false)] {
             let path: SmbPath = path.parse().unwrap();
             let opts = OpenOptions {
                 directory,
@@ -593,7 +742,7 @@ mod tests {
         };
         let file = rename(file_ids[0], "d\\g");
         waiting.notified().await;
-        let parent = rename(file_ids[1], "e");
+        let other = rename(file_ids[1], "i");
         for _ in 0..10 {
             tokio::task::yield_now().await;
         }
@@ -605,7 +754,105 @@ mod tests {
 
         go.add_permits(1);
         assert_eq!(file.await.unwrap(), ntstatus::STATUS_SUCCESS);
-        assert_eq!(parent.await.unwrap(), ntstatus::STATUS_SUCCESS);
-        assert!(share.files.path_is_open(&"e\\g".parse().unwrap(), false));
+        assert_eq!(other.await.unwrap(), ntstatus::STATUS_SUCCESS);
+        assert_eq!(renames.load(Ordering::SeqCst), 2);
+        assert!(share.files.path_is_open(&"d\\g".parse().unwrap(), false));
+        assert!(share.files.path_is_open(&"i".parse().unwrap(), false));
+    }
+
+    fn p(s: &str) -> SmbPath {
+        s.parse().unwrap()
+    }
+
+    /// (action, path) of each change renaming `from` to `to` reports.
+    fn changes(
+        from: &str,
+        to: &str,
+        is_directory: bool,
+        replaced: Option<(&str, bool)>,
+    ) -> Vec<(u32, String, u32)> {
+        let replaced = replaced.map(|(name, is_directory)| StoredEntry {
+            name: name.to_string(),
+            is_directory,
+        });
+        rename_changes(&p(from), &p(to), is_directory, replaced, false)
+            .into_iter()
+            .map(|(path, action, filter)| (action, path.display_backslash(), filter))
+            .collect()
+    }
+
+    const FILE: u32 = FILE_NOTIFY_CHANGE_FILE_NAME;
+    const DIR: u32 = FILE_NOTIFY_CHANGE_DIR_NAME;
+
+    #[test]
+    fn renames_report_by_directory_and_kind() {
+        let s = |x: &str| x.to_string();
+        assert_eq!(
+            changes("d\\a", "D\\b", false, None),
+            [
+                (FILE_ACTION_RENAMED_OLD_NAME, s("d\\a"), FILE),
+                (FILE_ACTION_RENAMED_NEW_NAME, s("D\\b"), FILE),
+            ]
+        );
+        assert_eq!(
+            changes("d\\a", "e\\a", true, None),
+            [
+                (FILE_ACTION_REMOVED, s("d\\a"), DIR),
+                (FILE_ACTION_ADDED, s("e\\a"), DIR),
+            ]
+        );
+        // A change of case only is a rename within the directory.
+        assert_eq!(
+            changes("d\\a", "d\\A", false, None),
+            [
+                (FILE_ACTION_RENAMED_OLD_NAME, s("d\\a"), FILE),
+                (FILE_ACTION_RENAMED_NEW_NAME, s("d\\A"), FILE),
+            ]
+        );
+        // The same name in the same directory, however the directory is
+        // spelled, reports nothing.
+        assert!(changes("d\\a", "d\\a", false, None).is_empty());
+        assert!(changes("d\\a", "D\\a", false, None).is_empty());
+    }
+
+    #[test]
+    fn an_entry_at_the_new_name_is_removed_first_under_its_stored_name() {
+        let s = |x: &str| x.to_string();
+        let stored = Some(("t", false));
+        assert_eq!(
+            changes("d\\a", "d\\t", false, stored),
+            [
+                (FILE_ACTION_REMOVED, s("d\\t"), FILE),
+                (FILE_ACTION_RENAMED_OLD_NAME, s("d\\a"), FILE),
+                (FILE_ACTION_RENAMED_NEW_NAME, s("d\\t"), FILE),
+            ]
+        );
+        assert_eq!(
+            changes("d\\a", "d\\T", false, stored),
+            [
+                (FILE_ACTION_REMOVED, s("d\\t"), FILE),
+                (FILE_ACTION_RENAMED_OLD_NAME, s("d\\a"), FILE),
+                (FILE_ACTION_RENAMED_NEW_NAME, s("d\\T"), FILE),
+            ]
+        );
+        assert_eq!(
+            changes("d\\a", "e\\t", true, stored),
+            [
+                (FILE_ACTION_REMOVED, s("e\\t"), FILE),
+                (FILE_ACTION_REMOVED, s("d\\a"), DIR),
+                (FILE_ACTION_ADDED, s("e\\t"), DIR),
+            ]
+        );
+        // An open spelled differently from the stored name renamed to it.
+        assert!(changes("d\\X", "d\\x", false, Some(("x", false))).is_empty());
+        // A change of case finds the renamed file itself.
+        assert_eq!(
+            changes("d\\x", "d\\X", false, Some(("x", false))),
+            [
+                (FILE_ACTION_REMOVED, s("d\\x"), FILE),
+                (FILE_ACTION_RENAMED_OLD_NAME, s("d\\x"), FILE),
+                (FILE_ACTION_RENAMED_NEW_NAME, s("d\\X"), FILE),
+            ]
+        );
     }
 }

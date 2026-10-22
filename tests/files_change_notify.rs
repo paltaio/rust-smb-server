@@ -16,8 +16,8 @@ use common::crypto::{Cipher, EncryptedSession, is_transform};
 use common::notify::*;
 use common::{build_header, negotiate, read_frame, smb2_signature, tree_connect_body, write_frame};
 use smb_server::ntstatus::{
-    STATUS_INVALID_PARAMETER, STATUS_LOGON_FAILURE, STATUS_NOTIFY_CLEANUP, STATUS_NOTIFY_ENUM_DIR,
-    STATUS_PENDING, STATUS_SUCCESS,
+    STATUS_ACCESS_DENIED, STATUS_INVALID_PARAMETER, STATUS_LOGON_FAILURE, STATUS_NOTIFY_CLEANUP,
+    STATUS_NOTIFY_ENUM_DIR, STATUS_PENDING, STATUS_SUCCESS,
 };
 use smb_server::wire::header::{Command, SMB2_FLAGS_SIGNED, Smb2Header};
 use smb_server::wire::messages::FileId;
@@ -477,4 +477,195 @@ async fn a_request_without_watch_tree_on_a_tree_watch_gets_no_nested_names() {
     let (st, body) = ask(&mut watcher, dir, 4096, NAMES, false).await;
     assert_eq!(st, STATUS_SUCCESS);
     assert_eq!(notify_entries(&body, 4096), [added("y")]);
+}
+
+fn rename_info(to: &str, replace: bool) -> Vec<u8> {
+    let name = common::utf16le(to);
+    let mut buffer = vec![u8::from(replace)];
+    buffer.extend_from_slice(&[0; 15]);
+    buffer.extend_from_slice(&(name.len() as u32).to_le_bytes());
+    buffer.extend_from_slice(&name);
+    buffer
+}
+
+/// Renames `name`, opened with `options`, to `to`.
+async fn rename(c: &mut Client, name: &str, to: &str, replace: bool, options: u32) {
+    let status = rename_status(c, name, to, replace, options).await;
+    assert_eq!(status, STATUS_SUCCESS, "rename {name} to {to}");
+}
+
+/// [`rename`], returning the status of the SET_INFO.
+async fn rename_status(c: &mut Client, name: &str, to: &str, replace: bool, options: u32) -> u32 {
+    let file_id = c
+        .open_with_options(name, DELETE | FILE_READ_ATTRIBUTES, options)
+        .await
+        .expect("open for renaming");
+    let status = c
+        .set_info(file_id, FILE_RENAME_INFORMATION, rename_info(to, replace))
+        .await;
+    c.close(file_id).await;
+    status
+}
+
+#[tokio::test]
+async fn a_rename_within_a_directory_reports_both_names_in_one_answer() {
+    let (srv, _td) = server().await;
+    let mut watcher = srv.client().await;
+    let mut maker = srv.client().await;
+    let dir = watcher.open_dir("d").await;
+    create_file(&mut maker, "d\\a").await;
+    let mid = arm(&mut watcher, dir, 4096, NAMES, false).await;
+    rename(&mut maker, "d\\a", "d\\b", false, 0).await;
+    assert_eq!(
+        wait_notify(&mut watcher, mid, 4096).await,
+        (STATUS_SUCCESS, vec![old_name("a"), new_name("b")])
+    );
+}
+
+#[tokio::test]
+async fn a_move_reports_a_removal_and_an_addition() {
+    let (srv, _td) = server().await;
+    let mut watcher = srv.client().await;
+    let mut maker = srv.client().await;
+    make_dir(&mut maker, "d\\one").await;
+    make_dir(&mut maker, "d\\two").await;
+    create_file(&mut maker, "d\\one\\f").await;
+    let one = watcher.open_dir("d\\one").await;
+    let two = watcher.open_dir("d\\two").await;
+    let tree = watcher.open_dir("d").await;
+    let one_mid = arm(&mut watcher, one, 4096, NAMES, false).await;
+    let two_mid = arm(&mut watcher, two, 4096, NAMES, false).await;
+    let tree_mid = arm(&mut watcher, tree, 4096, NAMES, true).await;
+
+    rename(&mut maker, "d\\one\\f", "d\\two\\f", false, 0).await;
+    assert_eq!(
+        wait_notify(&mut watcher, one_mid, 4096).await,
+        (STATUS_SUCCESS, vec![removed("f")])
+    );
+    assert_eq!(
+        wait_notify(&mut watcher, two_mid, 4096).await,
+        (STATUS_SUCCESS, vec![added("f")])
+    );
+    assert_eq!(
+        wait_notify(&mut watcher, tree_mid, 4096).await,
+        (STATUS_SUCCESS, vec![removed("one\\f"), added("two\\f")])
+    );
+
+    // A request without WATCH_TREE gets no nested names.
+    rename(&mut maker, "d\\two\\f", "d\\one\\f", false, 0).await;
+    let (st, _) = ask(&mut watcher, tree, 4096, NAMES, false).await;
+    assert_eq!(st, STATUS_NOTIFY_ENUM_DIR);
+}
+
+#[tokio::test]
+async fn a_rename_over_a_file_reports_the_target_removed_then_the_rename() {
+    let (srv, _td) = server().await;
+    let mut watcher = srv.client().await;
+    let mut maker = srv.client().await;
+    make_dir(&mut maker, "o").await;
+    create_file(&mut maker, "d\\a").await;
+    create_file(&mut maker, "d\\t").await;
+    create_file(&mut maker, "d\\u").await;
+    create_file(&mut maker, "o\\u").await;
+    let dir = watcher.open_dir("d").await;
+    let other = watcher.open_dir("o").await;
+    let mid = arm(&mut watcher, dir, 4096, NAMES, false).await;
+    rename(&mut maker, "d\\a", "d\\t", true, 0).await;
+    assert_eq!(
+        wait_notify(&mut watcher, mid, 4096).await,
+        (
+            STATUS_SUCCESS,
+            vec![removed("t"), old_name("a"), new_name("t")]
+        )
+    );
+
+    // A move over a file in another directory.
+    let mid = arm(&mut watcher, dir, 4096, NAMES, false).await;
+    let other_mid = arm(&mut watcher, other, 4096, NAMES, false).await;
+    rename(&mut maker, "o\\u", "d\\u", true, 0).await;
+    assert_eq!(
+        wait_notify(&mut watcher, mid, 4096).await,
+        (STATUS_SUCCESS, vec![removed("u"), added("u")])
+    );
+    assert_eq!(
+        wait_notify(&mut watcher, other_mid, 4096).await,
+        (STATUS_SUCCESS, vec![removed("u")])
+    );
+}
+
+#[tokio::test]
+async fn a_renamed_watched_directory_keeps_its_buffer_and_its_watch() {
+    let (srv, _td) = server().await;
+    let mut watcher = srv.client().await;
+    let mut maker = srv.client().await;
+    make_dir(&mut maker, "d\\sub").await;
+    let sub = watcher.open_dir("d\\sub").await;
+    let mid = arm(&mut watcher, sub, 4096, NAMES, false).await;
+    create_file(&mut maker, "d\\sub\\a").await;
+    assert_eq!(
+        wait_notify(&mut watcher, mid, 4096).await,
+        (STATUS_SUCCESS, vec![added("a")])
+    );
+    create_file(&mut maker, "d\\sub\\b").await;
+    rename(&mut maker, "d\\sub", "d\\moved", false, FILE_DIRECTORY_FILE).await;
+    create_file(&mut maker, "d\\moved\\c").await;
+    let (st, body) = ask(&mut watcher, sub, 4096, NAMES, false).await;
+    assert_eq!(st, STATUS_SUCCESS);
+    assert_eq!(notify_entries(&body, 4096), [added("b"), added("c")]);
+}
+
+#[tokio::test]
+async fn renaming_an_ancestor_of_an_open_directory_is_refused() {
+    let (srv, _td) = server().await;
+    let mut watcher = srv.client().await;
+    let mut maker = srv.client().await;
+    make_dir(&mut maker, "d\\p").await;
+    make_dir(&mut maker, "d\\p\\q").await;
+    let deep = watcher.open_dir("d\\p\\q").await;
+    let mid = arm(&mut watcher, deep, 4096, NAMES, true).await;
+    for (from, to) in [("d\\p", "d\\r"), ("d", "z")] {
+        let status = rename_status(&mut maker, from, to, false, FILE_DIRECTORY_FILE).await;
+        assert_eq!(status, STATUS_ACCESS_DENIED, "rename {from}");
+    }
+    create_file(&mut maker, "d\\p\\q\\after").await;
+    assert_eq!(
+        wait_notify(&mut watcher, mid, 4096).await,
+        (STATUS_SUCCESS, vec![added("after")])
+    );
+}
+
+#[tokio::test]
+async fn a_rename_reaches_watches_by_the_kind_of_entry() {
+    let (srv, _td) = server().await;
+    let mut watcher = srv.client().await;
+    let mut maker = srv.client().await;
+    make_dir(&mut maker, "d\\sub").await;
+    create_file(&mut maker, "d\\f").await;
+    let dirs = watcher.open_dir("d").await;
+    let files = watcher.open_dir("d").await;
+    let dirs_mid = arm(&mut watcher, dirs, 4096, FILE_NOTIFY_CHANGE_DIR_NAME, false).await;
+    let files_mid = arm(
+        &mut watcher,
+        files,
+        4096,
+        FILE_NOTIFY_CHANGE_FILE_NAME,
+        false,
+    )
+    .await;
+
+    rename(&mut maker, "d\\sub", "d\\sub2", false, FILE_DIRECTORY_FILE).await;
+    assert_eq!(
+        wait_notify(&mut watcher, dirs_mid, 4096).await,
+        (STATUS_SUCCESS, vec![old_name("sub"), new_name("sub2")])
+    );
+    rename(&mut maker, "d\\f", "d\\g", false, 0).await;
+    assert_eq!(
+        wait_notify(&mut watcher, files_mid, 4096).await,
+        (STATUS_SUCCESS, vec![old_name("f"), new_name("g")])
+    );
+    // The file's rename was not buffered for the directory watch.
+    let body = notify_body(dirs, 4096, FILE_NOTIFY_CHANGE_DIR_NAME, false);
+    let mid = watcher.send_no_wait(Command::ChangeNotify, &body).await;
+    let frame = within(watcher.next_frame()).await;
+    assert_eq!(interim(&frame).map(|(m, _)| m), Some(mid));
 }

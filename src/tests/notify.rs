@@ -11,11 +11,12 @@ use crate::proto::header::{
     Command, SMB2_FLAGS_ASYNC_COMMAND, SMB2_FLAGS_RELATED_OPERATIONS, SMB2_HEADER_LEN,
 };
 use crate::proto::messages::change_notify::{
-    FILE_ACTION_ADDED, FILE_ACTION_REMOVED, FILE_NOTIFY_CHANGE_FILE_NAME,
+    FILE_ACTION_ADDED, FILE_ACTION_REMOVED, FILE_ACTION_RENAMED_NEW_NAME,
+    FILE_ACTION_RENAMED_OLD_NAME, FILE_NOTIFY_CHANGE_FILE_NAME,
 };
 use crate::proto::messages::{
     ChangeNotifyRequest, ChangeNotifyResponse, CloseRequest, CreateContext, CreateRequest,
-    CreateResponse, FileId, LeaseBreakAck, LeaseContext, QueryInfoRequest,
+    CreateResponse, FileId, LeaseBreakAck, LeaseContext, QueryInfoRequest, SetInfoRequest,
 };
 use crate::server::{ConfigHandle, ServerState};
 use crate::tests::memfs::MemFsBackend;
@@ -783,5 +784,512 @@ async fn a_create_that_waits_for_a_lease_break_reports_its_file_once() {
     assert_eq!(
         entries(&final_of(&mut watcher, async_id).await),
         [added("z")]
+    );
+}
+
+/// Renames `name`, opened with `options`, to `to`, replacing an existing
+/// target when `replace`.
+async fn rename(
+    peer: &mut Peer,
+    state: &Arc<ServerState>,
+    name: &str,
+    to: &str,
+    replace: bool,
+    options: u32,
+) {
+    let status = rename_status(peer, state, name, to, replace, options).await;
+    assert_eq!(status, 0, "rename {name} to {to}");
+}
+
+/// [`rename`], returning the status of the SET_INFO.
+async fn rename_status(
+    peer: &mut Peer,
+    state: &Arc<ServerState>,
+    name: &str,
+    to: &str,
+    replace: bool,
+    options: u32,
+) -> u32 {
+    let body = create_body(name, DELETE | 0x80, 1, options);
+    let (_, reply) = peer.request(state, Command::Create, &body).await;
+    assert_eq!(status(&reply), 0, "open {name} for renaming");
+    let file_id = CreateResponse::parse(&reply[SMB2_HEADER_LEN..])
+        .expect("create response")
+        .file_id;
+    let target = crate::utils::utf16le(to);
+    let mut buffer = vec![u8::from(replace)];
+    buffer.extend_from_slice(&[0; 15]);
+    buffer.extend_from_slice(&(target.len() as u32).to_le_bytes());
+    buffer.extend_from_slice(&target);
+    let mut body = Vec::new();
+    SetInfoRequest {
+        structure_size: 33,
+        info_type: 1,
+        file_information_class: 10,
+        buffer_length: buffer.len() as u32,
+        buffer_offset: 0x60,
+        reserved: 0,
+        additional_information: 0,
+        file_id,
+        buffer,
+    }
+    .write_to(&mut body)
+    .expect("set info");
+    let (_, reply) = peer.request(state, Command::SetInfo, &body).await;
+    close(peer, state, file_id).await;
+    status(&reply)
+}
+
+/// Arms a watch on `dir` and cancels the request, so later changes are
+/// buffered with no request waiting.
+async fn arm_idle(peer: &mut Peer, state: &Arc<ServerState>, dir: FileId, tree: bool) {
+    let mut body = notify_body(dir, 4096, NAMES);
+    body[2] = u8::from(tree);
+    let (mid, interim) = peer.request(state, Command::ChangeNotify, &body).await;
+    let async_id = header(&interim).async_id().expect("waiting");
+    let cancel = peer.message_with(Command::Cancel, mid, 1, &[4, 0, 0, 0]);
+    peer.dispatch(state, &cancel).await;
+    let last = final_of(peer, async_id).await;
+    assert_eq!(status(&last), ntstatus::STATUS_CANCELLED);
+}
+
+#[tokio::test]
+async fn a_replaced_target_spelled_differently_is_removed_under_its_stored_name() {
+    let (state, _) = server();
+    let mut watcher = Peer::new(&state, false).await;
+    let mut maker = Peer::new(&state, false).await;
+    let dir = open_dir(&mut watcher, &state, "d").await;
+    create_file(&mut maker, &state, "d\\a").await;
+    create_file(&mut maker, &state, "d\\t.txt").await;
+    let (_, async_id) = wait_notify(&mut watcher, &state, dir).await;
+    rename(&mut maker, &state, "d\\a", "d\\T.TXT", true, 0).await;
+    assert_eq!(
+        entries(&final_of(&mut watcher, async_id).await),
+        [
+            (FILE_ACTION_REMOVED, "t.txt".to_string()),
+            (FILE_ACTION_RENAMED_OLD_NAME, "a".to_string()),
+            (FILE_ACTION_RENAMED_NEW_NAME, "T.TXT".to_string()),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_change_of_case_removes_the_stored_name_first() {
+    let (state, _) = server();
+    let mut watcher = Peer::new(&state, false).await;
+    let mut maker = Peer::new(&state, false).await;
+    let dir = open_dir(&mut watcher, &state, "d").await;
+    create_file(&mut maker, &state, "d\\x.txt").await;
+    let (_, async_id) = wait_notify(&mut watcher, &state, dir).await;
+    rename(&mut maker, &state, "d\\x.txt", "d\\X.TXT", false, 0).await;
+    assert_eq!(
+        entries(&final_of(&mut watcher, async_id).await),
+        [
+            (FILE_ACTION_REMOVED, "x.txt".to_string()),
+            (FILE_ACTION_RENAMED_OLD_NAME, "x.txt".to_string()),
+            (FILE_ACTION_RENAMED_NEW_NAME, "X.TXT".to_string()),
+        ]
+    );
+}
+
+/// A point a backend call stops at until the test lets it go.
+struct Gate {
+    reached: tokio::sync::Semaphore,
+    go: tokio::sync::Semaphore,
+}
+
+impl Default for Gate {
+    fn default() -> Self {
+        Self {
+            reached: tokio::sync::Semaphore::new(0),
+            go: tokio::sync::Semaphore::new(0),
+        }
+    }
+}
+
+impl Gate {
+    async fn pass(&self) {
+        self.reached.add_permits(1);
+        self.go.acquire().await.expect("gate").forget();
+    }
+
+    /// Waits until a call stops here.
+    async fn reached(&self) {
+        let reached = self.reached.acquire();
+        tokio::time::timeout(Duration::from_secs(5), reached)
+            .await
+            .expect("the gate is reached in time")
+            .expect("gate")
+            .forget();
+    }
+
+    fn open(&self) {
+        self.go.add_permits(1);
+    }
+}
+
+/// Memory backend whose creates of a file named `x`, and stats of handles
+/// opened on such a file, stop at the gates given, and which counts the
+/// renames that reach it. With `blind`, opening an existing directory
+/// fails.
+#[derive(Clone, Default)]
+struct Gated {
+    inner: MemFsBackend,
+    create: Option<Arc<Gate>>,
+    stat: Option<Arc<Gate>>,
+    blind: bool,
+    renames: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Gated {
+    fn renames(&self) -> usize {
+        self.renames.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn state(&self) -> Arc<ServerState> {
+        SmbServer::builder()
+            .listen("127.0.0.1:0".parse().unwrap())
+            .share(Share::new("home", self.clone()).public())
+            .build()
+            .expect("build")
+            .state()
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::ShareBackend for Gated {
+    async fn open(
+        &self,
+        path: &crate::SmbPath,
+        opts: crate::OpenOptions,
+    ) -> crate::SmbResult<(Box<dyn crate::Handle>, crate::OpenAction)> {
+        if self.blind && opts.directory && opts.intent == crate::OpenIntent::Open {
+            return Err(crate::SmbError::AccessDenied);
+        }
+        let gated = path.file_name() == Some("x");
+        if gated
+            && opts.intent == crate::OpenIntent::Create
+            && let Some(gate) = &self.create
+        {
+            gate.pass().await;
+        }
+        let (handle, action) = self.inner.open(path, opts).await?;
+        match &self.stat {
+            Some(gate) if gated => {
+                let handle = GatedHandle {
+                    inner: handle,
+                    stat: Arc::clone(gate),
+                };
+                Ok((Box::new(handle), action))
+            }
+            _ => Ok((handle, action)),
+        }
+    }
+
+    async fn unlink(&self, path: &crate::SmbPath) -> crate::SmbResult<()> {
+        self.inner.unlink(path).await
+    }
+
+    async fn rename(
+        &self,
+        from: &crate::SmbPath,
+        to: &crate::SmbPath,
+        replace: bool,
+    ) -> crate::SmbResult<()> {
+        self.renames
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.rename(from, to, replace).await
+    }
+
+    fn capabilities(&self) -> crate::BackendCapabilities {
+        self.inner.capabilities()
+    }
+}
+
+/// A handle whose `stat` stops at a gate.
+struct GatedHandle {
+    inner: Box<dyn crate::Handle>,
+    stat: Arc<Gate>,
+}
+
+#[async_trait::async_trait]
+impl crate::Handle for GatedHandle {
+    async fn read(&self, offset: u64, len: u32) -> crate::SmbResult<bytes::Bytes> {
+        self.inner.read(offset, len).await
+    }
+
+    async fn write(&self, offset: u64, data: &[u8]) -> crate::SmbResult<u32> {
+        self.inner.write(offset, data).await
+    }
+
+    async fn flush(&self) -> crate::SmbResult<()> {
+        self.inner.flush().await
+    }
+
+    async fn stat(&self) -> crate::SmbResult<crate::FileInfo> {
+        self.stat.pass().await;
+        self.inner.stat().await
+    }
+
+    async fn set_times(&self, times: crate::FileTimes) -> crate::SmbResult<()> {
+        self.inner.set_times(times).await
+    }
+
+    async fn set_attributes(&self, attributes: u32) -> crate::SmbResult<()> {
+        self.inner.set_attributes(attributes).await
+    }
+
+    async fn truncate(&self, len: u64) -> crate::SmbResult<()> {
+        self.inner.truncate(len).await
+    }
+
+    async fn list_dir(&self, pattern: Option<&str>) -> crate::SmbResult<Vec<crate::DirEntry>> {
+        self.inner.list_dir(pattern).await
+    }
+
+    async fn close(self: Box<Self>) -> crate::SmbResult<()> {
+        self.inner.close().await
+    }
+}
+
+/// Opens `name` for reading and writing, creating it when `create`, and
+/// keeps it open.
+async fn hold_open(peer: &mut Peer, state: &Arc<ServerState>, name: &str, options: u32) -> FileId {
+    let body = create_body(name, 0x0012_0116 | DELETE, FILE_OPEN_IF, options);
+    let (_, reply) = peer.request(state, Command::Create, &body).await;
+    assert_eq!(status(&reply), 0, "open {name}");
+    CreateResponse::parse(&reply[SMB2_HEADER_LEN..])
+        .expect("create response")
+        .file_id
+}
+
+#[tokio::test]
+async fn a_directory_rename_waits_for_a_create_below_it_and_is_refused() {
+    let gate = Arc::new(Gate::default());
+    let backend = Gated {
+        create: Some(Arc::clone(&gate)),
+        ..Gated::default()
+    };
+    let state = backend.state();
+    let mut watcher = Peer::new(&state, false).await;
+    let top = open_dir(&mut watcher, &state, "d").await;
+    let sub = open_dir(&mut watcher, &state, "d\\sub").await;
+    arm_idle(&mut watcher, &state, top, true).await;
+    arm_idle(&mut watcher, &state, sub, false).await;
+
+    let mut maker = Peer::new(&state, false).await;
+    let creating = tokio::spawn({
+        let state = Arc::clone(&state);
+        async move {
+            let body = create_body("d\\sub\\x", 0x0012_0116, FILE_CREATE, 0);
+            let (_, reply) = maker.request(&state, Command::Create, &body).await;
+            assert_eq!(status(&reply), 0);
+            let file_id = CreateResponse::parse(&reply[SMB2_HEADER_LEN..])
+                .expect("create response")
+                .file_id;
+            (maker, file_id)
+        }
+    });
+    gate.reached().await;
+    let mut renamer = Peer::new(&state, false).await;
+    let renaming = tokio::spawn({
+        let state = Arc::clone(&state);
+        async move {
+            let status = rename_status(
+                &mut renamer,
+                &state,
+                "d\\sub",
+                "d\\moved",
+                false,
+                FILE_DIRECTORY_FILE,
+            )
+            .await;
+            (renamer, status)
+        }
+    });
+    settle().await;
+    assert_eq!(backend.renames(), 0, "the rename waits for the create");
+    gate.open();
+    let (mut maker, x) = creating.await.expect("create");
+    let (mut renamer, refused) = renaming.await.expect("rename");
+    // The new file is open below the directory.
+    assert_eq!(refused, ntstatus::STATUS_ACCESS_DENIED);
+    assert_eq!(backend.renames(), 0);
+
+    close(&mut maker, &state, x).await;
+    rename(
+        &mut renamer,
+        &state,
+        "d\\sub",
+        "d\\moved",
+        false,
+        FILE_DIRECTORY_FILE,
+    )
+    .await;
+    create_file(&mut maker, &state, "d\\moved\\y").await;
+    let (_, reply) = watcher
+        .request(
+            &state,
+            Command::ChangeNotify,
+            &notify_body(sub, 4096, NAMES),
+        )
+        .await;
+    assert_eq!(entries(&reply), [added("x"), added("y")]);
+    let mut body = notify_body(top, 4096, NAMES);
+    body[2] = 1;
+    let (_, reply) = watcher.request(&state, Command::ChangeNotify, &body).await;
+    assert_eq!(
+        entries(&reply),
+        [
+            added("sub\\x"),
+            (FILE_ACTION_RENAMED_OLD_NAME, "sub".to_string()),
+            (FILE_ACTION_RENAMED_NEW_NAME, "moved".to_string()),
+            added("moved\\y"),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_created_file_enters_the_file_table_before_a_rename_runs() {
+    let gate = Arc::new(Gate::default());
+    let backend = Gated {
+        stat: Some(Arc::clone(&gate)),
+        ..Gated::default()
+    };
+    let state = backend.state();
+    let mut maker = Peer::new(&state, false).await;
+    open_dir(&mut maker, &state, "d").await;
+    let creating = tokio::spawn({
+        let state = Arc::clone(&state);
+        async move {
+            let body = create_body("d\\x", 0x0012_0116, FILE_CREATE, 0);
+            let (_, reply) = maker.request(&state, Command::Create, &body).await;
+            (maker, status(&reply))
+        }
+    });
+    gate.reached().await;
+    let mut renamer = Peer::new(&state, false).await;
+    let renaming = tokio::spawn({
+        let state = Arc::clone(&state);
+        async move { rename_status(&mut renamer, &state, "d", "e", false, FILE_DIRECTORY_FILE).await }
+    });
+    settle().await;
+    assert_eq!(backend.renames(), 0, "the rename waits for the create");
+    gate.open();
+    let (_maker, created) = creating.await.expect("create");
+    assert_eq!(created, 0);
+    assert_eq!(
+        renaming.await.expect("rename"),
+        ntstatus::STATUS_ACCESS_DENIED
+    );
+    let share = home(&state).await;
+    assert!(share.files.path_is_open(&"d\\x".parse().unwrap(), false));
+}
+
+#[tokio::test]
+async fn a_delete_that_waited_for_a_rename_removes_the_file_by_its_new_name() {
+    let gate = Arc::new(Gate::default());
+    let backend = Gated {
+        create: Some(Arc::clone(&gate)),
+        ..Gated::default()
+    };
+    let state = backend.state();
+    let share = home(&state).await;
+    let mut watcher = Peer::new(&state, false).await;
+    let dir = open_dir(&mut watcher, &state, "d").await;
+    open_dir(&mut watcher, &state, "o").await;
+    let mut deleter = Peer::new(&state, false).await;
+    let doomed = hold_open(&mut deleter, &state, "d\\f", FILE_DELETE_ON_CLOSE).await;
+    arm_idle(&mut watcher, &state, dir, false).await;
+
+    // A create elsewhere holds renames off while the rename queues, and
+    // the delete then queues behind the rename.
+    let mut maker = Peer::new(&state, false).await;
+    let creating = tokio::spawn({
+        let state = Arc::clone(&state);
+        async move { create_file(&mut maker, &state, "o\\x").await }
+    });
+    gate.reached().await;
+    let mut renamer = Peer::new(&state, false).await;
+    let renaming = tokio::spawn({
+        let state = Arc::clone(&state);
+        async move { rename(&mut renamer, &state, "d", "e", false, FILE_DIRECTORY_FILE).await }
+    });
+    settle().await;
+    let closing = tokio::spawn({
+        let state = Arc::clone(&state);
+        async move { close(&mut deleter, &state, doomed).await }
+    });
+    let pending = "d\\f".parse().unwrap();
+    for _ in 0..100 {
+        if share.files.delete_pending_at(&pending, false) {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(share.files.delete_pending_at(&pending, false));
+    settle().await;
+    assert_eq!(backend.renames(), 0);
+    {
+        use crate::ShareBackend as _;
+        let opts = crate::OpenOptions::default();
+        let f = backend.inner.open(&pending, opts).await;
+        assert!(f.is_ok(), "the delete waits behind the rename");
+        f.unwrap().0.close().await.unwrap();
+    }
+    gate.open();
+    creating.await.expect("create");
+    renaming.await.expect("rename");
+    closing.await.expect("close");
+
+    use crate::ShareBackend as _;
+    let opts = crate::OpenOptions::default();
+    for gone in ["d\\f", "e\\f"] {
+        let path: crate::SmbPath = gone.parse().unwrap();
+        assert!(backend.inner.open(&path, opts).await.is_err(), "{gone}");
+    }
+    let (_, reply) = watcher
+        .request(
+            &state,
+            Command::ChangeNotify,
+            &notify_body(dir, 4096, NAMES),
+        )
+        .await;
+    assert_eq!(entries(&reply), [(FILE_ACTION_REMOVED, "f".to_string())]);
+}
+
+#[tokio::test]
+async fn names_below_a_renamed_directory_compare_without_case() {
+    let (state, _) = server();
+    let mut holder = Peer::new(&state, false).await;
+    open_dir(&mut holder, &state, "D").await;
+    open_dir(&mut holder, &state, "D\\SUB").await;
+    hold_open(&mut holder, &state, "D\\SUB\\x", 0).await;
+    let mut renamer = Peer::new(&state, false).await;
+    open_dir(&mut renamer, &state, "d").await;
+    let status = rename_status(&mut renamer, &state, "d", "e", false, FILE_DIRECTORY_FILE).await;
+    assert_eq!(status, ntstatus::STATUS_ACCESS_DENIED);
+}
+
+#[tokio::test]
+async fn a_rename_whose_stored_name_cannot_be_looked_up_is_reported_as_a_rename() {
+    let backend = Gated {
+        blind: true,
+        ..Gated::default()
+    };
+    let state = backend.state();
+    let mut watcher = Peer::new(&state, false).await;
+    let mut maker = Peer::new(&state, false).await;
+    let dir = open_dir(&mut watcher, &state, "d").await;
+    create_file(&mut maker, &state, "d\\a").await;
+    create_file(&mut maker, &state, "d\\t").await;
+    let (_, async_id) = wait_notify(&mut watcher, &state, dir).await;
+    rename(&mut maker, &state, "d\\a", "d\\t", true, 0).await;
+    assert_eq!(
+        entries(&final_of(&mut watcher, async_id).await),
+        [
+            (FILE_ACTION_RENAMED_OLD_NAME, "a".to_string()),
+            (FILE_ACTION_RENAMED_NEW_NAME, "t".to_string()),
+        ]
     );
 }

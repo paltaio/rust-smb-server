@@ -304,23 +304,10 @@ async fn closing_the_renamed_open_ends_a_waiting_rename() {
 }
 
 #[tokio::test]
-async fn renames_and_deletes_break_handle_caching_without_waiting() {
+async fn a_rename_or_delete_of_a_file_breaks_handle_caching_without_waiting() {
     let (server, _td) = server().await;
     let mut a = server.client().await;
     let mut b = server.client().await;
-    // A file open below a renamed directory.
-    hold_rh(&mut a, "d\\f.txt", KEY_A, SHARE_ALL).await;
-    let dir = b
-        .open_with_options("d", DELETE | FILE_READ_ATTRIBUTES, FILE_DIRECTORY_FILE)
-        .await
-        .unwrap();
-    let (status, _) = b
-        .send(Command::SetInfo, &rename_body(dir, "e", false))
-        .await;
-    assert_eq!(status, 0);
-    let n = a.next_break(WAIT).await.expect("break below the directory");
-    assert_break(&n, KEY_A, RH, R);
-
     // The renamed file itself.
     hold_rh(&mut a, "g.txt", KEY_B, SHARE_ALL).await;
     let g = b
@@ -344,6 +331,53 @@ async fn renames_and_deletes_break_handle_caching_without_waiting() {
     assert_eq!(b.set_delete(f, true).await, 0);
     let n = a.next_break(WAIT).await.expect("break of the deleted file");
     assert_break(&n, key, RH, R);
+}
+
+#[tokio::test]
+async fn a_directory_rename_waits_for_handle_caching_below_it_to_be_given_up() {
+    let (server, _td) = server().await;
+    let mut a = server.client().await;
+    let mut b = server.client().await;
+    let below = hold_rh(&mut a, "d\\f.txt", KEY_A, SHARE_ALL).await;
+    let dir = b
+        .open_with_options("d", DELETE | FILE_READ_ATTRIBUTES, FILE_DIRECTORY_FILE)
+        .await
+        .unwrap();
+
+    // The client keeps its handle: the rename fails once it has answered.
+    let mid = b
+        .send_no_wait(Command::SetInfo, &rename_body(dir, "e", false))
+        .await;
+    b.recv_interim(mid).await;
+    let n = a.next_break(WAIT).await.expect("break below the directory");
+    assert_break(&n, KEY_A, RH, R);
+    assert_eq!(ack(&mut a, KEY_A, R).await, (0, Some(R)));
+    let (status, _) = b.recv(mid, Command::SetInfo).await;
+    assert_eq!(status, ntstatus::STATUS_ACCESS_DENIED);
+
+    // Without the handle below, the rename goes through.
+    a.close(below).await;
+    let (status, _) = b
+        .send(Command::SetInfo, &rename_body(dir, "e", false))
+        .await;
+    assert_eq!(status, 0);
+}
+
+#[tokio::test]
+async fn renaming_the_share_root_is_refused_without_breaking_leases() {
+    let (server, _td) = server().await;
+    let mut a = server.client().await;
+    let mut b = server.client().await;
+    hold_rh(&mut a, "d\\f.txt", KEY_A, SHARE_ALL).await;
+    let root = b
+        .open_with_options("", DELETE | FILE_READ_ATTRIBUTES, FILE_DIRECTORY_FILE)
+        .await
+        .unwrap();
+    let (status, _) = b
+        .send(Command::SetInfo, &rename_body(root, "e", false))
+        .await;
+    assert_eq!(status, ntstatus::STATUS_ACCESS_DENIED);
+    assert!(a.drain_breaks().await.is_empty());
 }
 
 #[tokio::test]
