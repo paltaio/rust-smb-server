@@ -345,6 +345,55 @@ async fn a_kept_open_closes_when_its_time_runs_out() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_kept_open_that_wrote_reports_the_write_when_it_expires() {
+    let (state, _files) = server().await;
+    let mut watcher = Peer::new(&state, false).await;
+    let root = Open {
+        access: 0x0012_0089,
+        options: 0x1,
+        name: Some(""),
+        ..Open::default()
+    };
+    let root = create(&mut watcher, &state, root).await.file_id;
+    let mut notify = Vec::new();
+    crate::proto::messages::ChangeNotifyRequest {
+        structure_size: 32,
+        flags: 0,
+        output_buffer_length: 4096,
+        file_id: root,
+        completion_filter: 0x10,
+        reserved: 0,
+    }
+    .write_to(&mut notify)
+    .expect("change notify");
+    let (_, interim) = watcher
+        .request(&state, Command::ChangeNotify, &notify)
+        .await;
+    assert_eq!(status(&interim), ntstatus::STATUS_PENDING);
+
+    let mut peer = Peer::from_client(&state, true, CLIENT).await;
+    let resp = create(&mut peer, &state, Open::durable(RWH)).await;
+    assert!(is_durable(&resp), "durable granted");
+    let (_, reply) = peer
+        .request(&state, Command::Write, &write_body(resp.file_id))
+        .await;
+    assert_eq!(status(&reply), 0);
+    peer.drop_connection(&state).await;
+    settle().await;
+    assert!(watcher.rx.try_recv().is_none(), "kept, not closed");
+
+    tokio::time::sleep(TIMEOUT).await;
+    let last = watcher.next().await;
+    assert_eq!(status(&last), 0);
+    let entries = crate::proto::messages::ChangeNotifyResponse::parse(&last[SMB2_HEADER_LEN..])
+        .expect("notify response")
+        .buffer;
+    // MODIFIED f.txt.
+    assert_eq!(entries[4..8], 3u32.to_le_bytes());
+    assert_eq!(entries[12..], crate::utils::utf16le("f.txt"));
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_sharing_violation_closes_a_kept_open_without_waiting() {
     let (state, files) = server().await;
     let open = Open {

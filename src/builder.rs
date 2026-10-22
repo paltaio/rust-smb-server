@@ -151,12 +151,12 @@ impl Share {
 
     /// Answer change notification requests: a client watching a folder, as
     /// Explorer and Finder do for an open window, hears when a file or
-    /// folder in it is created, deleted or renamed through any connection to
-    /// this share. Writes, truncation, attribute and time changes, and
-    /// overwrites by CREATE are not reported, and neither are changes made
-    /// outside the server or through another share over the same directory.
-    /// When off, such requests fail with STATUS_NOT_SUPPORTED. On by
-    /// default.
+    /// folder in it is created, deleted, renamed, written, truncated or
+    /// overwritten, or has its attributes or times set, through any
+    /// connection to this share. A write is reported when the open that
+    /// wrote it closes. Changes made outside the server, or through another share
+    /// over the same directory, are not reported. When off, such requests
+    /// fail with STATUS_NOT_SUPPORTED. On by default.
     pub fn change_notify(mut self, enabled: bool) -> Self {
         self.change_notify = enabled;
         self

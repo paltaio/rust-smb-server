@@ -6,10 +6,10 @@ use std::time::Duration;
 use smb_server::wire::header::Command;
 use smb_server::wire::messages::{ChangeNotifyRequest, ChangeNotifyResponse, FileId};
 
-use super::client::Client;
+use super::client::{Client, interim};
 
 pub use smb_server::wire::messages::change_notify::{
-    FILE_ACTION_ADDED, FILE_ACTION_REMOVED, FILE_ACTION_RENAMED_NEW_NAME,
+    FILE_ACTION_ADDED, FILE_ACTION_MODIFIED, FILE_ACTION_REMOVED, FILE_ACTION_RENAMED_NEW_NAME,
     FILE_ACTION_RENAMED_OLD_NAME, FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME,
 };
 
@@ -130,4 +130,36 @@ pub fn old_name(name: &str) -> (u32, String) {
 
 pub fn new_name(name: &str) -> (u32, String) {
     (FILE_ACTION_RENAMED_NEW_NAME, name.to_string())
+}
+
+pub fn modified(name: &str) -> (u32, String) {
+    (FILE_ACTION_MODIFIED, name.to_string())
+}
+
+/// Arms a watch on `dir` and cancels the request, so later changes are
+/// buffered with no request waiting.
+pub async fn arm_idle(client: &mut Client, dir: FileId, filter: u32, tree: bool) {
+    let body = notify_body(dir, 4096, filter, tree);
+    let mid = client.send_no_wait(Command::ChangeNotify, &body).await;
+    let async_id = within(client.recv_interim(mid)).await;
+    client.cancel(mid, Some(async_id)).await;
+    let (status, _) = within(client.recv(mid, Command::ChangeNotify)).await;
+    assert_eq!(status, smb_server::ntstatus::STATUS_CANCELLED);
+}
+
+/// What a request on the armed watch `dir` gets at once, with `tree`, or
+/// `None` when it would wait; such a request is cancelled.
+pub async fn now(client: &mut Client, dir: FileId, tree: bool) -> Option<Vec<(u32, String)>> {
+    let body = notify_body(dir, 4096, 0, tree);
+    let mid = client.send_no_wait(Command::ChangeNotify, &body).await;
+    let frame = within(client.next_frame()).await;
+    match interim(&frame) {
+        Some((_, async_id)) => {
+            client.cancel(mid, Some(async_id)).await;
+            let (status, _) = within(client.recv(mid, Command::ChangeNotify)).await;
+            assert_eq!(status, smb_server::ntstatus::STATUS_CANCELLED);
+            None
+        }
+        None => Some(notify_entries(&frame[64..], 4096)),
+    }
 }

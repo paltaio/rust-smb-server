@@ -25,6 +25,10 @@ use smb_server::{Share, SmbServer, SmbServerBuilder};
 use tokio::net::TcpStream;
 
 const USER: &str = "alice";
+const LAST_WRITE: u32 = 0x10;
+const ATTRIBUTES: u32 = 0x4;
+/// The filter macOS clients use.
+const MACOS: u32 = 0xD47;
 const PASSWORD: &str = "password";
 
 /// `builder` with alice and the public share `share`, whose root holds the
@@ -162,7 +166,7 @@ async fn too_many_changes_between_requests_answer_enum_dir() {
     }
     let (st, body) = ask(&mut watcher, dir, 1000, NAMES, true).await;
     assert_eq!(st, STATUS_NOTIFY_ENUM_DIR);
-    assert_eq!(body, [9, 0, 0x48, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(body, [9, 0, 0x48, 0, 0, 0, 0, 0]);
 
     let mid = arm(&mut watcher, dir, 1000, NAMES, true).await;
     create_file(&mut maker, "d\\last").await;
@@ -235,7 +239,7 @@ async fn tree_disconnect_ends_a_waiting_request_with_cleanup() {
     );
     let (st, body) = within(watcher.recv(mid, Command::ChangeNotify)).await;
     assert_eq!(st, STATUS_NOTIFY_CLEANUP);
-    assert_eq!(body, [9, 0, 0x48, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(body, [9, 0, 0x48, 0, 0, 0, 0, 0]);
 }
 
 #[tokio::test]
@@ -376,14 +380,16 @@ async fn a_failed_reauthentication_ends_the_sessions_requests_with_cleanup() {
 }
 
 #[tokio::test]
-async fn overwriting_or_superseding_a_file_reports_nothing() {
+async fn an_overwrite_or_supersede_reports_new_contents() {
     let (srv, _td) = server().await;
     let mut watcher = srv.client().await;
     let mut maker = srv.client().await;
     let dir = watcher.open_dir("d").await;
+    let names = watcher.open_dir("d").await;
     create_file(&mut maker, "d\\f").await;
-    let mid = arm(&mut watcher, dir, 4096, NAMES, false).await;
+    arm_idle(&mut watcher, names, NAMES, false).await;
     for disposition in [FILE_OVERWRITE_IF, FILE_SUPERSEDE] {
+        let mid = arm(&mut watcher, dir, 4096, LAST_WRITE, false).await;
         let created = maker
             .create(Create {
                 name: "d\\f",
@@ -394,12 +400,153 @@ async fn overwriting_or_superseding_a_file_reports_nothing() {
             .await
             .expect("overwrite");
         maker.close(created.file_id).await;
+        assert_eq!(
+            wait_notify(&mut watcher, mid, 4096).await,
+            (STATUS_SUCCESS, vec![modified("f")])
+        );
     }
-    create_file(&mut maker, "d\\z").await;
+    assert_eq!(now(&mut watcher, names, false).await, None);
+}
+
+#[tokio::test]
+async fn attributes_set_through_basic_info_are_reported_under_attributes() {
+    let (srv, _td) = server().await;
+    let mut watcher = srv.client().await;
+    let mut maker = srv.client().await;
+    create_file(&mut maker, "d\\f").await;
+    let mut watches = Vec::new();
+    for filter in [ATTRIBUTES, MACOS, LAST_WRITE] {
+        let dir = watcher.open_dir("d").await;
+        arm_idle(&mut watcher, dir, filter, false).await;
+        watches.push(dir);
+    }
+    let file = maker
+        .open(
+            "d\\f",
+            FILE_WRITE_ATTRIBUTES | FILE_READ_ATTRIBUTES,
+            SHARE_ALL,
+        )
+        .await
+        .unwrap();
+    let mut basic = vec![0u8; 40];
+    basic[32..36].copy_from_slice(&FILE_ATTRIBUTE_READONLY.to_le_bytes());
+    assert_eq!(maker.set_info(file, FILE_BASIC_INFORMATION, basic).await, 0);
+    maker.close(file).await;
+    let found = [
+        now(&mut watcher, watches[0], false).await,
+        now(&mut watcher, watches[1], false).await,
+        now(&mut watcher, watches[2], false).await,
+    ];
     assert_eq!(
-        wait_notify(&mut watcher, mid, 4096).await,
-        (STATUS_SUCCESS, vec![added("z")])
+        found,
+        [Some(vec![modified("f")]), Some(vec![modified("f")]), None]
     );
+}
+
+#[tokio::test]
+async fn a_rename_into_a_subdirectory_modifies_it_for_write_time_watchers() {
+    let (srv, _td) = server().await;
+    let mut watcher = srv.client().await;
+    let mut maker = srv.client().await;
+    make_dir(&mut maker, "o").await;
+    make_dir(&mut maker, "d\\sub").await;
+    create_file(&mut maker, "d\\b.txt").await;
+    create_file(&mut maker, "d\\sub\\f2").await;
+    let plain = watcher.open_dir("d").await;
+    let tree = watcher.open_dir("d").await;
+    let macos = watcher.open_dir("d").await;
+    arm_idle(&mut watcher, plain, 0x17, false).await;
+    arm_idle(&mut watcher, tree, 0x17, true).await;
+    arm_idle(&mut watcher, macos, MACOS, false).await;
+    let seen = async |watcher: &mut Client| {
+        [
+            now(watcher, plain, false).await,
+            now(watcher, tree, true).await,
+            now(watcher, macos, false).await,
+        ]
+    };
+
+    // A rename inside the subdirectory.
+    rename(&mut maker, "d\\sub\\f2", "d\\sub\\f3", false, 0).await;
+    assert_eq!(
+        seen(&mut watcher).await,
+        [
+            Some(vec![modified("sub")]),
+            Some(vec![
+                old_name("sub\\f2"),
+                new_name("sub\\f3"),
+                modified("sub")
+            ]),
+            None,
+        ]
+    );
+    // A move into it.
+    rename(&mut maker, "d\\b.txt", "d\\sub\\b.txt", false, 0).await;
+    assert_eq!(
+        seen(&mut watcher).await,
+        [
+            Some(vec![removed("b.txt"), modified("sub")]),
+            Some(vec![removed("b.txt"), added("sub\\b.txt"), modified("sub")]),
+            Some(vec![removed("b.txt")]),
+        ]
+    );
+    // Creating, writing and deleting a file in it, and moving one out of
+    // it, leave it as it was.
+    let file = maker
+        .create(Create {
+            name: "d\\sub\\c.txt",
+            disposition: FILE_CREATE,
+            ..Create::default()
+        })
+        .await
+        .unwrap()
+        .file_id;
+    assert_eq!(maker.write(file, 0, b"data").await, Ok(4));
+    maker.close(file).await;
+    delete(&mut maker, "d\\sub\\c.txt", 0).await;
+    rename(&mut maker, "d\\sub\\b.txt", "o\\b.txt", false, 0).await;
+    assert_eq!(
+        seen(&mut watcher).await,
+        [
+            None,
+            Some(vec![
+                added("sub\\c.txt"),
+                modified("sub\\c.txt"),
+                removed("sub\\c.txt"),
+                removed("sub\\b.txt")
+            ]),
+            None,
+        ]
+    );
+}
+
+#[tokio::test]
+async fn the_close_response_comes_before_the_cleanup_of_its_requests() {
+    let (srv, _td) = server().await;
+    let mut watcher = srv.client().await;
+    let dir = watcher.open_dir("d").await;
+    let mid = arm(&mut watcher, dir, 4096, NAMES, false).await;
+    let mut body = Vec::new();
+    smb_server::wire::messages::CloseRequest {
+        structure_size: 24,
+        flags: 0,
+        reserved: 0,
+        file_id: dir,
+    }
+    .write_to(&mut body)
+    .unwrap();
+    let close = watcher.send_no_wait(Command::Close, &body).await;
+    let first = within(watcher.next_frame()).await;
+    let second = within(watcher.next_frame()).await;
+    let (first, _) = Smb2Header::parse(&first).unwrap();
+    let (second, rest) = Smb2Header::parse(&second).unwrap();
+    assert_eq!((first.command, first.message_id), (Command::Close, close));
+    assert_eq!(
+        (second.command, second.message_id),
+        (Command::ChangeNotify, mid)
+    );
+    assert_eq!(second.channel_sequence_status, STATUS_NOTIFY_CLEANUP);
+    assert_eq!(rest, [9, 0, 0x48, 0, 0, 0, 0, 0]);
 }
 
 #[tokio::test]
@@ -472,7 +619,7 @@ async fn a_request_without_watch_tree_on_a_tree_watch_gets_no_nested_names() {
     create_file(&mut maker, "d\\sub\\x").await;
     let (st, body) = ask(&mut watcher, dir, 4096, NAMES, false).await;
     assert_eq!(st, STATUS_NOTIFY_ENUM_DIR);
-    assert_eq!(body, [9, 0, 0x48, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(body, [9, 0, 0x48, 0, 0, 0, 0, 0]);
     create_file(&mut maker, "d\\y").await;
     let (st, body) = ask(&mut watcher, dir, 4096, NAMES, false).await;
     assert_eq!(st, STATUS_SUCCESS);

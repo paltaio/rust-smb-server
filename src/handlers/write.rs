@@ -1,6 +1,7 @@
 //! WRITE handler.
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use crate::proto::header::Smb2Header;
 use crate::proto::messages::{Dialect, WriteRequest, WriteResponse};
@@ -105,6 +106,9 @@ pub async fn handle(
     }
 
     let mut result = handle.write_owned(req.offset, req.data).await;
+    if result.is_ok() {
+        open.wrote.store(true, Ordering::Release);
+    }
     // A lease granted while the data was being written breaks now, so it
     // does not keep the old contents cached.
     if let Some(file) = open.file.as_ref() {

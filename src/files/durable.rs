@@ -829,6 +829,7 @@ mod tests {
                 slot: None,
                 durable: Some(reg),
                 watch: None,
+                wrote: Default::default(),
             }))
         }
 

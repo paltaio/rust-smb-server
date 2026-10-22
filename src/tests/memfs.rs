@@ -23,6 +23,10 @@ struct MemInner {
     /// All directories present (always includes "" for the root). Each
     /// directory is keyed by canonical path string.
     dirs: HashMap<String, ()>,
+    /// Times set on entries: creation, access, write and change.
+    times: HashMap<String, [u64; 4]>,
+    /// Entries marked read-only.
+    read_only: std::collections::HashSet<String>,
     /// Handles opened and not yet closed.
     open_handles: usize,
 }
@@ -269,26 +273,64 @@ impl Handle for MemHandle {
             .rsplit_once('\\')
             .map(|(_, n)| n.to_string())
             .unwrap_or_else(|| self.key.clone());
+        let [
+            creation_time,
+            last_access_time,
+            last_write_time,
+            change_time,
+        ] = g
+            .times
+            .get(&self.key)
+            .copied()
+            .unwrap_or([0x01D9_0000_0000_0000; 4]);
         Ok(FileInfo {
             name,
             end_of_file: size,
             allocation_size: size,
-            creation_time: 0x01D9_0000_0000_0000,
-            last_access_time: 0x01D9_0000_0000_0000,
-            last_write_time: 0x01D9_0000_0000_0000,
-            change_time: 0x01D9_0000_0000_0000,
+            creation_time,
+            last_access_time,
+            last_write_time,
+            change_time,
             is_directory: self.is_dir,
-            read_only: false,
+            read_only: g.read_only.contains(&self.key),
             file_index: 0,
         })
     }
 
-    async fn set_times(&self, _times: FileTimes) -> SmbResult<()> {
+    async fn set_times(&self, times: FileTimes) -> SmbResult<()> {
+        let mut g = self.inner.lock().unwrap();
+        let stored = g
+            .times
+            .entry(self.key.clone())
+            .or_insert([0x01D9_0000_0000_0000; 4]);
+        let wanted = [
+            times.creation_time,
+            times.last_access_time,
+            times.last_write_time,
+            times.change_time,
+        ];
+        for (slot, time) in stored.iter_mut().zip(wanted) {
+            if let Some(time) = time {
+                *slot = time;
+            }
+        }
         Ok(())
     }
 
-    async fn set_attributes(&self, _attributes: u32) -> SmbResult<()> {
-        Err(SmbError::NotSupported)
+    /// Keeps READONLY; ARCHIVE is accepted and not kept.
+    async fn set_attributes(&self, attributes: u32) -> SmbResult<()> {
+        const READONLY: u32 = 0x1;
+        const ARCHIVE: u32 = 0x20;
+        if attributes & !(READONLY | ARCHIVE) != 0 {
+            return Err(SmbError::NotSupported);
+        }
+        let mut g = self.inner.lock().unwrap();
+        if attributes & READONLY != 0 {
+            g.read_only.insert(self.key.clone());
+        } else {
+            g.read_only.remove(&self.key);
+        }
+        Ok(())
     }
 
     async fn truncate(&self, len: u64) -> SmbResult<()> {

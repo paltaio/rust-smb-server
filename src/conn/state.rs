@@ -449,6 +449,8 @@ pub struct Open {
     /// The change notification watch the first CHANGE_NOTIFY on the open
     /// armed.
     pub(crate) watch: Option<WatchReg>,
+    /// A WRITE through the open changed the file; its close reports that.
+    pub(crate) wrote: AtomicBool,
 }
 
 impl Open {
@@ -481,6 +483,7 @@ impl Drop for Open {
             file,
             self.delete_on_close,
             self.is_directory,
+            *self.wrote.get_mut(),
         ));
     }
 }

@@ -164,27 +164,44 @@
 //! - Change notifications: on every share unless [`Share::change_notify`]
 //!   turns them off, a CHANGE_NOTIFY on a directory waits until a file or
 //!   directory in it, or below it when the client asks for the whole tree,
-//!   is created, deleted or renamed through any connection to the share. A
-//!   rename within one directory is reported as its old and new name
-//!   together, a move to another directory as a removal from one and an
-//!   addition to the other. An entry the rename replaces, or the renamed
-//!   entry itself when only the case of its name changes, is first reported
-//!   removed under its name as stored. A watched directory can be renamed,
-//!   and its watches follow it. Changes are buffered on the directory
-//!   handle between requests, up to the buffer size of its first request
-//!   and at most 64 KiB; when more arrive, or they do not fit the request
-//!   being answered, the answer is STATUS_NOTIFY_ENUM_DIR. Writes,
-//!   truncation, attribute and time changes, and overwrites by CREATE are
-//!   not reported, and neither are changes made outside the server or
-//!   through another share over the same directory. Watches follow paths: a
-//!   change made through a symlink inside the share reaches the watchers of
-//!   the path it was made through. Names are spelled as the client that
-//!   made the change spelled them, but for the stored names above. The
-//!   backend is called only for a rename into a watched directory that may
-//!   replace an entry or changes the case of a name: on a case-sensitive
-//!   backend [`ShareBackend::open`] of the target and [`Handle::stat`],
-//!   otherwise `open` of the target's directory and [`Handle::list_dir`]
-//!   with the target's name.
+//!   changes through any connection to the share:
+//!   - A create or delete is reported as an addition or a removal.
+//!   - A rename within one directory is reported as its old and new name
+//!     together, a move to another directory as a removal from one and an
+//!     addition to the other. Either is followed by a modification, under
+//!     LAST_WRITE, of the directory the entry is in afterwards, unless that
+//!     is the share root. An entry the rename replaces,
+//!     or the renamed entry itself when only the case of its name changes,
+//!     is first reported removed under its name as stored. A watched
+//!     directory can be renamed, and its watches follow it.
+//!   - Attributes and times set through FileBasicInformation are reported
+//!     at once as a modification, under ATTRIBUTES and the bit of each time
+//!     changed but the change time. What changed is what [`Handle::stat`]
+//!     shows differently afterwards, so a value the backend does not keep
+//!     reports nothing.
+//!   - New contents are reported as a modification under SIZE, LAST_WRITE
+//!     and ATTRIBUTES: a write once, when the open that wrote closes, unless
+//!     that close deletes the file; a change of size through
+//!     FileEndOfFileInformation, a truncation through
+//!     FileAllocationInformation, and an overwrite or supersede by CREATE,
+//!     at once.
+//!
+//!   Changes are buffered on the directory handle between requests, up to
+//!   the buffer size of its first request and at most 64 KiB; when more
+//!   arrive, or they do not fit the request being answered, the answer is
+//!   STATUS_NOTIFY_ENUM_DIR. Changes made outside the server or through
+//!   another share over the same directory are not reported. Watches
+//!   follow paths: a change made through a symlink inside the share reaches
+//!   the watchers of the path it was made through. Names are spelled as the
+//!   client that made the change spelled them, but for the stored names
+//!   above. The backend is called for these reports in three cases: a
+//!   FileBasicInformation that passed something to the backend calls
+//!   [`Handle::stat`] once more; a size change on a share with watches
+//!   calls `stat` before and after; and a rename into a watched directory
+//!   that may replace an entry or changes the case of a name calls, on a
+//!   case-sensitive backend, [`ShareBackend::open`] of the target and
+//!   `stat`, otherwise `open` of the target's directory and
+//!   [`Handle::list_dir`] with the target's name.
 //! - Share listing: unless [`SmbServerBuilder::share_listing`] turns it
 //!   off, IPC$ serves the `srvsvc` pipe, so clients can list the server's
 //!   shares. A session sees the shares it may connect to, in the order

@@ -15,6 +15,7 @@ use tracing::debug;
 use crate::backend::{FileInfo, Handle};
 use crate::conn::state::Open;
 use crate::handlers::shared::restore_fixed_times;
+use crate::proto::messages::change_notify::FILE_ACTION_MODIFIED;
 
 pub(crate) use durable::{Claim, Durability, DurableReg, DurableTable, Unclaimed, v2_timeout};
 pub use durable::{DEFAULT_DURABLE_HANDLE_TIMEOUT, DEFAULT_MAX_DISCONNECTED_OPENS};
@@ -25,7 +26,7 @@ pub(crate) use leases::{AfterSend, BreakWait, LeaseRef, LeaseTable, MAX_BREAK_WA
 pub(crate) use table::{FileRef, FileTable, OpenRequest, Refused, Sharing};
 #[cfg(test)]
 pub(crate) use watch::MAX_WATCHES_PER_CONNECTION;
-pub(crate) use watch::{Answer, Change, NotifyBudget, WatchReg, WatchTable};
+pub(crate) use watch::{Answer, CONTENT_CHANGED, Change, NotifyBudget, WatchReg, WatchTable};
 
 /// Default for
 /// [`SmbServerBuilder::max_opens_per_connection`](crate::SmbServerBuilder::max_opens_per_connection)
@@ -59,15 +60,17 @@ impl Drop for OpenSlot {
 }
 
 /// Closes an open that is no longer reachable by FileId (MS-SMB2 3.3.4.17,
-/// MS-FSA 2.1.5.5): ends its change notification watch, restores the times
-/// it fixed, closes the backend handle, drops its byte-range locks and
-/// removes the file when this was the last open of a delete-pending file.
+/// MS-FSA 2.1.5.5): ends the change notification watch still on it,
+/// restores the times it fixed, closes the backend handle, drops its
+/// byte-range locks and removes the file when this was the last open of a
+/// delete-pending file.
 /// With `want_attrs`, returns the file's attributes as they were before the
 /// handle closed. Waits for requests still using the open.
 pub(crate) async fn close_open(open_arc: &Arc<RwLock<Open>>, want_attrs: bool) -> Option<FileInfo> {
     let mut open = open_arc.write().await;
     // Requests waiting on the watch end with STATUS_NOTIFY_CLEANUP before
-    // the close reports anything (MS-SMB2 3.3.5.10).
+    // the close reports anything (MS-SMB2 3.3.5.10). CLOSE takes the watch
+    // out first and ends it once its response is queued.
     drop(open.watch.take());
     restore_fixed_times(&open).await;
     let handle = open.handle.take()?;
@@ -80,21 +83,24 @@ pub(crate) async fn close_open(open_arc: &Arc<RwLock<Open>>, want_attrs: bool) -
     open.slot.take();
     let delete_on_close = open.delete_on_close;
     let is_directory = open.is_directory;
+    let wrote = open.wrote.load(Ordering::Acquire);
     drop(open);
-    finish_close(handle, file, delete_on_close, is_directory).await;
+    finish_close(handle, file, delete_on_close, is_directory, wrote).await;
     info
 }
 
 /// Closes the backend handle of an open and takes the open out of its
 /// share's file table. With `delete_on_close` the file becomes
 /// delete-pending, unless it is a directory with entries (MS-FSA 2.1.5.5
-/// phase 1), and is removed when this was its last open. Every path that
-/// ends an open goes through here.
+/// phase 1), and is removed when this was its last open. An open that
+/// `wrote` and leaves the file in place reports the new contents to the
+/// share's watchers, once. Every path that ends an open goes through here.
 pub(crate) async fn finish_close(
     handle: Box<dyn Handle>,
     file: Option<FileRef>,
     delete_on_close: bool,
     is_directory: bool,
+    wrote: bool,
 ) {
     let delete_on_close =
         delete_on_close && (!is_directory || handle.dir_is_empty().await.unwrap_or(false));
@@ -102,8 +108,29 @@ pub(crate) async fn finish_close(
         let path = file.as_ref().map(FileRef::path).unwrap_or_default();
         debug!(error = %e, path = %path, "backend close failed");
     }
-    if let Some(pending) = file.and_then(|f| f.release(delete_on_close)) {
-        pending.run().await;
+    let Some(file) = file else {
+        return;
+    };
+    let share = Arc::clone(file.share());
+    // The name is read and reported with no rename in between, when anyone
+    // on the share may hear it.
+    let names = if wrote && !share.watches.is_empty() {
+        Some(share.files.names_lock().await)
+    } else {
+        None
+    };
+    let path = file.path();
+    match file.release(delete_on_close) {
+        Some(pending) => {
+            drop(names);
+            pending.run().await;
+        }
+        None if names.is_some() => share.watches.report(&[Change {
+            path: &path,
+            action: FILE_ACTION_MODIFIED,
+            filter: CONTENT_CHANGED,
+        }]),
+        None => {}
     }
 }
 
@@ -210,6 +237,7 @@ mod tests {
             slot: None,
             durable: None,
             watch: None,
+            wrote: Default::default(),
         });
         let in_table = || {
             share.files.path_is_open(&path, false) || share.files.delete_pending_at(&path, false)

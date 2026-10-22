@@ -75,17 +75,14 @@ impl ChangeNotifyResponse {
     /// OutputBufferOffset: the buffer follows the fixed part of the body.
     pub const BUFFER_OFFSET: u16 = 0x48;
 
-    /// The response body carrying the entries `buffer`. An empty buffer
-    /// still takes the one byte StructureSize 9 counts.
+    /// The response body carrying the entries `buffer`. Without entries
+    /// the body is the 8 fixed bytes, as Windows sends it.
     pub(crate) fn encode(buffer: &[u8]) -> Vec<u8> {
-        let mut out = Vec::with_capacity(8 + buffer.len().max(1));
+        let mut out = Vec::with_capacity(8 + buffer.len());
         out.extend_from_slice(&9u16.to_le_bytes());
         out.extend_from_slice(&Self::BUFFER_OFFSET.to_le_bytes());
         out.extend_from_slice(&(buffer.len() as u32).to_le_bytes());
         out.extend_from_slice(buffer);
-        if buffer.is_empty() {
-            out.push(0);
-        }
         out
     }
 
@@ -248,9 +245,10 @@ mod tests {
     }
 
     #[test]
-    fn responses_without_entries_keep_one_byte() {
+    fn responses_without_entries_are_8_bytes() {
         let empty = ChangeNotifyResponse::encode(&[]);
-        assert_eq!(empty, [9, 0, 0x48, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(empty, [9, 0, 0x48, 0, 0, 0, 0, 0]);
+        assert_eq!(ChangeNotifyResponse::parse(&empty).unwrap().buffer, []);
         let full = ChangeNotifyResponse::encode(&[1, 2, 3]);
         let parsed = ChangeNotifyResponse::parse(&full).unwrap();
         assert_eq!(parsed.output_buffer_length, 3);

@@ -17,6 +17,7 @@ use crate::proto::messages::change_notify::{
 use crate::proto::messages::{
     ChangeNotifyRequest, ChangeNotifyResponse, CloseRequest, CreateContext, CreateRequest,
     CreateResponse, FileId, LeaseBreakAck, LeaseContext, QueryInfoRequest, SetInfoRequest,
+    WriteRequest,
 };
 use crate::server::{ConfigHandle, ServerState};
 use crate::tests::memfs::MemFsBackend;
@@ -450,7 +451,7 @@ async fn assert_cleanup(state: &Arc<ServerState>, watcher: &Peer, last: &[u8]) {
     assert_eq!(status(last), ntstatus::STATUS_NOTIFY_CLEANUP);
     assert_eq!(
         last[SMB2_HEADER_LEN..],
-        [9, 0, 0x48, 0, 0, 0, 0, 0, 0],
+        [9, 0, 0x48, 0, 0, 0, 0, 0],
         "an empty CHANGE_NOTIFY body"
     );
     settle().await;
@@ -843,7 +844,18 @@ async fn rename_status(
 /// Arms a watch on `dir` and cancels the request, so later changes are
 /// buffered with no request waiting.
 async fn arm_idle(peer: &mut Peer, state: &Arc<ServerState>, dir: FileId, tree: bool) {
-    let mut body = notify_body(dir, 4096, NAMES);
+    arm_idle_with(peer, state, dir, NAMES, tree).await;
+}
+
+/// [`arm_idle`] with the filter `filter`.
+async fn arm_idle_with(
+    peer: &mut Peer,
+    state: &Arc<ServerState>,
+    dir: FileId,
+    filter: u32,
+    tree: bool,
+) {
+    let mut body = notify_body(dir, 4096, filter);
     body[2] = u8::from(tree);
     let (mid, interim) = peer.request(state, Command::ChangeNotify, &body).await;
     let async_id = header(&interim).async_id().expect("waiting");
@@ -938,6 +950,8 @@ struct Gated {
     create: Option<Arc<Gate>>,
     stat: Option<Arc<Gate>>,
     blind: bool,
+    /// Handles take no creation time.
+    drop_creation: bool,
     renames: Arc<std::sync::atomic::AtomicUsize>,
 }
 
@@ -974,16 +988,16 @@ impl crate::ShareBackend for Gated {
             gate.pass().await;
         }
         let (handle, action) = self.inner.open(path, opts).await?;
-        match &self.stat {
-            Some(gate) if gated => {
-                let handle = GatedHandle {
-                    inner: handle,
-                    stat: Arc::clone(gate),
-                };
-                Ok((Box::new(handle), action))
-            }
-            _ => Ok((handle, action)),
+        let stat = self.stat.as_ref().filter(|_| gated).map(Arc::clone);
+        if stat.is_none() && !self.drop_creation {
+            return Ok((handle, action));
         }
+        let handle = GatedHandle {
+            inner: handle,
+            stat,
+            drop_creation: self.drop_creation,
+        };
+        Ok((Box::new(handle), action))
     }
 
     async fn unlink(&self, path: &crate::SmbPath) -> crate::SmbResult<()> {
@@ -1006,10 +1020,12 @@ impl crate::ShareBackend for Gated {
     }
 }
 
-/// A handle whose `stat` stops at a gate.
+/// A handle whose `stat` stops at a gate, and which may drop creation
+/// times.
 struct GatedHandle {
     inner: Box<dyn crate::Handle>,
-    stat: Arc<Gate>,
+    stat: Option<Arc<Gate>>,
+    drop_creation: bool,
 }
 
 #[async_trait::async_trait]
@@ -1027,11 +1043,16 @@ impl crate::Handle for GatedHandle {
     }
 
     async fn stat(&self) -> crate::SmbResult<crate::FileInfo> {
-        self.stat.pass().await;
+        if let Some(gate) = &self.stat {
+            gate.pass().await;
+        }
         self.inner.stat().await
     }
 
-    async fn set_times(&self, times: crate::FileTimes) -> crate::SmbResult<()> {
+    async fn set_times(&self, mut times: crate::FileTimes) -> crate::SmbResult<()> {
+        if self.drop_creation {
+            times.creation_time = None;
+        }
         self.inner.set_times(times).await
     }
 
@@ -1291,5 +1312,373 @@ async fn a_rename_whose_stored_name_cannot_be_looked_up_is_reported_as_a_rename(
             (FILE_ACTION_RENAMED_OLD_NAME, "a".to_string()),
             (FILE_ACTION_RENAMED_NEW_NAME, "t".to_string()),
         ]
+    );
+}
+
+/// What a request on the armed watch `dir` gets at once, or `None` when it
+/// would wait; such a request is cancelled.
+async fn now(peer: &mut Peer, state: &Arc<ServerState>, dir: FileId) -> Option<Vec<(u32, String)>> {
+    let (mid, reply) = peer
+        .request(state, Command::ChangeNotify, &notify_body(dir, 4096, NAMES))
+        .await;
+    if status(&reply) != ntstatus::STATUS_PENDING {
+        return Some(entries(&reply));
+    }
+    let async_id = header(&reply).async_id().expect("waiting");
+    let cancel = peer.message_with(Command::Cancel, mid, 1, &[4, 0, 0, 0]);
+    peer.dispatch(state, &cancel).await;
+    let last = final_of(peer, async_id).await;
+    assert_eq!(status(&last), ntstatus::STATUS_CANCELLED);
+    None
+}
+
+fn modified(name: &str) -> (u32, String) {
+    (
+        crate::proto::messages::change_notify::FILE_ACTION_MODIFIED,
+        name.to_string(),
+    )
+}
+
+async fn set_info(
+    peer: &mut Peer,
+    state: &Arc<ServerState>,
+    file_id: FileId,
+    class: u8,
+    buffer: Vec<u8>,
+) -> u32 {
+    let mut body = Vec::new();
+    SetInfoRequest {
+        structure_size: 33,
+        info_type: 1,
+        file_information_class: class,
+        buffer_length: buffer.len() as u32,
+        buffer_offset: 0x60,
+        reserved: 0,
+        additional_information: 0,
+        file_id,
+        buffer,
+    }
+    .write_to(&mut body)
+    .expect("set info");
+    status(&peer.request(state, Command::SetInfo, &body).await.1)
+}
+
+async fn write(peer: &mut Peer, state: &Arc<ServerState>, file_id: FileId, data: &[u8]) {
+    let mut body = Vec::new();
+    WriteRequest {
+        structure_size: 49,
+        data_offset: WriteRequest::STANDARD_DATA_OFFSET,
+        length: data.len() as u32,
+        offset: 0,
+        file_id,
+        channel: 0,
+        remaining_bytes: 0,
+        write_channel_info_offset: 0,
+        write_channel_info_length: 0,
+        flags: 0,
+        data: data.to_vec(),
+    }
+    .write_to(&mut body)
+    .expect("write");
+    assert_eq!(
+        status(&peer.request(state, Command::Write, &body).await.1),
+        0
+    );
+}
+
+const CREATION: u32 = 0x40;
+const LAST_ACCESS: u32 = 0x20;
+const LAST_WRITE: u32 = 0x10;
+const SIZE: u32 = 0x8;
+const ATTRIBUTES: u32 = 0x4;
+/// The filter macOS clients use.
+const MACOS: u32 = 0xD47;
+
+#[tokio::test]
+async fn times_set_through_basic_info_are_reported_under_their_bits() {
+    let (state, _) = server();
+    let mut watcher = Peer::new(&state, false).await;
+    let mut maker = Peer::new(&state, false).await;
+    let filters = [CREATION, LAST_ACCESS, LAST_WRITE, ATTRIBUTES];
+    let mut watches = Vec::new();
+    for filter in filters {
+        let dir = open_dir(&mut watcher, &state, "d").await;
+        arm_idle_with(&mut watcher, &state, dir, filter, false).await;
+        watches.push(dir);
+    }
+    // f0 gets a creation time, f1 an access time, f2 a write time, f3 a
+    // change time; the change time alone reports nothing.
+    let mut files = Vec::new();
+    for at in 0..4 {
+        let name = format!("d\\f{at}");
+        let file = hold_open(&mut maker, &state, &name, 0).await;
+        let mut buffer = vec![0u8; 40];
+        buffer[at * 8..at * 8 + 8].copy_from_slice(&0x01D0_0000_0000_0000u64.to_le_bytes());
+        assert_eq!(set_info(&mut maker, &state, file, 4, buffer).await, 0);
+        files.push(file);
+    }
+    // Reported while the files are still open.
+    for (at, dir) in watches.into_iter().enumerate() {
+        let expected = (at < 3).then(|| vec![modified(&format!("f{at}"))]);
+        assert_eq!(
+            now(&mut watcher, &state, dir).await,
+            expected,
+            "filter {:#x}",
+            filters[at]
+        );
+    }
+    for file in files {
+        close(&mut maker, &state, file).await;
+    }
+}
+
+#[tokio::test]
+async fn a_write_is_reported_once_when_its_open_closes() {
+    let (state, _) = server();
+    let mut watcher = Peer::new(&state, false).await;
+    let mut writer = Peer::new(&state, false).await;
+    let times = open_dir(&mut watcher, &state, "d").await;
+    let macos = open_dir(&mut watcher, &state, "d").await;
+    let names = open_dir(&mut watcher, &state, "d").await;
+    let file = hold_open(&mut writer, &state, "d\\f", 0).await;
+    arm_idle_with(&mut watcher, &state, macos, MACOS, false).await;
+    arm_idle_with(&mut watcher, &state, names, NAMES, false).await;
+    let (_, interim) = watcher
+        .request(
+            &state,
+            Command::ChangeNotify,
+            &notify_body(times, 4096, LAST_WRITE),
+        )
+        .await;
+    let async_id = header(&interim).async_id().expect("waiting");
+
+    write(&mut writer, &state, file, b"one").await;
+    write(&mut writer, &state, file, b"two").await;
+    settle().await;
+    assert!(watcher.rx.try_recv().is_none(), "nothing before the close");
+    close(&mut writer, &state, file).await;
+    assert_eq!(
+        entries(&final_of(&mut watcher, async_id).await),
+        [modified("f")]
+    );
+    // ATTRIBUTES goes with every content change.
+    assert_eq!(
+        now(&mut watcher, &state, macos).await,
+        Some(vec![modified("f")])
+    );
+    assert_eq!(now(&mut watcher, &state, names).await, None);
+    assert_eq!(now(&mut watcher, &state, times).await, None);
+
+    // A close that deletes the written file reports the removal only.
+    let file = hold_open(&mut writer, &state, "d\\g", FILE_DELETE_ON_CLOSE).await;
+    assert_eq!(
+        now(&mut watcher, &state, names).await,
+        Some(vec![added("g")])
+    );
+    write(&mut writer, &state, file, b"gone").await;
+    close(&mut writer, &state, file).await;
+    assert_eq!(
+        now(&mut watcher, &state, macos).await,
+        Some(vec![added("g"), (FILE_ACTION_REMOVED, "g".to_string())])
+    );
+}
+
+#[tokio::test]
+async fn size_changes_are_reported_once_and_an_unchanged_size_not_at_all() {
+    let (state, _) = server();
+    let share = home(&state).await;
+    let mut watcher = Peer::new(&state, false).await;
+    let mut maker = Peer::new(&state, false).await;
+    let dir = open_dir(&mut watcher, &state, "d").await;
+    let file = hold_open(&mut maker, &state, "d\\f", 0).await;
+    write(&mut maker, &state, file, b"0123456789").await;
+    arm_idle_with(&mut watcher, &state, dir, SIZE, false).await;
+    let size = |n: u64| n.to_le_bytes().to_vec();
+
+    // FileEndOfFileInformation: one report for one change.
+    let pushes = share.watches.pushes();
+    assert_eq!(set_info(&mut maker, &state, file, 20, size(4)).await, 0);
+    assert_eq!(share.watches.pushes() - pushes, 1);
+    assert_eq!(
+        now(&mut watcher, &state, dir).await,
+        Some(vec![modified("f")])
+    );
+    assert_eq!(set_info(&mut maker, &state, file, 20, size(4)).await, 0);
+    assert_eq!(now(&mut watcher, &state, dir).await, None, "the same size");
+    assert_eq!(set_info(&mut maker, &state, file, 20, size(8)).await, 0);
+    assert_eq!(
+        now(&mut watcher, &state, dir).await,
+        Some(vec![modified("f")])
+    );
+    // FileAllocationInformation past the end changes nothing; below it,
+    // it truncates.
+    assert_eq!(set_info(&mut maker, &state, file, 19, size(4096)).await, 0);
+    assert_eq!(now(&mut watcher, &state, dir).await, None);
+    assert_eq!(set_info(&mut maker, &state, file, 19, size(2)).await, 0);
+    assert_eq!(
+        now(&mut watcher, &state, dir).await,
+        Some(vec![modified("f")])
+    );
+
+    // A directory has no size to set.
+    let sub = create_body(
+        "d\\sub",
+        0x2 | 0x0012_0089,
+        FILE_OPEN_IF,
+        FILE_DIRECTORY_FILE,
+    );
+    let (_, reply) = maker.request(&state, Command::Create, &sub).await;
+    let sub = CreateResponse::parse(&reply[SMB2_HEADER_LEN..])
+        .expect("create response")
+        .file_id;
+    assert_eq!(
+        set_info(&mut maker, &state, sub, 20, size(0)).await,
+        ntstatus::STATUS_INVALID_PARAMETER
+    );
+    assert_eq!(now(&mut watcher, &state, dir).await, None);
+}
+
+#[tokio::test]
+async fn cleanup_waits_until_the_close_response_is_queued() {
+    let (state, _) = server();
+    let (mut watcher, dir, async_id) = waiting(&state, false).await;
+    let (_, close) = watcher.message(Command::Close, &close_body(dir));
+    let out = crate::dispatch::dispatch_frame(&state, &watcher.conn, &close)
+        .await
+        .expect("a response");
+    assert_eq!(status(&out.bytes), 0);
+    settle().await;
+    assert!(
+        watcher.rx.try_recv().is_none(),
+        "nothing before the CLOSE response"
+    );
+    drop(out.after_send);
+    let last = final_of(&mut watcher, async_id).await;
+    assert_cleanup(&state, &watcher, &last).await;
+}
+
+#[tokio::test]
+async fn a_basic_info_that_changes_nothing_reports_nothing() {
+    let (state, _) = server();
+    let mut watcher = Peer::new(&state, false).await;
+    let mut maker = Peer::new(&state, false).await;
+    let dir = open_dir(&mut watcher, &state, "d").await;
+    let file = hold_open(&mut maker, &state, "d\\f", 0).await;
+    arm_idle_with(&mut watcher, &state, dir, 0xFFF, false).await;
+    let basic = |time: i64, attributes: u32| {
+        let mut buffer = Vec::with_capacity(40);
+        for _ in 0..4 {
+            buffer.extend_from_slice(&time.to_le_bytes());
+        }
+        buffer.extend_from_slice(&attributes.to_le_bytes());
+        buffer.extend_from_slice(&[0; 4]);
+        buffer
+    };
+    // Times left alone, kept as they are or released, the attributes the
+    // file has, ARCHIVE the backend does not keep, the times it has.
+    for (time, attributes) in [
+        (0, 0),
+        (-1, 0),
+        (-2, 0),
+        (0, 0x80),
+        (0, 0x20),
+        (0x01D9_0000_0000_0000, 0),
+    ] {
+        let status = set_info(&mut maker, &state, file, 4, basic(time, attributes)).await;
+        assert_eq!(status, 0, "{time:#x} {attributes:#x}");
+    }
+    assert_eq!(now(&mut watcher, &state, dir).await, None);
+}
+
+#[tokio::test]
+async fn a_time_the_backend_drops_is_not_reported() {
+    let backend = Gated {
+        drop_creation: true,
+        ..Gated::default()
+    };
+    let state = backend.state();
+    let mut watcher = Peer::new(&state, false).await;
+    let mut maker = Peer::new(&state, false).await;
+    let creation = open_dir(&mut watcher, &state, "d").await;
+    let write_time = open_dir(&mut watcher, &state, "d").await;
+    let file = hold_open(&mut maker, &state, "d\\f", 0).await;
+    arm_idle_with(&mut watcher, &state, creation, CREATION, false).await;
+    arm_idle_with(&mut watcher, &state, write_time, LAST_WRITE, false).await;
+    let mut buffer = vec![0u8; 40];
+    buffer[0..8].copy_from_slice(&0x01D0_0000_0000_0000u64.to_le_bytes());
+    buffer[16..24].copy_from_slice(&0x01D0_0000_0000_0000u64.to_le_bytes());
+    assert_eq!(set_info(&mut maker, &state, file, 4, buffer).await, 0);
+    assert_eq!(now(&mut watcher, &state, creation).await, None);
+    assert_eq!(
+        now(&mut watcher, &state, write_time).await,
+        Some(vec![modified("f")])
+    );
+}
+
+#[tokio::test]
+async fn a_directory_s_attributes_are_reported_to_its_parent_s_watchers() {
+    let (state, _) = server();
+    let mut watcher = Peer::new(&state, false).await;
+    let mut maker = Peer::new(&state, false).await;
+    let dir = open_dir(&mut watcher, &state, "d").await;
+    let body = create_body("d\\sub", 0x100 | 0x80, FILE_OPEN_IF, FILE_DIRECTORY_FILE);
+    let (_, reply) = maker.request(&state, Command::Create, &body).await;
+    let sub = CreateResponse::parse(&reply[SMB2_HEADER_LEN..])
+        .expect("create response")
+        .file_id;
+    arm_idle_with(&mut watcher, &state, dir, ATTRIBUTES, false).await;
+    let mut buffer = vec![0u8; 40];
+    buffer[32..36].copy_from_slice(&0x1u32.to_le_bytes());
+    assert_eq!(set_info(&mut maker, &state, sub, 4, buffer).await, 0);
+    assert_eq!(
+        now(&mut watcher, &state, dir).await,
+        Some(vec![modified("sub")])
+    );
+}
+
+#[tokio::test]
+async fn a_written_open_ended_with_its_tree_session_or_connection_reports_the_write() {
+    let (state, _) = server();
+    let mut watcher = Peer::new(&state, false).await;
+    let dir = open_dir(&mut watcher, &state, "d").await;
+    arm_idle_with(&mut watcher, &state, dir, LAST_WRITE, false).await;
+    for (at, end) in [Command::TreeDisconnect, Command::Logoff, Command::Echo]
+        .into_iter()
+        .enumerate()
+    {
+        let mut writer = Peer::new(&state, false).await;
+        let name = format!("d\\f{at}");
+        let file = hold_open(&mut writer, &state, &name, 0).await;
+        write(&mut writer, &state, file, b"data").await;
+        assert_eq!(now(&mut watcher, &state, dir).await, None, "{end:?}");
+        if end == Command::Echo {
+            writer.drop_connection(&state).await;
+        } else {
+            let (_, reply) = writer.request(&state, end, &[4, 0, 0, 0]).await;
+            assert_eq!(status(&reply), 0);
+        }
+        assert_eq!(
+            now(&mut watcher, &state, dir).await,
+            Some(vec![modified(&format!("f{at}"))]),
+            "{end:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_write_is_reported_under_the_name_the_file_has_at_close() {
+    let (state, _) = server();
+    let mut watcher = Peer::new(&state, false).await;
+    let mut writer = Peer::new(&state, false).await;
+    let dir = open_dir(&mut watcher, &state, "d").await;
+    let file = hold_open(&mut writer, &state, "d\\f", 0).await;
+    arm_idle_with(&mut watcher, &state, dir, LAST_WRITE, false).await;
+    write(&mut writer, &state, file, b"data").await;
+    let mut renamer = Peer::new(&state, false).await;
+    rename(&mut renamer, &state, "d\\f", "d\\g", false, 0).await;
+    close(&mut writer, &state, file).await;
+    assert_eq!(
+        now(&mut watcher, &state, dir).await,
+        Some(vec![modified("g")])
     );
 }

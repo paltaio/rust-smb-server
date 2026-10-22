@@ -3,12 +3,12 @@
 use std::sync::Arc;
 
 use crate::proto::header::Smb2Header;
-use crate::proto::messages::{CloseRequest, CloseResponse};
+use crate::proto::messages::{CloseRequest, CloseResponse, FileId};
 
 use crate::conn::pending::Stop;
 use crate::conn::state::Connection;
 use crate::dispatch::HandlerResponse;
-use crate::files::close_open;
+use crate::files::{WatchReg, close_open};
 use crate::handlers::shared::lookup_session_tree;
 use crate::ntstatus;
 use crate::server::ServerState;
@@ -38,9 +38,15 @@ pub async fn handle(
         Some(o) => o,
         None => return HandlerResponse::err(ntstatus::STATUS_FILE_CLOSED),
     };
-    // MS-SMB2 3.3.4.17: requests waiting on the open end with it.
-    conn.pending
-        .stop_where(Stop::Retry, |op| op.file_id == Some(req.file_id));
+    // MS-SMB2 3.3.4.17: requests waiting on the open end with it. They are
+    // answered after the CLOSE response is queued, as Windows orders them:
+    // their stop and the open's change notification watch go with the
+    // response.
+    let ended = EndWaiters {
+        conn: Arc::clone(conn),
+        file_id: req.file_id,
+        watch: open_arc.write().await.watch.take(),
+    };
 
     let want_attrs = req.flags & FLAG_POSTQUERY_ATTRIB != 0;
     let info = close_open(&open_arc, want_attrs).await;
@@ -64,5 +70,24 @@ pub async fn handle(
     };
     let mut buf = Vec::new();
     resp.write_to(&mut buf).expect("encode");
-    HandlerResponse::ok(buf)
+    let mut response = HandlerResponse::ok(buf);
+    response.after_send.push(Box::new(ended));
+    response
+}
+
+/// Ends the requests waiting on a closed open, and its watch, when
+/// dropped.
+struct EndWaiters {
+    conn: Arc<Connection>,
+    file_id: FileId,
+    watch: Option<WatchReg>,
+}
+
+impl Drop for EndWaiters {
+    fn drop(&mut self) {
+        self.conn
+            .pending
+            .stop_where(Stop::Retry, |op| op.file_id == Some(self.file_id));
+        drop(self.watch.take());
+    }
 }

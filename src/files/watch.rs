@@ -12,7 +12,10 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::ntstatus;
 use crate::path::{SmbPath, rebase};
-use crate::proto::messages::change_notify::{entries_len, push_entry};
+use crate::proto::messages::change_notify::{
+    FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE,
+    entries_len, push_entry,
+};
 use crate::server::ShareBindings;
 
 /// Most bytes one watch buffers, whatever OutputBufferLength asked for.
@@ -25,6 +28,14 @@ pub(crate) const MAX_NOTIFY_BYTES: usize = 8 << 20;
 
 /// Most watches one connection may hold.
 pub(crate) const MAX_WATCHES_PER_CONNECTION: usize = 4096;
+
+/// Filter of a change to a file's contents: a write, a size change, an
+/// overwrite. Windows reports a write or a truncation to watchers asking
+/// for LAST_WRITE, and not to watchers asking for ATTRIBUTES without it.
+/// ATTRIBUTES is set here on purpose, so watchers that ask for attributes
+/// but not for times, as macOS clients do, hear about new contents too.
+pub(crate) const CONTENT_CHANGED: u32 =
+    FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_ATTRIBUTES;
 
 /// One change to report: `action` (FILE_ACTION_*) happened at `path`, and
 /// it matches the FILE_NOTIFY_CHANGE_* bits `filter`.
@@ -334,6 +345,9 @@ pub(crate) struct WatchTable {
     /// is looked up.
     tree_count: AtomicUsize,
     dirs: Mutex<HashMap<String, Vec<Arc<Watch>>>>,
+    /// Batches pushed into watches.
+    #[cfg(test)]
+    pushes: AtomicUsize,
 }
 
 impl WatchTable {
@@ -343,6 +357,8 @@ impl WatchTable {
             count: AtomicUsize::new(0),
             tree_count: AtomicUsize::new(0),
             dirs: Mutex::default(),
+            #[cfg(test)]
+            pushes: AtomicUsize::new(0),
         }
     }
 
@@ -431,6 +447,8 @@ impl WatchTable {
         // batch; either way the end gives back what it holds.
         drop(dirs);
         for (watch, entries) in batches {
+            #[cfg(test)]
+            self.pushes.fetch_add(1, Ordering::AcqRel);
             watch.push(&entries);
         }
     }
@@ -484,6 +502,17 @@ impl WatchTable {
             let key = dir_key(watch.state().dir.components(), self.case_sensitive);
             dirs.entry(key).or_default().push(watch);
         }
+    }
+
+    /// True when the share has no watch, so no change reaches anyone.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.count.load(Ordering::Acquire) == 0
+    }
+
+    /// Batches pushed into watches so far.
+    #[cfg(test)]
+    pub(crate) fn pushes(&self) -> usize {
+        self.pushes.load(Ordering::Acquire)
     }
 
     /// Watches on the share.

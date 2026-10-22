@@ -7,13 +7,13 @@ use crate::proto::messages::{InfoType, SetInfoRequest, SetInfoResponse};
 
 use crate::access_mask::{DELETE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA};
 use crate::backend::{
-    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_TEMPORARY, FileTimes, OpenOptions, ShareBackend,
-    VALID_SET_ATTRIBUTES,
+    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_TEMPORARY, FileInfo, FileTimes, OpenOptions,
+    ShareBackend, VALID_SET_ATTRIBUTES,
 };
 use crate::conn::pending::{Stop, stopped};
 use crate::conn::state::{Connection, Open};
 use crate::dispatch::HandlerResponse;
-use crate::files::{BreakWait, Change, MAX_BREAK_WAIT, Trigger};
+use crate::files::{BreakWait, CONTENT_CHANGED, Change, MAX_BREAK_WAIT, Trigger};
 use crate::handlers::shared::{lookup_open, lookup_session_tree, restore_fixed_times};
 use crate::handlers::{Outcome, Pending};
 use crate::info_class as ic;
@@ -21,11 +21,14 @@ use crate::ntstatus;
 use crate::path::{SmbPath, same_path};
 use crate::proto::messages::FileId;
 use crate::proto::messages::change_notify::{
-    FILE_ACTION_ADDED, FILE_ACTION_REMOVED, FILE_ACTION_RENAMED_NEW_NAME,
-    FILE_ACTION_RENAMED_OLD_NAME, FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME,
+    FILE_ACTION_ADDED, FILE_ACTION_MODIFIED, FILE_ACTION_REMOVED, FILE_ACTION_RENAMED_NEW_NAME,
+    FILE_ACTION_RENAMED_OLD_NAME, FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_CREATION,
+    FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_ACCESS,
+    FILE_NOTIFY_CHANGE_LAST_WRITE,
 };
-use crate::server::ServerState;
+use crate::server::{ServerState, ShareBindings};
 use crate::utils::utf16le_to_units;
+use tokio::sync::RwLock;
 use tracing::warn;
 
 /// Classes MS-FSCC 2.4 lists as settable: Basic, Rename, Link, Disposition,
@@ -74,6 +77,7 @@ async fn set(
         Some(o) => o,
         None => return Ok(HandlerResponse::err(ntstatus::STATUS_FILE_CLOSED)),
     };
+    let share = Arc::clone(&tree_arc.read().await.share);
     if req.buffer_length == 0 {
         return Ok(HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER));
     }
@@ -111,24 +115,44 @@ async fn set(
             let time = |at: usize| i64::from_le_bytes(buffer[at..at + 8].try_into().unwrap());
             let times = [time(0), time(8), time(16), time(24)];
             let attributes = u32::from_le_bytes(buffer[32..36].try_into().unwrap());
-            let mut open = open_arc.write().await;
-            set_basic_info(&mut open, times, attributes).await
+            let changed = set_basic_info(&mut *open_arc.write().await, times, attributes).await;
+            match changed {
+                Ok(filter) => {
+                    report_modified(&share, &open_arc, filter).await;
+                    Ok(())
+                }
+                Err(status) => Err(status),
+            }
         }
         Class::EndOfFile => {
             if buffer.len() < 8 {
                 return Ok(HandlerResponse::err(ntstatus::STATUS_INFO_LENGTH_MISMATCH));
             }
             let new_len = u64::from_le_bytes(buffer[0..8].try_into().unwrap());
-            let open = open_arc.read().await;
-            truncate(&open, new_len, false).await
+            let heard = !share.watches.is_empty();
+            let resized = truncate(&*open_arc.read().await, new_len, false, heard).await;
+            match resized {
+                Ok(resized) => {
+                    report_resized(&share, &open_arc, resized).await;
+                    Ok(())
+                }
+                Err(status) => Err(status),
+            }
         }
         Class::Allocation => {
             if buffer.len() < 8 {
                 return Ok(HandlerResponse::err(ntstatus::STATUS_INFO_LENGTH_MISMATCH));
             }
             let size = u64::from_le_bytes(buffer[0..8].try_into().unwrap());
-            let open = open_arc.read().await;
-            truncate(&open, size, true).await
+            let heard = !share.watches.is_empty();
+            let resized = truncate(&*open_arc.read().await, size, true, heard).await;
+            match resized {
+                Ok(resized) => {
+                    report_resized(&share, &open_arc, resized).await;
+                    Ok(())
+                }
+                Err(status) => Err(status),
+            }
         }
         Class::Disposition => {
             if buffer.is_empty() {
@@ -181,6 +205,33 @@ async fn set(
         return Ok(HandlerResponse::err(status));
     }
     Ok(set_info_ok())
+}
+
+/// Reports a change through `open_arc` that matches the filter bits
+/// `filter`, if any, as MODIFIED, when the share has watches. The open's
+/// name is read under the share's names lock, taken with the open
+/// unlocked, so it is current.
+async fn report_modified(share: &ShareBindings, open_arc: &RwLock<Open>, filter: u32) {
+    if filter == 0 || share.watches.is_empty() {
+        return;
+    }
+    let _names = share.files.names_lock().await;
+    let path = open_arc.read().await.path();
+    if let Some(path) = path {
+        share.watches.report(&[Change {
+            path: &path,
+            action: FILE_ACTION_MODIFIED,
+            filter,
+        }]);
+    }
+}
+
+/// Reports a size change through `open_arc` when `resized`, once; Windows
+/// reports a truncation twice.
+async fn report_resized(share: &ShareBindings, open_arc: &RwLock<Open>, resized: bool) {
+    if resized {
+        report_modified(share, open_arc, CONTENT_CHANGED).await;
+    }
 }
 
 /// A FileRenameInformation request.
@@ -417,7 +468,8 @@ fn same_name(from: &SmbPath, to: &SmbPath, case_sensitive: bool) -> bool {
 /// This follows Windows; MS-FSA instead reports a replaced target spelled
 /// as stored as MODIFIED. Then a rename within one directory is
 /// RENAMED_OLD_NAME and RENAMED_NEW_NAME, one into another directory
-/// REMOVED and ADDED. A rename to the same name, or to the stored name of
+/// REMOVED and ADDED, and the directory the entry lands in is MODIFIED
+/// under LAST_WRITE. A rename to the same name, or to the stored name of
 /// the renamed entry, reports nothing.
 fn rename_changes(
     from: &SmbPath,
@@ -460,6 +512,12 @@ fn rename_changes(
     let filter = kind(is_directory);
     changes.push((from.clone(), old, filter));
     changes.push((to.clone(), new, filter));
+    // The directory the entry lands in has a new write time, which Windows
+    // reports as a change of that directory.
+    let into = parent(to);
+    if !into.is_root() {
+        changes.push((into, FILE_ACTION_MODIFIED, FILE_NOTIFY_CHANGE_LAST_WRITE));
+    }
     changes
 }
 
@@ -468,8 +526,10 @@ fn rename_changes(
 /// time fixed against later changes made through this open, -2 lets those
 /// changes update it again, and a time set through the open stays fixed. A
 /// time or attribute set that equals the current one is not passed to the
-/// backend.
-async fn set_basic_info(open: &mut Open, times: [i64; 4], attributes: u32) -> Result<(), u32> {
+/// backend. Returns the FILE_NOTIFY_CHANGE_* bits of what changed, as a stat
+/// before and after shows it: the attributes and each time but the change
+/// time (MS-FSA 2.1.5.15.2).
+async fn set_basic_info(open: &mut Open, times: [i64; 4], attributes: u32) -> Result<u32, u32> {
     if times.iter().any(|&t| t < -2)
         || (attributes & FILE_ATTRIBUTE_DIRECTORY != 0 && !open.is_directory)
         || (attributes & FILE_ATTRIBUTE_TEMPORARY != 0 && open.is_directory)
@@ -479,12 +539,14 @@ async fn set_basic_info(open: &mut Open, times: [i64; 4], attributes: u32) -> Re
     let handle = open.handle.as_ref().ok_or(ntstatus::STATUS_FILE_CLOSED)?;
     let current = handle.stat().await.map_err(|e| e.to_nt_status())?;
 
+    let mut passed = false;
     let wanted_attributes = attributes & VALID_SET_ATTRIBUTES;
     if attributes != 0 && wanted_attributes != current.attributes() & VALID_SET_ATTRIBUTES {
         handle
             .set_attributes(wanted_attributes)
             .await
             .map_err(|e| e.to_nt_status())?;
+        passed = true;
     }
 
     let [creation, access, write, change] = times;
@@ -500,7 +562,18 @@ async fn set_basic_info(open: &mut Open, times: [i64; 4], attributes: u32) -> Re
             .set_times(wanted_times)
             .await
             .map_err(|e| e.to_nt_status())?;
+        passed = true;
     }
+    // What the backend keeps decides what changed: one that drops a value,
+    // or does not store an attribute, reports nothing for it.
+    let changed = if passed {
+        handle
+            .stat()
+            .await
+            .map_or(0, |after| changed_fields(&current, &after))
+    } else {
+        0
+    };
 
     let fixed = |t: i64, now: u64, before: Option<u64>| match t {
         0 => before,
@@ -513,14 +586,41 @@ async fn set_basic_info(open: &mut Open, times: [i64; 4], attributes: u32) -> Re
         fixed(access, current.last_access_time, before.last_access_time);
     open.fixed_times.last_write_time =
         fixed(write, current.last_write_time, before.last_write_time);
-    Ok(())
+    Ok(changed)
+}
+
+/// The FILE_NOTIFY_CHANGE_* bits of the fields FileBasicInformation sets
+/// that differ between `before` and `after`.
+fn changed_fields(before: &FileInfo, after: &FileInfo) -> u32 {
+    [
+        (
+            before.attributes() & VALID_SET_ATTRIBUTES != after.attributes() & VALID_SET_ATTRIBUTES,
+            FILE_NOTIFY_CHANGE_ATTRIBUTES,
+        ),
+        (
+            before.creation_time != after.creation_time,
+            FILE_NOTIFY_CHANGE_CREATION,
+        ),
+        (
+            before.last_access_time != after.last_access_time,
+            FILE_NOTIFY_CHANGE_LAST_ACCESS,
+        ),
+        (
+            before.last_write_time != after.last_write_time,
+            FILE_NOTIFY_CHANGE_LAST_WRITE,
+        ),
+    ]
+    .into_iter()
+    .filter(|(differs, _)| *differs)
+    .fold(0, |bits, (_, bit)| bits | bit)
 }
 
 /// FileEndOfFileInformation, or FileAllocationInformation when
 /// `allocation` is set (MS-FSA 2.1.5.15.1, 2.1.5.15.4). An allocation size
 /// below the end of file truncates the file to it; a larger one leaves the
-/// file as it is, and no space is reserved.
-async fn truncate(open: &Open, size: u64, allocation: bool) -> Result<(), u32> {
+/// file as it is, and no space is reserved. With `measure`, returns whether
+/// the size changed, from a stat before and after.
+async fn truncate(open: &Open, size: u64, allocation: bool, measure: bool) -> Result<bool, u32> {
     if open.is_directory {
         return Err(ntstatus::STATUS_INVALID_PARAMETER);
     }
@@ -535,17 +635,26 @@ async fn truncate(open: &Open, size: u64, allocation: bool) -> Result<(), u32> {
         }
     };
     break_leases();
-    if allocation {
+    let before = if allocation || measure {
         let info = handle.stat().await.map_err(|e| e.to_nt_status())?;
-        if size >= info.end_of_file {
-            return Ok(());
+        if allocation && size >= info.end_of_file {
+            return Ok(false);
         }
-    }
+        info.end_of_file
+    } else {
+        0
+    };
     let result = handle.truncate(size).await;
     break_leases();
     result.map_err(|e| e.to_nt_status())?;
     restore_fixed_times(open).await;
-    Ok(())
+    if !measure {
+        return Ok(false);
+    }
+    Ok(handle
+        .stat()
+        .await
+        .map_or(true, |after| after.end_of_file != before))
 }
 
 /// FileDispositionInformation (MS-FSA 2.1.5.15.3). The flag belongs to the
@@ -706,6 +815,7 @@ mod tests {
                 slot: None,
                 durable: None,
                 watch: None,
+                wrote: Default::default(),
             };
             tree.opens
                 .write()
@@ -783,6 +893,7 @@ mod tests {
 
     const FILE: u32 = FILE_NOTIFY_CHANGE_FILE_NAME;
     const DIR: u32 = FILE_NOTIFY_CHANGE_DIR_NAME;
+    const LAST_WRITE: u32 = FILE_NOTIFY_CHANGE_LAST_WRITE;
 
     #[test]
     fn renames_report_by_directory_and_kind() {
@@ -792,6 +903,7 @@ mod tests {
             [
                 (FILE_ACTION_RENAMED_OLD_NAME, s("d\\a"), FILE),
                 (FILE_ACTION_RENAMED_NEW_NAME, s("D\\b"), FILE),
+                (FILE_ACTION_MODIFIED, s("D"), LAST_WRITE),
             ]
         );
         assert_eq!(
@@ -799,6 +911,7 @@ mod tests {
             [
                 (FILE_ACTION_REMOVED, s("d\\a"), DIR),
                 (FILE_ACTION_ADDED, s("e\\a"), DIR),
+                (FILE_ACTION_MODIFIED, s("e"), LAST_WRITE),
             ]
         );
         // A change of case only is a rename within the directory.
@@ -807,12 +920,25 @@ mod tests {
             [
                 (FILE_ACTION_RENAMED_OLD_NAME, s("d\\a"), FILE),
                 (FILE_ACTION_RENAMED_NEW_NAME, s("d\\A"), FILE),
+                (FILE_ACTION_MODIFIED, s("d"), LAST_WRITE),
             ]
         );
         // The same name in the same directory, however the directory is
         // spelled, reports nothing.
         assert!(changes("d\\a", "d\\a", false, None).is_empty());
         assert!(changes("d\\a", "D\\a", false, None).is_empty());
+    }
+
+    #[test]
+    fn a_rename_into_the_share_root_modifies_no_directory() {
+        let s = |x: &str| x.to_string();
+        assert_eq!(
+            changes("d\\a", "a", false, None),
+            [
+                (FILE_ACTION_REMOVED, s("d\\a"), FILE),
+                (FILE_ACTION_ADDED, s("a"), FILE),
+            ]
+        );
     }
 
     #[test]
@@ -825,6 +951,7 @@ mod tests {
                 (FILE_ACTION_REMOVED, s("d\\t"), FILE),
                 (FILE_ACTION_RENAMED_OLD_NAME, s("d\\a"), FILE),
                 (FILE_ACTION_RENAMED_NEW_NAME, s("d\\t"), FILE),
+                (FILE_ACTION_MODIFIED, s("d"), LAST_WRITE),
             ]
         );
         assert_eq!(
@@ -833,6 +960,7 @@ mod tests {
                 (FILE_ACTION_REMOVED, s("d\\t"), FILE),
                 (FILE_ACTION_RENAMED_OLD_NAME, s("d\\a"), FILE),
                 (FILE_ACTION_RENAMED_NEW_NAME, s("d\\T"), FILE),
+                (FILE_ACTION_MODIFIED, s("d"), LAST_WRITE),
             ]
         );
         assert_eq!(
@@ -841,6 +969,7 @@ mod tests {
                 (FILE_ACTION_REMOVED, s("e\\t"), FILE),
                 (FILE_ACTION_REMOVED, s("d\\a"), DIR),
                 (FILE_ACTION_ADDED, s("e\\t"), DIR),
+                (FILE_ACTION_MODIFIED, s("e"), LAST_WRITE),
             ]
         );
         // An open spelled differently from the stored name renamed to it.
@@ -852,6 +981,7 @@ mod tests {
                 (FILE_ACTION_REMOVED, s("d\\x"), FILE),
                 (FILE_ACTION_RENAMED_OLD_NAME, s("d\\x"), FILE),
                 (FILE_ACTION_RENAMED_NEW_NAME, s("d\\X"), FILE),
+                (FILE_ACTION_MODIFIED, s("d"), LAST_WRITE),
             ]
         );
     }
