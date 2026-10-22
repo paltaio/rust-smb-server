@@ -102,12 +102,16 @@ impl AuthPolicy {
     /// the last failure is under `lockout` old. An empty `user` is not
     /// checked.
     pub fn is_locked_out(&self, user: &str, addr: Option<IpAddr>) -> bool {
+        self.is_locked_out_at(user, addr, Instant::now())
+    }
+
+    /// [`AuthPolicy::is_locked_out`] at `now`.
+    fn is_locked_out_at(&self, user: &str, addr: Option<IpAddr>, now: Instant) -> bool {
         let max = self.settings.max_logon_failures;
         if max == 0 {
             return false;
         }
         let failures = self.lock_failures();
-        let now = Instant::now();
         let locked = |key: ThrottleKey| {
             failures
                 .get(&key)
@@ -130,20 +134,24 @@ impl AuthPolicy {
     /// Names that are not configured count the same, so a lockout says
     /// nothing about which names exist.
     pub fn record_failure(&self, user: &str, addr: Option<IpAddr>) {
+        self.record_failure_at(user, addr, Instant::now());
+    }
+
+    /// [`AuthPolicy::record_failure`] at `now`.
+    fn record_failure_at(&self, user: &str, addr: Option<IpAddr>, now: Instant) {
         if self.settings.max_logon_failures == 0 {
             return;
         }
         if !user.is_empty() {
-            self.count_failure(user_key(user));
+            self.count_failure(user_key(user), now);
         }
         if let Some(addr) = addr {
-            self.count_failure(addr_key(addr));
+            self.count_failure(addr_key(addr), now);
         }
     }
 
-    fn count_failure(&self, key: ThrottleKey) {
+    fn count_failure(&self, key: ThrottleKey, now: Instant) {
         let lockout = self.settings.lockout;
-        let now = Instant::now();
         let mut failures = self.lock_failures();
         if !failures.contains_key(&key) && failures.len() >= THROTTLE_CAPACITY {
             failures.retain(|_, f| now.duration_since(f.last) < lockout);
@@ -246,17 +254,18 @@ mod tests {
 
     #[test]
     fn lockout_expires() {
-        let p = policy(1, Duration::from_millis(20));
-        p.record_failure("alice", None);
+        let lockout = Duration::from_secs(60);
+        let start = Instant::now();
+        let p = policy(1, lockout);
+        p.record_failure_at("alice", None, start);
         assert!(p.is_locked_out("alice", None));
-        std::thread::sleep(Duration::from_millis(30));
-        assert!(!p.is_locked_out("alice", None));
+        assert!(p.is_locked_out_at("alice", None, start + lockout - Duration::from_millis(1)));
+        assert!(!p.is_locked_out_at("alice", None, start + lockout));
         // The old count does not carry over into a new window.
-        let p = policy(2, Duration::from_millis(20));
-        p.record_failure("alice", None);
-        std::thread::sleep(Duration::from_millis(30));
-        p.record_failure("alice", None);
-        assert!(!p.is_locked_out("alice", None));
+        let p = policy(2, lockout);
+        p.record_failure_at("alice", None, start);
+        p.record_failure_at("alice", None, start + lockout);
+        assert!(!p.is_locked_out_at("alice", None, start + lockout));
     }
 
     #[test]

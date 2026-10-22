@@ -19,32 +19,49 @@ use smb_server::wire::header::Command;
 use smb_server::{Access, ConfigHandle, LocalFsBackend, Share, SmbServer, ntstatus};
 use tokio::net::TcpStream;
 
-/// Signs in alice and connects the share until `stop` is set, on a new
-/// connection whenever the session ends. Returns the number of sessions
-/// and trees established.
+/// Signs in alice and connects the share until `stop` is set, with a new
+/// session on the same connection whenever the session ends. Returns the
+/// number of sessions and trees established.
 async fn connect_until(addr: SocketAddr, stop: Arc<AtomicBool>) -> (usize, usize) {
     let (mut sessions, mut trees) = (0, 0);
+    let mut s = TcpStream::connect(addr).await.expect("connect");
+    negotiate(&mut s).await;
+    let mut message_id = 1;
     while !stop.load(Ordering::Relaxed) {
-        let mut s = TcpStream::connect(addr).await.expect("connect");
-        negotiate(&mut s).await;
         let Login {
-            status, session_id, ..
-        } = spnego_login(&mut s, 1, 0, "alice", "password").await;
+            status,
+            session_id,
+            frame,
+            ..
+        } = spnego_login(&mut s, message_id, 0, "alice", "password").await;
+        message_id = parse_response_header(&frame).0.message_id + 1;
         if status != STATUS_SUCCESS {
             assert_eq!(status, ntstatus::STATUS_LOGON_FAILURE);
             continue;
         }
         sessions += 1;
-        for message_id in 3..23 {
+        let mut ended = false;
+        for _ in 0..20 {
             let hdr = build_header(Command::TreeConnect, message_id, session_id, 0);
+            message_id += 1;
             write_frame(&mut s, &hdr, &tree_connect_body(r"\\127.0.0.1\share")).await;
             let frame = read_frame(&mut s).await;
             match parse_response_header(&frame).0.channel_sequence_status {
                 STATUS_SUCCESS => trees += 1,
                 ntstatus::STATUS_ACCESS_DENIED | ntstatus::STATUS_BAD_NETWORK_NAME => {}
-                ntstatus::STATUS_USER_SESSION_DELETED => break,
+                ntstatus::STATUS_USER_SESSION_DELETED => {
+                    ended = true;
+                    break;
+                }
                 other => panic!("TREE_CONNECT status {other:#x}"),
             }
+        }
+        // A session still in place makes room for the next one.
+        if !ended {
+            let hdr = build_header(Command::Logoff, message_id, session_id, 0);
+            message_id += 1;
+            write_frame(&mut s, &hdr, &[4, 0, 0, 0]).await;
+            read_frame(&mut s).await;
         }
     }
     (sessions, trees)

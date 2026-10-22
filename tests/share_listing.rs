@@ -1025,12 +1025,11 @@ async fn turned_off_share_listing_opens_no_pipe() {
 
 #[tokio::test]
 async fn a_long_list_comes_in_fragments_of_the_negotiated_size() {
-    let td = tempfile::tempdir().expect("tempdir");
     let remark = "r".repeat(40);
     let mut builder = SmbServer::builder();
     for i in 0..400 {
         builder = builder.share(
-            Share::new(format!("share{i:03}"), common::client::local(td.path()))
+            Share::new(format!("share{i:03}"), Unopened)
                 .public()
                 .remark(remark.clone()),
         );
@@ -1291,4 +1290,36 @@ async fn a_signed_smb311_session_lists_the_shares() {
     assert_eq!(common::auth::status(&reply), 0);
     let names = list_through(send).await;
     assert_eq!(names, ["public", "home", "secret$", "docs", "IPC$"]);
+}
+
+/// A backend that holds no file and opens nothing, for shares that are
+/// only listed.
+struct Unopened;
+
+#[async_trait::async_trait]
+impl smb_server::ShareBackend for Unopened {
+    async fn open(
+        &self,
+        _path: &smb_server::SmbPath,
+        _opts: smb_server::OpenOptions,
+    ) -> smb_server::SmbResult<(Box<dyn smb_server::Handle>, smb_server::OpenAction)> {
+        Err(smb_server::SmbError::NotSupported)
+    }
+
+    async fn unlink(&self, _path: &smb_server::SmbPath) -> smb_server::SmbResult<()> {
+        Err(smb_server::SmbError::NotSupported)
+    }
+
+    async fn rename(
+        &self,
+        _from: &smb_server::SmbPath,
+        _to: &smb_server::SmbPath,
+        _replace_if_exists: bool,
+    ) -> smb_server::SmbResult<()> {
+        Err(smb_server::SmbError::NotSupported)
+    }
+
+    fn capabilities(&self) -> smb_server::BackendCapabilities {
+        smb_server::BackendCapabilities::default()
+    }
 }
