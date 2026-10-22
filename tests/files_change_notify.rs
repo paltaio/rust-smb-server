@@ -15,9 +15,11 @@ use common::client::*;
 use common::crypto::{Cipher, EncryptedSession, is_transform};
 use common::notify::*;
 use common::{build_header, negotiate, read_frame, smb2_signature, tree_connect_body, write_frame};
+#[cfg(unix)]
+use smb_server::ntstatus::STATUS_DELETE_PENDING;
 use smb_server::ntstatus::{
-    STATUS_ACCESS_DENIED, STATUS_DELETE_PENDING, STATUS_INVALID_PARAMETER, STATUS_LOGON_FAILURE,
-    STATUS_NOTIFY_CLEANUP, STATUS_NOTIFY_ENUM_DIR, STATUS_PENDING, STATUS_SUCCESS,
+    STATUS_ACCESS_DENIED, STATUS_INVALID_PARAMETER, STATUS_LOGON_FAILURE, STATUS_NOTIFY_CLEANUP,
+    STATUS_NOTIFY_ENUM_DIR, STATUS_PENDING, STATUS_SUCCESS,
 };
 use smb_server::wire::header::{Command, SMB2_FLAGS_SIGNED, Smb2Header};
 use smb_server::wire::messages::FileId;
@@ -835,5 +837,491 @@ async fn a_mark_ends_watches_armed_through_a_symlink_to_the_directory() {
     assert_eq!(
         wait_notify(&mut watcher, mid, 4096).await,
         (STATUS_DELETE_PENDING, vec![])
+    );
+}
+
+/// Kernel watches on the inode of `dir` held by this process.
+#[cfg(target_os = "linux")]
+fn kernel_watches_on(dir: &std::path::Path) -> usize {
+    use std::os::unix::fs::MetadataExt;
+    let ino = format!(" ino:{:x} ", std::fs::metadata(dir).unwrap().ino());
+    let mut count = 0;
+    for entry in std::fs::read_dir("/proc/self/fd").unwrap().flatten() {
+        let is_inotify = std::fs::read_link(entry.path())
+            .is_ok_and(|target| target.as_os_str() == "anon_inode:inotify");
+        if !is_inotify {
+            continue;
+        }
+        let info = std::fs::read_to_string(
+            std::path::Path::new("/proc/self/fdinfo").join(entry.file_name()),
+        )
+        .unwrap_or_default();
+        count += info
+            .lines()
+            .filter(|line| line.starts_with("inotify wd:") && line.contains(&ino))
+            .count();
+    }
+    count
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn changes_made_on_disk_are_reported() {
+    let (srv, td) = server().await;
+    let d = td.path().join("d");
+    std::fs::create_dir(td.path().join("o")).unwrap();
+    std::fs::write(d.join("w"), b"old").unwrap();
+    let mut watcher = srv.client().await;
+    let names = watcher.open_dir("d").await;
+    let contents = watcher.open_dir("d").await;
+    let attributes = watcher.open_dir("d").await;
+
+    let mid = arm(&mut watcher, names, 4096, NAMES, false).await;
+    drop(std::fs::File::create(d.join("x")).unwrap());
+    assert_eq!(
+        wait_notify(&mut watcher, mid, 4096).await,
+        (STATUS_SUCCESS, vec![added("x")])
+    );
+    let mid = arm(&mut watcher, names, 4096, NAMES, false).await;
+    std::fs::rename(d.join("x"), d.join("y")).unwrap();
+    assert_eq!(
+        wait_notify(&mut watcher, mid, 4096).await,
+        (STATUS_SUCCESS, vec![old_name("x"), new_name("y")])
+    );
+    let mid = arm(&mut watcher, names, 4096, NAMES, false).await;
+    std::fs::remove_file(d.join("y")).unwrap();
+    assert_eq!(
+        wait_notify(&mut watcher, mid, 4096).await,
+        (STATUS_SUCCESS, vec![removed("y")])
+    );
+    let mid = arm(&mut watcher, names, 4096, NAMES, false).await;
+    std::fs::rename(d.join("w"), td.path().join("o").join("w")).unwrap();
+    assert_eq!(
+        wait_notify(&mut watcher, mid, 4096).await,
+        (STATUS_SUCCESS, vec![removed("w")])
+    );
+    std::fs::rename(td.path().join("o").join("w"), d.join("w")).unwrap();
+    let mid = arm(&mut watcher, names, 4096, NAMES, false).await;
+    assert_eq!(
+        wait_notify(&mut watcher, mid, 4096).await,
+        (STATUS_SUCCESS, vec![added("w")])
+    );
+
+    // Contents under the content filter, attributes under ATTRIBUTES.
+    let mid = arm(&mut watcher, contents, 4096, LAST_WRITE, false).await;
+    std::fs::write(d.join("w"), b"new").unwrap();
+    assert_eq!(
+        wait_notify(&mut watcher, mid, 4096).await,
+        (STATUS_SUCCESS, vec![modified("w")])
+    );
+    let mid = arm(&mut watcher, attributes, 4096, ATTRIBUTES, false).await;
+    let mut permissions = std::fs::metadata(d.join("w")).unwrap().permissions();
+    permissions.set_readonly(true);
+    std::fs::set_permissions(d.join("w"), permissions).unwrap();
+    let (status, entries) = wait_notify(&mut watcher, mid, 4096).await;
+    assert_eq!(status, STATUS_SUCCESS);
+    assert_eq!(entries[0], modified("w"));
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_change_made_through_the_server_is_reported_once() {
+    let (srv, td) = server().await;
+    let mut watcher = srv.client().await;
+    let mut maker = srv.client().await;
+    let dir = watcher.open_dir("d").await;
+    arm_idle(&mut watcher, dir, 0x17, false).await;
+    let file = maker
+        .create(Create {
+            name: "d\\x",
+            disposition: FILE_CREATE,
+            ..Create::default()
+        })
+        .await
+        .unwrap()
+        .file_id;
+    assert_eq!(maker.write(file, 0, b"data").await, Ok(4));
+    maker.close(file).await;
+    rename(&mut maker, "d\\x", "d\\y", false, 0).await;
+    make_dir(&mut maker, "d\\sub").await;
+    delete(&mut maker, "d\\y", 0).await;
+    assert_eq!(
+        now(&mut watcher, dir, false).await,
+        Some(vec![
+            added("x"),
+            modified("x"),
+            old_name("x"),
+            new_name("y"),
+            added("sub"),
+            removed("y")
+        ])
+    );
+    // What the kernel saw of the same changes adds nothing: a change made
+    // on disk afterwards, which the kernel reports after them, is the next
+    // thing heard.
+    std::fs::create_dir(td.path().join("d").join("z")).unwrap();
+    let mid = arm(&mut watcher, dir, 4096, NAMES, false).await;
+    assert_eq!(
+        wait_notify(&mut watcher, mid, 4096).await,
+        (STATUS_SUCCESS, vec![added("z")])
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn the_kernel_watch_goes_with_the_last_watch_of_its_directory() {
+    let (srv, td) = server().await;
+    let d = td.path().join("d");
+    let mut watcher = srv.client().await;
+    let first = watcher.open_dir("d").await;
+    let second = watcher.open_dir("d").await;
+    assert_eq!(kernel_watches_on(&d), 0);
+    arm_idle(&mut watcher, first, NAMES, false).await;
+    arm_idle(&mut watcher, second, NAMES, false).await;
+    assert_eq!(kernel_watches_on(&d), 1, "one kernel watch per directory");
+    watcher.close(first).await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(kernel_watches_on(&d), 1);
+    assert_eq!(kernel_watches_on(td.path()), 1, "and one on its parent");
+    watcher.close(second).await;
+    assert!(eventually(|| kernel_watches_on(&d) == 0).await);
+    assert!(eventually(|| kernel_watches_on(td.path()) == 0).await);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_watched_directory_moved_on_disk_asks_for_a_listing() {
+    let (srv, td) = server().await;
+    let mut watcher = srv.client().await;
+    let mut maker = srv.client().await;
+    make_dir(&mut maker, "d\\sub").await;
+    let sub = watcher.open_dir("d\\sub").await;
+    arm_idle(&mut watcher, sub, NAMES, false).await;
+    rename(&mut maker, "d\\sub", "d\\moved", false, FILE_DIRECTORY_FILE).await;
+    // The kernel reports the rename before this, so hearing only this
+    // shows the rename asked for no listing.
+    let d = td.path().join("d");
+    std::fs::create_dir(d.join("moved").join("x")).unwrap();
+    let mid = arm(&mut watcher, sub, 4096, NAMES, false).await;
+    assert_eq!(
+        wait_notify(&mut watcher, mid, 4096).await,
+        (STATUS_SUCCESS, vec![added("x")])
+    );
+    std::fs::rename(d.join("moved"), d.join("away")).unwrap();
+    let mid = arm(&mut watcher, sub, 4096, NAMES, false).await;
+    assert_eq!(
+        wait_notify(&mut watcher, mid, 4096).await,
+        (STATUS_NOTIFY_ENUM_DIR, vec![])
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_directory_deleted_on_disk_ends_its_watches() {
+    let (srv, td) = server().await;
+    let sub = td.path().join("d").join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    let mut watcher = srv.client().await;
+    let dir = watcher.open_dir("d\\sub").await;
+    let mid = arm(&mut watcher, dir, 4096, NAMES, false).await;
+    std::fs::remove_dir(&sub).unwrap();
+    let deleted = (STATUS_DELETE_PENDING, vec![]);
+    assert_eq!(wait_notify(&mut watcher, mid, 4096).await, deleted);
+    let (status, _) = ask(&mut watcher, dir, 4096, NAMES, false).await;
+    assert_eq!(status, deleted.0, "and so does the next request");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_directory_deleted_on_disk_before_its_first_request_ends_it() {
+    let (srv, td) = server().await;
+    let sub = td.path().join("d").join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    let mut watcher = srv.client().await;
+    let dir = watcher.open_dir("d\\sub").await;
+    std::fs::remove_dir(&sub).unwrap();
+    let (status, _) = ask(&mut watcher, dir, 4096, NAMES, false).await;
+    assert_eq!(status, STATUS_DELETE_PENDING);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_directory_replaced_on_disk_by_a_rename_ends_its_watches() {
+    let (srv, td) = server().await;
+    let d = td.path().join("d");
+    std::fs::create_dir(d.join("sub")).unwrap();
+    std::fs::create_dir(td.path().join("other")).unwrap();
+    let mut watcher = srv.client().await;
+    let dir = watcher.open_dir("d\\sub").await;
+    let mid = arm(&mut watcher, dir, 4096, NAMES, false).await;
+    std::fs::rename(td.path().join("other"), d.join("sub")).unwrap();
+    assert_eq!(
+        wait_notify(&mut watcher, mid, 4096).await,
+        (STATUS_DELETE_PENDING, vec![])
+    );
+}
+
+/// `LocalFsBackend` that waits `delay` after each change it makes, before
+/// the server can report it.
+#[cfg(target_os = "linux")]
+struct Slow {
+    inner: smb_server::LocalFsBackend,
+    delay: std::time::Duration,
+}
+
+#[cfg(target_os = "linux")]
+#[async_trait::async_trait]
+impl smb_server::ShareBackend for Slow {
+    async fn open(
+        &self,
+        path: &smb_server::SmbPath,
+        opts: smb_server::OpenOptions,
+    ) -> smb_server::SmbResult<(Box<dyn smb_server::Handle>, smb_server::OpenAction)> {
+        let opened = self.inner.open(path, opts).await;
+        if matches!(&opened, Ok((_, action)) if *action != smb_server::OpenAction::Opened) {
+            tokio::time::sleep(self.delay).await;
+        }
+        opened
+    }
+
+    async fn unlink(&self, path: &smb_server::SmbPath) -> smb_server::SmbResult<()> {
+        let unlinked = self.inner.unlink(path).await;
+        tokio::time::sleep(self.delay).await;
+        unlinked
+    }
+
+    async fn rename(
+        &self,
+        from: &smb_server::SmbPath,
+        to: &smb_server::SmbPath,
+        replace_if_exists: bool,
+    ) -> smb_server::SmbResult<()> {
+        let renamed = self.inner.rename(from, to, replace_if_exists).await;
+        tokio::time::sleep(self.delay).await;
+        renamed
+    }
+
+    fn capabilities(&self) -> smb_server::BackendCapabilities {
+        self.inner.capabilities()
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_change_the_server_reports_late_is_still_reported_once() {
+    let td = tempfile::tempdir().unwrap();
+    std::fs::create_dir(td.path().join("d")).unwrap();
+    // Longer than the backend's reports wait, so they are compared before
+    // the server reports.
+    let slow = Slow {
+        inner: local(td.path()),
+        delay: std::time::Duration::from_millis(600),
+    };
+    let share = Share::new("share", slow).public();
+    let srv = Server::start(SmbServer::builder().user(USER, PASSWORD).share(share)).await;
+    let mut watcher = srv.client().await;
+    let mut maker = srv.client().await;
+    let dir = watcher.open_dir("d").await;
+    arm_idle(&mut watcher, dir, NAMES, false).await;
+    make_dir(&mut maker, "d\\x").await;
+    rename(&mut maker, "d\\x", "d\\y", false, FILE_DIRECTORY_FILE).await;
+    delete(&mut maker, "d\\y", FILE_DIRECTORY_FILE).await;
+    assert_eq!(
+        now(&mut watcher, dir, false).await,
+        Some(vec![added("x"), old_name("x"), new_name("y"), removed("y")])
+    );
+    std::fs::create_dir(td.path().join("d").join("z")).unwrap();
+    let mid = arm(&mut watcher, dir, 4096, NAMES, false).await;
+    assert_eq!(
+        wait_notify(&mut watcher, mid, 4096).await,
+        (STATUS_SUCCESS, vec![added("z")])
+    );
+}
+
+/// `LocalFsBackend` on which a CREATE that must create loses the race to
+/// another program, which creates the directory first.
+#[cfg(target_os = "linux")]
+struct Racing {
+    inner: smb_server::LocalFsBackend,
+    root: std::path::PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+#[async_trait::async_trait]
+impl smb_server::ShareBackend for Racing {
+    async fn open(
+        &self,
+        path: &smb_server::SmbPath,
+        opts: smb_server::OpenOptions,
+    ) -> smb_server::SmbResult<(Box<dyn smb_server::Handle>, smb_server::OpenAction)> {
+        if opts.intent != smb_server::OpenIntent::Create {
+            return self.inner.open(path, opts).await;
+        }
+        let on_disk: std::path::PathBuf = path.components().iter().collect();
+        std::fs::create_dir(self.root.join(on_disk)).unwrap();
+        // Longer than the backend's reports wait.
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        Err(smb_server::SmbError::Exists)
+    }
+
+    async fn unlink(&self, path: &smb_server::SmbPath) -> smb_server::SmbResult<()> {
+        self.inner.unlink(path).await
+    }
+
+    async fn rename(
+        &self,
+        from: &smb_server::SmbPath,
+        to: &smb_server::SmbPath,
+        replace_if_exists: bool,
+    ) -> smb_server::SmbResult<()> {
+        self.inner.rename(from, to, replace_if_exists).await
+    }
+
+    fn capabilities(&self) -> smb_server::BackendCapabilities {
+        self.inner.capabilities()
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_create_that_loses_to_a_change_on_disk_reports_that_change() {
+    let td = tempfile::tempdir().unwrap();
+    std::fs::create_dir(td.path().join("d")).unwrap();
+    let racing = Racing {
+        inner: local(td.path()),
+        root: td.path().to_path_buf(),
+    };
+    let share = Share::new("share", racing).public();
+    let srv = Server::start(SmbServer::builder().user(USER, PASSWORD).share(share)).await;
+    let mut watcher = srv.client().await;
+    let mut maker = srv.client().await;
+    let dir = watcher.open_dir("d").await;
+    arm_idle(&mut watcher, dir, NAMES, false).await;
+    let refused = maker.create(dir_create("d\\x", FILE_CREATE)).await;
+    assert!(refused.is_err(), "the CREATE fails");
+    assert_eq!(now(&mut watcher, dir, false).await, Some(vec![added("x")]));
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_change_on_disk_is_heard_before_a_later_one_through_the_server() {
+    let (srv, td) = server().await;
+    let mut watcher = srv.client().await;
+    let mut maker = srv.client().await;
+    let dir = watcher.open_dir("d").await;
+    arm_idle(&mut watcher, dir, NAMES, false).await;
+    std::fs::create_dir(td.path().join("d").join("a")).unwrap();
+    // The kernel's report is read, and waiting, when the server deletes.
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    delete(&mut maker, "d\\a", FILE_DIRECTORY_FILE).await;
+    assert_eq!(
+        now(&mut watcher, dir, false).await,
+        Some(vec![added("a"), removed("a")])
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_tree_watch_hears_a_directory_made_on_disk_before_a_file_made_in_it() {
+    let (srv, td) = server().await;
+    let mut watcher = srv.client().await;
+    let mut maker = srv.client().await;
+    let dir = watcher.open_dir("d").await;
+    arm_idle(&mut watcher, dir, NAMES, true).await;
+    std::fs::create_dir(td.path().join("d").join("b")).unwrap();
+    // The kernel's report is read, and waiting, when the server creates.
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    create_file(&mut maker, "d\\b\\c").await;
+    assert_eq!(
+        now(&mut watcher, dir, true).await,
+        Some(vec![added("b"), added("b\\c")])
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_removal_on_disk_right_after_a_save_through_the_server_is_reported() {
+    let (srv, td) = server().await;
+    let mut watcher = srv.client().await;
+    let mut editor = srv.client().await;
+    create_file(&mut editor, "d\\f").await;
+    let dir = watcher.open_dir("d").await;
+    arm_idle(&mut watcher, dir, NAMES, false).await;
+    // Save by writing a new file and renaming it over the old one.
+    let temp = editor
+        .create(Create {
+            name: "d\\f.tmp",
+            access: RW | DELETE,
+            disposition: FILE_CREATE,
+            ..Create::default()
+        })
+        .await
+        .unwrap()
+        .file_id;
+    assert_eq!(editor.write(temp, 0, b"new").await, Ok(3));
+    let to = rename_info("d\\f", true);
+    assert_eq!(
+        editor.set_info(temp, FILE_RENAME_INFORMATION, to).await,
+        STATUS_SUCCESS
+    );
+    editor.close(temp).await;
+    assert_eq!(
+        now(&mut watcher, dir, false).await,
+        Some(vec![
+            added("f.tmp"),
+            removed("f"),
+            old_name("f.tmp"),
+            new_name("f")
+        ])
+    );
+    std::fs::remove_file(td.path().join("d").join("f")).unwrap();
+    let mid = arm(&mut watcher, dir, 4096, NAMES, false).await;
+    assert_eq!(
+        wait_notify(&mut watcher, mid, 4096).await,
+        (STATUS_SUCCESS, vec![removed("f")])
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_write_on_disk_to_a_file_open_only_to_read_is_reported() {
+    let (srv, td) = server().await;
+    let file = td.path().join("d").join("r");
+    std::fs::write(&file, b"old").unwrap();
+    let mut watcher = srv.client().await;
+    let mut reader = srv.client().await;
+    let read = reader
+        .open_with_options("d\\r", FILE_GENERIC_READ, 0)
+        .await
+        .unwrap();
+    let dir = watcher.open_dir("d").await;
+    let mid = arm(&mut watcher, dir, 4096, LAST_WRITE, false).await;
+    std::fs::write(&file, b"new").unwrap();
+    assert_eq!(
+        wait_notify(&mut watcher, mid, 4096).await,
+        (STATUS_SUCCESS, vec![modified("r")])
+    );
+    reader.close(read).await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn changes_on_disk_are_not_reported_when_host_watching_is_off() {
+    let td = tempfile::tempdir().unwrap();
+    let d = td.path().join("d");
+    std::fs::create_dir(&d).unwrap();
+    let share = Share::new("share", local(td.path()).watch_host_changes(false)).public();
+    let srv = Server::start(SmbServer::builder().user(USER, PASSWORD).share(share)).await;
+    let mut watcher = srv.client().await;
+    let mut maker = srv.client().await;
+    let dir = watcher.open_dir("d").await;
+    let mid = arm(&mut watcher, dir, 4096, NAMES, false).await;
+    std::fs::write(d.join("outside"), b"x").unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert_eq!(kernel_watches_on(&d), 0);
+    create_file(&mut maker, "d\\inside").await;
+    assert_eq!(
+        wait_notify(&mut watcher, mid, 4096).await,
+        (STATUS_SUCCESS, vec![added("inside")])
     );
 }

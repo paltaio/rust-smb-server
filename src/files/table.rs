@@ -3,13 +3,15 @@
 //! open: sharing modes (2.1.5.1.2.2), the delete-pending flag (2.1.5.15.3),
 //! byte-range locks (2.1.5.8) and leases (MS-SMB2 3.3.1.4).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use tracing::{debug, warn};
 
-use crate::access_mask::{DELETE, FILE_APPEND_DATA, FILE_EXECUTE, FILE_READ_DATA, FILE_WRITE_DATA};
+use crate::access_mask::{
+    DELETE, FILE_APPEND_DATA, FILE_EXECUTE, FILE_READ_DATA, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA,
+};
 use crate::backend::FileInfo;
 use crate::conn::outbound::Outbound;
 use crate::error::SmbError;
@@ -602,6 +604,27 @@ impl FileTable {
         })
     }
 
+    /// For each of `paths`, whether an open on the share that may write
+    /// the file's data or attributes currently has it as its name. The
+    /// opens are looked at once for all of them.
+    pub(crate) fn open_to_change(&self, paths: &[SmbPath], case_sensitive: bool) -> Vec<bool> {
+        if paths.is_empty() {
+            return Vec::new();
+        }
+        let mut open = HashSet::new();
+        for node in self.files().values() {
+            for entry in &node.state().opens {
+                if entry.sharing.access & (WRITE_ACCESS | FILE_WRITE_ATTRIBUTES) != 0 {
+                    open.insert(path_key(&entry.path, case_sensitive));
+                }
+            }
+        }
+        paths
+            .iter()
+            .map(|path| open.contains(&path_key(path, case_sensitive)))
+            .collect()
+    }
+
     /// True if the file named `path` is delete-pending.
     pub(crate) fn delete_pending_at(&self, path: &SmbPath, case_sensitive: bool) -> bool {
         self.files().values().any(|node| {
@@ -1108,6 +1131,11 @@ impl FileRef {
         FileKey::new(info.file_index, path, case_sensitive) == self.node.state().key
     }
 
+    /// True if the backend's file id `file_index` is this file's.
+    pub(crate) fn has_index(&self, file_index: u64) -> bool {
+        file_index != 0 && self.node.state().key == FileKey::Index(file_index)
+    }
+
     /// Whether the file is delete-pending (MS-FSA Link.IsDeleted).
     pub(crate) fn delete_pending(&self) -> bool {
         self.node.state().delete_pending.is_some()
@@ -1339,19 +1367,20 @@ impl PendingDelete {
             .delete_pending
             .clone()
             .unwrap_or_else(|| self.path.clone());
+        let filter = if self.is_directory {
+            FILE_NOTIFY_CHANGE_DIR_NAME
+        } else {
+            FILE_NOTIFY_CHANGE_FILE_NAME
+        };
+        let removed = [Change {
+            path: &path,
+            action: FILE_ACTION_REMOVED,
+            filter,
+            seen: true,
+        }];
+        let expected = self.share.watches.expect(&removed, None);
         match self.share.backend.unlink(&path).await {
-            Ok(()) => {
-                let filter = if self.is_directory {
-                    FILE_NOTIFY_CHANGE_DIR_NAME
-                } else {
-                    FILE_NOTIFY_CHANGE_FILE_NAME
-                };
-                self.share.watches.report(&[Change {
-                    path: &path,
-                    action: FILE_ACTION_REMOVED,
-                    filter,
-                }]);
-            }
+            Ok(()) => expected.report(&self.share.watches, &removed),
             Err(SmbError::NotEmpty) => {
                 debug!(path = %path, "delete-on-close skipped a non-empty directory");
             }

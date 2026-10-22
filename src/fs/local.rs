@@ -62,6 +62,9 @@ pub struct LocalFsBackend {
     read_only: bool,
     /// Case rule of name lookups in the share root.
     case_sensitive: bool,
+    /// Watches directories for changes made outside the server.
+    #[cfg(target_os = "linux")]
+    hub: Option<Arc<super::inotify::Hub>>,
 }
 
 impl LocalFsBackend {
@@ -76,6 +79,8 @@ impl LocalFsBackend {
             root_dev,
             read_only: false,
             case_sensitive,
+            #[cfg(target_os = "linux")]
+            hub: Some(Arc::default()),
         })
     }
 
@@ -85,6 +90,32 @@ impl LocalFsBackend {
     pub fn read_only(mut self) -> Self {
         self.read_only = true;
         self
+    }
+
+    /// Report changes made to the share's directories outside the server,
+    /// by other programs on the host or through other shares, to clients
+    /// that watch them. On Linux only, through inotify: only the entries
+    /// directly in a watched directory are seen. The parent of each watched
+    /// directory, the share root's parent included, is watched too, to see
+    /// the directory deleted. The backend holds at most 4096 kernel
+    /// watches; a directory past that, or one the kernel will not watch,
+    /// past `fs.inotify.max_user_watches` or `fs.inotify.max_user_instances`
+    /// or without `/proc`, gets only the changes made through the server,
+    /// with a warning logged once. On by default.
+    #[must_use]
+    pub fn watch_host_changes(self, enabled: bool) -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            Self {
+                hub: enabled.then(Arc::default),
+                ..self
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = enabled;
+            self
+        }
     }
 }
 
@@ -542,6 +573,8 @@ impl LocalFsBackend {
                 name: file_name_for(path),
                 root_dev: self.root_dev,
                 dir_handle: Arc::new(dir_handle),
+                #[cfg(target_os = "linux")]
+                hub: self.hub.clone(),
             });
             return Ok((handle, action));
         }
@@ -579,6 +612,8 @@ impl LocalFsBackend {
                         name: file_name_for(path),
                         root_dev: self.root_dev,
                         dir_handle: Arc::new(dir_handle),
+                        #[cfg(target_os = "linux")]
+                        hub: self.hub.clone(),
                     });
                     return Ok((handle, OpenAction::Opened));
                 }
@@ -818,6 +853,8 @@ enum LocalHandle {
         name: String,
         root_dev: Option<u64>,
         dir_handle: Arc<Dir>,
+        #[cfg(target_os = "linux")]
+        hub: Option<Arc<super::inotify::Hub>>,
     },
 }
 
@@ -911,6 +948,7 @@ impl Handle for LocalHandle {
                 dir_handle,
                 name,
                 root_dev,
+                ..
             } => {
                 let dir_handle = Arc::clone(dir_handle);
                 let name = name.clone();
@@ -1018,6 +1056,18 @@ impl Handle for LocalHandle {
                     .map_err(io_to_smb)?
                     .map_err(io_to_smb)
             }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn watch(&self) -> SmbResult<Option<Box<dyn crate::backend::DirWatch>>> {
+        match self {
+            LocalHandle::Dir {
+                dir_handle,
+                hub: Some(hub),
+                ..
+            } => Ok(hub.watch(&**dir_handle)),
+            _ => Ok(None),
         }
     }
 

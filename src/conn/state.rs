@@ -16,8 +16,8 @@ use crate::builder::Access;
 use crate::conn::outbound::Outbound;
 use crate::conn::pending::{PendingOps, Stop};
 use crate::files::{
-    DurableReg, DurableTable, FileRef, NotifyBudget, OpenSlot, WatchReg, close_opens, end_opens,
-    finish_close,
+    Closing, DurableReg, DurableTable, FileRef, NotifyBudget, OpenSlot, WatchReg, close_opens,
+    end_opens, finish_close,
 };
 use crate::path::SmbPath;
 use crate::rpc::pipe::{Pipe, PipeBudget};
@@ -451,6 +451,8 @@ pub struct Open {
     pub(crate) watch: Option<WatchReg>,
     /// A WRITE through the open changed the file; its close reports that.
     pub(crate) wrote: AtomicBool,
+    /// The CREATE that made the open created or overwrote the file.
+    pub(crate) created: bool,
     /// FileDispositionInformation through the open marked its directory
     /// for deletion (MS-FSA Open.ChangeNotifyDirectoryMarkedDeleted). It
     /// stays set when the mark is cleared.
@@ -481,13 +483,14 @@ impl Drop for Open {
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
+        let closing = Closing::announce(self, false);
         let file = self.file.take();
         runtime.spawn(finish_close(
             handle,
             file,
             self.delete_on_close,
             self.is_directory,
-            *self.wrote.get_mut(),
+            closing,
         ));
     }
 }

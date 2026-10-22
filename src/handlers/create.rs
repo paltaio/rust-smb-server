@@ -28,7 +28,7 @@ use crate::backend::{
 use crate::conn::pending::{Stop, stopped};
 use crate::conn::state::{Connection, Open};
 use crate::dispatch::HandlerResponse;
-use crate::error::SmbError;
+use crate::error::{SmbError, SmbResult};
 use crate::files::{
     BreakWait, CONTENT_CHANGED, Change, Durability, FileRef, Granted, LeaseId, LeaseRef,
     LeaseRequest, LeaseState, LeaseVersion, MAX_BREAK_WAIT, OpenRequest, OpenSlot, Refused,
@@ -780,11 +780,8 @@ async fn attempt(
                             intent: OpenIntent::Create,
                             ..args.opts
                         };
-                        match backend.open(path, create).await {
-                            Ok(opened) => {
-                                report_opened(&share, path, args.opts.directory, opened.1);
-                                break (None, Some(opened));
-                            }
+                        match open_reported(&share, path, create).await {
+                            Ok(opened) => break (None, Some(opened)),
                             Err(SmbError::Exists) if tries < 2 => tries += 1,
                             Err(e) => return open_failed(e),
                         }
@@ -799,11 +796,8 @@ async fn attempt(
     // The open this attempt made, or the one a waiting CREATE kept.
     let (handle, action) = match opened {
         Some(opened) => opened,
-        None => match backend.open(path, args.opts).await {
-            Ok(opened) => {
-                report_opened(&share, path, args.opts.directory, opened.1);
-                opened
-            }
+        None => match open_reported(&share, path, args.opts).await {
+            Ok(opened) => opened,
             Err(e) => return open_failed(e),
         },
     };
@@ -961,6 +955,7 @@ async fn attempt(
         durable,
         watch: None,
         wrote: Default::default(),
+        created: action != OpenAction::Opened,
         marked_deleted: Default::default(),
     };
     let open_arc = Arc::new(tokio::sync::RwLock::new(open));
@@ -1007,22 +1002,42 @@ async fn attempt(
     Step::Done(response)
 }
 
-/// Tells the watchers of `share` that the backend created or overwrote
-/// `path` (MS-FSA 2.1.5.1.1, 2.1.5.1.2). This runs right after the backend
-/// call, so a CREATE that then waits for a lease break, or fails, reports
-/// the change it made once.
-fn report_opened(share: &ShareBindings, path: &SmbPath, directory: bool, action: OpenAction) {
-    let (action, filter) = match action {
-        OpenAction::Created if directory => (FILE_ACTION_ADDED, FILE_NOTIFY_CHANGE_DIR_NAME),
-        OpenAction::Created => (FILE_ACTION_ADDED, FILE_NOTIFY_CHANGE_FILE_NAME),
-        OpenAction::Overwritten => (FILE_ACTION_MODIFIED, CONTENT_CHANGED),
-        _ => return,
+/// Opens `path` on the backend with `opts` and tells the watchers of
+/// `share` when that created or overwrote it (MS-FSA 2.1.5.1.1,
+/// 2.1.5.1.2). The report goes out right after the backend call, so a
+/// CREATE that then waits for a lease break, or fails, reports the change
+/// it made once. A creation is noted before the call, so the backend's own
+/// report of it is left out whenever it arrives.
+async fn open_reported(
+    share: &ShareBindings,
+    path: &SmbPath,
+    opts: OpenOptions,
+) -> SmbResult<(Box<dyn Handle>, OpenAction)> {
+    let names = if opts.directory {
+        FILE_NOTIFY_CHANGE_DIR_NAME
+    } else {
+        FILE_NOTIFY_CHANGE_FILE_NAME
     };
-    share.watches.report(&[Change {
+    let added = [Change {
         path,
-        action,
-        filter,
-    }]);
+        action: FILE_ACTION_ADDED,
+        filter: names,
+        seen: true,
+    }];
+    let may_create = !matches!(opts.intent, OpenIntent::Open | OpenIntent::Truncate);
+    let expected = may_create.then(|| share.watches.expect(&added, None));
+    let opened = share.backend.open(path, opts).await;
+    match (&opened, expected) {
+        (Ok((_, OpenAction::Created)), Some(expected)) => expected.report(&share.watches, &added),
+        (Ok((_, OpenAction::Overwritten)), _) => share.watches.report(&[Change {
+            path,
+            action: FILE_ACTION_MODIFIED,
+            filter: CONTENT_CHANGED,
+            seen: true,
+        }]),
+        _ => {}
+    }
+    opened
 }
 
 /// The CREATE response body for an open of a file with `info`, holding a

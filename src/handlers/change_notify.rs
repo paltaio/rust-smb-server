@@ -80,9 +80,10 @@ pub async fn handle(
     // A watch its directory's deletion ended is replaced once the mark is
     // cleared (MS-FSA 2.1.5.11).
     // A watch that ended while this request held the open stays: the
-    // request takes its end.
+    // request takes its end. So does one whose directory was deleted
+    // outside the server.
     let watch = match &open.watch {
-        Some(reg) if !reg.ended() || names.is_none() => Arc::clone(reg.watch()),
+        Some(reg) if !reg.ended() || names.is_none() || reg.gone() => Arc::clone(reg.watch()),
         _ => {
             // Closed while this request waited for the open.
             let Some(dir) = open.path() else {
@@ -109,6 +110,11 @@ pub async fn handle(
             watch
         }
     };
+    // Each request asks again for the backend's reports of the directory,
+    // in case they stopped.
+    if let Some(handle) = open.handle.as_deref() {
+        share.watches.listen(&share, &watch, handle).await;
+    }
     drop(open);
     drop(names);
 

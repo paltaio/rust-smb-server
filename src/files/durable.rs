@@ -830,6 +830,7 @@ mod tests {
                 durable: Some(reg),
                 watch: None,
                 wrote: Default::default(),
+                created: false,
                 marked_deleted: Default::default(),
             }))
         }

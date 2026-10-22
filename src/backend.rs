@@ -350,6 +350,80 @@ pub trait Handle: Send + Sync {
     async fn dir_is_empty(&self) -> SmbResult<bool> {
         Ok(self.list_dir(None).await?.is_empty())
     }
+
+    /// Watch this directory for changes to its entries made by anyone,
+    /// including outside the server. The server asks one open of a watched
+    /// directory and shares the watch among every watch of that directory;
+    /// it may outlive the handle, and is dropped with the directory's last
+    /// watch. The default returns `Ok(None)`: the server then reports only
+    /// the changes made through it.
+    async fn watch(&self) -> SmbResult<Option<Box<dyn DirWatch>>> {
+        Ok(None)
+    }
+}
+
+/// What a backend saw happen to an entry of a watched directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DirChangeKind {
+    /// The entry appeared.
+    Added,
+    /// The entry went away.
+    Removed,
+    /// The entry was renamed within the directory from `from`.
+    Renamed { from: String },
+    /// The entry's contents were written.
+    Modified,
+    /// The entry's attributes or times changed.
+    AttributesChanged,
+    /// Changes were lost; the client has to list the directory again.
+    Lost,
+    /// The watched directory itself was renamed or moved. Changes to its
+    /// entries keep coming.
+    Moved,
+    /// The watched directory itself was deleted. No change follows.
+    Deleted,
+}
+
+/// A change to an entry of a watched directory, as the backend saw it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DirChange {
+    /// Name of the entry in the directory. Empty for
+    /// [`DirChangeKind::Lost`], [`DirChangeKind::Moved`] and
+    /// [`DirChangeKind::Deleted`].
+    pub name: String,
+    /// What happened to the entry.
+    pub kind: DirChangeKind,
+    /// The entry is a directory.
+    pub is_directory: bool,
+}
+
+impl DirChange {
+    /// A change of `kind` to the entry `name`, a directory when
+    /// `is_directory`.
+    pub fn new(name: impl Into<String>, kind: DirChangeKind, is_directory: bool) -> Self {
+        Self {
+            name: name.into(),
+            kind,
+            is_directory,
+        }
+    }
+}
+
+/// Changes to the entries of one directory, from [`Handle::watch`].
+#[async_trait]
+pub trait DirWatch: Send {
+    /// The next changes, in the order they happened; `None` once the watch
+    /// has stopped. A watch that stops without [`DirChangeKind::Deleted`]
+    /// may have lost changes, and the server asks for a new one. The server
+    /// leaves out names it cannot use, and takes a rename from or to one as
+    /// the addition or removal of the other name.
+    ///
+    /// Must be cancel-safe: the server may drop the future before it
+    /// completes, and changes it had not returned must come with the next
+    /// call.
+    async fn next(&mut self) -> Option<Vec<DirChange>>;
 }
 
 /// Backend for the synthetic IPC$ share. `open`, `unlink` and `rename`

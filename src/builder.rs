@@ -154,9 +154,11 @@ impl Share {
     /// folder in it is created, deleted, renamed, written, truncated or
     /// overwritten, or has its attributes or times set, through any
     /// connection to this share. A write is reported when the open that
-    /// wrote it closes. Changes made outside the server, or through another share
-    /// over the same directory, are not reported. When off, such requests
-    /// fail with STATUS_NOT_SUPPORTED. On by default.
+    /// wrote it closes. Changes made outside the server, or through another
+    /// share over the same directory, are reported only by a backend that
+    /// watches for them: `LocalFsBackend` does on Linux, for the entries
+    /// directly in a watched folder. When off, such requests fail with
+    /// STATUS_NOT_SUPPORTED. On by default.
     pub fn change_notify(mut self, enabled: bool) -> Self {
         self.change_notify = enabled;
         self

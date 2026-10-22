@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::RwLock;
 use tracing::debug;
 
+use crate::access_mask::{FILE_APPEND_DATA, FILE_WRITE_DATA};
 use crate::backend::{FileInfo, Handle};
 use crate::conn::state::Open;
 use crate::handlers::shared::restore_fixed_times;
@@ -38,6 +39,53 @@ pub const DEFAULT_MAX_OPENS_PER_CONNECTION: usize = 16384;
 /// Default for
 /// [`SmbServerBuilder::max_locks_per_open`](crate::SmbServerBuilder::max_locks_per_open).
 pub const DEFAULT_MAX_LOCKS_PER_OPEN: usize = 1024;
+
+/// What a closing open did to its file: whether its close reports new
+/// contents, and which of the backend's reports of the close it hides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Closing {
+    /// The open could not write the file's data.
+    ReadOnly,
+    /// The open could write the file's data, or created or overwrote it,
+    /// and wrote nothing.
+    Unwritten,
+    /// The open sets times it fixed again as it closes.
+    RestoresTimes,
+    /// A WRITE through the open changed the file.
+    Wrote,
+}
+
+impl Closing {
+    /// How `open` closes; `restores_times` when the close sets the times
+    /// the open fixed again. The share's watches are told before the close
+    /// touches the file, so the backend's reports of it are left out
+    /// whenever they arrive.
+    pub(crate) fn announce(open: &Open, restores_times: bool) -> Self {
+        let fixed = open.fixed_times;
+        let closing = if open.wrote.load(Ordering::Acquire) {
+            Self::Wrote
+        } else if restores_times
+            && (fixed.last_access_time.is_some() || fixed.last_write_time.is_some())
+        {
+            Self::RestoresTimes
+        } else if !open.is_directory
+            && (open.created || open.granted_access & (FILE_WRITE_DATA | FILE_APPEND_DATA) != 0)
+        {
+            Self::Unwritten
+        } else {
+            Self::ReadOnly
+        };
+        if let Some(file) = &open.file {
+            let watches = &file.share().watches;
+            match closing {
+                Self::ReadOnly => {}
+                Self::Unwritten => watches.closed(&file.path()),
+                Self::RestoresTimes | Self::Wrote => watches.touch(&file.path()),
+            }
+        }
+        closing
+    }
+}
 
 /// Counts one open against its connection's limit until dropped.
 pub(crate) struct OpenSlot(Arc<AtomicUsize>);
@@ -73,6 +121,7 @@ pub(crate) async fn close_open(open_arc: &Arc<RwLock<Open>>, want_attrs: bool) -
     // the close reports anything (MS-SMB2 3.3.5.10). CLOSE takes the watch
     // out first and ends it once its response is queued.
     drop(open.watch.take());
+    let closing = Closing::announce(&open, true);
     restore_fixed_times(&open).await;
     let handle = open.handle.take()?;
     let info = if want_attrs {
@@ -84,9 +133,8 @@ pub(crate) async fn close_open(open_arc: &Arc<RwLock<Open>>, want_attrs: bool) -
     open.slot.take();
     let delete_on_close = open.delete_on_close;
     let is_directory = open.is_directory;
-    let wrote = open.wrote.load(Ordering::Acquire);
     drop(open);
-    finish_close(handle, file, delete_on_close, is_directory, wrote).await;
+    finish_close(handle, file, delete_on_close, is_directory, closing).await;
     info
 }
 
@@ -94,7 +142,7 @@ pub(crate) async fn close_open(open_arc: &Arc<RwLock<Open>>, want_attrs: bool) -
 /// share's file table. With `delete_on_close` the file becomes
 /// delete-pending, unless it is a directory with entries (MS-FSA 2.1.5.5
 /// phase 1), and is removed when this was its last open. An open that
-/// `wrote` and leaves the file in place reports the new contents to the
+/// wrote and leaves the file in place reports the new contents to the
 /// share's watchers, once. A directory this leaves delete-pending, open
 /// elsewhere, ends its watches with STATUS_DELETE_PENDING. Every path that
 /// ends an open goes through here.
@@ -103,8 +151,9 @@ pub(crate) async fn finish_close(
     file: Option<FileRef>,
     delete_on_close: bool,
     is_directory: bool,
-    wrote: bool,
+    closing: Closing,
 ) {
+    let wrote = closing == Closing::Wrote;
     let share = file.as_ref().map(|f| Arc::clone(f.share()));
     // A directory is checked for entries and marked with no CREATE or
     // rename running, so it is still empty when it becomes delete-pending.
@@ -149,6 +198,7 @@ pub(crate) async fn finish_close(
                     path: &path,
                     action: FILE_ACTION_MODIFIED,
                     filter: CONTENT_CHANGED,
+                    seen: true,
                 }]);
             }
             for path in &marked {
@@ -262,6 +312,7 @@ mod tests {
             durable: None,
             watch: None,
             wrote: Default::default(),
+            created: false,
             marked_deleted: Default::default(),
         });
         let in_table = || {

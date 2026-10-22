@@ -7,13 +7,19 @@
 //! tree below the directory and how much it buffers (MS-SMB2 3.3.1.3).
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
+use tokio::task::AbortHandle;
+
+use crate::backend::{DirChange, DirChangeKind, DirWatch, Handle};
 use crate::ntstatus;
-use crate::path::{SmbPath, rebase};
+use crate::path::{SmbPath, is_valid_component, rebase};
 use crate::proto::messages::change_notify::{
-    FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE,
+    FILE_ACTION_ADDED, FILE_ACTION_MODIFIED, FILE_ACTION_REMOVED, FILE_ACTION_RENAMED_NEW_NAME,
+    FILE_ACTION_RENAMED_OLD_NAME, FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_DIR_NAME,
+    FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE,
     entries_len, push_entry,
 };
 use crate::server::ShareBindings;
@@ -43,6 +49,10 @@ pub(crate) struct Change<'a> {
     pub path: &'a SmbPath,
     pub action: u32,
     pub filter: u32,
+    /// A backend that reports changes sees this addition, removal or rename
+    /// itself. The removal of an entry a rename replaced is not seen: the
+    /// backend sees only the rename.
+    pub seen: bool,
 }
 
 /// How a CHANGE_NOTIFY is answered.
@@ -132,6 +142,291 @@ pub(crate) struct Watch {
     budget: Arc<NotifyBudget>,
 }
 
+/// How long the server's own change to an entry hides the backend's
+/// report of the same change.
+const ECHO_TIME: Duration = Duration::from_secs(5);
+
+/// Most changes of the server one watched directory remembers.
+const ECHO_LIMIT: usize = 1024;
+
+/// How long a backend report waits before it is compared with what the
+/// server did: the server reports its own change right after making it.
+const HOST_GRACE: Duration = Duration::from_millis(200);
+
+/// Batches of backend reports one watched directory holds while they wait.
+const HOST_QUEUE: usize = 64;
+
+/// Marks the server's rename of a watched directory itself in its
+/// [`Echo`], under an empty name.
+const RENAMED_SELF: u32 = 0;
+
+async fn sleep_until_due(due: Option<tokio::time::Instant>) {
+    if let Some(due) = due {
+        tokio::time::sleep_until(due).await;
+    }
+}
+
+/// The server's recent changes to the entries of a watched directory, by
+/// name as the table compares names.
+#[derive(Default)]
+struct Echo {
+    /// Changes the server reported, each hiding one backend report:
+    /// additions, removals and renames, and as MODIFIED the close of a file
+    /// that could be written and was not.
+    reported: VecDeque<(Instant, u32, String)>,
+    /// Entries the server changed, hiding modifications.
+    touched: VecDeque<(Instant, String)>,
+}
+
+impl Echo {
+    fn prune(&mut self, now: Instant) {
+        let fresh = |at: &Instant| now.duration_since(*at) < ECHO_TIME;
+        while self.reported.front().is_some_and(|(at, ..)| !fresh(at)) {
+            self.reported.pop_front();
+        }
+        while self.touched.front().is_some_and(|(at, _)| !fresh(at)) {
+            self.touched.pop_front();
+        }
+    }
+
+    fn report(&mut self, action: u32, name: String) {
+        let now = Instant::now();
+        self.prune(now);
+        if self.reported.len() == ECHO_LIMIT {
+            self.reported.pop_front();
+        }
+        self.reported.push_back((now, action, name));
+    }
+
+    fn closed(&mut self, name: String) {
+        self.report(FILE_ACTION_MODIFIED, name);
+    }
+
+    fn touch(&mut self, name: String) {
+        if self.touched.len() == ECHO_LIMIT {
+            self.touched.pop_front();
+        }
+        self.touched.push_back((Instant::now(), name));
+    }
+
+    /// Takes the server's report of `action` on `name`, if there is one.
+    fn take(&mut self, action: u32, name: &str) -> bool {
+        self.prune(Instant::now());
+        let found = self
+            .reported
+            .iter()
+            .position(|(_, a, n)| *a == action && n == name);
+        found.map(|at| self.reported.remove(at)).is_some()
+    }
+
+    /// Takes the server's report of any of `actions` on `name`, the first
+    /// that matches.
+    fn take_any(&mut self, actions: &[u32], name: &str) -> bool {
+        actions.iter().any(|&action| self.take(action, name))
+    }
+
+    fn touched(&mut self, name: &str) -> bool {
+        self.prune(Instant::now());
+        self.touched.iter().any(|(_, n)| n == name)
+    }
+
+    /// Takes back the latest record of a change the server made to `name`.
+    fn untouch(&mut self, name: &str) {
+        if let Some(at) = self.touched.iter().rposition(|(_, n)| n == name) {
+            self.touched.remove(at);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.reported.clear();
+        self.touched.clear();
+    }
+}
+
+/// The backend's reports of changes to one watched directory's entries,
+/// shared by every watch of the directory.
+struct Host {
+    /// The directory, moved by renames as its watches are.
+    dir: Mutex<SmbPath>,
+    share: Weak<ShareBindings>,
+    /// What the server itself did to the directory's entries lately, to
+    /// tell the backend's reports of it from other changes.
+    echo: Mutex<Echo>,
+    /// Reports waiting for [`HOST_GRACE`] from their arrival. Its lock is
+    /// held while they are passed on, so they go out in order.
+    waiting: Mutex<VecDeque<(tokio::time::Instant, Vec<DirChange>)>>,
+    /// The task that takes the backend's reports.
+    task: Mutex<Option<AbortHandle>>,
+    stopped: AtomicBool,
+    /// The backend gives no reports for the directory, so nothing is
+    /// recorded in `echo`.
+    idle: AtomicBool,
+}
+
+impl Host {
+    fn new(dir: SmbPath, share: &Arc<ShareBindings>) -> Self {
+        Self {
+            dir: Mutex::new(dir),
+            share: Arc::downgrade(share),
+            echo: Mutex::default(),
+            waiting: Mutex::default(),
+            task: Mutex::new(None),
+            stopped: AtomicBool::new(false),
+            idle: AtomicBool::new(false),
+        }
+    }
+
+    /// Takes the backend's reports from `source` until the host stops, the
+    /// reports end or the share goes away. Each batch waits [`HOST_GRACE`]
+    /// from its arrival, unless a change the server reports in the
+    /// directory sends it on first.
+    fn start(self: &Arc<Self>, source: Box<dyn DirWatch>) {
+        let host = Arc::clone(self);
+        let task = tokio::spawn(async move {
+            let mut source = source;
+            let mut open = true;
+            loop {
+                let (due, full) = {
+                    let waiting = lock(&host.waiting);
+                    let due = waiting.front().map(|(at, _)| *at + HOST_GRACE);
+                    (due, waiting.len() >= HOST_QUEUE)
+                };
+                if !open && due.is_none() {
+                    break;
+                }
+                tokio::select! {
+                    changes = source.next(), if open && !full => match changes {
+                        Some(changes) => {
+                            let now = tokio::time::Instant::now();
+                            lock(&host.waiting).push_back((now, changes));
+                        }
+                        None => open = false,
+                    },
+                    () = sleep_until_due(due), if due.is_some() => {
+                        if !host.pass_on(Some(tokio::time::Instant::now())) {
+                            return;
+                        }
+                    }
+                }
+            }
+            if let Some(share) = host.share.upgrade() {
+                share.watches.host_ended(&host);
+            }
+        });
+        *lock(&self.task) = Some(task.abort_handle());
+        if self.stopped.load(Ordering::Acquire) {
+            task.abort();
+        }
+    }
+
+    /// Passes on the waiting reports that arrived by `now`, or all of them.
+    /// False once the share is gone.
+    fn pass_on(self: &Arc<Self>, now: Option<tokio::time::Instant>) -> bool {
+        let Some(share) = self.share.upgrade() else {
+            return false;
+        };
+        let mut waiting = lock(&self.waiting);
+        while let Some((at, _)) = waiting.front() {
+            if now.is_some_and(|now| *at + HOST_GRACE > now) {
+                break;
+            }
+            let Some((_, changes)) = waiting.pop_front() else {
+                break;
+            };
+            share.watches.take_host_changes(&share, self, changes);
+        }
+        true
+    }
+
+    fn stop(&self) {
+        self.stopped.store(true, Ordering::Release);
+        if let Some(task) = lock(&self.task).take() {
+            task.abort();
+        }
+    }
+}
+
+/// Changes the server is about to make, noted in the echoes of the watched
+/// directories they happen in before the backend can report them. Dropped
+/// without [`Expected::report`], as when the change failed, the notes are
+/// taken back; a note a backend report already took stood for a change
+/// someone else made, which is then reported as theirs.
+pub(crate) struct Expected {
+    marks: Vec<Mark>,
+}
+
+/// One change noted in a host's echo.
+struct Mark {
+    host: Arc<Host>,
+    /// Index of the change among those expected; `None` for the rename of
+    /// the watched directory itself.
+    change: Option<usize>,
+    /// The action noted to hide one backend report, if any.
+    action: Option<u32>,
+    /// The entry's name as the table compares names.
+    key: String,
+    /// The entry's name as spelled, and the change's filter.
+    name: String,
+    filter: u32,
+}
+
+impl Expected {
+    /// Reports `changes`, the changes this expected, now made. A directory
+    /// that started hearing its backend since gets them noted now.
+    pub(crate) fn report(mut self, table: &WatchTable, changes: &[Change<'_>]) {
+        let marks = std::mem::take(&mut self.marks);
+        table.deliver(changes, |at, host| {
+            marks
+                .iter()
+                .any(|mark| mark.change == Some(at) && Arc::ptr_eq(&mark.host, host))
+        });
+    }
+}
+
+impl Drop for Expected {
+    fn drop(&mut self) {
+        for mark in self.marks.drain(..) {
+            let taken = {
+                let mut echo = lock(&mark.host.echo);
+                echo.untouch(&mark.key);
+                mark.action
+                    .is_some_and(|action| !echo.take(action, &mark.key))
+            };
+            let Some(share) = mark.host.share.upgrade() else {
+                continue;
+            };
+            if taken {
+                let _order = lock(&mark.host.waiting);
+                let heard = [(
+                    mark.action.unwrap_or_default(),
+                    mark.name.as_str(),
+                    mark.filter,
+                )];
+                match mark.change {
+                    Some(_) => share.watches.hear(&mark.host, &heard, false),
+                    None => share.watches.hear(&mark.host, &[], true),
+                }
+            }
+        }
+    }
+}
+
+/// The watches of one directory, and the backend's reports for them.
+#[derive(Default)]
+struct Watched {
+    watches: Vec<Arc<Watch>>,
+    host: Option<Arc<Host>>,
+}
+
+impl Drop for Watched {
+    /// The backend's reports stop with the last watch of the directory.
+    fn drop(&mut self) {
+        if let Some(host) = &self.host {
+            host.stop();
+        }
+    }
+}
+
 struct WatchState {
     /// The watched directory.
     dir: SmbPath,
@@ -145,6 +440,9 @@ struct WatchState {
     overflow: bool,
     /// Set once the watch is removed.
     end: Option<u32>,
+    /// The directory was deleted outside the server, which ended the watch
+    /// for good.
+    gone: bool,
     /// Tickets of the waiting requests, oldest first.
     queue: VecDeque<u64>,
     next_ticket: u64,
@@ -175,12 +473,29 @@ impl Watch {
                 nested: false,
                 overflow: false,
                 end: None,
+                gone: false,
                 queue: VecDeque::new(),
                 next_ticket: 0,
             }),
             changed: tokio::sync::watch::Sender::new(0),
             budget: Arc::clone(budget),
         }))
+    }
+
+    /// Drops what the watch buffered: its next answer is
+    /// STATUS_NOTIFY_ENUM_DIR.
+    fn lose(&self) {
+        let mut state = self.state();
+        if state.end.is_some() || state.overflow {
+            return;
+        }
+        self.budget.refund(state.entries.len());
+        state.entries = Vec::new();
+        state.last = None;
+        state.nested = false;
+        state.overflow = true;
+        drop(state);
+        self.bump();
     }
 
     fn state(&self) -> MutexGuard<'_, WatchState> {
@@ -333,10 +648,13 @@ impl Drop for Ticket {
 /// The watches on one share, by watched directory (MS-FSA
 /// Volume.ChangeNotifyList).
 ///
-/// Lock order: `dirs`, then a watch's state. A report pushes into the
-/// watches it matched after letting go of `dirs`. Neither is held while taking a
-/// lock of the file, lease or durable tables, and neither is taken while
-/// holding one of those.
+/// Lock order: a host's waiting reports, then `dirs`, then a watch's state
+/// or a host's directory, echo or task, a host's directory before its
+/// echo. A report passes on the waiting reports of the directories it
+/// changed, then pushes into the watches it matched, after letting go of
+/// `dirs`. Only a host's waiting reports are held while taking a lock of
+/// the file table, and none of these is taken while holding a lock of the
+/// file, lease or durable tables.
 pub(crate) struct WatchTable {
     case_sensitive: bool,
     /// Watches in the table; with none, a report costs one load.
@@ -344,7 +662,7 @@ pub(crate) struct WatchTable {
     /// Watches with SMB2_WATCH_TREE; with none, only the parent of a change
     /// is looked up.
     tree_count: AtomicUsize,
-    dirs: Mutex<HashMap<String, Vec<Arc<Watch>>>>,
+    dirs: Mutex<HashMap<String, Watched>>,
     /// Batches pushed into watches.
     #[cfg(test)]
     pushes: AtomicUsize,
@@ -365,7 +683,7 @@ impl WatchTable {
     fn insert(&self, watch: &Arc<Watch>) {
         let mut dirs = lock(&self.dirs);
         let key = dir_key(watch.state().dir.components(), self.case_sensitive);
-        dirs.entry(key).or_default().push(Arc::clone(watch));
+        dirs.entry(key).or_default().watches.push(Arc::clone(watch));
         self.count.fetch_add(1, Ordering::AcqRel);
         if watch.tree {
             self.tree_count.fetch_add(1, Ordering::AcqRel);
@@ -375,14 +693,14 @@ impl WatchTable {
     fn remove(&self, watch: &Arc<Watch>) {
         let mut dirs = lock(&self.dirs);
         let key = dir_key(watch.state().dir.components(), self.case_sensitive);
-        let Some(watches) = dirs.get_mut(&key) else {
+        let Some(watched) = dirs.get_mut(&key) else {
             return;
         };
-        let Some(at) = watches.iter().position(|w| Arc::ptr_eq(w, watch)) else {
+        let Some(at) = watched.watches.iter().position(|w| Arc::ptr_eq(w, watch)) else {
             return;
         };
-        watches.swap_remove(at);
-        if watches.is_empty() {
+        watched.watches.swap_remove(at);
+        if watched.watches.is_empty() {
             dirs.remove(&key);
         }
         self.count.fetch_sub(1, Ordering::AcqRel);
@@ -402,8 +720,95 @@ impl WatchTable {
     /// change made through a symlink inside the share reaches the watchers
     /// of the path it was made through, not of the directory the symlink
     /// leads to. Each watch takes the changes of one call together, in
-    /// order.
+    /// order, after the backend's reports of the same directories that
+    /// arrived before.
     pub(crate) fn report(&self, changes: &[Change<'_>]) {
+        self.deliver(changes, |_, _| false);
+    }
+
+    /// Notes `changes`, which the server is about to make, so the backend's
+    /// reports of them are left out whenever they arrive; with
+    /// `renamed_dir`, also the rename of that watched directory itself.
+    /// The changes are reported through the returned [`Expected`].
+    pub(crate) fn expect(&self, changes: &[Change<'_>], renamed_dir: Option<&SmbPath>) -> Expected {
+        let mut marks = Vec::new();
+        if self.is_empty() {
+            return Expected { marks };
+        }
+        let dirs = lock(&self.dirs);
+        for (at, change) in changes.iter().enumerate() {
+            if let Some((host, key)) = self.host_of(&dirs, change.path) {
+                let action = self.note(&host, change, &key);
+                let name = change.path.file_name().unwrap_or_default().to_string();
+                marks.push(Mark {
+                    host,
+                    change: Some(at),
+                    action,
+                    key,
+                    name,
+                    filter: change.filter,
+                });
+            }
+        }
+        let renamed = renamed_dir.and_then(|dir| {
+            dirs.get(&dir_key(dir.components(), self.case_sensitive))?
+                .host
+                .clone()
+                .filter(|host| !host.idle.load(Ordering::Acquire))
+        });
+        if let Some(host) = renamed {
+            lock(&host.echo).report(RENAMED_SELF, String::new());
+            marks.push(Mark {
+                host,
+                change: None,
+                action: Some(RENAMED_SELF),
+                key: String::new(),
+                name: String::new(),
+                filter: 0,
+            });
+        }
+        Expected { marks }
+    }
+
+    /// The listening host of the directory `path` is in, and the name of
+    /// `path` in it as the table compares names.
+    fn host_of(
+        &self,
+        dirs: &HashMap<String, Watched>,
+        path: &SmbPath,
+    ) -> Option<(Arc<Host>, String)> {
+        let components = path.components();
+        let parent = components.len().checked_sub(1)?;
+        let host = dirs
+            .get(&dir_key(&components[..parent], self.case_sensitive))?
+            .host
+            .clone()
+            .filter(|host| !host.idle.load(Ordering::Acquire))?;
+        Some((host, self.name_key(&components[parent])))
+    }
+
+    /// Notes `change` to the entry `name` in `host`'s echo. Returns the
+    /// action noted to hide one backend report, if any.
+    fn note(&self, host: &Host, change: &Change<'_>, name: &str) -> Option<u32> {
+        let named = matches!(
+            change.action,
+            FILE_ACTION_ADDED
+                | FILE_ACTION_REMOVED
+                | FILE_ACTION_RENAMED_OLD_NAME
+                | FILE_ACTION_RENAMED_NEW_NAME
+        );
+        let mut echo = lock(&host.echo);
+        echo.touch(name.to_string());
+        if named && change.seen {
+            echo.report(change.action, name.to_string());
+            return Some(change.action);
+        }
+        None
+    }
+
+    /// Pushes `changes` into the watches they reach, noting each in the echo
+    /// of its directory first unless `noted` says it is, by its index.
+    fn deliver(&self, changes: &[Change<'_>], noted: impl Fn(usize, &Arc<Host>) -> bool) {
         if self.count.load(Ordering::Acquire) == 0 {
             return;
         }
@@ -411,19 +816,33 @@ impl WatchTable {
         let dirs = lock(&self.dirs);
         let mut batches: Vec<(Arc<Watch>, Batch)> = Vec::new();
         let mut slots: HashMap<*const Watch, usize> = HashMap::new();
-        for change in changes {
+        let mut hosts: Vec<Arc<Host>> = Vec::new();
+        for (at, change) in changes.iter().enumerate() {
             let components = change.path.components();
             let Some(parent) = components.len().checked_sub(1) else {
                 continue;
             };
+            if let Some((host, name)) = self.host_of(&dirs, change.path)
+                && !noted(at, &host)
+            {
+                self.note(&host, change, &name);
+            }
             let top = if deep { 0 } else { parent };
             for depth in (top..=parent).rev() {
-                let Some(watches) = dirs.get(&dir_key(&components[..depth], self.case_sensitive))
+                let Some(watched) = dirs.get(&dir_key(&components[..depth], self.case_sensitive))
                 else {
                     continue;
                 };
+                // What the backend reported earlier in this directory or a
+                // directory above, which a tree watch hears too, goes first.
+                if let Some(host) = &watched.host
+                    && !host.idle.load(Ordering::Acquire)
+                    && !hosts.iter().any(|h| Arc::ptr_eq(h, host))
+                {
+                    hosts.push(Arc::clone(host));
+                }
                 let mut name = None;
-                for watch in watches {
+                for watch in &watched.watches {
                     if watch.filter & change.filter == 0 || (depth < parent && !watch.tree) {
                         continue;
                     }
@@ -446,6 +865,9 @@ impl WatchTable {
         // A watch removed from here on ends before or after it takes the
         // batch; either way the end gives back what it holds.
         drop(dirs);
+        for host in hosts {
+            host.pass_on(None);
+        }
         for (watch, entries) in batches {
             #[cfg(test)]
             self.pushes.fetch_add(1, Ordering::AcqRel);
@@ -460,21 +882,67 @@ impl WatchTable {
         if self.is_empty() {
             return;
         }
-        let ended = {
-            let mut dirs = lock(&self.dirs);
-            let Some(watches) = dirs.remove(&dir_key(dir.components(), self.case_sensitive)) else {
-                return;
-            };
-            for watch in &watches {
-                self.count.fetch_sub(1, Ordering::AcqRel);
-                if watch.tree {
-                    self.tree_count.fetch_sub(1, Ordering::AcqRel);
-                }
-            }
-            watches
-        };
+        let key = dir_key(dir.components(), self.case_sensitive);
+        let ended = self.take_entry(&mut lock(&self.dirs), &key);
         for watch in ended {
             watch.end(status);
+        }
+    }
+
+    /// Takes the watches of the directory keyed `key` out of the table.
+    fn take_entry(&self, dirs: &mut HashMap<String, Watched>, key: &str) -> Vec<Arc<Watch>> {
+        let Some(mut watched) = dirs.remove(key) else {
+            return Vec::new();
+        };
+        for watch in &watched.watches {
+            self.count.fetch_sub(1, Ordering::AcqRel);
+            if watch.tree {
+                self.tree_count.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+        std::mem::take(&mut watched.watches)
+    }
+
+    /// `name` as the table compares names.
+    fn name_key(&self, name: &str) -> String {
+        if self.case_sensitive {
+            name.to_string()
+        } else {
+            name.to_lowercase()
+        }
+    }
+
+    /// Notes that the server changed the entry at `path`, or is about to
+    /// close it after changing it, so the backend's reports of that
+    /// entry's modification are dropped for [`ECHO_TIME`].
+    pub(crate) fn touch(&self, path: &SmbPath) {
+        self.echo_at(path, Echo::touch);
+    }
+
+    /// Notes that the server is about to close the entry at `path`, open
+    /// to write, created or overwritten, without having written it, so the
+    /// backend's next report of its modification is dropped.
+    pub(crate) fn closed(&self, path: &SmbPath) {
+        self.echo_at(path, Echo::closed);
+    }
+
+    /// Records the server's change to the entry at `path` with `record`,
+    /// when its directory hears the backend.
+    fn echo_at(&self, path: &SmbPath, record: fn(&mut Echo, String)) {
+        if self.is_empty() {
+            return;
+        }
+        let components = path.components();
+        let Some(parent) = components.len().checked_sub(1) else {
+            return;
+        };
+        let dirs = lock(&self.dirs);
+        let host = dirs
+            .get(&dir_key(&components[..parent], self.case_sensitive))
+            .and_then(|watched| watched.host.as_ref())
+            .filter(|host| !host.idle.load(Ordering::Acquire));
+        if let Some(host) = host {
+            record(&mut lock(&host.echo), self.name_key(&components[parent]));
         }
     }
 
@@ -496,36 +964,290 @@ impl WatchTable {
         let dirs = lock(&self.dirs);
         (top..=parent).any(|depth| {
             dirs.get(&dir_key(&components[..depth], self.case_sensitive))
-                .is_some_and(|watches| depth == parent || watches.iter().any(|w| w.tree))
+                .is_some_and(|watched| depth == parent || watched.watches.iter().any(|w| w.tree))
         })
     }
 
     /// Moves every watch of `from`, or of a directory below it, to the
-    /// matching directory under `to`, which `from` was renamed to. What the
-    /// watches buffered stays.
+    /// matching directory under `to`, which `from` was renamed to, with the
+    /// backend's reports for it. What the watches buffered stays.
     pub(crate) fn rename(&self, from: &SmbPath, to: &SmbPath) {
         if self.count.load(Ordering::Acquire) == 0 {
             return;
         }
         let mut dirs = lock(&self.dirs);
+        let keys: Vec<String> = dirs.keys().cloned().collect();
         let mut moved = Vec::new();
-        dirs.retain(|_, watches| {
-            watches.retain(|watch| {
+        for key in keys {
+            let Some(watched) = dirs.get(&key) else {
+                continue;
+            };
+            let mut new_key = None;
+            for watch in &watched.watches {
                 let mut state = watch.state();
-                match rebase(&state.dir, from, to, self.case_sensitive) {
-                    Some(dir) => {
-                        state.dir = dir;
-                        moved.push(Arc::clone(watch));
-                        false
-                    }
-                    None => true,
+                if let Some(dir) = rebase(&state.dir, from, to, self.case_sensitive) {
+                    new_key = Some(dir_key(dir.components(), self.case_sensitive));
+                    state.dir = dir;
                 }
-            });
-            !watches.is_empty()
+            }
+            if let Some(host) = &watched.host {
+                let mut dir = lock(&host.dir);
+                if let Some(rebased) = rebase(&dir, from, to, self.case_sensitive) {
+                    new_key
+                        .get_or_insert_with(|| dir_key(rebased.components(), self.case_sensitive));
+                    *dir = rebased;
+                }
+            }
+            if let Some(new_key) = new_key
+                && let Some(watched) = dirs.remove(&key)
+            {
+                moved.push((new_key, watched));
+            }
+        }
+        for (key, mut watched) in moved {
+            match dirs.get_mut(&key) {
+                // What was watched under the new name is gone; the reports
+                // of the moved directory are kept.
+                Some(existing) => {
+                    existing.watches.append(&mut watched.watches);
+                    if let Some(old) = std::mem::replace(&mut existing.host, watched.host.take()) {
+                        old.stop();
+                    }
+                }
+                None => {
+                    dirs.insert(key, watched);
+                }
+            }
+        }
+    }
+
+    /// Asks `handle`, an open of the directory `watch` watches, for the
+    /// backend's reports of changes to the directory's entries, unless the
+    /// directory has them already or the backend gave none. They go to
+    /// every watch of the directory until its last watch ends or they stop.
+    pub(crate) async fn listen(
+        &self,
+        share: &Arc<ShareBindings>,
+        watch: &Arc<Watch>,
+        handle: &dyn Handle,
+    ) {
+        // The server's own changes are recorded before the backend can see
+        // any.
+        let host = {
+            let mut dirs = lock(&self.dirs);
+            let dir = watch.state().dir.clone();
+            let Some(watched) = dirs.get_mut(&dir_key(dir.components(), self.case_sensitive))
+            else {
+                return;
+            };
+            if watched.host.is_some() || !watched.watches.iter().any(|w| Arc::ptr_eq(w, watch)) {
+                return;
+            }
+            let host = Arc::new(Host::new(dir, share));
+            watched.host = Some(Arc::clone(&host));
+            host
+        };
+        match handle.watch().await {
+            Ok(Some(source)) => host.start(source),
+            _ => {
+                host.idle.store(true, Ordering::Release);
+                lock(&host.echo).clear();
+            }
+        }
+    }
+
+    /// Takes `host` away from its directory, which can listen again.
+    fn detach(&self, host: &Arc<Host>) {
+        let mut dirs = lock(&self.dirs);
+        let key = dir_key(lock(&host.dir).components(), self.case_sensitive);
+        if let Some(watched) = dirs.get_mut(&key)
+            && watched.host.as_ref().is_some_and(|h| Arc::ptr_eq(h, host))
+        {
+            watched.host = None;
+        }
+    }
+
+    /// The watches of the directory `host` reports for.
+    fn watches_of(&self, host: &Arc<Host>) -> Vec<Arc<Watch>> {
+        let dirs = lock(&self.dirs);
+        let key = dir_key(lock(&host.dir).components(), self.case_sensitive);
+        dirs.get(&key)
+            .filter(|watched| watched.host.as_ref().is_some_and(|h| Arc::ptr_eq(h, host)))
+            .map(|watched| watched.watches.clone())
+            .unwrap_or_default()
+    }
+
+    /// The backend's reports ended without the directory being deleted:
+    /// changes may have been lost, so every watch of it answers
+    /// STATUS_NOTIFY_ENUM_DIR next, and the directory can listen again.
+    fn host_ended(&self, host: &Arc<Host>) {
+        for watch in self.watches_of(host) {
+            watch.lose();
+        }
+        self.detach(host);
+    }
+
+    /// The directory `host` reports for was deleted outside the server: its
+    /// watches end with STATUS_DELETE_PENDING, as when it is marked for
+    /// deletion through the server, and stay ended.
+    fn host_deleted(&self, host: &Arc<Host>) {
+        let ended = {
+            let mut dirs = lock(&self.dirs);
+            let key = dir_key(lock(&host.dir).components(), self.case_sensitive);
+            let ours = dirs
+                .get(&key)
+                .is_some_and(|watched| watched.host.as_ref().is_some_and(|h| Arc::ptr_eq(h, host)));
+            if !ours {
+                return;
+            }
+            self.take_entry(&mut dirs, &key)
+        };
+        for watch in ended {
+            watch.state().gone = true;
+            watch.end(ntstatus::STATUS_DELETE_PENDING);
+        }
+    }
+
+    /// Buffers the backend's `changes` to the directory `host` reports for
+    /// in each of its watches whose filter asks for them, but those the
+    /// server made.
+    fn take_host_changes(&self, share: &ShareBindings, host: &Arc<Host>, changes: Vec<DirChange>) {
+        let dir = lock(&host.dir).clone();
+        let names = |directory: bool| {
+            if directory {
+                FILE_NOTIFY_CHANGE_DIR_NAME
+            } else {
+                FILE_NOTIFY_CHANGE_FILE_NAME
+            }
+        };
+        let case_sensitive = share.backend.capabilities().case_sensitive;
+        // (action, name, filter) of what the watches hear.
+        let mut heard: Vec<(u32, &str, u32)> = Vec::new();
+        // Modifications heard, by index in `heard`, unless an open through
+        // the server may be making them, with their paths.
+        let mut unless_open: Vec<(usize, SmbPath)> = Vec::new();
+        let mut lost = false;
+        for change in &changes {
+            let valid = is_valid_component(&change.name);
+            let filter = names(change.is_directory);
+            // A rename to or from a name the server cannot use is the
+            // removal or addition of the other name.
+            let kind = match &change.kind {
+                DirChangeKind::Renamed { from } => match (is_valid_component(from), valid) {
+                    (true, true) => change.kind.clone(),
+                    (true, false) => {
+                        let key = self.name_key(from);
+                        if !lock(&host.echo)
+                            .take_any(&[FILE_ACTION_REMOVED, FILE_ACTION_RENAMED_OLD_NAME], &key)
+                        {
+                            heard.push((FILE_ACTION_REMOVED, from, filter));
+                        }
+                        continue;
+                    }
+                    (false, true) => DirChangeKind::Added,
+                    (false, false) => continue,
+                },
+                kind => kind.clone(),
+            };
+            match kind {
+                DirChangeKind::Deleted => {
+                    self.host_deleted(host);
+                    return;
+                }
+                DirChangeKind::Lost => {
+                    lost = true;
+                    continue;
+                }
+                // Moved outside the server, the directory keeps its watches
+                // under its old name, where the server's changes below it
+                // no longer reach them.
+                DirChangeKind::Moved => {
+                    lost |= !lock(&host.echo).take(RENAMED_SELF, "");
+                    continue;
+                }
+                _ if !valid => continue,
+                _ => {}
+            }
+            let key = self.name_key(&change.name);
+            match kind {
+                // A rename the kernel split in two matches the server's
+                // rename too.
+                DirChangeKind::Added | DirChangeKind::Removed => {
+                    let (action, half) = if kind == DirChangeKind::Added {
+                        (FILE_ACTION_ADDED, FILE_ACTION_RENAMED_NEW_NAME)
+                    } else {
+                        (FILE_ACTION_REMOVED, FILE_ACTION_RENAMED_OLD_NAME)
+                    };
+                    if !lock(&host.echo).take_any(&[action, half], &key) {
+                        heard.push((action, &change.name, filter));
+                    }
+                }
+                DirChangeKind::Renamed { .. } => {
+                    let DirChangeKind::Renamed { from } = &change.kind else {
+                        continue;
+                    };
+                    let from_key = self.name_key(from);
+                    let mut echo = lock(&host.echo);
+                    let echoed = echo.take(FILE_ACTION_RENAMED_OLD_NAME, &from_key)
+                        & echo.take(FILE_ACTION_RENAMED_NEW_NAME, &key);
+                    drop(echo);
+                    if !echoed {
+                        heard.push((FILE_ACTION_RENAMED_OLD_NAME, from, filter));
+                        heard.push((FILE_ACTION_RENAMED_NEW_NAME, &change.name, filter));
+                    }
+                }
+                DirChangeKind::Modified | DirChangeKind::AttributesChanged => {
+                    let Ok(path) = dir.join(&change.name) else {
+                        continue;
+                    };
+                    let echoed = {
+                        let mut echo = lock(&host.echo);
+                        (kind == DirChangeKind::Modified && echo.take(FILE_ACTION_MODIFIED, &key))
+                            || echo.touched(&key)
+                    };
+                    if echoed {
+                        continue;
+                    }
+                    let filter = match kind {
+                        DirChangeKind::Modified => CONTENT_CHANGED,
+                        _ => FILE_NOTIFY_CHANGE_ATTRIBUTES,
+                    };
+                    unless_open.push((heard.len(), path));
+                    heard.push((FILE_ACTION_MODIFIED, &change.name, filter));
+                }
+                _ => {}
+            }
+        }
+        let paths: Vec<SmbPath> = unless_open.iter().map(|(_, path)| path.clone()).collect();
+        let open = share.files.open_to_change(&paths, case_sensitive);
+        let mut dropped = vec![false; heard.len()];
+        for ((at, _), open) in unless_open.iter().zip(open) {
+            dropped[*at] = open;
+        }
+        let mut at = 0;
+        heard.retain(|_| {
+            at += 1;
+            !dropped[at - 1]
         });
-        for watch in moved {
-            let key = dir_key(watch.state().dir.components(), self.case_sensitive);
-            dirs.entry(key).or_default().push(watch);
+        self.hear(host, &heard, lost);
+    }
+
+    /// Pushes `heard`, (action, name, filter) of changes the backend
+    /// reported, into each watch of `host`'s directory whose filter asks
+    /// for them, after STATUS_NOTIFY_ENUM_DIR when `lost`.
+    fn hear(&self, host: &Arc<Host>, heard: &[(u32, &str, u32)], lost: bool) {
+        for watch in self.watches_of(host) {
+            if lost {
+                watch.lose();
+            }
+            let batch: Batch = heard
+                .iter()
+                .filter(|(_, _, filter)| watch.filter & filter != 0)
+                .map(|(action, name, _)| (*action, name.encode_utf16().collect()))
+                .collect();
+            if !batch.is_empty() {
+                watch.push(&batch);
+            }
         }
     }
 
@@ -584,6 +1306,12 @@ impl WatchReg {
         self.watch.state().end.is_some()
     }
 
+    /// Whether the watch ended because its directory was deleted outside
+    /// the server.
+    pub(crate) fn gone(&self) -> bool {
+        self.watch.state().gone
+    }
+
     /// Takes the watch out of the table, so no change reaches it; dropping
     /// the registration ends it.
     pub(crate) fn leave_table(&self) {
@@ -632,6 +1360,7 @@ mod tests {
             path: &p(path),
             action: FILE_ACTION_ADDED,
             filter: FILE_NOTIFY_CHANGE_FILE_NAME,
+            seen: true,
         }]);
     }
 
@@ -790,6 +1519,7 @@ mod tests {
             path: &p("d\\ab"),
             action: FILE_ACTION_REMOVED,
             filter: FILE_NOTIFY_CHANGE_FILE_NAME,
+            seen: true,
         }]);
         assert_eq!(budget.bytes(), 16);
         assert_eq!(names(&watch).unwrap(), ["ab"]);
@@ -798,6 +1528,7 @@ mod tests {
             path: &p("d\\ab"),
             action: FILE_ACTION_ADDED,
             filter: FILE_NOTIFY_CHANGE_FILE_NAME,
+            seen: true,
         }]);
         assert_eq!((budget.watches(), budget.bytes()), (1, 16));
         drop(reg);
@@ -964,11 +1695,13 @@ mod tests {
                 path: &from,
                 action: FILE_ACTION_RENAMED_OLD_NAME,
                 filter: FILE_NOTIFY_CHANGE_FILE_NAME,
+                seen: true,
             },
             Change {
                 path: &to,
                 action: FILE_ACTION_RENAMED_NEW_NAME,
                 filter: FILE_NOTIFY_CHANGE_FILE_NAME,
+                seen: true,
             },
         ]);
         // One push each: a request woken in between could not take half.
@@ -977,6 +1710,192 @@ mod tests {
         assert_eq!(names(&fits).unwrap(), ["c", "e"]);
         let ticket = half.enqueue(4096, true);
         assert_eq!(half.take(&ticket), Some(Answer::EnumDir));
+    }
+
+    /// The (action, name) of each change a request on `watch` gets now, or
+    /// `None` when it would wait.
+    fn actions(watch: &Arc<Watch>) -> Option<Vec<(u32, String)>> {
+        let ticket = watch.enqueue(MAX_NOTIFY_BUFFER, true);
+        match watch.take(&ticket)? {
+            Answer::Changes(buf) => Some(decode(&buf)),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn host_changes_leave_out_what_the_server_did() {
+        use crate::backend::{DirChange, DirChangeKind};
+        let budget: Arc<NotifyBudget> = Arc::default();
+        let share = ShareBindings::new(
+            "s".to_string(),
+            Arc::new(MemFsBackend::new()),
+            ShareMode::Public,
+            HashMap::new(),
+            false,
+            true,
+            true,
+        );
+        let all = NAMES | CONTENT_CHANGED;
+        let reg = WatchReg::arm(&share, p("d"), all, false, 4096, &budget).unwrap();
+        let names_reg = WatchReg::arm(&share, p("d"), NAMES, false, 4096, &budget).unwrap();
+        let watch = Arc::clone(reg.watch());
+        let names_only = Arc::clone(names_reg.watch());
+        let host = Arc::new(Host::new(p("d"), &share));
+        lock(&share.watches.dirs)
+            .get_mut(&dir_key(p("d").components(), false))
+            .unwrap()
+            .host = Some(Arc::clone(&host));
+        let take = |changes| share.watches.take_host_changes(&share, &host, changes);
+        let server = |action, path: &str, seen| {
+            share.watches.report(&[Change {
+                path: &p(path),
+                action,
+                filter: FILE_NOTIFY_CHANGE_FILE_NAME,
+                seen,
+            }]);
+        };
+        let both = || (names(&watch), names(&names_only));
+        server(FILE_ACTION_ADDED, "d\\X", true);
+        server(FILE_ACTION_RENAMED_OLD_NAME, "d\\X", true);
+        server(FILE_ACTION_RENAMED_NEW_NAME, "d\\y", true);
+        share.watches.touch(&p("d\\w"));
+        assert_eq!(names(&watch).unwrap(), ["X", "X", "y"]);
+        assert_eq!(names(&names_only).unwrap(), ["X", "X", "y"]);
+
+        let host_change = |name: &str, kind| DirChange::new(name, kind, false);
+        let renamed = |from: &str| DirChangeKind::Renamed {
+            from: from.to_string(),
+        };
+        // One backend report reaches each watch whose filter asks for it.
+        take(vec![
+            host_change("x", DirChangeKind::Added),
+            host_change("y", renamed("x")),
+            host_change("w", DirChangeKind::Modified),
+            host_change("v", DirChangeKind::Modified),
+            host_change("b", renamed("a")),
+            host_change("bad:name", DirChangeKind::Added),
+        ]);
+        assert_eq!(names(&watch).unwrap(), ["v", "a", "b"]);
+        assert_eq!(names(&names_only).unwrap(), ["a", "b"]);
+
+        // Each server report hides one backend report, for every watch.
+        take(vec![host_change("x", DirChangeKind::Added)]);
+        assert_eq!(both(), (Some(vec!["x".into()]), Some(vec!["x".into()])));
+
+        // A rename the kernel split into a removal and an addition.
+        server(FILE_ACTION_RENAMED_OLD_NAME, "d\\m", true);
+        server(FILE_ACTION_RENAMED_NEW_NAME, "d\\n", true);
+        both();
+        take(vec![host_change("m", DirChangeKind::Removed)]);
+        take(vec![host_change("n", DirChangeKind::Added)]);
+        assert_eq!(both(), (None, None));
+
+        // The removal of an entry a rename replaced is not seen by the
+        // backend, so it hides nothing: a later removal is reported.
+        server(FILE_ACTION_REMOVED, "d\\t", false);
+        server(FILE_ACTION_RENAMED_OLD_NAME, "d\\s", true);
+        server(FILE_ACTION_RENAMED_NEW_NAME, "d\\t", true);
+        both();
+        take(vec![host_change("t", renamed("s"))]);
+        take(vec![host_change("t", DirChangeKind::Removed)]);
+        assert_eq!(
+            actions(&watch).unwrap(),
+            [(FILE_ACTION_REMOVED, "t".to_string())]
+        );
+        names(&names_only);
+
+        // A rename to or from a name the server cannot use.
+        take(vec![
+            host_change("bad:1", renamed("c")),
+            host_change("e", renamed("bad:2")),
+            host_change("bad:4", renamed("bad:3")),
+        ]);
+        let expected = vec![
+            (FILE_ACTION_REMOVED, "c".to_string()),
+            (FILE_ACTION_ADDED, "e".to_string()),
+        ];
+        assert_eq!(actions(&watch).unwrap(), expected);
+        assert_eq!(actions(&names_only).unwrap(), expected);
+
+        // A close of a file opened to write hides one modification.
+        share.watches.closed(&p("d\\u"));
+        take(vec![host_change("u", DirChangeKind::Modified)]);
+        assert_eq!(names(&watch), None);
+        take(vec![host_change("u", DirChangeKind::Modified)]);
+        assert_eq!(names(&watch).unwrap(), ["u"]);
+        // An open that may change the file hides its changes; one that
+        // only reads does not.
+        let file = |access| {
+            let sharing = crate::files::Sharing { access, share: 7 };
+            let info = crate::backend::FileInfo::new("");
+            crate::files::FileRef::register(&share, &info, &p("d\\r"), sharing.into())
+                .unwrap()
+                .0
+        };
+        let reader = file(crate::access_mask::FILE_READ_DATA);
+        take(vec![host_change("r", DirChangeKind::AttributesChanged)]);
+        assert_eq!(names(&watch).unwrap(), ["r"]);
+        let writer = file(crate::access_mask::FILE_WRITE_ATTRIBUTES);
+        take(vec![host_change("r", DirChangeKind::AttributesChanged)]);
+        assert_eq!(names(&watch), None);
+        drop((reader, writer));
+
+        // A lost queue, or a move of the directory the server did not
+        // make, is an ENUM_DIR.
+        take(vec![host_change("", DirChangeKind::Lost)]);
+        for watch in [&watch, &names_only] {
+            let ticket = watch.enqueue(4096, true);
+            assert_eq!(watch.take(&ticket), Some(Answer::EnumDir));
+        }
+        let expected = share.watches.expect(&[], Some(&p("d")));
+        share.watches.rename(&p("d"), &p("e"));
+        expected.report(&share.watches, &[]);
+        take(vec![host_change("", DirChangeKind::Moved)]);
+        assert_eq!(both(), (None, None));
+        take(vec![host_change("", DirChangeKind::Moved)]);
+        let ticket = watch.enqueue(4096, true);
+        assert_eq!(watch.take(&ticket), Some(Answer::EnumDir));
+
+        // A deleted directory ends its watches for good.
+        take(vec![host_change("", DirChangeKind::Deleted)]);
+        let ticket = watch.enqueue(4096, true);
+        assert_eq!(
+            watch.take(&ticket),
+            Some(Answer::Ended(ntstatus::STATUS_DELETE_PENDING))
+        );
+        assert!(reg.gone() && names_reg.gone());
+        assert!(share.watches.is_empty());
+    }
+
+    #[test]
+    fn watches_renamed_onto_watched_name_keep_their_own_reports() {
+        let budget: Arc<NotifyBudget> = Arc::default();
+        let share = ShareBindings::new(
+            "s".to_string(),
+            Arc::new(MemFsBackend::new()),
+            ShareMode::Public,
+            HashMap::new(),
+            false,
+            true,
+            true,
+        );
+        let _old = WatchReg::arm(&share, p("e"), NAMES, false, 4096, &budget).unwrap();
+        let _moved = WatchReg::arm(&share, p("d"), NAMES, false, 4096, &budget).unwrap();
+        let attach = |dir: &str| {
+            let host = Arc::new(Host::new(p(dir), &share));
+            lock(&share.watches.dirs)
+                .get_mut(&dir_key(p(dir).components(), false))
+                .unwrap()
+                .host = Some(Arc::clone(&host));
+            host
+        };
+        let old = attach("e");
+        let moved = attach("d");
+        share.watches.rename(&p("d"), &p("e"));
+        let dirs = lock(&share.watches.dirs);
+        let kept = dirs[&dir_key(p("e").components(), false)].host.as_ref();
+        assert!(kept.is_some_and(|host| Arc::ptr_eq(host, &moved)));
+        assert!(old.stopped.load(Ordering::Acquire));
     }
 
     #[tokio::test]

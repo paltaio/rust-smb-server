@@ -236,6 +236,7 @@ async fn report_modified(share: &ShareBindings, open_arc: &RwLock<Open>, filter:
             path: &path,
             action: FILE_ACTION_MODIFIED,
             filter,
+            seen: true,
         }]);
     }
 }
@@ -400,24 +401,33 @@ async fn rename_attempt(
         return Renamed::Done(Err(ntstatus::STATUS_ACCESS_DENIED));
     }
     file.break_leases(Trigger::Handle);
-    drop(open);
     let replaced = replaced.filter(|_| may_exist(&from));
+    // Renaming one link of a file over another removes the source link.
+    let links = replaced
+        .as_ref()
+        .is_some_and(|entry| file.has_index(entry.file_index))
+        && !same_path(&from, to, case_sensitive);
+    drop(open);
+    let changes = rename_changes(&from, to, is_directory, replaced, links, case_sensitive);
+    let changes: Vec<Change<'_>> = changes
+        .iter()
+        .map(|(path, action, filter, seen)| Change {
+            path,
+            action: *action,
+            filter: *filter,
+            seen: *seen,
+        })
+        .collect();
+    let expected = share
+        .watches
+        .expect(&changes, is_directory.then_some(&from));
     let result = match share.backend.rename(&from, to, rename.replace).await {
         Ok(()) => {
             share.files.rename_paths(&from, to, case_sensitive);
             if is_directory {
                 share.watches.rename(&from, to);
             }
-            let changes = rename_changes(&from, to, is_directory, replaced, case_sensitive);
-            let changes: Vec<Change<'_>> = changes
-                .iter()
-                .map(|(path, action, filter)| Change {
-                    path,
-                    action: *action,
-                    filter: *filter,
-                })
-                .collect();
-            share.watches.report(&changes);
+            expected.report(&share.watches, &changes);
             Ok(())
         }
         Err(e) => Err(e.to_nt_status()),
@@ -431,6 +441,8 @@ async fn rename_attempt(
 struct StoredEntry {
     name: String,
     is_directory: bool,
+    /// The backend's file id, `0` if it has none.
+    file_index: u64,
 }
 
 /// The entry `path` names: on a case-sensitive backend, found by opening
@@ -446,9 +458,11 @@ async fn stored_entry(
         let (handle, _) = backend.open(path, OpenOptions::default()).await.ok()?;
         let info = handle.stat().await;
         let _ = handle.close().await;
+        let info = info.ok()?;
         return Some(StoredEntry {
             name: name.to_string(),
-            is_directory: info.ok()?.is_directory,
+            is_directory: info.is_directory,
+            file_index: info.file_index,
         });
     }
     let opts = OpenOptions {
@@ -465,6 +479,7 @@ async fn stored_entry(
         .map(|e| StoredEntry {
             name: e.info.name,
             is_directory: e.info.is_directory,
+            file_index: e.info.file_index,
         })
 }
 
@@ -475,8 +490,8 @@ fn same_name(from: &SmbPath, to: &SmbPath, case_sensitive: bool) -> bool {
     same_path(&parent(from), &parent(to), case_sensitive) && from.file_name() == to.file_name()
 }
 
-/// The changes renaming `from` to `to` reports, as (path, action, filter)
-/// in order (MS-FSA 2.1.5.15.12). An entry already at the new name, which
+/// The changes renaming `from` to `to` reports, as (path, action, filter,
+/// seen) in order (MS-FSA 2.1.5.15.12). An entry already at the new name, which
 /// the rename replaced, or the renamed entry itself when only the case of
 /// its name changes, is REMOVED first under its name as stored (`stored`).
 /// This follows Windows; MS-FSA instead reports a replaced target spelled
@@ -484,14 +499,18 @@ fn same_name(from: &SmbPath, to: &SmbPath, case_sensitive: bool) -> bool {
 /// RENAMED_OLD_NAME and RENAMED_NEW_NAME, one into another directory
 /// REMOVED and ADDED, and the directory the entry lands in is MODIFIED
 /// under LAST_WRITE. A rename to the same name, or to the stored name of
-/// the renamed entry, reports nothing.
+/// the renamed entry, reports nothing. `seen` tells which of these a
+/// backend that reports changes sees itself: not the removal of the
+/// replaced entry, and when `links` names two links of one file, which the
+/// backend renames by removing the source, not the new name either.
 fn rename_changes(
     from: &SmbPath,
     to: &SmbPath,
     is_directory: bool,
     stored: Option<StoredEntry>,
+    links: bool,
     case_sensitive: bool,
-) -> Vec<(SmbPath, u32, u32)> {
+) -> Vec<(SmbPath, u32, u32, bool)> {
     if same_name(from, to, case_sensitive) {
         return Vec::new();
     }
@@ -516,7 +535,7 @@ fn rename_changes(
     if let Some(entry) = stored
         && let Ok(path) = parent(to).join(&entry.name)
     {
-        changes.push((path, FILE_ACTION_REMOVED, kind(entry.is_directory)));
+        changes.push((path, FILE_ACTION_REMOVED, kind(entry.is_directory), false));
     }
     let (old, new) = if same_path(&parent(from), &parent(to), case_sensitive) {
         (FILE_ACTION_RENAMED_OLD_NAME, FILE_ACTION_RENAMED_NEW_NAME)
@@ -524,13 +543,18 @@ fn rename_changes(
         (FILE_ACTION_REMOVED, FILE_ACTION_ADDED)
     };
     let filter = kind(is_directory);
-    changes.push((from.clone(), old, filter));
-    changes.push((to.clone(), new, filter));
+    changes.push((from.clone(), old, filter, true));
+    changes.push((to.clone(), new, filter, !links));
     // The directory the entry lands in has a new write time, which Windows
     // reports as a change of that directory.
     let into = parent(to);
     if !into.is_root() {
-        changes.push((into, FILE_ACTION_MODIFIED, FILE_NOTIFY_CHANGE_LAST_WRITE));
+        changes.push((
+            into,
+            FILE_ACTION_MODIFIED,
+            FILE_NOTIFY_CHANGE_LAST_WRITE,
+            true,
+        ));
     }
     changes
 }
@@ -845,6 +869,7 @@ mod tests {
                 durable: None,
                 watch: None,
                 wrote: Default::default(),
+                created: false,
                 marked_deleted: Default::default(),
             };
             tree.opens
@@ -914,11 +939,46 @@ mod tests {
         let replaced = replaced.map(|(name, is_directory)| StoredEntry {
             name: name.to_string(),
             is_directory,
+            file_index: 0,
         });
-        rename_changes(&p(from), &p(to), is_directory, replaced, false)
+        rename_changes(&p(from), &p(to), is_directory, replaced, false, false)
             .into_iter()
-            .map(|(path, action, filter)| (action, path.display_backslash(), filter))
+            .map(|(path, action, filter, _)| (action, path.display_backslash(), filter))
             .collect()
+    }
+
+    #[test]
+    fn a_backend_sees_neither_a_replaced_entry_go_nor_a_link_renamed_over_another() {
+        let stored = || {
+            Some(StoredEntry {
+                name: "b".to_string(),
+                is_directory: false,
+                file_index: 7,
+            })
+        };
+        let seen = |links| {
+            rename_changes(&p("a"), &p("b"), false, stored(), links, false)
+                .into_iter()
+                .map(|(path, action, _, seen)| (action, path.display_backslash(), seen))
+                .collect::<Vec<_>>()
+        };
+        let s = |x: &str| x.to_string();
+        assert_eq!(
+            seen(false),
+            [
+                (FILE_ACTION_REMOVED, s("b"), false),
+                (FILE_ACTION_RENAMED_OLD_NAME, s("a"), true),
+                (FILE_ACTION_RENAMED_NEW_NAME, s("b"), true),
+            ]
+        );
+        assert_eq!(
+            seen(true),
+            [
+                (FILE_ACTION_REMOVED, s("b"), false),
+                (FILE_ACTION_RENAMED_OLD_NAME, s("a"), true),
+                (FILE_ACTION_RENAMED_NEW_NAME, s("b"), false),
+            ]
+        );
     }
 
     const FILE: u32 = FILE_NOTIFY_CHANGE_FILE_NAME;

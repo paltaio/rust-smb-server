@@ -199,12 +199,53 @@
 //!   Changes are buffered on the directory handle between requests, up to
 //!   the buffer size of its first request and at most 64 KiB; when more
 //!   arrive, or they do not fit the request being answered, the answer is
-//!   STATUS_NOTIFY_ENUM_DIR. Changes made outside the server or through
-//!   another share over the same directory are not reported. Watches
-//!   follow paths: a change made through a symlink inside the share reaches
-//!   the watchers of the path it was made through. Names are spelled as the
-//!   client that made the change spelled them, but for the stored names
-//!   above. The backend is called for these reports in three cases: a
+//!   STATUS_NOTIFY_ENUM_DIR. Watches follow paths: a change made through a
+//!   symlink inside the share reaches the watchers of the path it was made
+//!   through, and on Linux, as a change on disk, those of the directory
+//!   the symlink leads to. Names are spelled as the client that made the
+//!   change spelled them, but for the stored names above.
+//!
+//!   Changes made outside the server, or through another share over the
+//!   same directory, are reported when the backend's [`Handle::watch`]
+//!   reports them. `LocalFsBackend` does on Linux, through inotify, unless
+//!   its `watch_host_changes` turns it off: additions, removals, renames
+//!   within the directory, new contents when a writer closes the file
+//!   (under SIZE, LAST_WRITE and ATTRIBUTES) and attribute or time changes
+//!   (under ATTRIBUTES) of the entries directly in a watched directory,
+//!   also for a client that asks for the whole tree. A move out of or into
+//!   the directory is a removal or an addition, and so is a rename from or
+//!   to a name the server cannot use. A lost kernel queue, and a watched
+//!   directory renamed or moved outside the server, are answered
+//!   STATUS_NOTIFY_ENUM_DIR; such a directory stays watched under its old
+//!   name. A watched directory deleted outside the server, or replaced by a
+//!   rename, ends its watches with STATUS_DELETE_PENDING, and every later
+//!   CHANGE_NOTIFY on its handles gets the same. The parent of each watched
+//!   directory is watched too, the share root's parent included, only to
+//!   see the directory go. A change in a parent is reported only to the
+//!   watchers of that parent, so a change in the share root's parent is
+//!   reported to no one. One backend holds at most 4096 kernel watches,
+//!   parents included. A directory past that, or one the kernel will not
+//!   watch, past `fs.inotify.max_user_watches` or
+//!   `fs.inotify.max_user_instances` or without `/proc`, gets only the
+//!   changes made through the server, with a warning logged once. Other
+//!   backends and platforms report only changes made through the server.
+//!
+//!   The server leaves out the backend's reports of its own changes. Each
+//!   addition, removal or rename it made in the last 5 seconds drops one
+//!   matching backend report. A modification or attribute change is
+//!   dropped while an open through the server that may write the entry's
+//!   data or attributes has it open, for 5 seconds after the server
+//!   reported a change to it or closed an open that wrote it or restored
+//!   times fixed through it, and once after it closed an open that could
+//!   write it, or created or overwrote it, and wrote nothing. A backend
+//!   report waits up to 200 milliseconds for that comparison, and goes out
+//!   before any change the server reports after it arrived in the same
+//!   directory, or below it to a watch of the whole tree.
+//!
+//!   The backend is called for these reports in four cases:
+//!   [`Handle::watch`], through an open of a watched directory, on the
+//!   first request on that directory and on the next request after the
+//!   backend's reports stopped; a
 //!   FileBasicInformation that passed something to the backend calls
 //!   [`Handle::stat`] once more; a size change on a share with watches
 //!   calls `stat` before and after; and a rename into a watched directory
@@ -233,10 +274,12 @@
 //! well.
 //!
 //! Later releases may add methods with default bodies, fields to
-//! [`FileInfo`], [`BackendCapabilities`] and [`VolumeInfo`], and variants
-//! to [`OpenIntent`]. A backend that implements the required methods,
-//! builds those types through [`FileInfo::new`] and the `Default` impls, and
-//! matches `OpenIntent` with a wildcard arm keeps compiling.
+//! [`FileInfo`], [`BackendCapabilities`], [`VolumeInfo`] and [`DirChange`],
+//! and variants to [`OpenIntent`] and [`DirChangeKind`]. A backend that
+//! implements the required methods, builds those types through
+//! [`FileInfo::new`], [`DirChange::new`] and the `Default` impls, and
+//! matches `OpenIntent` and `DirChangeKind` with a wildcard arm keeps
+//! compiling.
 
 mod access_mask;
 mod auth_policy;
@@ -269,8 +312,8 @@ mod utils;
 mod wildcard;
 
 pub use backend::{
-    BackendCapabilities, DirEntry, FileInfo, FileTimes, Handle, OpenAction, OpenIntent,
-    OpenOptions, ShareBackend, VolumeInfo,
+    BackendCapabilities, DirChange, DirChangeKind, DirEntry, DirWatch, FileInfo, FileTimes, Handle,
+    OpenAction, OpenIntent, OpenOptions, ShareBackend, VolumeInfo,
 };
 pub use builder::{Access, BuildError, Share, SmbServerBuilder};
 pub use bytes::Bytes;
