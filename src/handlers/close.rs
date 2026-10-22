@@ -42,10 +42,14 @@ pub async fn handle(
     // answered after the CLOSE response is queued, as Windows orders them:
     // their stop and the open's change notification watch go with the
     // response.
+    let watch = open_arc.write().await.watch.take();
+    if let Some(watch) = &watch {
+        watch.leave_table();
+    }
     let ended = EndWaiters {
         conn: Arc::clone(conn),
         file_id: req.file_id,
-        watch: open_arc.write().await.watch.take(),
+        watch,
     };
 
     let want_attrs = req.flags & FLAG_POSTQUERY_ATTRIB != 0;

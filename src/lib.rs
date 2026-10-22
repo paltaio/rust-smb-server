@@ -186,6 +186,16 @@
 //!     FileAllocationInformation, and an overwrite or supersede by CREATE,
 //!     at once.
 //!
+//!   A watched directory marked for deletion, through
+//!   FileDispositionInformation or by the close of an open that asked for
+//!   delete-on-close while other opens of it remain, ends every watch of
+//!   it: the requests waiting on them, and any request on an open of the
+//!   directory while it stays delete-pending, get STATUS_DELETE_PENDING. An
+//!   open that marked the directory, and any open made with delete-on-close,
+//!   always gets STATUS_DELETE_PENDING; once the mark is cleared, other
+//!   opens watch again. Watches of the directories above it stay, and hear
+//!   the removal once the directory is deleted.
+//!
 //!   Changes are buffered on the directory handle between requests, up to
 //!   the buffer size of its first request and at most 64 KiB; when more
 //!   arrive, or they do not fit the request being answered, the answer is

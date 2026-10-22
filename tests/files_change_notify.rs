@@ -16,8 +16,8 @@ use common::crypto::{Cipher, EncryptedSession, is_transform};
 use common::notify::*;
 use common::{build_header, negotiate, read_frame, smb2_signature, tree_connect_body, write_frame};
 use smb_server::ntstatus::{
-    STATUS_ACCESS_DENIED, STATUS_INVALID_PARAMETER, STATUS_LOGON_FAILURE, STATUS_NOTIFY_CLEANUP,
-    STATUS_NOTIFY_ENUM_DIR, STATUS_PENDING, STATUS_SUCCESS,
+    STATUS_ACCESS_DENIED, STATUS_DELETE_PENDING, STATUS_INVALID_PARAMETER, STATUS_LOGON_FAILURE,
+    STATUS_NOTIFY_CLEANUP, STATUS_NOTIFY_ENUM_DIR, STATUS_PENDING, STATUS_SUCCESS,
 };
 use smb_server::wire::header::{Command, SMB2_FLAGS_SIGNED, Smb2Header};
 use smb_server::wire::messages::FileId;
@@ -815,4 +815,25 @@ async fn a_rename_reaches_watches_by_the_kind_of_entry() {
     let mid = watcher.send_no_wait(Command::ChangeNotify, &body).await;
     let frame = within(watcher.next_frame()).await;
     assert_eq!(interim(&frame).map(|(m, _)| m), Some(mid));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_mark_ends_watches_armed_through_a_symlink_to_the_directory() {
+    let (srv, td) = server().await;
+    std::fs::create_dir(td.path().join("d").join("w")).unwrap();
+    std::os::unix::fs::symlink("w", td.path().join("d").join("link")).unwrap();
+    let mut watcher = srv.client().await;
+    let mut marker = srv.client().await;
+    let link = watcher.open_dir("d\\link").await;
+    let mid = arm(&mut watcher, link, 4096, NAMES, false).await;
+    let mark = marker
+        .open_with_options("d\\w", DELETE | FILE_READ_ATTRIBUTES, FILE_DIRECTORY_FILE)
+        .await
+        .unwrap();
+    assert_eq!(marker.set_delete(mark, true).await, STATUS_SUCCESS);
+    assert_eq!(
+        wait_notify(&mut watcher, mid, 4096).await,
+        (STATUS_DELETE_PENDING, vec![])
+    );
 }

@@ -451,6 +451,10 @@ pub struct Open {
     pub(crate) watch: Option<WatchReg>,
     /// A WRITE through the open changed the file; its close reports that.
     pub(crate) wrote: AtomicBool,
+    /// FileDispositionInformation through the open marked its directory
+    /// for deletion (MS-FSA Open.ChangeNotifyDirectoryMarkedDeleted). It
+    /// stays set when the mark is cleared.
+    pub(crate) marked_deleted: AtomicBool,
 }
 
 impl Open {

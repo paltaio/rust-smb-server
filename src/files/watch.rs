@@ -453,6 +453,31 @@ impl WatchTable {
         }
     }
 
+    /// Ends every watch of the directory `dir`, on any connection, with
+    /// `status` and takes them out of the table (MS-FSA 2.1.5.15.3).
+    /// Watches of directories above or below it stay.
+    pub(crate) fn end_at(&self, dir: &SmbPath, status: u32) {
+        if self.is_empty() {
+            return;
+        }
+        let ended = {
+            let mut dirs = lock(&self.dirs);
+            let Some(watches) = dirs.remove(&dir_key(dir.components(), self.case_sensitive)) else {
+                return;
+            };
+            for watch in &watches {
+                self.count.fetch_sub(1, Ordering::AcqRel);
+                if watch.tree {
+                    self.tree_count.fetch_sub(1, Ordering::AcqRel);
+                }
+            }
+            watches
+        };
+        for watch in ended {
+            watch.end(status);
+        }
+    }
+
     /// Whether a change at `path` would reach a watch, whatever its
     /// filter.
     pub(crate) fn watching(&self, path: &SmbPath) -> bool {
@@ -552,6 +577,17 @@ impl WatchReg {
 
     pub(crate) fn watch(&self) -> &Arc<Watch> {
         &self.watch
+    }
+
+    /// Whether the watch has ended while its open stays.
+    pub(crate) fn ended(&self) -> bool {
+        self.watch.state().end.is_some()
+    }
+
+    /// Takes the watch out of the table, so no change reaches it; dropping
+    /// the registration ends it.
+    pub(crate) fn leave_table(&self) {
+        self.share.watches.remove(&self.watch);
     }
 }
 

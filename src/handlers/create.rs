@@ -961,6 +961,7 @@ async fn attempt(
         durable,
         watch: None,
         wrote: Default::default(),
+        marked_deleted: Default::default(),
     };
     let open_arc = Arc::new(tokio::sync::RwLock::new(open));
     tree.opens.get_mut().insert(file_id, open_arc);

@@ -1,6 +1,7 @@
 //! SET_INFO handler.
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use crate::proto::header::Smb2Header;
 use crate::proto::messages::{InfoType, SetInfoRequest, SetInfoResponse};
@@ -158,8 +159,21 @@ async fn set(
             if buffer.is_empty() {
                 return Ok(HandlerResponse::err(ntstatus::STATUS_INFO_LENGTH_MISMATCH));
             }
+            let delete = buffer[0] != 0;
+            // A directory is marked and its watches ended under one name,
+            // with no rename in between.
+            let is_directory = open_arc.read().await.is_directory;
+            let names = if delete && is_directory {
+                Some(share.files.names_lock().await)
+            } else {
+                None
+            };
             let open = open_arc.read().await;
-            set_disposition(&open, buffer[0] != 0).await
+            let result = set_disposition(&open, delete).await;
+            if result.is_ok() && names.is_some() {
+                end_watches_of_deleted(&share, &open);
+            }
+            result
         }
         Class::Rename => {
             // FILE_RENAME_INFORMATION layout (MS-FSCC §2.4.37):
@@ -672,7 +686,22 @@ async fn set_disposition(open: &Open, delete: bool) -> Result<(), u32> {
     }
     let file = open.file.as_ref().ok_or(ntstatus::STATUS_FILE_CLOSED)?;
     file.set_delete_pending(delete);
+    if delete && open.is_directory {
+        open.marked_deleted.store(true, Ordering::Release);
+    }
     Ok(())
+}
+
+/// Ends every watch of the directory `open` just marked for deletion,
+/// whichever open armed it and under whichever of the directory's names,
+/// with STATUS_DELETE_PENDING (MS-FSA 2.1.5.15.3). The caller holds the
+/// share's names lock.
+fn end_watches_of_deleted(share: &ShareBindings, open: &Open) {
+    if let Some(file) = &open.file {
+        for path in file.open_paths() {
+            share.watches.end_at(&path, ntstatus::STATUS_DELETE_PENDING);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -816,6 +845,7 @@ mod tests {
                 durable: None,
                 watch: None,
                 wrote: Default::default(),
+                marked_deleted: Default::default(),
             };
             tree.opens
                 .write()

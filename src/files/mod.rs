@@ -15,6 +15,7 @@ use tracing::debug;
 use crate::backend::{FileInfo, Handle};
 use crate::conn::state::Open;
 use crate::handlers::shared::restore_fixed_times;
+use crate::ntstatus;
 use crate::proto::messages::change_notify::FILE_ACTION_MODIFIED;
 
 pub(crate) use durable::{Claim, Durability, DurableReg, DurableTable, Unclaimed, v2_timeout};
@@ -94,7 +95,9 @@ pub(crate) async fn close_open(open_arc: &Arc<RwLock<Open>>, want_attrs: bool) -
 /// delete-pending, unless it is a directory with entries (MS-FSA 2.1.5.5
 /// phase 1), and is removed when this was its last open. An open that
 /// `wrote` and leaves the file in place reports the new contents to the
-/// share's watchers, once. Every path that ends an open goes through here.
+/// share's watchers, once. A directory this leaves delete-pending, open
+/// elsewhere, ends its watches with STATUS_DELETE_PENDING. Every path that
+/// ends an open goes through here.
 pub(crate) async fn finish_close(
     handle: Box<dyn Handle>,
     file: Option<FileRef>,
@@ -102,19 +105,33 @@ pub(crate) async fn finish_close(
     is_directory: bool,
     wrote: bool,
 ) {
+    let share = file.as_ref().map(|f| Arc::clone(f.share()));
+    // A directory is checked for entries and marked with no CREATE or
+    // rename running, so it is still empty when it becomes delete-pending.
+    let exclusive = match &share {
+        Some(share) if delete_on_close && is_directory => Some(share.files.rename_lock().await),
+        _ => None,
+    };
     let delete_on_close =
         delete_on_close && (!is_directory || handle.dir_is_empty().await.unwrap_or(false));
     if let Err(e) = handle.close().await {
         let path = file.as_ref().map(FileRef::path).unwrap_or_default();
         debug!(error = %e, path = %path, "backend close failed");
     }
-    let Some(file) = file else {
+    let (Some(file), Some(share)) = (file, &share) else {
         return;
     };
-    let share = Arc::clone(file.share());
+    // A directory that stays delete-pending, open elsewhere, ends its
+    // watches under each of its names, as FileDispositionInformation would.
+    let marks_deleted = delete_on_close && is_directory;
+    let marked = if marks_deleted {
+        file.open_paths()
+    } else {
+        Vec::new()
+    };
     // The name is read and reported with no rename in between, when anyone
     // on the share may hear it.
-    let names = if wrote && !share.watches.is_empty() {
+    let names = if exclusive.is_none() && wrote && !share.watches.is_empty() {
         Some(share.files.names_lock().await)
     } else {
         None
@@ -123,14 +140,21 @@ pub(crate) async fn finish_close(
     match file.release(delete_on_close) {
         Some(pending) => {
             drop(names);
+            drop(exclusive);
             pending.run().await;
         }
-        None if names.is_some() => share.watches.report(&[Change {
-            path: &path,
-            action: FILE_ACTION_MODIFIED,
-            filter: CONTENT_CHANGED,
-        }]),
-        None => {}
+        None => {
+            if wrote && (names.is_some() || exclusive.is_some()) {
+                share.watches.report(&[Change {
+                    path: &path,
+                    action: FILE_ACTION_MODIFIED,
+                    filter: CONTENT_CHANGED,
+                }]);
+            }
+            for path in &marked {
+                share.watches.end_at(path, ntstatus::STATUS_DELETE_PENDING);
+            }
+        }
     }
 }
 
@@ -238,6 +262,7 @@ mod tests {
             durable: None,
             watch: None,
             wrote: Default::default(),
+            marked_deleted: Default::default(),
         });
         let in_table = || {
             share.files.path_is_open(&path, false) || share.files.delete_pending_at(&path, false)

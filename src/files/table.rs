@@ -1088,6 +1088,19 @@ impl FileRef {
             .unwrap_or_default()
     }
 
+    /// The names the opens of this file have, each once: every path a
+    /// watch of it can be armed under.
+    pub(crate) fn open_paths(&self) -> Vec<SmbPath> {
+        let state = self.node.state();
+        let mut paths: Vec<SmbPath> = Vec::new();
+        for entry in &state.opens {
+            if !paths.contains(&entry.path) {
+                paths.push(entry.path.clone());
+            }
+        }
+        paths
+    }
+
     /// True if this is an entry for the file `info` describes, reached
     /// through `path`.
     pub(crate) fn is_for(&self, info: &FileInfo, path: &SmbPath) -> bool {

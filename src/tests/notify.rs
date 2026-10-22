@@ -1682,3 +1682,228 @@ async fn a_write_is_reported_under_the_name_the_file_has_at_close() {
         Some(vec![modified("g")])
     );
 }
+
+/// Opens the directory `name` for listing and deleting, with `options`
+/// besides FILE_DIRECTORY_FILE, creating it if needed.
+async fn dir_for_delete(
+    peer: &mut Peer,
+    state: &Arc<ServerState>,
+    name: &str,
+    options: u32,
+) -> FileId {
+    let body = create_body(
+        name,
+        LIST | DELETE,
+        FILE_OPEN_IF,
+        FILE_DIRECTORY_FILE | options,
+    );
+    let (_, reply) = peer.request(state, Command::Create, &body).await;
+    assert_eq!(status(&reply), 0, "open {name}");
+    CreateResponse::parse(&reply[SMB2_HEADER_LEN..])
+        .expect("create response")
+        .file_id
+}
+
+/// The status of a CHANGE_NOTIFY on `dir` answered at once.
+async fn answered_at_once(peer: &mut Peer, state: &Arc<ServerState>, dir: FileId) -> u32 {
+    let (_, reply) = peer
+        .request(state, Command::ChangeNotify, &notify_body(dir, 4096, NAMES))
+        .await;
+    assert_eq!(
+        header(&reply).flags & SMB2_FLAGS_ASYNC_COMMAND,
+        0,
+        "answered at once"
+    );
+    status(&reply)
+}
+
+#[tokio::test]
+async fn marking_a_watched_directory_for_deletion_ends_every_watch_of_it() {
+    let (state, _) = server();
+    let mut watcher = Peer::new(&state, false).await;
+    open_dir(&mut watcher, &state, "d").await;
+    let first = open_dir(&mut watcher, &state, "d\\w").await;
+    let second = open_dir(&mut watcher, &state, "d\\w").await;
+    let (_, first_waiting) = wait_notify(&mut watcher, &state, first).await;
+    let (_, second_waiting) = wait_notify(&mut watcher, &state, second).await;
+
+    let mut marker = Peer::new(&state, false).await;
+    let mark = dir_for_delete(&mut marker, &state, "d\\w", 0).await;
+    assert_eq!(set_info(&mut marker, &state, mark, 13, vec![1]).await, 0);
+    // Both waiting requests end, whichever arrives first.
+    let mut ended = Vec::new();
+    for _ in 0..2 {
+        let last = watcher.next().await;
+        assert_eq!(status(&last), ntstatus::STATUS_DELETE_PENDING);
+        ended.push(header(&last).async_id().expect("an AsyncId"));
+    }
+    ended.sort_unstable();
+    let mut waited = vec![first_waiting, second_waiting];
+    waited.sort_unstable();
+    assert_eq!(ended, waited);
+    // Later requests on any open of it are answered at once.
+    for dir in [first, second] {
+        assert_eq!(
+            answered_at_once(&mut watcher, &state, dir).await,
+            ntstatus::STATUS_DELETE_PENDING
+        );
+    }
+    assert_eq!(
+        answered_at_once(&mut marker, &state, mark).await,
+        ntstatus::STATUS_DELETE_PENDING
+    );
+    assert_eq!(home(&state).await.watches.len(), 0);
+}
+
+#[tokio::test]
+async fn a_cleared_mark_lets_other_opens_watch_again() {
+    let (state, _) = server();
+    let mut watcher = Peer::new(&state, false).await;
+    let mut marker = Peer::new(&state, false).await;
+    open_dir(&mut watcher, &state, "d").await;
+    let dir = open_dir(&mut watcher, &state, "d\\w").await;
+    let (_, waiting) = wait_notify(&mut watcher, &state, dir).await;
+    assert_eq!(watcher.conn.notify_budget.watches(), 1);
+    let mark = dir_for_delete(&mut marker, &state, "d\\w", 0).await;
+    assert_eq!(set_info(&mut marker, &state, mark, 13, vec![1]).await, 0);
+    assert_eq!(
+        status(&final_of(&mut watcher, waiting).await),
+        ntstatus::STATUS_DELETE_PENDING
+    );
+    assert_eq!(watcher.conn.notify_budget.watches(), 0, "the ended watch");
+    assert_eq!(set_info(&mut marker, &state, mark, 13, vec![0]).await, 0);
+
+    // The marking open stays marked; the other one watches afresh.
+    assert_eq!(
+        answered_at_once(&mut marker, &state, mark).await,
+        ntstatus::STATUS_DELETE_PENDING
+    );
+    let (_, waiting) = wait_notify(&mut watcher, &state, dir).await;
+    assert_eq!(
+        watcher.conn.notify_budget.watches(),
+        1,
+        "the new watch only"
+    );
+    create_file(&mut marker, &state, "d\\w\\x").await;
+    assert_eq!(
+        entries(&final_of(&mut watcher, waiting).await),
+        [added("x")]
+    );
+}
+
+#[tokio::test]
+async fn a_watch_above_a_deleted_directory_stays_and_hears_its_removal() {
+    let (state, _) = server();
+    let mut watcher = Peer::new(&state, false).await;
+    let mut marker = Peer::new(&state, false).await;
+    let top = open_dir(&mut watcher, &state, "d").await;
+    let dir = open_dir(&mut watcher, &state, "d\\w").await;
+    arm_idle(&mut watcher, &state, top, true).await;
+    arm_idle(&mut watcher, &state, dir, false).await;
+    let mark = dir_for_delete(&mut marker, &state, "d\\w", 0).await;
+    assert_eq!(set_info(&mut marker, &state, mark, 13, vec![1]).await, 0);
+    close(&mut marker, &state, mark).await;
+    close(&mut watcher, &state, dir).await;
+    let mut body = notify_body(top, 4096, NAMES);
+    body[2] = 1;
+    let (_, reply) = watcher.request(&state, Command::ChangeNotify, &body).await;
+    assert_eq!(entries(&reply), [(FILE_ACTION_REMOVED, "w".to_string())]);
+}
+
+#[tokio::test]
+async fn a_delete_on_close_open_ends_the_watches_once_it_leaves_the_directory_delete_pending() {
+    let (state, _) = server();
+    let mut watcher = Peer::new(&state, false).await;
+    let mut opener = Peer::new(&state, false).await;
+    let top = open_dir(&mut watcher, &state, "d").await;
+    let dir = open_dir(&mut watcher, &state, "d\\w").await;
+    arm_idle(&mut watcher, &state, top, true).await;
+    let (_, waiting) = wait_notify(&mut watcher, &state, dir).await;
+
+    let doomed = dir_for_delete(&mut opener, &state, "d\\w", FILE_DELETE_ON_CLOSE).await;
+    assert_eq!(
+        answered_at_once(&mut opener, &state, doomed).await,
+        ntstatus::STATUS_DELETE_PENDING
+    );
+    settle().await;
+    assert!(watcher.rx.try_recv().is_none(), "not delete-pending yet");
+    close(&mut opener, &state, doomed).await;
+    assert_eq!(
+        status(&final_of(&mut watcher, waiting).await),
+        ntstatus::STATUS_DELETE_PENDING
+    );
+    close(&mut watcher, &state, dir).await;
+    let mut body = notify_body(top, 4096, NAMES);
+    body[2] = 1;
+    let (_, reply) = watcher.request(&state, Command::ChangeNotify, &body).await;
+    assert_eq!(entries(&reply), [(FILE_ACTION_REMOVED, "w".to_string())]);
+}
+
+#[tokio::test]
+async fn a_mark_ends_watches_armed_under_another_spelling() {
+    let (state, _) = server();
+    let mut watcher = Peer::new(&state, false).await;
+    let mut marker = Peer::new(&state, false).await;
+    open_dir(&mut watcher, &state, "d").await;
+    let mark = dir_for_delete(&mut marker, &state, "d\\w", 0).await;
+    let dir = open_dir(&mut watcher, &state, "d\\W").await;
+    let (_, waiting) = wait_notify(&mut watcher, &state, dir).await;
+    assert_eq!(set_info(&mut marker, &state, mark, 13, vec![1]).await, 0);
+    assert_eq!(
+        status(&final_of(&mut watcher, waiting).await),
+        ntstatus::STATUS_DELETE_PENDING
+    );
+}
+
+#[tokio::test]
+async fn a_directory_that_cannot_be_deleted_keeps_its_watches() {
+    let (state, _) = server();
+    let mut watcher = Peer::new(&state, false).await;
+    let mut other = Peer::new(&state, false).await;
+    open_dir(&mut watcher, &state, "d").await;
+    let dir = open_dir(&mut watcher, &state, "d\\w").await;
+    create_file(&mut other, &state, "d\\w\\keep").await;
+    let (_, waiting) = wait_notify(&mut watcher, &state, dir).await;
+
+    // A disposition is refused, and a delete-on-close close leaves it.
+    let mark = dir_for_delete(&mut other, &state, "d\\w", 0).await;
+    assert_eq!(
+        set_info(&mut other, &state, mark, 13, vec![1]).await,
+        ntstatus::STATUS_DIRECTORY_NOT_EMPTY
+    );
+    let doomed = dir_for_delete(&mut other, &state, "d\\w", FILE_DELETE_ON_CLOSE).await;
+    close(&mut other, &state, doomed).await;
+    settle().await;
+    assert!(watcher.rx.try_recv().is_none(), "still waiting");
+    create_file(&mut other, &state, "d\\w\\x").await;
+    assert_eq!(
+        entries(&final_of(&mut watcher, waiting).await),
+        [added("x")]
+    );
+}
+
+#[tokio::test]
+async fn a_closing_open_s_watch_is_left_out_of_a_mark() {
+    let (state, _) = server();
+    let mut watcher = Peer::new(&state, false).await;
+    let mut marker = Peer::new(&state, false).await;
+    open_dir(&mut watcher, &state, "d").await;
+    let dir = open_dir(&mut watcher, &state, "d\\w").await;
+    let (_, waiting) = wait_notify(&mut watcher, &state, dir).await;
+    let mark = dir_for_delete(&mut marker, &state, "d\\w", 0).await;
+
+    // The CLOSE response is not queued yet when the mark comes.
+    let (_, close_msg) = watcher.message(Command::Close, &close_body(dir));
+    let out = crate::dispatch::dispatch_frame(&state, &watcher.conn, &close_msg)
+        .await
+        .expect("a response");
+    assert_eq!(set_info(&mut marker, &state, mark, 13, vec![1]).await, 0);
+    settle().await;
+    assert!(
+        watcher.rx.try_recv().is_none(),
+        "nothing before the CLOSE response"
+    );
+    drop(out.after_send);
+    let last = final_of(&mut watcher, waiting).await;
+    assert_eq!(status(&last), ntstatus::STATUS_NOTIFY_CLEANUP);
+}
