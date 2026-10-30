@@ -14,6 +14,8 @@ use crate::builder::BuildError;
 
 #[cfg(target_os = "linux")]
 mod avahi;
+#[cfg(target_vendor = "apple")]
+mod dns_sd;
 #[cfg(all(unix, not(target_vendor = "apple")))]
 mod responder;
 pub(crate) mod target;
@@ -57,9 +59,17 @@ const MAX_RENAMES: usize = 16;
 /// dot is not announced. When another program holds UDP port 5353, the
 /// server is not announced.
 ///
-/// On Apple platforms and Windows nothing is announced. Each of these
-/// cases, and any failure to announce, is logged; `serve` runs on either
-/// way.
+/// On Apple platforms, the server registers with mDNSResponder, which
+/// renames it on a conflict and withdraws the records when the server
+/// stops or exits. The SRV record points at the host name, which
+/// mDNSResponder announces with the host's IPv4 and IPv6 addresses,
+/// whatever addresses the listener accepts. A wildcard listen address
+/// registers the service on every interface, any other address on that
+/// address's interface only. When mDNSResponder restarts, the server
+/// registers again.
+///
+/// On Windows nothing is announced. Each of these cases, and any failure
+/// to announce, is logged; `serve` runs on either way.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct Discovery {
@@ -76,10 +86,12 @@ impl Discovery {
     /// Instance name: the name file managers list the server under. 1 to
     /// 63 bytes of UTF-8 without control characters, used as given, so
     /// pass it in Unicode normalization form C. Defaults to the NetBIOS
-    /// name in upper case. When another service on the network has the
-    /// name, the server is renamed with a number added, and the new name
-    /// is logged. With the built-in responder, a name that contains a dot
-    /// is not announced.
+    /// name in upper case. On Apple platforms with neither a name nor a
+    /// model set, the server is registered under the computer name
+    /// instead, and macOS announces the Mac's own model for it. When
+    /// another service on the network has the name, the server is renamed
+    /// with a number added, and the new name is logged. With the built-in
+    /// responder, a name that contains a dot is not announced.
     pub fn name(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
         self
@@ -103,6 +115,7 @@ impl Discovery {
         if listen.ip().to_canonical().is_loopback() {
             return Err(BuildError::DiscoveryOnLoopback(listen));
         }
+        let default_name = self.name.is_none();
         let name = self.name.unwrap_or_else(|| netbios_name.to_uppercase());
         if !target::valid_name(&name) {
             return Err(BuildError::DiscoveryName(name));
@@ -112,6 +125,7 @@ impl Discovery {
         }
         Ok(Settings {
             name,
+            default_name,
             model: self.model,
         })
     }
@@ -121,6 +135,8 @@ impl Discovery {
 #[derive(Debug, Clone)]
 pub(crate) struct Settings {
     pub(crate) name: String,
+    /// `name` is the default, not one set through [`Discovery::name`].
+    pub(crate) default_name: bool,
     pub(crate) model: Option<String>,
 }
 
@@ -129,6 +145,9 @@ pub(crate) struct Settings {
 #[cfg_attr(any(target_vendor = "apple", not(unix)), allow(dead_code))]
 pub(crate) struct Service {
     pub(crate) name: String,
+    /// `name` is the default, not one set through [`Discovery::name`].
+    #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
+    pub(crate) default_name: bool,
     pub(crate) model: Option<String>,
     pub(crate) port: u16,
     pub(crate) scope: Scope,
@@ -165,7 +184,9 @@ impl Backend for System {
             responder::Leave::Withdraw
         })
         .await;
-        #[cfg(not(all(unix, not(target_vendor = "apple"))))]
+        #[cfg(target_vendor = "apple")]
+        dns_sd::run(service, stop).await;
+        #[cfg(not(unix))]
         {
             drop((service, stop));
             warn!(
@@ -203,6 +224,7 @@ impl Announcer {
             local.is_ipv6() && socket2::SockRef::from(listener).only_v6().unwrap_or(false);
         let service = Service {
             name: settings.name.clone(),
+            default_name: settings.default_name,
             model: settings.model.clone(),
             port: local.port(),
             scope: Scope::new(local.ip(), v6_only),

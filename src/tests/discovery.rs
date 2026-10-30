@@ -232,6 +232,7 @@ fn names_and_models_are_checked_at_build() {
     .expect("build");
     let settings = server.state().config.discovery.clone().expect("discovery");
     assert_eq!(settings.name, "Media Server");
+    assert!(!settings.default_name);
     assert_eq!(settings.model.as_deref(), Some("Xserve3,1"));
 }
 
@@ -240,6 +241,7 @@ fn the_name_defaults_to_the_netbios_name_in_upper_case() {
     let server = announced("0.0.0.0:0", Discovery::new()).expect("build");
     let settings = server.state().config.discovery.clone().expect("discovery");
     assert_eq!(settings.name, "FILES");
+    assert!(settings.default_name);
     assert_eq!(settings.model, None);
 
     let server = SmbServer::builder()

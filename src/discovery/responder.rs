@@ -289,6 +289,7 @@ mod tests {
     async fn a_name_with_a_dot_is_not_announced() {
         let service = Service {
             name: "My.NAS".to_string(),
+            default_name: false,
             model: None,
             port: 445,
             scope: Scope::V4,
