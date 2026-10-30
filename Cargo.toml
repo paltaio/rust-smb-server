@@ -7,6 +7,9 @@ license = "MIT"
 repository = "https://github.com/paltaio/rust-smb-server"
 description = "SMB2/3 file-sharing server library with pluggable storage backends."
 
+[package.metadata.docs.rs]
+all-features = true
+
 [workspace]
 resolver = "2"
 members = [
@@ -74,9 +77,17 @@ windows-sys = { version = "0.61", features = ["Wdk_Storage_FileSystem", "Win32_S
 rustix = { version = "1", features = ["fs"], optional = true }
 libc = "0.2"
 
+[target.'cfg(all(unix, not(target_vendor = "apple")))'.dependencies]
+mdns-sd = { version = "0.21.6", optional = true }
+if-addrs = { version = "0.15", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = { version = "6.2", default-features = false, features = ["tokio"], optional = true }
+
 [features]
 default = ["localfs"]
 localfs = ["dep:cap-std", "dep:cap-primitives", "dep:rustix", "dep:windows-sys"]
+discovery = ["dep:mdns-sd", "dep:zbus", "dep:if-addrs"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

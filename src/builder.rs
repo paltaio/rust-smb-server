@@ -198,6 +198,7 @@ pub(crate) fn valid_remark(remark: &str) -> bool {
 
 /// Errors raised by `SmbServerBuilder::build`.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum BuildError {
     #[error("listen address must be set")]
     MissingListenAddr,
@@ -222,6 +223,12 @@ pub enum BuildError {
         setting: &'static str,
         expected: &'static str,
     },
+    #[error("discovery name `{0}` must be 1 to 63 bytes without control characters")]
+    DiscoveryName(String),
+    #[error("discovery model `{0}` must be 1 to 249 printable ASCII characters")]
+    DiscoveryModel(String),
+    #[error("discovery cannot announce the loopback listen address {0}")]
+    DiscoveryOnLoopback(SocketAddr),
 }
 
 /// Why a share name cannot be configured.
@@ -263,6 +270,8 @@ pub struct SmbServerBuilder {
     max_opens_per_connection: usize,
     max_locks_per_open: usize,
     share_listing: bool,
+    #[cfg(feature = "discovery")]
+    discovery: Option<crate::discovery::Discovery>,
 }
 
 impl Default for SmbServerBuilder {
@@ -287,6 +296,8 @@ impl SmbServerBuilder {
             max_opens_per_connection: crate::files::DEFAULT_MAX_OPENS_PER_CONNECTION,
             max_locks_per_open: crate::files::DEFAULT_MAX_LOCKS_PER_OPEN,
             share_listing: true,
+            #[cfg(feature = "discovery")]
+            discovery: None,
         }
     }
 
@@ -488,6 +499,16 @@ impl SmbServerBuilder {
         self
     }
 
+    /// Announce the server on the local network while
+    /// [`SmbServer::serve`] runs; see [`Discovery`](crate::Discovery). Off
+    /// unless called. [`build`](Self::build) fails when the listen address
+    /// is a loopback address. Needs the `discovery` feature.
+    #[cfg(feature = "discovery")]
+    pub fn discovery(mut self, discovery: crate::discovery::Discovery) -> Self {
+        self.discovery = Some(discovery);
+        self
+    }
+
     pub fn build(self) -> Result<SmbServer, BuildError> {
         let limits = &self.limits;
         if limits.max_connections == 0 {
@@ -573,6 +594,11 @@ impl SmbServerBuilder {
         let listen = self.listen_addr.ok_or(BuildError::MissingListenAddr)?;
 
         let netbios = self.netbios_name.unwrap_or_else(default_netbios_name);
+        #[cfg(feature = "discovery")]
+        let discovery = self
+            .discovery
+            .map(|discovery| discovery.settings(listen, &netbios))
+            .transpose()?;
 
         let mut share_bindings: Vec<Arc<ShareBindings>> = Vec::with_capacity(self.shares.len());
         for s in self.shares {
@@ -597,6 +623,8 @@ impl SmbServerBuilder {
             server_guid,
             limits: self.limits,
             share_listing: self.share_listing,
+            #[cfg(feature = "discovery")]
+            discovery,
         };
         let users = ServerUsers {
             table: tokio::sync::RwLock::new(user_table),
@@ -642,7 +670,7 @@ fn default_netbios_name() -> String {
 }
 
 #[cfg(unix)]
-fn host_name() -> Option<String> {
+pub(crate) fn host_name() -> Option<String> {
     let mut buf = [0u8; 256];
     // SAFETY: `buf` is valid for writes of `buf.len()` bytes.
     let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
@@ -654,12 +682,12 @@ fn host_name() -> Option<String> {
 }
 
 #[cfg(windows)]
-fn host_name() -> Option<String> {
+pub(crate) fn host_name() -> Option<String> {
     std::env::var("COMPUTERNAME").ok()
 }
 
 #[cfg(not(any(unix, windows)))]
-fn host_name() -> Option<String> {
+pub(crate) fn host_name() -> Option<String> {
     None
 }
 

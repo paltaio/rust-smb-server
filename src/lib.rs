@@ -286,6 +286,8 @@ mod auth_policy;
 mod backend;
 mod builder;
 pub(crate) mod conn;
+#[cfg(feature = "discovery")]
+mod discovery;
 mod dispatch;
 mod error;
 mod files;
@@ -301,6 +303,8 @@ mod server;
 #[cfg(test)]
 mod tests {
     mod async_requests;
+    #[cfg(feature = "discovery")]
+    mod discovery;
     mod durable;
     mod dynamic_config;
     pub(crate) mod memfs;
@@ -317,6 +321,8 @@ pub use backend::{
 };
 pub use builder::{Access, BuildError, Share, SmbServerBuilder};
 pub use bytes::Bytes;
+#[cfg(feature = "discovery")]
+pub use discovery::Discovery;
 pub use error::{SmbError, SmbResult};
 pub use files::{
     DEFAULT_DURABLE_HANDLE_TIMEOUT, DEFAULT_MAX_DISCONNECTED_OPENS, DEFAULT_MAX_LOCKS_PER_OPEN,

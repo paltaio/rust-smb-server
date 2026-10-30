@@ -146,7 +146,7 @@ Not supported:
 - DFS
 - multichannel and compression
 - alternate data streams and extended attributes
-- network discovery (mDNS, NetBIOS, WS-Discovery): clients connect by name or address
+- network discovery (mDNS, NetBIOS, WS-Discovery), except mDNS on Linux and other non-Apple Unix systems with the `discovery` feature
 
 ## License
 

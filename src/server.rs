@@ -177,6 +177,9 @@ pub struct ServerConfig {
     pub limits: Limits,
     /// IPC$ serves the srvsvc pipe, so clients can list the shares.
     pub share_listing: bool,
+    /// The server is announced on the local network while it serves.
+    #[cfg(feature = "discovery")]
+    pub(crate) discovery: Option<crate::discovery::Settings>,
 }
 
 pub struct ServerUsers {
@@ -637,6 +640,9 @@ pub struct SmbServer {
     bound: tokio::sync::Mutex<Option<TcpListener>>,
     /// Bound address, set by `bind()`.
     local_addr: tokio::sync::Mutex<Option<SocketAddr>>,
+    /// What announces the server when discovery is on.
+    #[cfg(feature = "discovery")]
+    discovery_backend: Arc<dyn crate::discovery::Backend>,
 }
 
 impl SmbServer {
@@ -649,7 +655,18 @@ impl SmbServer {
             state: Arc::new(state),
             bound: tokio::sync::Mutex::new(None),
             local_addr: tokio::sync::Mutex::new(None),
+            #[cfg(feature = "discovery")]
+            discovery_backend: Arc::new(crate::discovery::System),
         }
+    }
+
+    #[cfg(all(test, feature = "discovery"))]
+    pub(crate) fn with_discovery_backend(
+        mut self,
+        backend: Arc<dyn crate::discovery::Backend>,
+    ) -> Self {
+        self.discovery_backend = backend;
+        self
     }
 
     pub fn config_handle(&self) -> ConfigHandle {
@@ -730,6 +747,19 @@ impl SmbServer {
                 limits.max_connections.min(Semaphore::MAX_PERMITS),
             ));
             let mut at_capacity = false;
+            #[cfg(feature = "discovery")]
+            let announcer = state
+                .config
+                .discovery
+                .as_ref()
+                .filter(|_| !shutting_down.load(Ordering::Acquire))
+                .and_then(|settings| {
+                    crate::discovery::Announcer::start(
+                        settings,
+                        &listener,
+                        self.discovery_backend.clone(),
+                    )
+                });
 
             loop {
                 let stopped = shutdown.notified();
@@ -802,12 +832,22 @@ impl SmbServer {
                 }
             }
             drop(listener);
-            if !connections.is_empty() {
-                info!(open = connections.len(), "waiting for connections to close");
-            }
-            while connections.join_next().await.is_some() {}
-            close_opens(state.durable.take_for(None, None)).await;
-            state.durable.closed().await;
+            let drained = async {
+                if !connections.is_empty() {
+                    info!(open = connections.len(), "waiting for connections to close");
+                }
+                while connections.join_next().await.is_some() {}
+                close_opens(state.durable.take_for(None, None)).await;
+                state.durable.closed().await;
+            };
+            #[cfg(feature = "discovery")]
+            tokio::join!(drained, async {
+                if let Some(announcer) = announcer {
+                    announcer.stop().await;
+                }
+            });
+            #[cfg(not(feature = "discovery"))]
+            drained.await;
             info!("server stopped");
             Ok::<(), io::Error>(())
         }
