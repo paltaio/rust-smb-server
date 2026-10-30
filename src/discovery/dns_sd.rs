@@ -10,7 +10,7 @@ use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
 use tracing::{debug, info, warn};
 
-use super::target::Scope;
+use super::target::{Names, Scope};
 use super::{Service, Stop};
 
 /// The parts of `dns_sd.h` the server uses.
@@ -625,30 +625,6 @@ fn check_code(code: i32) -> Result<(), i32> {
     if code == NO_ERROR { Ok(()) } else { Err(code) }
 }
 
-/// The names mDNSResponder registered the service under.
-#[derive(Debug, Default)]
-struct Names {
-    /// The name asked for, `None` for the computer name.
-    requested: Option<String>,
-    current: Option<String>,
-}
-
-impl Names {
-    /// Takes note of a registration under `name`, and returns whether the
-    /// name changed, so that the device-info record must follow.
-    fn registered(&mut self, name: &str) -> bool {
-        match (&self.current, &self.requested) {
-            (Some(current), _) if current == name => return false,
-            (Some(from), _) | (None, Some(from)) if from != name => {
-                info!(%from, to = %name, "registered under a new name");
-            }
-            _ => info!(%name, "announced"),
-        }
-        self.current = Some(name.to_string());
-        true
-    }
-}
-
 /// The name to register, or `None` for the computer name: the default
 /// name without a model lets mDNSResponder add the Mac's own model.
 fn registered_name(service: &Service) -> Option<&str> {
@@ -764,26 +740,6 @@ mod tests {
         let rdata = txt_rdata(&long);
         assert_eq!(rdata.len(), 256);
         assert_eq!(rdata[0], 255);
-    }
-
-    #[test]
-    fn the_device_info_record_follows_renames() {
-        let mut names = Names::default();
-        assert!(names.registered("mac-host"));
-        assert!(!names.registered("mac-host"));
-        let mut names = Names {
-            requested: Some("FILES".to_string()),
-            current: None,
-        };
-        assert!(names.registered("FILES"));
-        assert!(!names.registered("FILES"));
-        assert!(names.registered("FILES (2)"));
-        assert!(!names.registered("FILES (2)"));
-        let mut names = Names {
-            requested: Some("FILES".to_string()),
-            current: None,
-        };
-        assert!(names.registered("FILES (2)"));
     }
 
     #[test]

@@ -146,7 +146,7 @@ Not supported:
 - DFS
 - multichannel and compression
 - alternate data streams and extended attributes
-- network discovery (mDNS, NetBIOS, WS-Discovery), except mDNS on Unix systems with the `discovery` feature
+- network discovery over NetBIOS and WS-Discovery
 
 ## License
 

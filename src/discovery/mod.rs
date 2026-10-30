@@ -16,6 +16,8 @@ use crate::builder::BuildError;
 mod avahi;
 #[cfg(target_vendor = "apple")]
 mod dns_sd;
+#[cfg(windows)]
+mod dnsapi;
 #[cfg(all(unix, not(target_vendor = "apple")))]
 mod responder;
 pub(crate) mod target;
@@ -68,8 +70,18 @@ const MAX_RENAMES: usize = 16;
 /// address's interface only. When mDNSResponder restarts, the server
 /// registers again.
 ///
-/// On Windows nothing is announced. Each of these cases, and any failure
-/// to announce, is logged; `serve` runs on either way.
+/// On Windows, the server registers with the DNS client service, which
+/// picks a new name when the name is taken, and withdraws the records
+/// when the server stops or its process exits. The SRV record points at
+/// the computer's DNS host name, which the DNS client announces with the
+/// host's IPv4 and IPv6 addresses, whatever addresses the listener
+/// accepts; a listen address other than a wildcard registers the service
+/// on that address's interface only. The device-info record carries port
+/// 9. A name that contains a dot is not announced. A restart of the DNS
+/// Client service drops the registration until the server is restarted.
+///
+/// On other platforms nothing is announced. Each of these cases, and any
+/// failure to announce, is logged; `serve` runs on either way.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct Discovery {
@@ -90,8 +102,9 @@ impl Discovery {
     /// model set, the server is registered under the computer name
     /// instead, and macOS announces the Mac's own model for it. When
     /// another service on the network has the name, the server is renamed
-    /// with a number added, and the new name is logged. With the built-in
-    /// responder, a name that contains a dot is not announced.
+    /// with a number added, and the new name is logged. On Windows, and
+    /// with the built-in responder, a name that contains a dot is not
+    /// announced.
     pub fn name(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
         self
@@ -186,7 +199,9 @@ impl Backend for System {
         .await;
         #[cfg(target_vendor = "apple")]
         dns_sd::run(service, stop).await;
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        dnsapi::run(service, stop).await;
+        #[cfg(not(any(unix, windows)))]
         {
             drop((service, stop));
             warn!(

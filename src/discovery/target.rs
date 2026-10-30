@@ -4,6 +4,8 @@
 
 use std::net::IpAddr;
 
+use tracing::info;
+
 /// Longest instance name, in bytes: one DNS label.
 const MAX_NAME_BYTES: usize = 63;
 
@@ -32,6 +34,32 @@ pub(crate) fn numbered_name(name: &str, n: usize) -> String {
         cut -= 1;
     }
     format!("{}{suffix}", name[..cut].trim_end())
+}
+
+/// The names a system responder registered the service under.
+#[derive(Debug, Default)]
+#[cfg_attr(not(any(target_vendor = "apple", windows)), allow(dead_code))]
+pub(crate) struct Names {
+    /// The name asked for, `None` for the system's default name.
+    pub(crate) requested: Option<String>,
+    pub(crate) current: Option<String>,
+}
+
+#[cfg_attr(not(any(target_vendor = "apple", windows)), allow(dead_code))]
+impl Names {
+    /// Takes note of a registration under `name`, and returns whether the
+    /// name changed, so that the device-info record must follow.
+    pub(crate) fn registered(&mut self, name: &str) -> bool {
+        match (&self.current, &self.requested) {
+            (Some(current), _) if current == name => return false,
+            (Some(from), _) | (None, Some(from)) if from != name => {
+                info!(%from, to = %name, "registered under a new name");
+            }
+            _ => info!(%name, "announced"),
+        }
+        self.current = Some(name.to_string());
+        true
+    }
 }
 
 /// The addresses a listener accepts connections on.
@@ -136,6 +164,26 @@ mod tests {
                 assert!(valid_name(&numbered_name(name, n)), "{name:?} {n}");
             }
         }
+    }
+
+    #[test]
+    fn the_device_info_record_follows_renames() {
+        let mut names = Names::default();
+        assert!(names.registered("mac-host"));
+        assert!(!names.registered("mac-host"));
+        let mut names = Names {
+            requested: Some("FILES".to_string()),
+            current: None,
+        };
+        assert!(names.registered("FILES"));
+        assert!(!names.registered("FILES"));
+        assert!(names.registered("FILES (2)"));
+        assert!(!names.registered("FILES (2)"));
+        let mut names = Names {
+            requested: Some("FILES".to_string()),
+            current: None,
+        };
+        assert!(names.registered("FILES (2)"));
     }
 
     #[test]
