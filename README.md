@@ -146,7 +146,7 @@ Not supported:
 - DFS
 - multichannel and compression
 - alternate data streams and extended attributes
-- network discovery over NetBIOS and WS-Discovery
+- network discovery over NetBIOS
 
 ## License
 

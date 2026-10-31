@@ -500,6 +500,20 @@ pub mod fuzzing {
         let _ = srvsvc::call(opnum, stub, &view);
     }
 
+    /// Runs `data` as a WS-Discovery datagram; see the `wsd_datagram`
+    /// fuzz target for its layout.
+    #[cfg(all(feature = "discovery", unix))]
+    pub fn wsd_datagram(data: &[u8]) {
+        crate::discovery::wsd::fuzz_datagram(data);
+    }
+
+    /// Answers `data` as a whole request to the WS-Discovery metadata
+    /// endpoint.
+    #[cfg(all(feature = "discovery", unix))]
+    pub fn wsd_http(data: &[u8]) {
+        crate::discovery::wsd::fuzz_http(data);
+    }
+
     /// Dispatches one frame payload on a fresh connection to `server`.
     pub async fn dispatch(server: &crate::SmbServer, frame: &[u8]) -> Option<Vec<u8>> {
         let state = server.state();

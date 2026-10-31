@@ -294,6 +294,7 @@ mod tests {
             port: 445,
             scope: Scope::V4,
             host: "host".to_string(),
+            device: None,
         };
         // Returns at once instead of announcing until `leave` resolves.
         tokio::time::timeout(Duration::from_secs(5), run(service, std::future::pending()))

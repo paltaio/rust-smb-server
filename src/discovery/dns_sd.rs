@@ -696,6 +696,7 @@ mod tests {
             port: 445,
             scope: Scope::V4,
             host: "host".to_string(),
+            device: None,
         }
     }
 

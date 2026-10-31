@@ -4,13 +4,30 @@
 
 use std::net::IpAddr;
 
+use sha2::{Digest, Sha256};
 use tracing::info;
+use uuid::Uuid;
 
 /// Longest instance name, in bytes: one DNS label.
 const MAX_NAME_BYTES: usize = 63;
 
 /// Longest model, so that `model=<model>` fits one TXT string.
 const MAX_MODEL_BYTES: usize = 255 - "model=".len();
+
+/// Longest NetBIOS name, in characters.
+const MAX_NETBIOS_CHARS: usize = 15;
+
+/// Characters a NetBIOS name cannot hold.
+const NETBIOS_RESERVED: &[char] = &[
+    '"', '/', '\\', '[', ']', ':', '|', '<', '>', '+', '=', ';', ',', '?', '*',
+];
+
+/// Longest device metadata field, in characters: DPWS limits fields to
+/// fewer than 256.
+const MAX_FIELD_CHARS: usize = 255;
+
+/// The only port Windows opens a computer it found over WS-Discovery on.
+pub(crate) const SMB_PORT: u16 = 445;
 
 /// Whether `name` can be an instance name: 1 to 63 bytes without control
 /// characters (RFC 6763 4.1.1).
@@ -23,6 +40,81 @@ pub(crate) fn valid_name(name: &str) -> bool {
 pub(crate) fn valid_model(model: &str) -> bool {
     (1..=MAX_MODEL_BYTES).contains(&model.len())
         && model.bytes().all(|b| (0x20..=0x7e).contains(&b))
+}
+
+/// Whether `name` can be a NetBIOS computer or workgroup name: 1 to 15
+/// characters without control characters or any of `"/\[]:|<>+=;,?*`.
+pub(crate) fn valid_netbios_name(name: &str) -> bool {
+    (1..=MAX_NETBIOS_CHARS).contains(&name.chars().count())
+        && !name
+            .chars()
+            .any(|c| c.is_control() || NETBIOS_RESERVED.contains(&c))
+}
+
+/// Whether `value` fits a device metadata field: 1 to 255 characters
+/// without control characters.
+pub(crate) fn valid_field(value: &str) -> bool {
+    (1..=MAX_FIELD_CHARS).contains(&value.chars().count()) && !value.chars().any(char::is_control)
+}
+
+/// Why WS-Discovery does not run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WsSkip {
+    /// Turned off through the builder.
+    Off,
+    /// Windows announces the computer itself.
+    Windows,
+    /// The server listens on a port other than 445.
+    Port,
+    /// The NetBIOS name is not one [`valid_netbios_name`] accepts.
+    Name,
+}
+
+/// Why WS-Discovery does not run for a server listening on `port` under
+/// NetBIOS name `name`, or `None` when it runs. `enabled` is `None` unless
+/// set explicitly.
+pub(crate) fn ws_discovery_skip(
+    enabled: Option<bool>,
+    port: u16,
+    name: &str,
+    windows: bool,
+) -> Option<WsSkip> {
+    if enabled == Some(false) {
+        Some(WsSkip::Off)
+    } else if windows {
+        Some(WsSkip::Windows)
+    } else if port != SMB_PORT {
+        Some(WsSkip::Port)
+    } else if !valid_netbios_name(name) {
+        Some(WsSkip::Name)
+    } else {
+        None
+    }
+}
+
+/// The WS-Discovery endpoint of a server on `port`: a version 8 UUID from
+/// SHA-256 over the server GUID when one was set, otherwise over the host
+/// label and the NetBIOS name, so that it stays the same across restarts.
+pub(crate) fn endpoint_uuid(server_guid: Option<Uuid>, host: &str, name: &str, port: u16) -> Uuid {
+    let mut hash = Sha256::new();
+    hash.update(b"smb-server ws-discovery endpoint\0");
+    match server_guid {
+        Some(guid) => {
+            hash.update([1]);
+            hash.update(guid.as_bytes());
+        }
+        None => {
+            hash.update([2]);
+            hash.update(host.to_ascii_lowercase().as_bytes());
+            hash.update([0]);
+            hash.update(name.to_uppercase().as_bytes());
+        }
+    }
+    hash.update(port.to_be_bytes());
+    let digest = hash.finalize();
+    let mut bytes = [0; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    Uuid::new_v8(bytes)
 }
 
 /// `name` with ` (n)` appended, shortened on a character boundary to fit
@@ -143,6 +235,87 @@ mod tests {
         for model in ["", "m".repeat(250).as_str(), "Caf\u{e9}", "a\tb", "\u{7f}"] {
             assert!(!valid_model(model), "{model:?}");
         }
+    }
+
+    #[test]
+    fn netbios_names_are_short_without_separators() {
+        for workgroup in [
+            "WORKGROUP",
+            "W",
+            "HOME-NET_2",
+            "W".repeat(15).as_str(),
+            "\u{c9}QUIPE",
+        ] {
+            assert!(valid_netbios_name(workgroup), "{workgroup:?}");
+        }
+        for workgroup in [
+            "",
+            "W".repeat(16).as_str(),
+            "A/B",
+            "A\\B",
+            "A:B",
+            "A*",
+            "A\tB",
+        ] {
+            assert!(!valid_netbios_name(workgroup), "{workgroup:?}");
+        }
+    }
+
+    #[test]
+    fn metadata_fields_are_short_and_printable() {
+        for value in [
+            "smb-server",
+            "0.7.0",
+            "x".repeat(255).as_str(),
+            "\u{e9}".repeat(255).as_str(),
+        ] {
+            assert!(valid_field(value), "{value:?}");
+        }
+        for value in ["", "x".repeat(256).as_str(), "a\nb", "\u{7f}"] {
+            assert!(!valid_field(value), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn ws_discovery_runs_on_port_445_off_windows() {
+        let skip = |enabled, port, name, windows| ws_discovery_skip(enabled, port, name, windows);
+        assert_eq!(skip(None, 445, "FILES", false), None);
+        assert_eq!(skip(Some(true), 445, "FILES", false), None);
+        assert_eq!(skip(Some(false), 445, "FILES", false), Some(WsSkip::Off));
+        assert_eq!(skip(None, 4445, "FILES", false), Some(WsSkip::Port));
+        assert_eq!(skip(Some(true), 0, "FILES", false), Some(WsSkip::Port));
+        assert_eq!(skip(None, 445, "A/B", false), Some(WsSkip::Name));
+        assert_eq!(skip(None, 445, "", false), Some(WsSkip::Name));
+        assert_eq!(skip(None, 445, "FILES", true), Some(WsSkip::Windows));
+        assert_eq!(skip(Some(true), 445, "FILES", true), Some(WsSkip::Windows));
+        assert_eq!(skip(Some(false), 445, "FILES", true), Some(WsSkip::Off));
+    }
+
+    #[test]
+    fn endpoints_are_stable_version_8_uuids() {
+        let uuid = |s: &str| s.parse::<Uuid>().unwrap();
+        let by_host = endpoint_uuid(None, "nas-host", "NAS-HOST", 445);
+        assert_eq!(by_host, uuid("ee90cc1b-3b1a-8eb6-97bd-0680fdfe52a4"));
+        assert_eq!(by_host.get_version_num(), 8);
+        assert_eq!(endpoint_uuid(None, "NAS-Host", "nas-host", 445), by_host);
+        // Two servers on one host under different names.
+        assert_eq!(
+            endpoint_uuid(None, "nas-host", "FILES", 445),
+            uuid("9780b5ab-8357-8593-bc53-e2dcfa0a099c")
+        );
+        assert_eq!(
+            endpoint_uuid(None, "nas-host", "NAS-HOST", 4445),
+            uuid("36d11f81-1966-8c7c-9cbf-099ce1e7bdea")
+        );
+        let guid = uuid("6ba7b810-9dad-11d1-80b4-00c04fd430c8");
+        assert_eq!(
+            endpoint_uuid(Some(guid), "nas-host", "NAS-HOST", 445),
+            uuid("a15167c2-4122-86a5-8473-c658a0f7e16d")
+        );
+        assert_eq!(
+            endpoint_uuid(Some(guid), "other", "OTHER", 445),
+            endpoint_uuid(Some(guid), "", "", 445)
+        );
     }
 
     #[test]

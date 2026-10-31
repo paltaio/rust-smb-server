@@ -8,7 +8,10 @@ use tokio::net::TcpStream;
 use tokio::sync::Notify;
 use tokio::time::Instant;
 
-use crate::discovery::{Backend, Service, Stop};
+use uuid::Uuid;
+
+use crate::discovery::target::endpoint_uuid;
+use crate::discovery::{Backend, DeviceInfo, Service, Stop, ws_device};
 use crate::{BuildError, Discovery, SmbServer};
 
 #[derive(Clone, Copy)]
@@ -250,4 +253,147 @@ fn the_name_defaults_to_the_netbios_name_in_upper_case() {
         .discovery(Discovery::new())
         .build();
     assert!(matches!(server, Err(BuildError::DiscoveryName(n)) if n.is_empty()));
+}
+
+#[test]
+fn ws_discovery_options_are_checked_at_build() {
+    for workgroup in ["", "W".repeat(16).as_str(), "A/B", "A:B", "a\tb"] {
+        assert!(
+            matches!(
+                announced("0.0.0.0:0", Discovery::new().workgroup(workgroup)),
+                Err(BuildError::DiscoveryWorkgroup(w)) if w == workgroup
+            ),
+            "{workgroup:?}"
+        );
+    }
+    let long = "x".repeat(256);
+    for (discovery, setting, value) in [
+        (Discovery::new().manufacturer(""), "manufacturer", ""),
+        (
+            Discovery::new().model_name(long.as_str()),
+            "model_name",
+            long.as_str(),
+        ),
+        (
+            Discovery::new().firmware_version("1\n2"),
+            "firmware_version",
+            "1\n2",
+        ),
+    ] {
+        assert!(
+            matches!(
+                announced("0.0.0.0:0", discovery),
+                Err(BuildError::DiscoveryMetadata { setting: s, value: v }) if s == setting && v == value
+            ),
+            "{setting}"
+        );
+    }
+    for listen in ["0.0.0.0:4445", "[::]:139"] {
+        let port = listen.parse::<SocketAddr>().unwrap().port();
+        assert!(
+            matches!(
+                announced(listen, Discovery::new().ws_discovery(true)),
+                Err(BuildError::WsDiscoveryPort(p)) if p == port
+            ),
+            "{listen}"
+        );
+        assert!(announced(listen, Discovery::new()).is_ok());
+        assert!(announced(listen, Discovery::new().ws_discovery(false)).is_ok());
+    }
+    for listen in ["0.0.0.0:445", "0.0.0.0:0"] {
+        assert!(announced(listen, Discovery::new().ws_discovery(true)).is_ok());
+    }
+    for name in ["", "a/b", "n".repeat(16).as_str(), "a\tb"] {
+        let build = |discovery| {
+            SmbServer::builder()
+                .listen("0.0.0.0:445".parse().unwrap())
+                .netbios_name(name)
+                .discovery(discovery)
+                .build()
+        };
+        assert!(
+            matches!(
+                build(Discovery::new().name("Files").ws_discovery(true)),
+                Err(BuildError::WsDiscoveryNetbiosName(n)) if n == name
+            ),
+            "{name:?}"
+        );
+        // Without ws_discovery(true), WS-Discovery is skipped at run time.
+        if let Ok(server) = build(Discovery::new().name("Files")) {
+            let settings = server.state().config.discovery.clone().expect("discovery");
+            assert_eq!(ws_device(&settings, 445, "files"), None, "{name:?}");
+        }
+    }
+}
+
+#[test]
+fn ws_discovery_metadata_has_defaults_and_overrides() {
+    let server = announced("0.0.0.0:445", Discovery::new().name("Media")).expect("build");
+    let settings = server.state().config.discovery.clone().expect("discovery");
+    assert_eq!(
+        settings.info,
+        DeviceInfo {
+            computer: "FILES".to_string(),
+            workgroup: "WORKGROUP".to_string(),
+            manufacturer: "smb-server".to_string(),
+            model_name: "smb-server".to_string(),
+            firmware_version: env!("CARGO_PKG_VERSION").to_string(),
+        }
+    );
+    assert_eq!(settings.ws_discovery, None);
+    assert_eq!(settings.server_guid, None);
+
+    let guid = Uuid::from_u128(0x6ba7_b810_9dad_11d1_80b4_00c0_4fd4_30c8);
+    let server = SmbServer::builder()
+        .listen("0.0.0.0:445".parse().unwrap())
+        .netbios_name("files")
+        .server_guid(guid)
+        .discovery(
+            Discovery::new()
+                .workgroup("home")
+                .manufacturer("Acme")
+                .model_name("NAS 2")
+                .firmware_version("2.1"),
+        )
+        .build()
+        .expect("build");
+    let settings = server.state().config.discovery.clone().expect("discovery");
+    assert_eq!(settings.info.workgroup, "HOME");
+    assert_eq!(settings.info.manufacturer, "Acme");
+    assert_eq!(settings.info.model_name, "NAS 2");
+    assert_eq!(settings.info.firmware_version, "2.1");
+    assert_eq!(settings.server_guid, Some(guid));
+}
+
+#[test]
+fn ws_discovery_runs_on_port_445_off_windows() {
+    let server = announced("0.0.0.0:0", Discovery::new()).expect("build");
+    let settings = server.state().config.discovery.clone().expect("discovery");
+    let device = ws_device(&settings, 445, "files");
+    if cfg!(windows) {
+        assert_eq!(device, None);
+    } else {
+        let device = device.expect("device");
+        assert_eq!(device.endpoint, endpoint_uuid(None, "files", "FILES", 445));
+        assert_eq!(device.info, settings.info);
+    }
+    assert_eq!(ws_device(&settings, 4445, "files"), None);
+
+    let guid = Uuid::from_u128(1);
+    let server = SmbServer::builder()
+        .listen("0.0.0.0:445".parse().unwrap())
+        .netbios_name("files")
+        .server_guid(guid)
+        .discovery(Discovery::new())
+        .build()
+        .expect("build");
+    let settings = server.state().config.discovery.clone().expect("discovery");
+    if !cfg!(windows) {
+        let device = ws_device(&settings, 445, "other").expect("device");
+        assert_eq!(device.endpoint, endpoint_uuid(Some(guid), "", "", 445));
+    }
+
+    let server = announced("0.0.0.0:445", Discovery::new().ws_discovery(false)).expect("build");
+    let settings = server.state().config.discovery.clone().expect("discovery");
+    assert_eq!(ws_device(&settings, 445, "files"), None);
 }

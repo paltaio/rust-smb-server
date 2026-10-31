@@ -68,7 +68,7 @@ rc4.workspace = true
 aes-gcm.workspace = true
 ccm.workspace = true
 socket2 = "0.6"
-if-addrs = { version = "0.15", optional = true }
+if-addrs = { version = "0.15", optional = true, features = ["link-local"] }
 
 [target.'cfg(windows)'.dependencies]
 cap-primitives = { workspace = true, optional = true }
@@ -77,6 +77,7 @@ windows-sys = { version = "0.61", features = ["Wdk_Storage_FileSystem", "Win32_S
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["fs"], optional = true }
 libc = "0.2"
+quick-xml = { version = "0.42", optional = true }
 
 [target.'cfg(all(unix, not(target_vendor = "apple")))'.dependencies]
 mdns-sd = { version = "0.21.6", optional = true }
@@ -91,6 +92,9 @@ discovery = [
     "dep:mdns-sd",
     "dep:zbus",
     "dep:if-addrs",
+    "dep:quick-xml",
+    "socket2/all",
+    "uuid/v8",
     "windows-sys/Win32_Foundation",
     "windows-sys/Win32_NetworkManagement_Dns",
     "windows-sys/Win32_System_SystemInformation",

@@ -9,7 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-smb-server = { path = ".." }
+smb-server = { path = "..", features = ["discovery"] }
 tokio = { version = "1.40", features = ["rt"] }
 
 [workspace]
@@ -104,6 +104,20 @@ bench = false
 [[bin]]
 name = "srvsvc_request"
 path = "fuzz_targets/srvsvc_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wsd_datagram"
+path = "fuzz_targets/wsd_datagram.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wsd_http"
+path = "fuzz_targets/wsd_http.rs"
 test = false
 doc = false
 bench = false

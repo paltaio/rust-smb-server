@@ -229,6 +229,21 @@ pub enum BuildError {
     DiscoveryModel(String),
     #[error("discovery cannot announce the loopback listen address {0}")]
     DiscoveryOnLoopback(SocketAddr),
+    #[error(
+        "discovery workgroup `{0}` must be 1 to 15 characters without control characters or any of \"/\\[]:|<>+=;,?*"
+    )]
+    DiscoveryWorkgroup(String),
+    #[error("discovery {setting} `{value}` must be 1 to 255 characters without control characters")]
+    DiscoveryMetadata {
+        setting: &'static str,
+        value: String,
+    },
+    #[error("WS-Discovery needs the server on port 445, not {0}")]
+    WsDiscoveryPort(u16),
+    #[error(
+        "WS-Discovery needs a NetBIOS name of 1 to 15 characters without control characters or any of \"/\\[]:|<>+=;,?*, not `{0}`"
+    )]
+    WsDiscoveryNetbiosName(String),
 }
 
 /// Why a share name cannot be configured.
@@ -502,7 +517,9 @@ impl SmbServerBuilder {
     /// Announce the server on the local network while
     /// [`SmbServer::serve`] runs; see [`Discovery`](crate::Discovery). Off
     /// unless called. [`build`](Self::build) fails when the listen address
-    /// is a loopback address. Needs the `discovery` feature.
+    /// is a loopback address, and when WS-Discovery is turned on and the
+    /// listen port is set to one other than 445 or the NetBIOS name is not
+    /// one Windows accepts. Needs the `discovery` feature.
     #[cfg(feature = "discovery")]
     pub fn discovery(mut self, discovery: crate::discovery::Discovery) -> Self {
         self.discovery = Some(discovery);
@@ -597,7 +614,7 @@ impl SmbServerBuilder {
         #[cfg(feature = "discovery")]
         let discovery = self
             .discovery
-            .map(|discovery| discovery.settings(listen, &netbios))
+            .map(|discovery| discovery.settings(listen, &netbios, self.server_guid))
             .transpose()?;
 
         let mut share_bindings: Vec<Arc<ShareBindings>> = Vec::with_capacity(self.shares.len());

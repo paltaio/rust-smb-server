@@ -1,4 +1,5 @@
-//! Network discovery: announcing the server over mDNS and DNS-SD.
+//! Network discovery: announcing the server over mDNS and DNS-SD, and
+//! to Windows over WS-Discovery.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -8,7 +9,8 @@ use async_trait::async_trait;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
-use tracing::{Instrument, warn};
+use tracing::{Instrument, debug, info, warn};
+use uuid::Uuid;
 
 use crate::builder::BuildError;
 
@@ -21,8 +23,10 @@ mod dnsapi;
 #[cfg(all(unix, not(target_vendor = "apple")))]
 mod responder;
 pub(crate) mod target;
+#[cfg(unix)]
+pub(crate) mod wsd;
 
-use target::Scope;
+use target::{Scope, WsSkip};
 
 /// Most renames tried in a row when the name is taken.
 #[cfg_attr(any(target_vendor = "apple", not(unix)), allow(dead_code))]
@@ -80,13 +84,45 @@ const MAX_RENAMES: usize = 16;
 /// 9. A name that contains a dot is not announced. A restart of the DNS
 /// Client service drops the registration until the server is restarted.
 ///
-/// On other platforms nothing is announced. Each of these cases, and any
-/// failure to announce, is logged; `serve` runs on either way.
+/// On other platforms nothing is announced over mDNS.
+///
+/// On hosts other than Windows, a server listening on port 445 is also
+/// announced to Windows, which lists computers in its Network folder
+/// through WS-Discovery and opens them on port 445. The server answers
+/// probes on UDP port 3702, sends Hello when it starts or gains an address
+/// and Bye when it stops, and serves its metadata over HTTP on TCP port
+/// 5357, or on a free port, with a warning, when another program has 5357.
+/// Windows lists it under its NetBIOS name, which must be 1 to 15
+/// characters without control characters or any of `"/\[]:|<>+=;,?*`, in
+/// workgroup [`workgroup`](Self::workgroup), and opens it by resolving
+/// that name, which works when the NetBIOS name is the host's name. The
+/// server answers on each interface that is up, has an address the
+/// listener accepts, and is not loopback, point-to-point, a VPN tunnel
+/// (`tun*`, `utun*`, `wg*`), a container network (`docker*`, `br-*`,
+/// `veth*`, `cni*`, `flannel*`, `cali*`) or one of Apple's peer-to-peer
+/// links (`awdl*`, `llw*`, `anpi*`). It answers senders with a link-local
+/// address or an address on one of that interface's networks, and follows
+/// interface changes within 5 seconds. Its endpoint address is derived
+/// from [`server_guid`](crate::SmbServerBuilder::server_guid) when that is
+/// set, otherwise from the host name and the NetBIOS name, and from the
+/// port, so it stays the same across restarts. On macOS, a server that
+/// does not run as root receives the probes only when the binary has the
+/// Local Network permission; without it, Hello and Bye go out but probes
+/// never arrive. On Windows, which announces the computer itself, and on
+/// other ports, nothing is announced over WS-Discovery.
+///
+/// Each of these cases, and any failure to announce, is logged; `serve`
+/// runs on either way.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct Discovery {
     name: Option<String>,
     model: Option<String>,
+    ws_discovery: Option<bool>,
+    workgroup: Option<String>,
+    manufacturer: Option<String>,
+    model_name: Option<String>,
+    firmware_version: Option<String>,
 }
 
 impl Discovery {
@@ -118,15 +154,61 @@ impl Discovery {
         self
     }
 
+    /// Whether to announce the server to Windows over WS-Discovery. By
+    /// default it is announced when it listens on port 445 on a host other
+    /// than Windows, and the reason is logged when it is not. With `true`,
+    /// [`build`](crate::SmbServerBuilder::build) fails when the listen
+    /// port is set to one other than 445 or the NetBIOS name is not one
+    /// Windows accepts, and a skipped announcement is logged as a warning.
+    pub fn ws_discovery(mut self, enabled: bool) -> Self {
+        self.ws_discovery = Some(enabled);
+        self
+    }
+
+    /// Workgroup Windows lists the server in. 1 to 15 characters without
+    /// control characters or any of `"/\[]:|<>+=;,?*`, sent in upper
+    /// case. Defaults to `WORKGROUP`.
+    pub fn workgroup(mut self, workgroup: impl Into<String>) -> Self {
+        self.workgroup = Some(workgroup.into());
+        self
+    }
+
+    /// Manufacturer Windows shows in the server's properties. 1 to 255
+    /// characters without control characters. Defaults to `smb-server`.
+    pub fn manufacturer(mut self, manufacturer: impl Into<String>) -> Self {
+        self.manufacturer = Some(manufacturer.into());
+        self
+    }
+
+    /// Model name Windows shows in the server's properties, apart from
+    /// the [`model`](Self::model) code the Finder reads. 1 to 255
+    /// characters without control characters. Defaults to `smb-server`.
+    pub fn model_name(mut self, model_name: impl Into<String>) -> Self {
+        self.model_name = Some(model_name.into());
+        self
+    }
+
+    /// Firmware version Windows shows in the server's properties. 1 to
+    /// 255 characters without control characters. Defaults to the version
+    /// of this crate.
+    pub fn firmware_version(mut self, version: impl Into<String>) -> Self {
+        self.firmware_version = Some(version.into());
+        self
+    }
+
     /// Checks the options against the listen address and fills in the
-    /// default name.
+    /// defaults.
     pub(crate) fn settings(
         self,
         listen: SocketAddr,
         netbios_name: &str,
+        server_guid: Option<Uuid>,
     ) -> Result<Settings, BuildError> {
         if listen.ip().to_canonical().is_loopback() {
             return Err(BuildError::DiscoveryOnLoopback(listen));
+        }
+        if self.ws_discovery == Some(true) && !matches!(listen.port(), 0 | target::SMB_PORT) {
+            return Err(BuildError::WsDiscoveryPort(listen.port()));
         }
         let default_name = self.name.is_none();
         let name = self.name.unwrap_or_else(|| netbios_name.to_uppercase());
@@ -136,13 +218,47 @@ impl Discovery {
         if let Some(model) = self.model.as_ref().filter(|m| !target::valid_model(m)) {
             return Err(BuildError::DiscoveryModel(model.clone()));
         }
+        let workgroup = self
+            .workgroup
+            .unwrap_or_else(|| DEFAULT_WORKGROUP.to_string());
+        if !target::valid_netbios_name(&workgroup.to_uppercase()) {
+            return Err(BuildError::DiscoveryWorkgroup(workgroup));
+        }
+        let computer = netbios_name.to_uppercase();
+        if self.ws_discovery == Some(true) && !target::valid_netbios_name(&computer) {
+            return Err(BuildError::WsDiscoveryNetbiosName(netbios_name.to_string()));
+        }
+        let field = |setting: &'static str, value: Option<String>, default: &str| match value {
+            Some(value) if !target::valid_field(&value) => {
+                Err(BuildError::DiscoveryMetadata { setting, value })
+            }
+            value => Ok(value.unwrap_or_else(|| default.to_string())),
+        };
+        let info = DeviceInfo {
+            computer,
+            workgroup: workgroup.to_uppercase(),
+            manufacturer: field("manufacturer", self.manufacturer, env!("CARGO_PKG_NAME"))?,
+            model_name: field("model_name", self.model_name, env!("CARGO_PKG_NAME"))?,
+            firmware_version: field(
+                "firmware_version",
+                self.firmware_version,
+                env!("CARGO_PKG_VERSION"),
+            )?,
+        };
         Ok(Settings {
             name,
             default_name,
             model: self.model,
+            ws_discovery: self.ws_discovery,
+            server_guid,
+            info,
         })
     }
 }
+
+/// Workgroup announced unless set: the name Windows gives a new
+/// workgroup.
+const DEFAULT_WORKGROUP: &str = "WORKGROUP";
 
 /// [`Discovery`] as checked by the builder.
 #[derive(Debug, Clone)]
@@ -151,6 +267,33 @@ pub(crate) struct Settings {
     /// `name` is the default, not one set through [`Discovery::name`].
     pub(crate) default_name: bool,
     pub(crate) model: Option<String>,
+    /// Set through [`Discovery::ws_discovery`].
+    pub(crate) ws_discovery: Option<bool>,
+    /// Set through [`SmbServerBuilder::server_guid`](crate::SmbServerBuilder::server_guid).
+    pub(crate) server_guid: Option<Uuid>,
+    pub(crate) info: DeviceInfo,
+}
+
+/// What Windows shows for the server, from its WS-Discovery metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) struct DeviceInfo {
+    /// NetBIOS name, in upper case.
+    pub(crate) computer: String,
+    /// In upper case.
+    pub(crate) workgroup: String,
+    pub(crate) manufacturer: String,
+    pub(crate) model_name: String,
+    pub(crate) firmware_version: String,
+}
+
+/// The server as a WS-Discovery device.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) struct Device {
+    /// Endpoint address, sent as `urn:uuid:<endpoint>`.
+    pub(crate) endpoint: Uuid,
+    pub(crate) info: DeviceInfo,
 }
 
 /// What a backend announces.
@@ -167,6 +310,8 @@ pub(crate) struct Service {
     /// First label of the host name, the SRV target when the server
     /// answers mDNS itself.
     pub(crate) host: String,
+    /// Announced over WS-Discovery when set.
+    pub(crate) device: Option<Device>,
 }
 
 /// Resolves when the backend is to withdraw the service.
@@ -181,33 +326,54 @@ pub(crate) trait Backend: Send + Sync {
 }
 
 /// Avahi on Linux when it runs, otherwise the built-in responder where
-/// there is one.
+/// there is one, and WS-Discovery beside it.
 pub(crate) struct System;
 
 #[async_trait]
 impl Backend for System {
-    async fn run(&self, service: Service, stop: Stop) {
-        #[cfg(target_os = "linux")]
-        if let Some(bus) = avahi::Bus::connect().await {
-            return bus.run(service, stop).await;
-        }
-        #[cfg(all(unix, not(target_vendor = "apple")))]
-        responder::run(service, async {
-            let _ = stop.await;
-            responder::Leave::Withdraw
-        })
-        .await;
-        #[cfg(target_vendor = "apple")]
-        dns_sd::run(service, stop).await;
-        #[cfg(windows)]
-        dnsapi::run(service, stop).await;
-        #[cfg(not(any(unix, windows)))]
-        {
-            drop((service, stop));
-            warn!(
-                "network discovery is not supported on this platform; the server is not announced"
-            );
-        }
+    async fn run(&self, mut service: Service, stop: Stop) {
+        let device = service.device.take();
+        let scope = service.scope;
+        let (mdns_stop, mdns_stopped) = oneshot::channel();
+        let (wsd_stop, wsd_stopped) = oneshot::channel::<()>();
+        tokio::join!(
+            async move {
+                let _ = stop.await;
+                drop((mdns_stop, wsd_stop));
+            },
+            mdns(service, mdns_stopped),
+            async move {
+                #[cfg(unix)]
+                if let Some(device) = device {
+                    wsd::run(device, scope, wsd_stopped).await;
+                }
+                #[cfg(not(unix))]
+                drop((device, scope, wsd_stopped));
+            },
+        );
+    }
+}
+
+/// Announces `service` over mDNS until `stop` resolves.
+async fn mdns(service: Service, stop: Stop) {
+    #[cfg(target_os = "linux")]
+    if let Some(bus) = avahi::Bus::connect().await {
+        return bus.run(service, stop).await;
+    }
+    #[cfg(all(unix, not(target_vendor = "apple")))]
+    responder::run(service, async {
+        let _ = stop.await;
+        responder::Leave::Withdraw
+    })
+    .await;
+    #[cfg(target_vendor = "apple")]
+    dns_sd::run(service, stop).await;
+    #[cfg(windows)]
+    dnsapi::run(service, stop).await;
+    #[cfg(not(any(unix, windows)))]
+    {
+        drop((service, stop));
+        warn!("network discovery is not supported on this platform; the server is not announced");
     }
 }
 
@@ -237,13 +403,15 @@ impl Announcer {
         };
         let v6_only =
             local.is_ipv6() && socket2::SockRef::from(listener).only_v6().unwrap_or(false);
+        let host = host_label().unwrap_or_else(|| "smbserver".to_string());
         let service = Service {
             name: settings.name.clone(),
             default_name: settings.default_name,
             model: settings.model.clone(),
             port: local.port(),
             scope: Scope::new(local.ip(), v6_only),
-            host: host_label().unwrap_or_else(|| "smbserver".to_string()),
+            device: ws_device(settings, local.port(), &host),
+            host,
         };
         let (stop, stopped) = oneshot::channel();
         let task =
@@ -271,6 +439,55 @@ impl Drop for Announcer {
     fn drop(&mut self) {
         self.task.abort();
     }
+}
+
+/// The device to announce over WS-Discovery for a server on `port`, or
+/// `None`, with the reason logged, when WS-Discovery does not run.
+pub(crate) fn ws_device(settings: &Settings, port: u16, host: &str) -> Option<Device> {
+    let computer = &settings.info.computer;
+    let skip = target::ws_discovery_skip(settings.ws_discovery, port, computer, cfg!(windows));
+    let reason = match skip {
+        None => {
+            if !computer.eq_ignore_ascii_case(host) {
+                warn!(
+                    name = %computer,
+                    %host,
+                    "the NetBIOS name is not the host name; Windows lists the server under it \
+                     but opens it only where that name resolves to this host"
+                );
+            }
+            return Some(Device {
+                endpoint: target::endpoint_uuid(settings.server_guid, host, computer, port),
+                info: settings.info.clone(),
+            });
+        }
+        Some(WsSkip::Off) => {
+            debug!("WS-Discovery is off");
+            return None;
+        }
+        Some(WsSkip::Windows) => "Windows announces the computer itself",
+        Some(WsSkip::Port) => "Windows opens servers it finds that way on port 445 only",
+        Some(WsSkip::Name) => {
+            warn!(
+                name = %computer,
+                "the server is not announced over WS-Discovery: the NetBIOS name must be 1 to 15 \
+                 characters without control characters or any of \"/\\[]:|<>+=;,?*"
+            );
+            return None;
+        }
+    };
+    if settings.ws_discovery == Some(true) {
+        warn!(
+            port,
+            "the server is not announced over WS-Discovery: {reason}"
+        );
+    } else {
+        info!(
+            port,
+            "the server is not announced over WS-Discovery: {reason}"
+        );
+    }
+    None
 }
 
 /// First label of the host name.
