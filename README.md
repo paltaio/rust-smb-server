@@ -2,6 +2,8 @@
 
 SMB server in Rust.
 
+Serves SMB 2.0.2, 2.1, 3.0, 3.0.2 and 3.1.1 over TCP.
+
 ## Install
 
 ```sh
@@ -60,6 +62,12 @@ server.serve().await?;
 
 Shares marked `.public()` or `.public_read_only()` are open to anonymous sessions. A logon as `guest` with an empty password, which the Finder sends for Connect As Guest, gets the same access unless a user of that name is configured; the name matches in any case. Guest and anonymous traffic is neither signed nor encrypted, so a client that requires signing gets no guest session.
 
+`shutdown()` on the server, or on the handle `server.shutdown_handle()` returns, stops it: `serve()` stops accepting connections, closes each one once its current request is answered, and returns once every connection and every file kept for a reconnect has closed.
+
+## Backends
+
+A share serves any type that implements `ShareBackend`; the crate documentation describes what the server does around each backend call. `LocalFsBackend`, from the default `localfs` feature, serves a directory on the host, and paths and symlinks cannot reach outside it. `.read_only()` makes it refuse writes.
+
 ## Runtime config
 
 Create a `ConfigHandle` before `serve()` and keep it in the task that owns admin/config updates:
@@ -87,6 +95,18 @@ server.serve().await?;
 ```
 
 Removing a user revokes that user's active sessions. Removing a share or revoking share access closes matching active tree connections and open handles.
+
+## Limits and timeouts
+
+`max_connections` (default 1024), `max_sessions_per_connection` (64), `max_trees_per_session` (128), `max_opens_per_connection` (16384) and `max_locks_per_open` (1024) on the builder cap what clients hold at once. A request past a limit fails with STATUS_INSUFFICIENT_RESOURCES, and a connection past `max_connections` is closed. `ConfigHandle::set_max_opens_per_connection` changes the open limit at run time.
+
+`handshake_timeout` (30 seconds) closes a connection still without a session, `idle_timeout` (15 minutes) one that has sent no request and has no open files, and `io_timeout` (60 seconds) one that takes longer to receive the rest of a request or to send a response. `tcp_keepalive` sets the idle time before TCP keepalive probes, 60 seconds by default. `max_read_size` and `max_write_size` set the largest READ and WRITE, 1 MiB by default and between 64 KiB and 8 MiB.
+
+After 10 failed logons for one user name, each within 60 seconds of the one before, logons with that name fail with STATUS_ACCOUNT_LOCKED_OUT until 60 seconds have passed since the last failure. A client address is locked out the same way after 100 failed logons under any names, and a connection is closed after 10. Unknown names count the same as configured ones. `logon_throttle(max_failures, lockout)` sets both numbers; 0 failures turns the throttle off.
+
+## Signing
+
+Signed sessions use HMAC-SHA-256 on SMB 2.0.2 and 2.1 and AES-CMAC on SMB 3.x. `require_signing(true)` on the builder makes every authenticated session sign its requests and tells clients in the NEGOTIATE response that signing is required. With it off, a client can still require signing for its own sessions.
 
 ## Encryption
 
@@ -123,6 +143,12 @@ Changes made outside the server, or through another share over the same director
 A file opened with a durable handle request, version 1 or 2, and a lease that caches handles stays open, for 2 minutes by default or the time a version 2 request asks for, up to 5 minutes or the configured time if that is longer, after the client's connection drops or it logs off, with its share mode, byte-range locks and lease. When the same user reconnects from the same client, it takes the file back and carries on with the same handle, locks and lease. An open, write, lock, rename or delete that needs what the lease caches closes a kept file at once, and so do `ConfigHandle` calls that remove the user or the share, revoke the user's access or lower it to read-only, change the share's mode, or change the user's password.
 
 `durable_handle_timeout` and `max_disconnected_opens` on the builder set the time and the most files kept at once. Call `.durable_handles(false)` on a `Share` to turn them off there.
+
+## Change notifications
+
+A client watching a folder, as Explorer and the Finder do for an open window, hears when a file or folder in it, or below it when the client watches the whole tree, is created, deleted, renamed, written, truncated or overwritten, or has its attributes or times set, through any connection to the share. A write is reported when the open that wrote closes. New contents are reported under SIZE, LAST_WRITE and ATTRIBUTES.
+
+Changes made outside the server, or through another share over the same directory, are reported only by a backend that watches for them. `LocalFsBackend` does on Linux, through inotify, for the entries directly in a watched folder; `.watch_host_changes(false)` on the backend turns that off. One backend holds at most 4096 kernel watches, and a folder past that, or past `fs.inotify.max_user_watches` or `fs.inotify.max_user_instances`, gets only the changes made through the server, with a warning logged once. Call `.change_notify(false)` on a `Share` to turn change notifications off there.
 
 ## Share listing
 
@@ -165,7 +191,7 @@ let server = SmbServer::builder()
 
 The server is announced over mDNS and DNS-SD as an `_smb._tcp` service with the port it listens on, under its NetBIOS name unless `Discovery::name` sets another; on macOS, with neither a name nor a model set, under the computer name. It shows up in the Finder sidebar and in Linux file managers such as GNOME Files and Dolphin. On Linux it registers with Avahi when Avahi runs, on macOS with mDNSResponder, on Windows with the DNS Client service; otherwise the server answers mDNS itself.
 
-On hosts other than Windows, a server listening on port 445 also answers WS-Discovery and shows up in the Network view of Windows Explorer, under its NetBIOS name and workgroup. Windows opens computers it finds that way on port 445 only and by their NetBIOS name, so the server is announced to Windows only on port 445 and only when its NetBIOS name is the host name. When the NetBIOS name is not the host name, the server logs a warning. Listen on `[::]:445` as above: Windows may resolve the name to an IPv6 address too and then connect over IPv6 alone, so it lists a server that listens on IPv4 only but cannot open it. Explorer lists the server only where network discovery is turned on for the client's network profile. On macOS, run the server as root for WS-Discovery: as a non-root user, macOS may refuse to send its messages or not deliver the probes to it, and Windows then does not list the server.
+On hosts other than Windows, a server listening on port 445 also answers WS-Discovery and shows up in the Network view of Windows Explorer, under its NetBIOS name and workgroup. Windows opens computers it finds that way on port 445 only and by their NetBIOS name, so the server is announced to Windows only on port 445 and only when its NetBIOS name is the host name. When the NetBIOS name is not the host name, the server logs a warning. The NetBIOS name defaults to the first label of the host name in upper case, cut to 15 characters; `netbios_name` on the builder sets another. Listen on `[::]:445` as above: Windows may resolve the name to an IPv6 address too and then connect over IPv6 alone, so it lists a server that listens on IPv4 only but cannot open it. Explorer lists the server only where network discovery is turned on for the client's network profile. On macOS, run the server as root for WS-Discovery: as a non-root user, macOS may refuse to send its messages or not deliver the probes to it, and Windows then does not list the server.
 
 On the host firewall, open UDP port 5353 for mDNS, and UDP port 3702 and TCP port 5357 for WS-Discovery. When another program holds TCP port 5357, the server serves on a free port instead and logs a warning.
 
@@ -173,14 +199,19 @@ On the host firewall, open UDP port 5353 for mDNS, and UDP port 3702 and TCP por
 
 Not supported:
 
-- Kerberos; authentication is NTLM only
+- SMB1
+- Kerberos and NTLMv1; authentication is NTLMv2 only
 - oplocks and directory leases
 - answering a replayed CREATE with the open it repeats, and persistent and resilient handles
 - change notifications for changes made outside the server or through another share over the same directory, except with `LocalFsBackend` on Linux for the entries directly in a watched folder
 - named pipes other than `srvsvc`, and RPC calls other than listing shares and describing the server
 - DFS
 - multichannel and compression
+- transports other than direct TCP: NetBIOS sessions, QUIC and RDMA
 - alternate data streams and extended attributes
+- security descriptors and quotas
+- server-side copy and reparse points
+- snapshots for Previous Versions
 - network discovery over NetBIOS
 
 ## License
