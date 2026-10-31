@@ -12,14 +12,14 @@ Or in `Cargo.toml`:
 
 ```toml
 [dependencies]
-smb-server = "0.7"
+smb-server = "0.8"
 ```
 
 With network discovery:
 
 ```toml
 [dependencies]
-smb-server = { version = "0.7", features = ["discovery"] }
+smb-server = { version = "0.8", features = ["discovery"] }
 ```
 
 ## Run the example
