@@ -68,15 +68,19 @@ pub(crate) enum WsSkip {
     Port,
     /// The NetBIOS name is not one [`valid_netbios_name`] accepts.
     Name,
+    /// The NetBIOS name is not the host name, so Windows cannot resolve
+    /// it to this host.
+    Host,
 }
 
 /// Why WS-Discovery does not run for a server listening on `port` under
-/// NetBIOS name `name`, or `None` when it runs. `enabled` is `None` unless
-/// set explicitly.
+/// NetBIOS name `name` on host `host`, the first label of the host name,
+/// or `None` when it runs. `enabled` is `None` unless set explicitly.
 pub(crate) fn ws_discovery_skip(
     enabled: Option<bool>,
     port: u16,
     name: &str,
+    host: &str,
     windows: bool,
 ) -> Option<WsSkip> {
     if enabled == Some(false) {
@@ -87,6 +91,8 @@ pub(crate) fn ws_discovery_skip(
         Some(WsSkip::Port)
     } else if !valid_netbios_name(name) {
         Some(WsSkip::Name)
+    } else if !name.eq_ignore_ascii_case(host) {
+        Some(WsSkip::Host)
     } else {
         None
     }
@@ -278,7 +284,8 @@ mod tests {
 
     #[test]
     fn ws_discovery_runs_on_port_445_off_windows() {
-        let skip = |enabled, port, name, windows| ws_discovery_skip(enabled, port, name, windows);
+        let skip =
+            |enabled, port, name, windows| ws_discovery_skip(enabled, port, name, "files", windows);
         assert_eq!(skip(None, 445, "FILES", false), None);
         assert_eq!(skip(Some(true), 445, "FILES", false), None);
         assert_eq!(skip(Some(false), 445, "FILES", false), Some(WsSkip::Off));
@@ -286,6 +293,13 @@ mod tests {
         assert_eq!(skip(Some(true), 0, "FILES", false), Some(WsSkip::Port));
         assert_eq!(skip(None, 445, "A/B", false), Some(WsSkip::Name));
         assert_eq!(skip(None, 445, "", false), Some(WsSkip::Name));
+        assert_eq!(skip(None, 445, "files", false), None);
+        assert_eq!(skip(None, 445, "MEDIA", false), Some(WsSkip::Host));
+        assert_eq!(skip(Some(true), 445, "MEDIA", false), Some(WsSkip::Host));
+        assert_eq!(
+            ws_discovery_skip(None, 445, "NAS-HOST", "nas-host-with-a-long-name", false),
+            Some(WsSkip::Host)
+        );
         assert_eq!(skip(None, 445, "FILES", true), Some(WsSkip::Windows));
         assert_eq!(skip(Some(true), 445, "FILES", true), Some(WsSkip::Windows));
         assert_eq!(skip(Some(false), 445, "FILES", true), Some(WsSkip::Off));

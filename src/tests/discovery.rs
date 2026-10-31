@@ -10,8 +10,12 @@ use tokio::time::Instant;
 
 use uuid::Uuid;
 
+use crate::discovery::target::Scope;
 use crate::discovery::target::endpoint_uuid;
 use crate::discovery::{Backend, DeviceInfo, Service, Stop, ws_device};
+
+/// A dual-stack listener.
+const V6: Scope = Scope::V6 { dual_stack: true };
 use crate::{BuildError, Discovery, SmbServer};
 
 #[derive(Clone, Copy)]
@@ -321,7 +325,7 @@ fn ws_discovery_options_are_checked_at_build() {
         // Without ws_discovery(true), WS-Discovery is skipped at run time.
         if let Ok(server) = build(Discovery::new().name("Files")) {
             let settings = server.state().config.discovery.clone().expect("discovery");
-            assert_eq!(ws_device(&settings, 445, "files"), None, "{name:?}");
+            assert_eq!(ws_device(&settings, 445, "files", V6), None, "{name:?}");
         }
     }
 }
@@ -369,7 +373,7 @@ fn ws_discovery_metadata_has_defaults_and_overrides() {
 fn ws_discovery_runs_on_port_445_off_windows() {
     let server = announced("0.0.0.0:0", Discovery::new()).expect("build");
     let settings = server.state().config.discovery.clone().expect("discovery");
-    let device = ws_device(&settings, 445, "files");
+    let device = ws_device(&settings, 445, "files", V6);
     if cfg!(windows) {
         assert_eq!(device, None);
     } else {
@@ -377,7 +381,9 @@ fn ws_discovery_runs_on_port_445_off_windows() {
         assert_eq!(device.endpoint, endpoint_uuid(None, "files", "FILES", 445));
         assert_eq!(device.info, settings.info);
     }
-    assert_eq!(ws_device(&settings, 4445, "files"), None);
+    assert_eq!(ws_device(&settings, 4445, "files", V6), None);
+    // The NetBIOS name, FILES, is not the host name.
+    assert_eq!(ws_device(&settings, 445, "media", V6), None);
 
     let guid = Uuid::from_u128(1);
     let server = SmbServer::builder()
@@ -389,11 +395,15 @@ fn ws_discovery_runs_on_port_445_off_windows() {
         .expect("build");
     let settings = server.state().config.discovery.clone().expect("discovery");
     if !cfg!(windows) {
-        let device = ws_device(&settings, 445, "other").expect("device");
+        let device = ws_device(&settings, 445, "files", V6).expect("device");
         assert_eq!(device.endpoint, endpoint_uuid(Some(guid), "", "", 445));
     }
 
     let server = announced("0.0.0.0:445", Discovery::new().ws_discovery(false)).expect("build");
     let settings = server.state().config.discovery.clone().expect("discovery");
-    assert_eq!(ws_device(&settings, 445, "files"), None);
+    assert_eq!(ws_device(&settings, 445, "files", V6), None);
+
+    let server = announced("0.0.0.0:445", Discovery::new().ws_discovery(true)).expect("build");
+    let settings = server.state().config.discovery.clone().expect("discovery");
+    assert_eq!(ws_device(&settings, 445, "media", V6), None);
 }

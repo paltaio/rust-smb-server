@@ -92,12 +92,18 @@ const MAX_RENAMES: usize = 16;
 /// probes on UDP port 3702, sends Hello when it starts or gains an address
 /// and Bye when it stops, and serves its metadata over HTTP on TCP port
 /// 5357, or on a free port, with a warning, when another program has 5357.
-/// Windows lists it under its NetBIOS name, which must be 1 to 15
-/// characters without control characters or any of `"/\[]:|<>+=;,?*`, in
-/// workgroup [`workgroup`](Self::workgroup), and opens it by resolving
-/// that name, which works when the NetBIOS name is the host's name. The
-/// server answers on each interface that is up, has an address the
-/// listener accepts, and is not loopback, point-to-point, a VPN tunnel
+/// Windows lists it under its NetBIOS name, in workgroup
+/// [`workgroup`](Self::workgroup), and opens it by resolving that name, so
+/// the server is announced to Windows only when its NetBIOS name is the
+/// first label of the host name, ignoring case; otherwise a warning says to
+/// set [`netbios_name`](crate::SmbServerBuilder::netbios_name) to the host
+/// name. The NetBIOS name must also be 1 to 15 characters without control
+/// characters or any of `"/\[]:|<>+=;,?*`. Listen on `[::]:445`: Windows
+/// may resolve the name to an IPv6 address too and then connect over IPv6
+/// alone, so it lists a server that listens on IPv4 only but cannot open
+/// it, and such a server logs a warning. The server answers on each
+/// interface that is up, has an address the listener accepts, and is not
+/// loopback, point-to-point, a VPN tunnel
 /// (`tun*`, `utun*`, `wg*`), a container network (`docker*`, `br-*`,
 /// `veth*`, `cni*`, `flannel*`, `cali*`) or one of Apple's peer-to-peer
 /// links (`awdl*`, `llw*`, `anpi*`). It answers senders with a link-local
@@ -105,11 +111,12 @@ const MAX_RENAMES: usize = 16;
 /// interface changes within 5 seconds. Its endpoint address is derived
 /// from [`server_guid`](crate::SmbServerBuilder::server_guid) when that is
 /// set, otherwise from the host name and the NetBIOS name, and from the
-/// port, so it stays the same across restarts. On macOS, a server that
-/// does not run as root receives the probes only when the binary has the
-/// Local Network permission; without it, Hello and Bye go out but probes
-/// never arrive. On Windows, which announces the computer itself, and on
-/// other ports, nothing is announced over WS-Discovery.
+/// port, so it stays the same across restarts. On macOS, WS-Discovery
+/// needs the server to run as root: otherwise macOS refuses to send its
+/// messages, which is logged as a warning, or does not deliver the probes
+/// to it, and Windows does not list the server. On Windows, which
+/// announces the computer itself, and on other ports, nothing is announced
+/// over WS-Discovery.
 ///
 /// Each of these cases, and any failure to announce, is logged; `serve`
 /// runs on either way.
@@ -410,7 +417,12 @@ impl Announcer {
             model: settings.model.clone(),
             port: local.port(),
             scope: Scope::new(local.ip(), v6_only),
-            device: ws_device(settings, local.port(), &host),
+            device: ws_device(
+                settings,
+                local.port(),
+                &host,
+                Scope::new(local.ip(), v6_only),
+            ),
             host,
         };
         let (stop, stopped) = oneshot::channel();
@@ -441,19 +453,25 @@ impl Drop for Announcer {
     }
 }
 
-/// The device to announce over WS-Discovery for a server on `port`, or
-/// `None`, with the reason logged, when WS-Discovery does not run.
-pub(crate) fn ws_device(settings: &Settings, port: u16, host: &str) -> Option<Device> {
+/// The device to announce over WS-Discovery for a server on `port` on
+/// host `host`, listening on `scope`, or `None`, with the reason logged,
+/// when WS-Discovery does not run.
+pub(crate) fn ws_device(
+    settings: &Settings,
+    port: u16,
+    host: &str,
+    scope: Scope,
+) -> Option<Device> {
     let computer = &settings.info.computer;
-    let skip = target::ws_discovery_skip(settings.ws_discovery, port, computer, cfg!(windows));
+    let skip =
+        target::ws_discovery_skip(settings.ws_discovery, port, computer, host, cfg!(windows));
     let reason = match skip {
         None => {
-            if !computer.eq_ignore_ascii_case(host) {
+            if matches!(scope, Scope::V4 | Scope::Addr(std::net::IpAddr::V4(_))) {
                 warn!(
-                    name = %computer,
-                    %host,
-                    "the NetBIOS name is not the host name; Windows lists the server under it \
-                     but opens it only where that name resolves to this host"
+                    "the listener accepts IPv4 only: Windows may resolve the server's name to \
+                     an IPv6 address too and then connect over IPv6 alone, so it lists the \
+                     server but cannot open it; listen on [::]:445 instead"
                 );
             }
             return Some(Device {
@@ -467,6 +485,16 @@ pub(crate) fn ws_device(settings: &Settings, port: u16, host: &str) -> Option<De
         }
         Some(WsSkip::Windows) => "Windows announces the computer itself",
         Some(WsSkip::Port) => "Windows opens servers it finds that way on port 445 only",
+        Some(WsSkip::Host) => {
+            warn!(
+                name = %computer,
+                %host,
+                "the server is not announced over WS-Discovery: Windows opens it by its NetBIOS \
+                 name, which reaches this host only when it is the host name; set netbios_name \
+                 to the host name"
+            );
+            return None;
+        }
         Some(WsSkip::Name) => {
             warn!(
                 name = %computer,

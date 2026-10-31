@@ -30,13 +30,16 @@ which go through Avahi on Linux when it runs, mDNSResponder on macOS and
 the DNS Client service on Windows, and otherwise through a responder
 built into the server. A server on port 445 on a host other than Windows
 also answers WS-Discovery, which fills the Network view of Windows
-Explorer. [`Discovery`] has the options and what each platform does.
+Explorer, when its NetBIOS name is the host name. Listen on `[::]:445`, as
+below: Windows may connect over IPv6 alone, so it cannot open a server
+that listens on IPv4 only. [`Discovery`] has the options and what each
+platform does.
 
 ```no_run
 use smb_server::{Discovery, Share, ShareBackend, SmbServer};
 # async fn run<B: ShareBackend>(backend: B) -> Result<(), Box<dyn std::error::Error>> {
 SmbServer::builder()
-    .listen("0.0.0.0:445".parse()?)
+    .listen("[::]:445".parse()?)
     .share(Share::new("public", backend).public_read_only())
     .discovery(Discovery::new())
     .build()?

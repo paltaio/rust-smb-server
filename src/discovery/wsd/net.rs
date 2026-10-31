@@ -4,6 +4,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -187,6 +188,9 @@ struct Shared {
     device: Arc<Device>,
     /// Connections to the metadata endpoints.
     slots: Arc<Semaphore>,
+    /// Whether macOS refused a send, which is logged as a warning once.
+    #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
+    refused: AtomicBool,
 }
 
 impl Shared {
@@ -204,7 +208,28 @@ impl Shared {
             )),
             device,
             slots: Arc::new(Semaphore::new(http::MAX_CONNECTIONS)),
+            refused: AtomicBool::new(false),
         }
+    }
+
+    /// Logs a message to `to` that could not be sent.
+    fn send_failed(&self, to: SocketAddr, e: &io::Error) {
+        // macOS refuses every WS-Discovery send of a process that does not
+        // run as root, with EHOSTUNREACH.
+        #[cfg(target_vendor = "apple")]
+        if e.raw_os_error() == Some(libc::EHOSTUNREACH)
+            && !self
+                .refused
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            warn!(
+                error = %e,
+                "macOS refuses to send the server's WS-Discovery messages, so Windows does not \
+                 list it; run the server as root to announce it to Windows"
+            );
+            return;
+        }
+        debug!(%to, error = %e, "cannot send a WS-Discovery message");
     }
 }
 
@@ -290,7 +315,7 @@ async fn update(
 
 /// Stops every handler, then sends Bye on each link, so that no reply or
 /// Hello follows a Bye.
-async fn finish(mut handlers: Vec<Handler>, shared: &Shared) {
+async fn finish(mut handlers: Vec<Handler>, shared: &Arc<Shared>) {
     for handler in &handlers {
         handler.stop.send_replace(true);
     }
@@ -302,7 +327,8 @@ async fn finish(mut handlers: Vec<Handler>, shared: &Shared) {
         let bye = engine::lock(&shared.engine).bye();
         let send = handler.send.clone();
         let group = handler.group;
-        byes.spawn(async move { send_copies(&send, group, &bye, MULTICAST_COPIES).await });
+        let shared = shared.clone();
+        byes.spawn(async move { send_copies(&send, group, &bye, MULTICAST_COPIES, &shared).await });
     }
     while byes.join_next().await.is_some() {}
 }
@@ -437,7 +463,7 @@ async fn hello(
         () = async {
             tokio::time::sleep(engine::app_delay()).await;
             let hello = engine::lock(&shared.engine).hello(&xaddr);
-            send_copies(&send, group, &hello, MULTICAST_COPIES).await;
+            send_copies(&send, group, &hello, MULTICAST_COPIES, &shared).await;
         } => {}
     }
 }
@@ -480,11 +506,12 @@ async fn receive(
         );
         if let Some(reply) = reply {
             let send = send.clone();
+            let shared = shared.clone();
             replies.spawn(async move {
                 if reply.delayed {
                     tokio::time::sleep(engine::app_delay()).await;
                 }
-                send_copies(&send, reply.to, &reply.message, UNICAST_COPIES).await;
+                send_copies(&send, reply.to, &reply.message, UNICAST_COPIES, &shared).await;
             });
         }
     }
@@ -492,10 +519,16 @@ async fn receive(
 }
 
 /// Sends `message` to `to` `copies` times, with the same MessageID.
-async fn send_copies(socket: &UdpSocket, to: SocketAddr, message: &[u8], copies: usize) {
+async fn send_copies(
+    socket: &UdpSocket,
+    to: SocketAddr,
+    message: &[u8],
+    copies: usize,
+    shared: &Shared,
+) {
     let send = || async {
         if let Err(e) = socket.send_to(message, to).await {
-            debug!(%to, error = %e, "cannot send a WS-Discovery message");
+            shared.send_failed(to, &e);
         }
     };
     send().await;

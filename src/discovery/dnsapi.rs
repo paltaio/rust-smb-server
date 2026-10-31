@@ -451,7 +451,11 @@ impl Registration {
             && !self.finished()
             && let Some(done) = self.completions.recv().await
         {
-            debug!(error = %describe(done.status), "withdrawn");
+            if done.status == ERROR_SUCCESS {
+                debug!("withdrawn");
+            } else {
+                warn!(error = %describe(done.status), "the DNS client did not withdraw the server");
+            }
             self.finish();
         }
     }
