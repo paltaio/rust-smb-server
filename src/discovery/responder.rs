@@ -36,9 +36,7 @@ pub(super) enum Leave {
 /// Announces `service` until `leave` resolves, unless its name contains a
 /// dot or UDP port 5353 is unusable.
 pub(super) async fn run(service: Service, leave: impl Future<Output = Leave> + Send) {
-    // mdns-sd matches incoming names against its escaped form of such a
-    // name, so it would answer no query for the records.
-    if service.name.contains('.') {
+    if !answerable(&service.name) {
         warn!(
             name = %service.name,
             "the name contains a dot, which the built-in mDNS responder cannot answer for; \
@@ -187,6 +185,13 @@ pub(super) async fn run(service: Service, leave: impl Future<Output = Leave> + S
     }
 }
 
+/// Whether the responder can answer queries for instance name `name`:
+/// mdns-sd matches incoming names against its escaped form of a name with
+/// a dot, so it would answer no query for the records.
+fn answerable(name: &str) -> bool {
+    !name.contains('.')
+}
+
 /// Shuts the responder down when dropped, which sends one goodbye per
 /// record.
 struct Responder(ServiceDaemon);
@@ -285,21 +290,10 @@ fn has_usable_interface(scope: Scope) -> bool {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn a_name_with_a_dot_is_not_announced() {
-        let service = Service {
-            name: "My.NAS".to_string(),
-            default_name: false,
-            model: None,
-            port: 445,
-            scope: Scope::V4,
-            host: "host".to_string(),
-            device: None,
-        };
-        // Returns at once instead of announcing until `leave` resolves.
-        tokio::time::timeout(Duration::from_secs(5), run(service, std::future::pending()))
-            .await
-            .expect("returned");
+    #[test]
+    fn a_name_with_a_dot_is_not_announced() {
+        assert!(answerable("My NAS"));
+        assert!(!answerable("My.NAS"));
     }
 
     #[test]

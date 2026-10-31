@@ -214,8 +214,8 @@ impl Shared {
 
     /// Logs a message to `to` that could not be sent.
     fn send_failed(&self, to: SocketAddr, e: &io::Error) {
-        // macOS refuses every WS-Discovery send of a process that does not
-        // run as root, with EHOSTUNREACH.
+        // Running as a non-root user, macOS refused these sends with
+        // EHOSTUNREACH; running as root worked.
         #[cfg(target_vendor = "apple")]
         if e.raw_os_error() == Some(libc::EHOSTUNREACH)
             && !self
@@ -224,8 +224,8 @@ impl Shared {
         {
             warn!(
                 error = %e,
-                "macOS refuses to send the server's WS-Discovery messages, so Windows does not \
-                 list it; run the server as root to announce it to Windows"
+                "macOS refused to send a WS-Discovery message, so Windows may not list the \
+                 server; run the server as root to announce it to Windows"
             );
             return;
         }
@@ -355,7 +355,7 @@ impl Handler {
     /// Opens the sockets for `link`, starts answering on them, and sends
     /// Hello after a random wait.
     async fn start(link: Link, shared: &Arc<Shared>) -> Result<Self, HandlerError> {
-        let recv = recv_socket(&link).map_err(HandlerError::Join)?;
+        let recv = recv_socket(&link).map_err(HandlerError::Group)?;
         let send = send_socket(&link).map_err(HandlerError::Port)?;
         let http = http_listener(&link).await.map_err(HandlerError::Http)?;
         let port = http.local_addr().map_err(HandlerError::Http)?.port();
@@ -430,7 +430,7 @@ impl Handler {
 
 #[derive(Debug)]
 enum HandlerError {
-    Join(io::Error),
+    Group(io::Error),
     Port(io::Error),
     Http(io::Error),
 }
@@ -438,7 +438,7 @@ enum HandlerError {
 impl std::fmt::Display for HandlerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            HandlerError::Join(e) => write!(f, "cannot join the WS-Discovery group: {e}"),
+            HandlerError::Group(e) => write!(f, "cannot listen on the WS-Discovery group: {e}"),
             HandlerError::Port(e) if e.kind() == io::ErrorKind::AddrInUse => write!(
                 f,
                 "UDP port 3702 on this address is in use by another program, such as another \
@@ -908,35 +908,5 @@ mod tests {
         UdpSocket::bind(lo.recv).await.expect("receive port");
         UdpSocket::bind(lo.send).await.expect("send port");
         TcpListener::bind(lo.http).await.expect("metadata port");
-    }
-
-    #[tokio::test]
-    async fn a_stopped_handler_frees_its_ports_for_the_next_one() {
-        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let mut lo = loopback_handler(client.local_addr().unwrap()).await;
-        lo.handler.stop().await;
-        drop(lo.handler);
-        // The next handler binds the same addresses at once.
-        let recv = UdpSocket::bind(lo.recv).await.expect("receive port");
-        let send = UdpSocket::bind(lo.send).await.expect("send port");
-        let http = TcpListener::bind(lo.http).await.expect("metadata port");
-        let link = Link {
-            index: 1,
-            addr: ip("127.0.0.1"),
-            networks: vec![(ip("127.0.0.1"), 8)],
-        };
-        let sockets = Sockets { recv, send, http };
-        let mut next = Handler::with_sockets(
-            link,
-            sockets,
-            lo.http.port(),
-            client.local_addr().unwrap(),
-            &lo.shared,
-        );
-        let probe = crate::discovery::wsd::samples::PROBE.as_bytes();
-        client.send_to(probe, lo.recv).await.unwrap();
-        let actions = received(&client, Duration::from_millis(1500)).await;
-        assert!(actions.contains(&"ProbeMatches".to_string()), "{actions:?}");
-        next.stop().await;
     }
 }

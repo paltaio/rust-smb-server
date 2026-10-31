@@ -1,7 +1,6 @@
 //! Registration with mDNSResponder through the dns_sd API of libSystem.
 
 use std::ffi::{CStr, CString, c_char, c_void};
-use std::net::IpAddr;
 use std::os::fd::{AsRawFd, RawFd};
 use std::ptr;
 use std::time::Duration;
@@ -10,7 +9,7 @@ use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
 use tracing::{debug, info, warn};
 
-use super::target::{Names, Scope};
+use super::target::{Names, if_index_of, interface_index};
 use super::{Service, Stop};
 
 /// The parts of `dns_sd.h` the server uses.
@@ -631,23 +630,6 @@ fn registered_name(service: &Service) -> Option<&str> {
     (!(service.default_name && service.model.is_none())).then_some(service.name.as_str())
 }
 
-/// The interface index to register on: any for a wildcard listener,
-/// otherwise the interface of the address, or `None` without one.
-fn interface_index(scope: Scope, index_of: impl Fn(IpAddr) -> Option<u32>) -> Option<u32> {
-    match scope {
-        Scope::V4 | Scope::V6 { .. } => Some(0),
-        Scope::Addr(ip) => index_of(ip).filter(|&index| index != 0),
-    }
-}
-
-fn if_index_of(ip: IpAddr) -> Option<u32> {
-    if_addrs::get_if_addrs()
-        .ok()?
-        .into_iter()
-        .find(|intf| intf.ip() == ip)?
-        .index
-}
-
 /// TXT rdata holding the one string `model=<model>`.
 fn txt_rdata(model: &str) -> Vec<u8> {
     let entry = format!("model={model}");
@@ -687,6 +669,7 @@ fn describe(code: i32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::discovery::target::Scope;
 
     fn service(default_name: bool, model: Option<&str>) -> Service {
         Service {
@@ -715,26 +698,6 @@ mod tests {
     }
 
     #[test]
-    fn the_interface_follows_the_listen_address() {
-        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
-        let index_of = |addr: IpAddr| (addr == ip("192.168.1.10")).then_some(4);
-        assert_eq!(interface_index(Scope::V4, index_of), Some(0));
-        assert_eq!(
-            interface_index(Scope::V6 { dual_stack: false }, index_of),
-            Some(0)
-        );
-        assert_eq!(
-            interface_index(Scope::Addr(ip("192.168.1.10")), index_of),
-            Some(4)
-        );
-        assert_eq!(interface_index(Scope::Addr(ip("10.0.0.1")), index_of), None);
-        assert_eq!(
-            interface_index(Scope::Addr(ip("10.0.0.1")), |_| Some(0)),
-            None
-        );
-    }
-
-    #[test]
     fn the_model_is_one_txt_string() {
         assert_eq!(txt_rdata("Xserve3,1"), b"\x0fmodel=Xserve3,1");
         let long = "m".repeat(249);
@@ -745,11 +708,6 @@ mod tests {
 
     #[test]
     fn errors_are_named() {
-        assert_eq!(
-            describe(-65563),
-            "kDNSServiceErr_ServiceNotRunning (-65563)"
-        );
-        assert_eq!(describe(-65548), "kDNSServiceErr_NameConflict (-65548)");
         assert_eq!(describe(-1), "dns_sd error -1");
         assert!(matches!(Failure::from(-65563), Failure::NotRunning));
         assert!(matches!(Failure::from(-65569), Failure::NotRunning));

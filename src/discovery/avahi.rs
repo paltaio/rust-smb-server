@@ -13,7 +13,7 @@ use zbus::message::Type;
 use zbus::{Connection, DynamicType, MatchRule, Message, MessageStream, OwnedObjectPath};
 
 use super::responder::{self, Leave};
-use super::target::Scope;
+use super::target::{Scope, if_index_of};
 use super::{MAX_RENAMES, Service, Stop};
 
 const BUS: &str = "org.freedesktop.DBus";
@@ -127,7 +127,7 @@ impl Bus {
             }
             info!("avahi-daemon is on the system bus; handing the announcement over to it");
         }
-        let Some((interface, protocol)) = scope_args(service.scope, interface_index) else {
+        let Some((interface, protocol)) = scope_args(service.scope, if_index_of) else {
             warn!("the listen address is on no interface; the server is not announced");
             return;
         };
@@ -537,15 +537,6 @@ fn scope_args(scope: Scope, index_of: impl Fn(IpAddr) -> Option<u32>) -> Option<
             Some((index, family(ip)))
         }
     }
-}
-
-/// Index of the interface that has `ip`.
-fn interface_index(ip: IpAddr) -> Option<u32> {
-    if_addrs::get_if_addrs()
-        .ok()?
-        .into_iter()
-        .find(|intf| intf.ip() == ip)?
-        .index
 }
 
 #[cfg(test)]

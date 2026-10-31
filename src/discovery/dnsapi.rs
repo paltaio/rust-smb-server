@@ -3,7 +3,6 @@
 
 use std::collections::BTreeMap;
 use std::ffi::c_void;
-use std::net::IpAddr;
 use std::ptr;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -21,7 +20,7 @@ use windows_sys::Win32::NetworkManagement::Dns::{
 };
 use windows_sys::Win32::System::SystemInformation::{ComputerNameDnsHostname, GetComputerNameExW};
 
-use super::target::{Names, Scope};
+use super::target::{Names, if_index_of, interface_index};
 use super::{Service, Stop};
 
 const SMB_TYPE: &str = "._smb._tcp.local";
@@ -177,24 +176,6 @@ async fn next_completion(registration: &mut Option<Registration>) -> Option<Comp
     }
 }
 
-/// The interface index to register on: 0, every interface, for a
-/// wildcard listener, otherwise the interface of the address, or `None`
-/// without one.
-fn interface_index(scope: Scope, index_of: impl Fn(IpAddr) -> Option<u32>) -> Option<u32> {
-    match scope {
-        Scope::V4 | Scope::V6 { .. } => Some(0),
-        Scope::Addr(ip) => index_of(ip).filter(|&index| index != 0),
-    }
-}
-
-fn if_index_of(ip: IpAddr) -> Option<u32> {
-    if_addrs::get_if_addrs()
-        .ok()?
-        .into_iter()
-        .find(|intf| intf.ip() == ip)?
-        .index
-}
-
 /// What to register.
 #[derive(Debug, Clone)]
 struct Spec {
@@ -234,7 +215,7 @@ impl Drop for Instance {
 }
 
 /// Where completion callbacks deliver, by the id passed as their context.
-/// An id outlives nothing: a callback for an id no longer here is dropped.
+/// A callback for an id no longer in the map is dropped.
 static WAITING: Mutex<BTreeMap<usize, mpsc::UnboundedSender<Completion>>> =
     Mutex::new(BTreeMap::new());
 static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
@@ -625,26 +606,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_interface_follows_the_listen_address() {
-        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
-        let index_of = |addr: IpAddr| (addr == ip("192.168.1.10")).then_some(7);
-        assert_eq!(interface_index(Scope::V4, index_of), Some(0));
-        assert_eq!(
-            interface_index(Scope::V6 { dual_stack: false }, index_of),
-            Some(0)
-        );
-        assert_eq!(
-            interface_index(Scope::Addr(ip("192.168.1.10")), index_of),
-            Some(7)
-        );
-        assert_eq!(interface_index(Scope::Addr(ip("10.0.0.1")), index_of), None);
-        assert_eq!(
-            interface_index(Scope::Addr(ip("10.0.0.1")), |_| Some(0)),
-            None
-        );
-    }
-
-    #[test]
     fn instance_labels_are_read_from_full_names() {
         assert_eq!(
             instance_label("FILES._smb._tcp.local", SMB_TYPE),
@@ -687,14 +648,6 @@ mod tests {
         };
         assert_eq!(read(&keys), ["model"]);
         assert_eq!(read(&values), ["Xserve3,1"]);
-    }
-
-    #[test]
-    fn strings_are_nul_terminated_utf16() {
-        assert_eq!(wide("A\u{e9}"), [0x41, 0xe9, 0]);
-        let s = wide("FILES._smb._tcp.local");
-        // SAFETY: `s` is NUL-terminated.
-        assert_eq!(unsafe { from_wide(s.as_ptr()) }, "FILES._smb._tcp.local");
     }
 
     #[test]

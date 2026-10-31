@@ -25,15 +25,10 @@ the server on the local network while [`SmbServer::serve`] runs, and
 withdraws it before `serve` returns. Nothing is announced unless it is
 called, and the listen address must not be a loopback address.
 
-The Finder, GNOME Files and Dolphin find the server over mDNS and DNS-SD,
-which go through Avahi on Linux when it runs, mDNSResponder on macOS and
-the DNS Client service on Windows, and otherwise through a responder
-built into the server. A server on port 445 on a host other than Windows
-also answers WS-Discovery, which fills the Network view of Windows
-Explorer, when its NetBIOS name is the host name. Listen on `[::]:445`, as
-below: Windows may connect over IPv6 alone, so it cannot open a server
-that listens on IPv4 only. [`Discovery`] has the options and what each
-platform does.
+The Finder, GNOME Files and Dolphin find the server over mDNS and DNS-SD.
+Listen on `[::]:445`, as below: Windows may connect over IPv6 alone, so
+it cannot open a server that listens on IPv4 only. [`Discovery`] has the
+options and what each platform does.
 
 ```no_run
 use smb_server::{Discovery, Share, ShareBackend, SmbServer};
@@ -535,8 +530,11 @@ pub mod fuzzing {
         let _ = srvsvc::call(opnum, stub, &view);
     }
 
-    /// Runs `data` as a WS-Discovery datagram; see the `wsd_datagram`
-    /// fuzz target for its layout.
+    /// Runs `data` through the WS-Discovery target service: the first byte
+    /// picks the family of the sender, the next 4 or 16 bytes its address
+    /// and 2 its port, and the rest is the datagram. A reply goes only to a
+    /// sender on the link, and is a well-formed envelope that fits a
+    /// datagram.
     #[cfg(all(feature = "discovery", unix))]
     pub fn wsd_datagram(data: &[u8]) {
         crate::discovery::wsd::fuzz_datagram(data);

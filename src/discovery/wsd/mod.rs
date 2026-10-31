@@ -1,5 +1,5 @@
 //! WS-Discovery: the server as a computer in the Windows Network folder,
-//! a DPWS device that Windows finds over UDP and reads the metadata of
+//! a DPWS device that Windows finds over UDP and whose metadata it reads
 //! over HTTP (MS-PBSD).
 
 mod engine;
@@ -17,10 +17,7 @@ async fn until_stopped(stop: &mut tokio::sync::watch::Receiver<bool>) {
     let _ = stop.wait_for(|stopped| *stopped).await;
 }
 
-/// Runs `data` through the target service: the first byte picks the
-/// family of the sender, the next 4 or 16 bytes its address and 2 its
-/// port, and the rest is the datagram. A reply goes only to a sender on
-/// the link, and is a well-formed envelope that fits a datagram.
+/// What `fuzzing::wsd_datagram` runs; its documentation describes `data`.
 #[cfg(fuzzing)]
 pub(crate) fn fuzz_datagram(data: &[u8]) {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};

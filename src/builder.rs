@@ -517,9 +517,10 @@ impl SmbServerBuilder {
     /// Announce the server on the local network while
     /// [`SmbServer::serve`] runs; see [`Discovery`](crate::Discovery). Off
     /// unless called. [`build`](Self::build) fails when the listen address
-    /// is a loopback address, and when WS-Discovery is turned on and the
-    /// listen port is set to one other than 445 or the NetBIOS name is not
-    /// one Windows accepts. Needs the `discovery` feature.
+    /// is a loopback address, and when
+    /// [`Discovery::ws_discovery`](crate::Discovery::ws_discovery) is `true`
+    /// and the listen port is set to one other than 445 or the NetBIOS name
+    /// is not one Windows accepts. Needs the `discovery` feature.
     #[cfg(feature = "discovery")]
     pub fn discovery(mut self, discovery: crate::discovery::Discovery) -> Self {
         self.discovery = Some(discovery);

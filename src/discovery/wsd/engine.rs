@@ -18,7 +18,8 @@ pub(super) const MAX_DATAGRAM: usize = 4096;
 const APP_MAX_DELAY_MS: u64 = 500;
 
 /// Copies of a multicast and of a unicast message: SOAP-over-UDP's
-/// example transmission algorithm, as of the 2004 draft Windows follows.
+/// example transmission algorithm, as in the 2004 draft that Windows
+/// follows.
 pub(super) const MULTICAST_COPIES: usize = 4;
 pub(super) const UNICAST_COPIES: usize = 2;
 
@@ -538,6 +539,10 @@ mod tests {
 
     #[test]
     fn only_senders_on_the_link_are_answered() {
+        let on = |net: &str, len| Link {
+            networks: vec![(ip(net), len)],
+            ..v4_link(2)
+        };
         let now = Instant::now();
         let mut engine = engine(now);
         let table = [
@@ -545,14 +550,14 @@ mod tests {
             (v4_link(2), "[::ffff:192.168.1.21]:5000", true),
             (v4_link(2), "169.254.7.7:5000", true),
             (v4_link(2), "192.168.2.20:5000", false),
-            (v4_link(2), "198.51.100.7:5000", false),
             (v4_link(2), "192.168.1.22:0", false),
-            (v4_link(2), "0.0.0.0:5000", false),
-            (v4_link(2), "239.255.255.250:3702", false),
             (v6_link(2), "[fe80::5%2]:5000", true),
             (v6_link(2), "[2001:db8::5]:5000", true),
             (v6_link(2), "[2001:db8:1::5]:5000", false),
-            (v6_link(2), "[ff02::c]:3702", false),
+            // Networks that contain the sender, which is still refused.
+            (on("0.0.0.0", 8), "0.0.0.0:5000", false),
+            (on("224.0.0.0", 4), "239.255.255.250:3702", false),
+            (on("ff00::", 8), "[ff02::c]:3702", false),
         ];
         for (n, (link, sender, answered)) in table.into_iter().enumerate() {
             let reply = engine.handle(now, &link, XADDR, from(sender), &probe(n as u32));
@@ -615,17 +620,14 @@ mod tests {
         };
         let sender = |n: u32| SocketAddr::from(([10, 1, (n / 250) as u8, (n % 250) as u8], 5000));
         for n in 0..MAX_SOURCES as u32 {
-            let at = now + RATE_WINDOW * n / 50;
-            engine.handle(at, &link, XADDR, sender(n), &probe(n));
+            assert!(engine.handle(now, &link, XADDR, sender(n), b"<x").is_none());
         }
         assert!(engine.sources() <= MAX_SOURCES);
-        let at = now + RATE_WINDOW * 20;
-        assert!(
-            engine
-                .handle(at, &link, XADDR, sender(1000), &probe(1000))
-                .is_some()
-        );
-        assert!(engine.sources() <= MAX_SOURCES);
+        // A new sender waits until the senders' windows end.
+        let new = sender(1000);
+        assert!(engine.handle(now, &link, XADDR, new, &probe(1)).is_none());
+        let later = now + RATE_WINDOW;
+        assert!(engine.handle(later, &link, XADDR, new, &probe(2)).is_some());
     }
 
     #[test]

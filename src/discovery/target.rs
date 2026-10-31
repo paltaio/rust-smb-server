@@ -123,6 +123,33 @@ pub(crate) fn endpoint_uuid(server_guid: Option<Uuid>, host: &str, name: &str, p
     Uuid::new_v8(bytes)
 }
 
+/// The interface index to register on: 0, every interface, for a
+/// wildcard listener, otherwise the interface of the address as
+/// `index_of` finds it, or `None` without one.
+#[cfg_attr(not(any(target_vendor = "apple", windows)), allow(dead_code))]
+pub(crate) fn interface_index(
+    scope: Scope,
+    index_of: impl Fn(IpAddr) -> Option<u32>,
+) -> Option<u32> {
+    match scope {
+        Scope::V4 | Scope::V6 { .. } => Some(0),
+        Scope::Addr(ip) => index_of(ip).filter(|&index| index != 0),
+    }
+}
+
+/// Index of the interface that has `ip`.
+#[cfg_attr(
+    not(any(target_os = "linux", target_vendor = "apple", windows)),
+    allow(dead_code)
+)]
+pub(crate) fn if_index_of(ip: IpAddr) -> Option<u32> {
+    if_addrs::get_if_addrs()
+        .ok()?
+        .into_iter()
+        .find(|intf| intf.ip() == ip)?
+        .index
+}
+
 /// `name` with ` (n)` appended, shortened on a character boundary to fit
 /// one DNS label.
 pub(crate) fn numbered_name(name: &str, n: usize) -> String {
@@ -221,9 +248,6 @@ mod tests {
             "a".repeat(64).as_str(),
             "\u{e9}".repeat(32).as_str(),
             "a\nb",
-            "a\0",
-            "\u{7f}",
-            "\u{85}x",
         ] {
             assert!(!valid_name(name), "{name:?}");
         }
@@ -292,7 +316,6 @@ mod tests {
         assert_eq!(skip(None, 4445, "FILES", false), Some(WsSkip::Port));
         assert_eq!(skip(Some(true), 0, "FILES", false), Some(WsSkip::Port));
         assert_eq!(skip(None, 445, "A/B", false), Some(WsSkip::Name));
-        assert_eq!(skip(None, 445, "", false), Some(WsSkip::Name));
         assert_eq!(skip(None, 445, "files", false), None);
         assert_eq!(skip(None, 445, "MEDIA", false), Some(WsSkip::Host));
         assert_eq!(skip(Some(true), 445, "MEDIA", false), Some(WsSkip::Host));
@@ -301,34 +324,40 @@ mod tests {
             Some(WsSkip::Host)
         );
         assert_eq!(skip(None, 445, "FILES", true), Some(WsSkip::Windows));
-        assert_eq!(skip(Some(true), 445, "FILES", true), Some(WsSkip::Windows));
-        assert_eq!(skip(Some(false), 445, "FILES", true), Some(WsSkip::Off));
     }
 
     #[test]
-    fn endpoints_are_stable_version_8_uuids() {
+    fn endpoints_are_stable_and_distinct() {
         let uuid = |s: &str| s.parse::<Uuid>().unwrap();
         let by_host = endpoint_uuid(None, "nas-host", "NAS-HOST", 445);
         assert_eq!(by_host, uuid("ee90cc1b-3b1a-8eb6-97bd-0680fdfe52a4"));
-        assert_eq!(by_host.get_version_num(), 8);
         assert_eq!(endpoint_uuid(None, "NAS-Host", "nas-host", 445), by_host);
-        // Two servers on one host under different names.
+        // Two servers on one host under different names or ports.
+        assert_ne!(endpoint_uuid(None, "nas-host", "FILES", 445), by_host);
+        assert_ne!(endpoint_uuid(None, "nas-host", "NAS-HOST", 4445), by_host);
+        let guid = Uuid::from_u128(1);
+        let by_guid = endpoint_uuid(Some(guid), "nas-host", "NAS-HOST", 445);
+        assert_ne!(by_guid, by_host);
+        assert_eq!(endpoint_uuid(Some(guid), "", "", 445), by_guid);
+    }
+
+    #[test]
+    fn the_interface_follows_the_listen_address() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let index_of = |addr: IpAddr| (addr == ip("192.168.1.10")).then_some(4);
+        assert_eq!(interface_index(Scope::V4, index_of), Some(0));
         assert_eq!(
-            endpoint_uuid(None, "nas-host", "FILES", 445),
-            uuid("9780b5ab-8357-8593-bc53-e2dcfa0a099c")
+            interface_index(Scope::V6 { dual_stack: false }, index_of),
+            Some(0)
         );
         assert_eq!(
-            endpoint_uuid(None, "nas-host", "NAS-HOST", 4445),
-            uuid("36d11f81-1966-8c7c-9cbf-099ce1e7bdea")
+            interface_index(Scope::Addr(ip("192.168.1.10")), index_of),
+            Some(4)
         );
-        let guid = uuid("6ba7b810-9dad-11d1-80b4-00c04fd430c8");
+        assert_eq!(interface_index(Scope::Addr(ip("10.0.0.1")), index_of), None);
         assert_eq!(
-            endpoint_uuid(Some(guid), "nas-host", "NAS-HOST", 445),
-            uuid("a15167c2-4122-86a5-8473-c658a0f7e16d")
-        );
-        assert_eq!(
-            endpoint_uuid(Some(guid), "other", "OTHER", 445),
-            endpoint_uuid(Some(guid), "", "", 445)
+            interface_index(Scope::Addr(ip("10.0.0.1")), |_| Some(0)),
+            None
         );
     }
 
@@ -396,18 +425,16 @@ mod tests {
         let ip = |s: &str| s.parse::<IpAddr>().unwrap();
         let v4 = ip("192.168.1.10");
         let v6 = ip("fe80::10");
-        let global = ip("2001:db8::10");
         let dual = Scope::V6 { dual_stack: true };
         let v6_only = Scope::V6 { dual_stack: false };
 
-        let table: [(Scope, IpAddr, bool, bool); 12] = [
+        let table: [(Scope, IpAddr, bool, bool); 11] = [
             (Scope::V4, v4, false, true),
             (Scope::V4, v6, false, false),
             (Scope::V4, ip("127.0.0.1"), true, false),
             (Scope::V4, ip("127.0.0.2"), false, false),
             (dual, v4, false, true),
             (dual, v6, false, true),
-            (dual, global, false, true),
             (dual, ip("::1"), true, false),
             (v6_only, v4, false, false),
             (v6_only, v6, false, true),

@@ -111,10 +111,10 @@ const MAX_RENAMES: usize = 16;
 /// interface changes within 5 seconds. Its endpoint address is derived
 /// from [`server_guid`](crate::SmbServerBuilder::server_guid) when that is
 /// set, otherwise from the host name and the NetBIOS name, and from the
-/// port, so it stays the same across restarts. On macOS, WS-Discovery
-/// needs the server to run as root: otherwise macOS refuses to send its
-/// messages, which is logged as a warning, or does not deliver the probes
-/// to it, and Windows does not list the server. On Windows, which
+/// port, so it stays the same across restarts. On macOS, run the server as
+/// root for WS-Discovery: as a non-root user, macOS may refuse to send its
+/// messages, which is logged as a warning, or not deliver the probes to
+/// it, and Windows then does not list the server. On Windows, which
 /// announces the computer itself, and on other ports, nothing is announced
 /// over WS-Discovery.
 ///
@@ -442,7 +442,7 @@ impl Announcer {
             .await
             .is_err()
         {
-            warn!("network discovery did not stop within 2 seconds");
+            warn!(timeout = ?STOP_TIMEOUT, "network discovery did not stop in time");
         }
     }
 }
