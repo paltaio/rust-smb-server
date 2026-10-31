@@ -58,6 +58,8 @@ server.bind().await?;
 server.serve().await?;
 ```
 
+Shares marked `.public()` or `.public_read_only()` are open to anonymous sessions. A logon as `guest` with an empty password, which the Finder sends for Connect As Guest, gets the same access unless a user of that name is configured; the name matches in any case. Guest and anonymous traffic is neither signed nor encrypted, so a client that requires signing gets no guest session.
+
 ## Runtime config
 
 Create a `ConfigHandle` before `serve()` and keep it in the task that owns admin/config updates:
@@ -108,7 +110,7 @@ let server = SmbServer::builder()
 
 To require it for every session, call `.encrypt_data(true)` on the builder.
 
-Where encryption is required, clients that cannot encrypt are refused: SMB 2.x, SMB 3.x without a cipher in common, and anonymous sessions, which get a session but no tree. `reject_unencrypted_access(false)` serves them unencrypted instead.
+Where encryption is required, clients that cannot encrypt are refused: SMB 2.x, SMB 3.x without a cipher in common, and anonymous and guest sessions, which get a session but no tree. `reject_unencrypted_access(false)` serves them unencrypted instead.
 
 ## Leases
 

@@ -175,12 +175,21 @@ pub fn ack_results(pdu: &[u8]) -> Vec<(u16, u16)> {
 /// An anonymous client, or one signed in as `user`, negotiated at
 /// `dialect`, on IPC$.
 pub async fn ipc_client(addr: SocketAddr, dialect: u16, user: Option<&str>) -> Client {
+    ipc_client_as(addr, dialect, user.map(|user| (user, "password"))).await
+}
+
+/// [`ipc_client`] signed in with a `(user, password)` pair.
+pub async fn ipc_client_as(
+    addr: SocketAddr,
+    dialect: u16,
+    credentials: Option<(&str, &str)>,
+) -> Client {
     let mut s = TcpStream::connect(addr).await.expect("connect");
     negotiate_dialects_from(&mut s, &[dialect], CLIENT_GUID).await;
-    let session_id = match user {
+    let session_id = match credentials {
         None => anonymous_session_setup(&mut s).await,
-        Some(user) => {
-            let login = login_with(&mut s, 1, 0, user, "password", LoginOptions::default()).await;
+        Some((user, password)) => {
+            let login = login_with(&mut s, 1, 0, user, password, LoginOptions::default()).await;
             assert_eq!(login.status, STATUS_SUCCESS, "login as {user}");
             login.session_id
         }

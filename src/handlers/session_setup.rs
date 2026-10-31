@@ -313,12 +313,19 @@ async fn continue_exchange(
     let existing = conn.sessions.read().await.get(&sid).cloned();
 
     // The failed-logon throttle counts by the user name the client sent and
-    // by the client's address.
+    // by the client's address. The guest password is empty and known to
+    // everyone, so guest logons count by address only: a lockout of the
+    // name would shut every client out of guest access.
     let claimed_user = NtlmAuthenticate::parse(&ntlm)
         .map(|a| a.user)
         .unwrap_or_default();
+    let throttled_user = if is_guest(&*server.users.table.read().await, &claimed_user) {
+        ""
+    } else {
+        claimed_user.as_str()
+    };
     let peer = conn.peer_addr.map(|a| a.ip());
-    if server.auth.is_locked_out(&claimed_user, peer) {
+    if server.auth.is_locked_out(throttled_user, peer) {
         info!("logon refused: too many failed logons for this user name or address");
         return logon_failed(
             server,
@@ -331,13 +338,19 @@ async fn continue_exchange(
         .await;
     }
 
+    // A guest logon is checked against the empty password, and only while
+    // a share is public.
+    let public = eq_ignore_case(&claimed_user, GUEST) && server.anonymous_allowed().await;
     let users = server.users.table.read().await;
     let result = {
         let pair = pending
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let (acceptor, raw_form) = (&pair.0, pair.1);
-        let lookup = |u: &str, _d: &str| configured_user(&users, u).map(|(_, c)| c.clone());
+        let lookup = |u: &str, _d: &str| match configured_user(&users, u) {
+            Some((_, creds)) => Some(creds.clone()),
+            None => (public && is_guest(&users, u)).then(|| UserCreds::from_password("")),
+        };
         acceptor
             .authenticate(&ntlm, lookup)
             .map_err(|e| {
@@ -348,22 +361,32 @@ async fn continue_exchange(
                 // The session carries the configured spelling of the name,
                 // which share access is granted to.
                 let mut nt_hash = None;
-                if let Identity::User { user, .. } = &mut outcome.identity
-                    && let Some((name, creds)) = configured_user(&users, user)
-                {
-                    *user = name.clone();
-                    nt_hash = Some(creds.nt_hash);
+                let mut guest = false;
+                if let Identity::User { user, .. } = &mut outcome.identity {
+                    match configured_user(&users, user) {
+                        Some((name, creds)) => {
+                            *user = name.clone();
+                            nt_hash = Some(creds.nt_hash);
+                        }
+                        None => guest = public && is_guest(&users, user),
+                    }
                 }
                 let mic = if raw_form {
                     None
                 } else {
                     mech_list_mic(acceptor, &outcome, client_mic.as_deref())?
                 };
-                Ok((outcome, raw_form, mic, nt_hash))
+                // A guest gets an anonymous session: the public shares and
+                // no key.
+                if guest {
+                    outcome.identity = Identity::Anonymous;
+                    outcome.session_key = [0; 16];
+                }
+                Ok((outcome, raw_form, mic, nt_hash, guest))
             })
     };
     drop(users);
-    let (outcome, raw_form, server_mic, nt_hash) = match result {
+    let (outcome, raw_form, server_mic, nt_hash, guest) = match result {
         Ok(r) => r,
         Err(status) => {
             return logon_failed(
@@ -371,19 +394,29 @@ async fn continue_exchange(
                 conn,
                 sid,
                 existing.is_some(),
-                Some(&claimed_user),
+                Some(throttled_user),
                 status,
             )
             .await;
         }
     };
-    if !claimed_user.is_empty() {
-        server.auth.record_success(&claimed_user);
+    if !throttled_user.is_empty() {
+        server.auth.record_success(throttled_user);
     }
 
     // Anonymous gating.
     if matches!(outcome.identity, Identity::Anonymous) && !server.anonymous_allowed().await {
         return HandlerResponse::err(ntstatus::STATUS_LOGON_FAILURE);
+    }
+    // MS-SMB2 3.3.5.5.3 sets Session.SigningRequired when the request's
+    // SecurityMode has SIGNING_REQUIRED, guests included, and a guest
+    // session has no key to sign with. The spec names no status for this;
+    // MS-SMB2 3.3.5.5 refuses a session that cannot be encrypted as the
+    // server requires with STATUS_ACCESS_DENIED, and the same status is used
+    // here.
+    if guest && req.security_mode & SessionSetupRequest::SECURITY_SIGNING_REQUIRED != 0 {
+        info!("guest logon refused: the client requires signing");
+        return HandlerResponse::err(ntstatus::STATUS_ACCESS_DENIED);
     }
 
     let session_base_key = outcome.session_key;
@@ -392,14 +425,16 @@ async fn continue_exchange(
         return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
     };
 
-    // MS-SMB2 3.3.5.5.3: anonymous sessions are flagged IS_NULL. There is no
-    // guest account, so IS_GUEST is never set. Authenticated sessions on a
-    // connection with a cipher get encryption keys, and are encrypted when
-    // the server encrypts every session.
+    // MS-SMB2 3.3.5.5.3: anonymous sessions are flagged IS_NULL, guest
+    // sessions IS_GUEST. Authenticated sessions on a connection with a
+    // cipher get encryption keys, and are encrypted when the server
+    // encrypts every session.
     let anonymous = matches!(outcome.identity, Identity::Anonymous);
     let cipher = (*conn.cipher.read().await).filter(|_| !anonymous);
     let encrypt_data = server.auth.settings.encrypt_data && cipher.is_some();
-    let session_flags = if anonymous {
+    let session_flags = if guest {
+        SessionSetupResponse::FLAG_IS_GUEST
+    } else if anonymous {
         SessionSetupResponse::FLAG_IS_NULL
     } else if encrypt_data {
         SessionSetupResponse::FLAG_ENCRYPT_DATA
@@ -418,7 +453,8 @@ async fn continue_exchange(
         status: ntstatus::STATUS_SUCCESS,
         override_tree_id: None,
         override_session_id: Some(sid),
-        // Anonymous sessions have no key; the dispatcher signs the rest.
+        // Anonymous and guest sessions have no key; the dispatcher signs
+        // the rest.
         skip_signing: anonymous,
         take_preauth_snapshot_for_session: None,
         after_send: Vec::new(),
@@ -426,12 +462,19 @@ async fn continue_exchange(
 
     // Reauthentication keeps the session, its key and its trees
     // (MS-SMB2 3.3.5.5.2), for the same user only.
+    // Guest sessions are anonymous sessions flagged IS_GUEST; the log
+    // names them as guests.
+    let identity = if guest {
+        "Guest".to_string()
+    } else {
+        format!("{:?}", outcome.identity)
+    };
     if let Some(existing) = existing {
         if !same_user(&existing.read().await.identity, &outcome.identity) {
-            info!(?outcome.identity, "reauthentication as another user refused");
+            info!(%identity, "reauthentication as another user refused");
             return HandlerResponse::err(ntstatus::STATUS_ACCESS_DENIED);
         }
-        info!(?outcome.identity, "session reauthenticated");
+        info!(%identity, "session reauthenticated");
         return response;
     }
 
@@ -485,7 +528,7 @@ async fn continue_exchange(
     if dialect == Dialect::Smb311 {
         response.take_preauth_snapshot_for_session = Some(sid);
     }
-    info!(?outcome.identity, "session established");
+    info!(%identity, "session established");
     response
 }
 
@@ -644,6 +687,15 @@ fn configured_user<'a>(
     exact.or(folded.filter(|_| folded_count == 1))
 }
 
+/// The user name of a guest logon.
+const GUEST: &str = "guest";
+
+/// True when a logon as `name` is a guest logon: the name is `guest` in any
+/// case and no configured user has that name.
+fn is_guest(users: &HashMap<String, UserCreds>, name: &str) -> bool {
+    eq_ignore_case(name, GUEST) && !users.keys().any(|user| eq_ignore_case(user, GUEST))
+}
+
 fn eq_ignore_case(a: &str, b: &str) -> bool {
     a.chars()
         .flat_map(char::to_uppercase)
@@ -700,6 +752,20 @@ mod tests {
         assert_eq!(configured_user(&users, "BOB").unwrap().0, "BOB");
         assert!(configured_user(&users, "Bob").is_none());
         assert!(configured_user(&users, "carol").is_none());
+    }
+
+    #[test]
+    fn guest_is_the_name_guest_when_no_user_has_it() {
+        let mut users = HashMap::new();
+        users.insert("alice".to_string(), UserCreds::from_password("a"));
+        for name in ["guest", "GUEST", "Guest"] {
+            assert!(is_guest(&users, name), "{name}");
+        }
+        assert!(!is_guest(&users, "alice"));
+        assert!(!is_guest(&users, "guests"));
+        assert!(!is_guest(&users, ""));
+        users.insert("Guest".to_string(), UserCreds::from_password("g"));
+        assert!(!is_guest(&users, "guest"));
     }
 
     use crate::proto::auth::ntlm::testing::{AuthMsg, build_auth};

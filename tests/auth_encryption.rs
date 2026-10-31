@@ -424,10 +424,49 @@ async fn encrypted_share_refuses_sessions_that_cannot_encrypt() {
     let resp = request(&mut s, Command::TreeConnect, 3, sid, 0, &tc).await;
     assert_eq!(status(&resp), STATUS_ACCESS_DENIED, "anonymous");
 
+    // A guest, on a connection that negotiated a cipher, gets the plain
+    // share unsigned.
+    let (mut s, _) = negotiate_with(addr, &body).await;
+    let login = login_with(&mut s, 1, 0, "guest", "", LoginOptions::default()).await;
+    assert_eq!(login.status, STATUS_SUCCESS);
+    assert_eq!(
+        session_flags(&login.frame),
+        SessionSetupResponse::FLAG_IS_GUEST
+    );
+    let sid = login.session_id;
+    let resp = request(&mut s, Command::TreeConnect, 3, sid, 0, &tc).await;
+    assert_eq!(status(&resp), STATUS_ACCESS_DENIED, "guest");
+    let plain = tree_connect_body(&path("plain"));
+    let resp = request(&mut s, Command::TreeConnect, 4, sid, 0, &plain).await;
+    assert_eq!(status(&resp), STATUS_SUCCESS, "guest on plain");
+
     let (mut s, login) = smb21_login(addr).await;
     assert_eq!(login.status, STATUS_SUCCESS);
     let resp = request(&mut s, Command::TreeConnect, 3, login.session_id, 0, &tc).await;
     assert_eq!(status(&resp), STATUS_ACCESS_DENIED, "SMB 2.1");
+}
+
+#[tokio::test]
+async fn encrypt_data_gives_guests_a_session_but_no_tree() {
+    let td = tempfile::tempdir().unwrap();
+    let addr = serve(builder(&td).encrypt_data(true)).await;
+
+    let body = negotiate_311_encryption_body(&[Cipher::Aes128Gcm]);
+    let (mut s, _) = negotiate_with(addr, &body).await;
+    let login = login_with(&mut s, 1, 0, "guest", "", LoginOptions::default()).await;
+    assert_eq!(login.status, STATUS_SUCCESS);
+    assert_eq!(
+        session_flags(&login.frame),
+        SessionSetupResponse::FLAG_IS_GUEST
+    );
+    let plain = tree_connect_body(&path("plain"));
+    let resp = request(&mut s, Command::TreeConnect, 3, login.session_id, 0, &plain).await;
+    assert_eq!(status(&resp), STATUS_ACCESS_DENIED);
+
+    // A client that cannot encrypt gets no session.
+    let (mut s, _) = negotiate_with(addr, &negotiate_body(&[0x0202, 0x0210], 0x0001, 0)).await;
+    let login = login_with(&mut s, 1, 0, "guest", "", LoginOptions::default()).await;
+    assert_eq!(login.status, STATUS_ACCESS_DENIED);
 }
 
 #[tokio::test]

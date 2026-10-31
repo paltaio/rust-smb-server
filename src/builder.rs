@@ -73,13 +73,19 @@ impl Share {
         }
     }
 
-    /// Anonymous + authenticated read+write.
+    /// Anonymous + authenticated read+write. A logon as `guest` with an
+    /// empty password, which the Finder sends for Connect As Guest, gets the
+    /// same access as an anonymous session unless a user of that name is
+    /// configured; the name matches in any case. Guest and anonymous traffic
+    /// is neither signed nor encrypted, so a client that requires signing
+    /// gets no guest session.
     pub fn public(mut self) -> Self {
         self.mode = ShareMode::Public;
         self
     }
 
-    /// Anonymous + authenticated read-only.
+    /// Anonymous + authenticated read-only. Guest logons get the same
+    /// access as anonymous sessions, as with [`Share::public`].
     pub fn public_read_only(mut self) -> Self {
         self.mode = ShareMode::PublicReadOnly;
         self
@@ -93,9 +99,9 @@ impl Share {
     }
 
     /// Encrypt all traffic to this share. SMB 3.x clients that cannot
-    /// encrypt, SMB 2.x clients and anonymous sessions are refused at
-    /// TREE_CONNECT unless `SmbServerBuilder::reject_unencrypted_access` is
-    /// turned off.
+    /// encrypt, SMB 2.x clients, and anonymous and guest sessions are
+    /// refused at TREE_CONNECT unless
+    /// `SmbServerBuilder::reject_unencrypted_access` is turned off.
     pub fn encrypt_data(mut self) -> Self {
         self.encrypt_data = true;
         self
@@ -341,9 +347,10 @@ impl SmbServerBuilder {
     }
 
     /// Require every authenticated session to sign its requests, and set
-    /// SMB2_NEGOTIATE_SIGNING_REQUIRED in the NEGOTIATE response. Anonymous
-    /// sessions have no key and stay unsigned. Off by default; a client can
-    /// still require signing for its own sessions.
+    /// SMB2_NEGOTIATE_SIGNING_REQUIRED in the NEGOTIATE response. It does
+    /// not apply to anonymous and guest sessions, which have no key and stay
+    /// unsigned. Off by default; a client can still require signing for its
+    /// own sessions.
     pub fn require_signing(mut self, required: bool) -> Self {
         self.auth.require_signing = required;
         self
@@ -351,7 +358,8 @@ impl SmbServerBuilder {
 
     /// Encrypt every authenticated session on a connection that negotiated
     /// a cipher. While `reject_unencrypted_access` is on, clients that
-    /// cannot encrypt get no session, and anonymous sessions get no tree.
+    /// cannot encrypt get no session, and anonymous and guest sessions get
+    /// no tree.
     /// Off by default; with it off, a client that sends encrypted requests
     /// gets encrypted replies, and `Share::encrypt_data` turns encryption
     /// on for one share.
@@ -363,10 +371,10 @@ impl SmbServerBuilder {
     /// Whether a session or share that must be encrypted refuses clients
     /// that cannot encrypt: SMB 2.x, SMB 3.0 and 3.0.2 without the
     /// encryption capability, SMB 3.1.1 without a common cipher, and
-    /// anonymous sessions. On SMB 3.0 and 3.0.2 it also refuses unencrypted
-    /// requests from clients that can encrypt; SMB 3.1.1 always refuses
-    /// them. On by default. Turned off, clients that cannot encrypt are
-    /// served unencrypted.
+    /// anonymous and guest sessions. On SMB 3.0 and 3.0.2 it also refuses
+    /// unencrypted requests from clients that can encrypt; SMB 3.1.1 always
+    /// refuses them. On by default. Turned off, clients that cannot encrypt
+    /// are served unencrypted.
     pub fn reject_unencrypted_access(mut self, reject: bool) -> Self {
         self.auth.reject_unencrypted_access = reject;
         self

@@ -74,3 +74,44 @@ async fn failures_from_one_address_lock_it_out() {
         STATUS_ACCOUNT_LOCKED_OUT
     );
 }
+
+#[tokio::test]
+async fn guest_logons_count_by_address_only_when_they_fail() {
+    let td = tempfile::tempdir().expect("tempdir");
+    let backend = LocalFsBackend::new(td.path()).expect("open root");
+    let (addr, _handle) = start_server(
+        SmbServer::builder()
+            .user("alice", "password")
+            .share(Share::new("pub", backend).public())
+            .logon_throttle(2, Duration::from_secs(60)),
+    )
+    .await;
+
+    // On one connection and on new ones, past the limit.
+    let mut s = TcpStream::connect(addr).await.expect("connect");
+    negotiate(&mut s).await;
+    for i in 0..3 {
+        let login = spnego_login(&mut s, 1 + 2 * i, 0, "guest", "").await;
+        assert_eq!(login.status, 0);
+    }
+    for _ in 0..3 {
+        assert_eq!(logon(addr, "guest", "").await, 0);
+    }
+    assert_eq!(logon(addr, "alice", "password").await, 0);
+
+    // The guest password is known to everyone, so the name is not locked.
+    for _ in 0..2 {
+        assert_eq!(logon(addr, "guest", "wrong").await, STATUS_LOGON_FAILURE);
+    }
+    assert_eq!(logon(addr, "guest", "").await, 0);
+
+    // The address is, at ten times the per-user limit.
+    for _ in 2..20 {
+        assert_eq!(logon(addr, "guest", "wrong").await, STATUS_LOGON_FAILURE);
+    }
+    assert_eq!(logon(addr, "guest", "").await, STATUS_ACCOUNT_LOCKED_OUT);
+    assert_eq!(
+        logon(addr, "alice", "password").await,
+        STATUS_ACCOUNT_LOCKED_OUT
+    );
+}

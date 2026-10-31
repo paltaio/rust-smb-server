@@ -798,6 +798,17 @@ async fn anonymous_sessions_see_the_public_shares_and_ipc() {
 }
 
 #[tokio::test]
+async fn guest_sessions_see_the_public_shares_and_ipc() {
+    let (server, _td) = listing_server().await;
+    let mut c = ipc_client_as(server.addr, SMB21, Some(("guest", ""))).await;
+    let file_id = c.srvsvc().await;
+    assert_eq!(
+        c.list_shares(file_id, 1).await.names(),
+        ["public", "docs", "IPC$"]
+    );
+}
+
+#[tokio::test]
 async fn users_see_the_shares_they_may_connect_to() {
     let (server, _td) = listing_server().await;
     let mut alice = ipc_client(server.addr, SMB21, Some("alice")).await;
