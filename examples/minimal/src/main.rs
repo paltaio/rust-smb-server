@@ -7,7 +7,10 @@
 //! - users `alice` and `bob` with the password from `SMB_PASSWORD`, or a
 //!   random one logged at startup,
 //! - three shares: `public` (anonymous read+write), `media` (anonymous
-//!   read-only), `home` (alice = read+write, bob = read).
+//!   read-only), `home` (alice = read+write, bob = read),
+//! - not announced on the network; `SMB_DISCOVERY=1` announces it when
+//!   built with the `discovery` feature and listening on an address other
+//!   than loopback.
 
 use std::path::PathBuf;
 
@@ -42,9 +45,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    let discovery = std::env::var("SMB_DISCOVERY").is_ok_and(|v| v == "1");
+
     tracing::info!(?listen, ?root, "starting example smb server");
 
-    let server = SmbServer::builder()
+    let builder = SmbServer::builder()
         .listen(listen)
         .user("alice", password.as_str())
         .user("bob", password.as_str())
@@ -60,8 +65,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Share::new("home", LocalFsBackend::new(root.join("home"))?)
                 .user("alice", Access::ReadWrite)
                 .user("bob", Access::Read),
-        )
-        .build()?;
+        );
+    #[cfg(feature = "discovery")]
+    let builder = if discovery {
+        builder.discovery(smb_server::Discovery::new())
+    } else {
+        builder
+    };
+    #[cfg(not(feature = "discovery"))]
+    if discovery {
+        tracing::warn!("SMB_DISCOVERY=1 needs the discovery feature; the server is not announced");
+    }
+    let server = builder.build()?;
 
     let addr = server.bind().await?;
     tracing::info!(%addr, "listening");

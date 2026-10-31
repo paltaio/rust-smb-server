@@ -15,6 +15,38 @@
 //! # Ok(()) }
 //! ```
 //!
+#![cfg_attr(
+    feature = "discovery",
+    doc = r#"
+# Network discovery
+
+With the `discovery` feature, [`SmbServerBuilder::discovery`] announces
+the server on the local network while [`SmbServer::serve`] runs, and
+withdraws it before `serve` returns. Nothing is announced unless it is
+called, and the listen address must not be a loopback address.
+
+The Finder, GNOME Files and Dolphin find the server over mDNS and DNS-SD,
+which go through Avahi on Linux when it runs, mDNSResponder on macOS and
+the DNS Client service on Windows, and otherwise through a responder
+built into the server. A server on port 445 on a host other than Windows
+also answers WS-Discovery, which fills the Network view of Windows
+Explorer. [`Discovery`] has the options and what each platform does.
+
+```no_run
+use smb_server::{Discovery, Share, ShareBackend, SmbServer};
+# async fn run<B: ShareBackend>(backend: B) -> Result<(), Box<dyn std::error::Error>> {
+SmbServer::builder()
+    .listen("0.0.0.0:445".parse()?)
+    .share(Share::new("public", backend).public_read_only())
+    .discovery(Discovery::new())
+    .build()?
+    .serve()
+    .await?;
+# Ok(()) }
+```
+"#
+)]
+//!
 //! # Writing a backend
 //!
 //! A share serves any [`ShareBackend`]. Each CREATE calls

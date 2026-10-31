@@ -15,6 +15,13 @@ Or in `Cargo.toml`:
 smb-server = "0.7"
 ```
 
+With network discovery:
+
+```toml
+[dependencies]
+smb-server = { version = "0.7", features = ["discovery"] }
+```
+
 ## Run the example
 
 ```sh
@@ -26,6 +33,12 @@ Listens on `127.0.0.1:4445` and serves directories under `smb-example` in the sy
 Shares: `public` (anon rw), `media` (anon ro), `home` (alice rw, bob ro).
 
 `alice` and `bob` use the password in `SMB_PASSWORD`. Without it, the example generates one and logs it at startup.
+
+`SMB_DISCOVERY=1` announces the example on the network. It needs the `discovery` feature and a listen address other than loopback:
+
+```sh
+SMB_DISCOVERY=1 SMB_LISTEN=0.0.0.0:4445 cargo run -p minimal-smb-example --features discovery
+```
 
 ## Embed
 
@@ -133,6 +146,26 @@ let server = SmbServer::builder()
 ```
 
 `remark` sets the comment shown next to a share. `listed(false)` leaves a share out of the list; it is still reachable and can be looked up by name, so it is not access control. `share_listing(false)` on the builder turns listing off.
+
+## Network discovery
+
+With the `discovery` feature, `.discovery(Discovery::new())` on the builder announces the server while `serve()` runs and withdraws it before `serve()` returns. The listen address must not be a loopback address.
+
+```rust
+use smb_server::{Discovery, LocalFsBackend, Share, SmbServer};
+
+let server = SmbServer::builder()
+    .listen("0.0.0.0:445".parse()?)
+    .share(Share::new("public", LocalFsBackend::new("/srv/public")?).public())
+    .discovery(Discovery::new())
+    .build()?;
+```
+
+The server is announced over mDNS and DNS-SD as an `_smb._tcp` service with the port it listens on, under its NetBIOS name unless `Discovery::name` sets another; on macOS, with neither a name nor a model set, under the computer name. It shows up in the Finder sidebar and in Linux file managers such as GNOME Files and Dolphin. On Linux it registers with Avahi when Avahi runs, on macOS with mDNSResponder, on Windows with the DNS Client service; otherwise the server answers mDNS itself.
+
+On hosts other than Windows, a server listening on port 445 also answers WS-Discovery and shows up in the Network view of Windows Explorer, under its NetBIOS name and workgroup. Windows opens computers it finds that way on port 445 only, so a server on another port is not announced to Windows. Explorer lists it only where network discovery is turned on for the client's network profile. On macOS, a server that does not run as root receives the WS-Discovery probes only when the binary has the Local Network permission.
+
+On the host firewall, open UDP port 5353 for mDNS, and UDP port 3702 and TCP port 5357 for WS-Discovery. When another program holds TCP port 5357, the server serves on a free port instead and logs a warning.
 
 ## Limitations
 
