@@ -71,24 +71,10 @@ pub async fn handle(
         || unbuffered_flag
         || open.create_options & WRITE_THROUGH_OPTIONS != 0;
 
-    // MS-SMB2 3.3.5.13: overwriting bytes needs FILE_WRITE_DATA and growing
-    // the file needs FILE_APPEND_DATA.
-    let can_write = open.granted_access & FILE_WRITE_DATA != 0;
-    let can_append = open.granted_access & FILE_APPEND_DATA != 0;
-    if !can_write && !can_append {
+    // MS-SMB2 3.3.5.13 and its note <365>: FILE_WRITE_DATA or
+    // FILE_APPEND_DATA alone lets a WRITE overwrite and grow the file.
+    if open.granted_access & (FILE_WRITE_DATA | FILE_APPEND_DATA) == 0 {
         return HandlerResponse::err(ntstatus::STATUS_ACCESS_DENIED);
-    }
-    let length = u64::from(req.length);
-    if req.length > 0 && !(can_write && can_append) {
-        let size = match handle.stat().await {
-            Ok(info) => info.end_of_file,
-            Err(e) => return HandlerResponse::err(e.to_nt_status()),
-        };
-        let overwrites = req.offset < size;
-        let grows = req.offset.saturating_add(length) > size;
-        if (overwrites && !can_write) || (grows && !can_append) {
-            return HandlerResponse::err(ntstatus::STATUS_ACCESS_DENIED);
-        }
     }
 
     if req.length == 0 {
@@ -99,7 +85,7 @@ pub async fn handle(
         return HandlerResponse::ok(buf);
     }
     if let Some(file) = open.file.as_ref() {
-        if let Err(status) = file.check_io(req.offset, length, true) {
+        if let Err(status) = file.check_io(req.offset, u64::from(req.length), true) {
             return HandlerResponse::err(status);
         }
         file.break_leases(Trigger::Write);

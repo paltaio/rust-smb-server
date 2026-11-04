@@ -120,28 +120,29 @@ async fn data_offset_past_0x100_is_refused() {
 }
 
 #[tokio::test]
-async fn append_only_open_only_appends() {
+async fn write_data_or_append_data_alone_overwrites_and_grows() {
     let td = tempdir().unwrap();
     std::fs::write(td.path().join("f.txt"), b"data").unwrap();
     let server = Server::public(local(td.path())).await;
     let mut c = server.client().await;
 
     let f = c.open("f.txt", FILE_APPEND_DATA, SHARE_ALL).await.unwrap();
-    assert_eq!(
-        c.write(f, 0, b"X").await,
-        Err(ntstatus::STATUS_ACCESS_DENIED)
-    );
+    assert_eq!(c.write(f, 0, b"D").await, Ok(1));
     assert_eq!(c.write(f, 4, b"++").await, Ok(2));
     c.close(f).await;
 
     let f = c.open("f.txt", FILE_WRITE_DATA, SHARE_ALL).await.unwrap();
-    assert_eq!(c.write(f, 0, b"D").await, Ok(1));
+    assert_eq!(c.write(f, 1, b"A").await, Ok(1));
+    assert_eq!(c.write(f, 6, b"!").await, Ok(1));
+    c.close(f).await;
+
+    let f = c.open("f.txt", FILE_GENERIC_READ, SHARE_ALL).await.unwrap();
     assert_eq!(
-        c.write(f, 6, b"!").await,
+        c.write(f, 0, b"X").await,
         Err(ntstatus::STATUS_ACCESS_DENIED)
     );
     c.close(f).await;
-    assert_eq!(std::fs::read(td.path().join("f.txt")).unwrap(), b"Data++");
+    assert_eq!(std::fs::read(td.path().join("f.txt")).unwrap(), b"DAta++!");
 }
 
 #[tokio::test]
