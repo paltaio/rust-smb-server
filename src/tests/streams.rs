@@ -1259,10 +1259,13 @@ const ACCEPT: u8 = 0;
 const REFUSE_WRITES: u8 = 1;
 const REFUSE_OPENS: u8 = 2;
 const REFUSE_OPENS_AND_MOVES_BACK: u8 = 3;
+const FAIL_A_STREAM_OPEN_AFTER_A_MOVE: u8 = 4;
+const FAILING_NEXT_STREAM_OPEN: u8 = 5;
 
 /// A memory backend that, as `mode` says, refuses opens for writing, every
 /// open, or every open and every rename into the default stream, with
-/// STATUS_ACCESS_DENIED.
+/// STATUS_ACCESS_DENIED; or fails the first stream open after a rename
+/// out of the default stream with STATUS_DISK_FULL.
 struct Picky {
     inner: MemFsBackend,
     mode: Arc<std::sync::atomic::AtomicU8>,
@@ -1308,7 +1311,17 @@ impl ShareBackend for Picky {
         stream: &StreamName,
         opts: OpenOptions,
     ) -> SmbResult<(Box<dyn Handle>, OpenAction)> {
-        if let Err(e) = self.check(&opts) {
+        let failing = self.mode.compare_exchange(
+            FAILING_NEXT_STREAM_OPEN,
+            ACCEPT,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        let checked = match failing {
+            Ok(_) => Err(crate::SmbError::DiskFull),
+            Err(_) => self.check(&opts),
+        };
+        if let Err(e) = checked {
             let _ = file.close().await;
             return Err(e);
         }
@@ -1326,7 +1339,14 @@ impl ShareBackend for Picky {
         if mode == REFUSE_OPENS_AND_MOVES_BACK && to.is_none() {
             return Err(crate::SmbError::AccessDenied);
         }
-        self.inner.rename_stream(path, from, to, replace).await
+        self.inner.rename_stream(path, from, to, replace).await?;
+        if mode == FAIL_A_STREAM_OPEN_AFTER_A_MOVE && from.is_none() {
+            self.mode.store(
+                FAILING_NEXT_STREAM_OPEN,
+                std::sync::atomic::Ordering::SeqCst,
+            );
+        }
+        Ok(())
     }
 }
 
@@ -1341,6 +1361,7 @@ async fn a_moved_stream_gets_a_new_handle_or_moves_back() {
     let state = server_on(Share::new("home", picky).public());
     let mut a = Client::new(&state).await;
     let set = |m| mode.store(m, std::sync::atomic::Ordering::SeqCst);
+    make(&mut a, "f.txt:e", b"").await;
 
     // A file made read-only after the open: the new handle reads only.
     let f = a
@@ -1352,7 +1373,7 @@ async fn a_moved_stream_gets_a_new_handle_or_moves_back() {
     set(REFUSE_WRITES);
     assert_eq!(a.rename(f, ":x", false).await, 0);
     assert_eq!(files.contents("f.txt"), Some(Vec::new()));
-    assert_eq!(files.stream_names("f.txt"), ["x"]);
+    assert_eq!(files.stream_names("f.txt"), ["e", "x"]);
     assert_eq!(a.read(f, 0, 64).await.unwrap(), b"data");
     assert_eq!(a.rename(f, "::$DATA", true).await, 0);
     assert_eq!(files.contents("f.txt"), Some(b"data".to_vec()));
@@ -1365,13 +1386,32 @@ async fn a_moved_stream_gets_a_new_handle_or_moves_back() {
         ntstatus::STATUS_ACCESS_DENIED
     );
     assert_eq!(files.contents("f.txt"), Some(b"data".to_vec()));
-    assert!(files.stream_names("f.txt").is_empty());
+    assert_eq!(files.stream_names("f.txt"), ["e"]);
     assert_eq!(a.read(f, 0, 64).await.unwrap(), b"data");
+
+    // An empty stream to replace that cannot be opened stays.
+    assert_eq!(
+        a.rename(f, ":e", true).await,
+        ntstatus::STATUS_ACCESS_DENIED
+    );
+    assert_eq!(files.stream_names("f.txt"), ["e"]);
+
+    // One the move replaced comes back with the data, and an error other
+    // than STATUS_ACCESS_DENIED gets no second try.
+    set(FAIL_A_STREAM_OPEN_AFTER_A_MOVE);
+    assert_eq!(a.rename(f, ":e", true).await, ntstatus::STATUS_DISK_FULL);
+    assert_eq!(files.contents("f.txt"), Some(b"data".to_vec()));
+    assert_eq!(files.stream_names("f.txt"), ["e"]);
+    assert_eq!(a.read(f, 0, 64).await.unwrap(), b"data");
+    set(ACCEPT);
+    let e = a.open(Create::new("f.txt:e").access(READ, SHARE_ALL)).await;
+    assert_eq!(a.read(e, 0, 64).await, Err(ntstatus::STATUS_END_OF_FILE));
+    a.close(e).await;
 
     // Nor a way back: the rename stands, and the open has no handle.
     set(REFUSE_OPENS_AND_MOVES_BACK);
     assert_eq!(a.rename(f, ":z", false).await, 0);
-    assert_eq!(files.stream_names("f.txt"), ["z"]);
+    assert_eq!(files.stream_names("f.txt"), ["e", "z"]);
     assert_eq!(a.read(f, 0, 64).await, Err(ntstatus::STATUS_FILE_CLOSED));
     a.close(f).await;
     set(ACCEPT);

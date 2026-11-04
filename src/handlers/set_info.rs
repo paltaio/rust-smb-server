@@ -10,8 +10,8 @@ use crate::access_mask::{
     DELETE, FILE_APPEND_DATA, FILE_READ_DATA, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA,
 };
 use crate::backend::{
-    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_TEMPORARY, FileInfo, FileTimes, Handle, OpenOptions,
-    ShareBackend, VALID_SET_ATTRIBUTES,
+    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_TEMPORARY, FileInfo, FileTimes, Handle, OpenIntent,
+    OpenOptions, ShareBackend, VALID_SET_ATTRIBUTES,
 };
 use crate::conn::pending::{Stop, stopped};
 use crate::conn::state::{Connection, Open};
@@ -633,10 +633,12 @@ async fn rename_stream(
     let path = file.path();
     let backend = share.backend.as_ref();
     let status = |e: SmbError| stream_error(e).to_nt_status();
+    let mut replaces = false;
     match &to {
         Some(to) => {
             let streams = handle.streams().await.map_err(status)?;
             let existing = streams.iter().find(|s| s.name.matches(to));
+            replaces = existing.is_some();
             let in_use = file.stream_in_use(to);
             if existing.is_some() || in_use {
                 if !replace {
@@ -689,6 +691,12 @@ async fn rename_stream(
             Some(reopened)
         }
         Some(to) => {
+            // A stream the move replaces is gone once the data moves back,
+            // so one that cannot be opened is not replaced at all.
+            if replaces {
+                let probe = reopen(backend, &path, Some(to), access).await;
+                close(probe.map_err(status)?, &path).await;
+            }
             backend
                 .rename_stream(&path, None, Some(to), replace)
                 .await
@@ -696,7 +704,12 @@ async fn rename_stream(
             match reopen(backend, &path, Some(to), access).await {
                 Ok(reopened) => Some(reopened),
                 Err(e) => match backend.rename_stream(&path, Some(to), None, true).await {
-                    Ok(()) => return Err(status(e)),
+                    Ok(()) => {
+                        if replaces {
+                            make_empty(backend, &path, to).await;
+                        }
+                        return Err(status(e));
+                    }
                     // The data stays in the stream, and so does the open,
                     // which has no handle left to use.
                     Err(back) => {
@@ -724,6 +737,24 @@ async fn close(handle: Box<dyn Handle>, path: &SmbPath) {
     }
 }
 
+/// Makes the empty named stream `stream` of the file at `path` again,
+/// after moving data back out of it took the empty stream a rename
+/// replaced.
+async fn make_empty(backend: &dyn ShareBackend, path: &SmbPath, stream: &StreamName) {
+    let opts = OpenOptions {
+        intent: OpenIntent::OpenOrCreate,
+        ..OpenOptions::default()
+    };
+    let made = match backend.open(path, OpenOptions::default()).await {
+        Ok((file, _)) => backend.open_stream(file, path, stream, opts).await,
+        Err(e) => Err(e),
+    };
+    match made {
+        Ok((handle, _)) => close(handle, path).await,
+        Err(e) => warn!(error = %e, path = %path, "a replaced empty stream was not made again"),
+    }
+}
+
 /// The size of the default stream of the file at `path`.
 async fn default_size(backend: &dyn ShareBackend, path: &SmbPath) -> Result<u64, u32> {
     let status = |e: SmbError| stream_error(e).to_nt_status();
@@ -738,9 +769,8 @@ async fn default_size(backend: &dyn ShareBackend, path: &SmbPath) -> Result<u64,
 
 /// A new backend handle on `stream` of the file at `path`, the default
 /// stream when `None`, for an open granted `access`. When the backend
-/// refuses the data access granted, for example to write a file made
-/// read-only since, the handle reads only, as the stream's attributes
-/// allow.
+/// refuses the write access granted with [`SmbError::AccessDenied`], for
+/// example on a file made read-only since, the handle reads only.
 async fn reopen(
     backend: &dyn ShareBackend,
     path: &SmbPath,
@@ -756,7 +786,7 @@ async fn reopen(
         ..OpenOptions::default()
     };
     let opened = open_data(backend, path, stream, granted).await;
-    if opened.is_ok() || !write {
+    if !write || !matches!(opened, Err(SmbError::AccessDenied)) {
         return opened;
     }
     let reading = OpenOptions {
