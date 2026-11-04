@@ -38,7 +38,7 @@ use crate::backend::{
 };
 use crate::error::{SmbError, SmbResult};
 use crate::path::{SmbPath, same_path};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::stream::StreamName;
 use crate::utils::{FILETIME_OFFSET, system_time_to_filetime};
 
@@ -97,7 +97,41 @@ use crate::wildcard::Pattern;
 /// Whether the share has named streams is decided once, by probing the
 /// share root for user extended attributes. Below the root, a mount
 /// without them lists no streams, and a stream request there fails with
-/// STATUS_ACCESS_DENIED. Other hosts have no named streams.
+/// STATUS_ACCESS_DENIED.
+///
+/// On macOS, a file's or directory's named streams are its extended
+/// attributes, and the host's Finder shows the tags, comments, labels and
+/// icons clients set. `AFP_AfpInfo` is `com.apple.FinderInfo`, in the
+/// 60-byte AfpInfo layout around its 32 bytes: a write must be those 60
+/// bytes at offset 0, starting with `AFP\0`, or it fails with
+/// STATUS_INVALID_PARAMETER, and Finder info of all zeros, a cut to zero
+/// or an overwrite removes the attribute. An `AFP_AfpInfo` stream without
+/// the attribute reads as AfpInfo with Finder info of all zeros and is not
+/// listed; a client can create it, and the first write stores it.
+/// `AFP_Resource` is `com.apple.ResourceFork`, which holds no empty fork:
+/// an `AFP_Resource` stream exists once it has data. Directories have no
+/// resource fork. Any other stream is the attribute of the same name, with
+/// the characters macOS clients send as U+F001 to U+F029 mapped back, so
+/// `com.apple.metadata\u{F022}_kMDItemUserTags` is the attribute
+/// `com.apple.metadata:_kMDItemUserTags`, and attributes list under those
+/// names. A stream name holds such characters only that way: `a*b` is an
+/// invalid name, and `a\u{F021}b` names the attribute `a*b`. Attribute
+/// names no stream name leads to, and `com.apple.FinderInfo` and
+/// `com.apple.ResourceFork` spelled in another case, are left out; a
+/// stream name that maps to one of them, or to more than 127 bytes, is
+/// invalid. Attributes whose names differ only in case are one stream, as
+/// on Linux. A write or size change that would leave `AFP_Resource` larger
+/// than 16 MiB, or another stream larger than 1 MiB, fails with
+/// STATUS_DISK_FULL, as does a rename that moves more than the target
+/// holds, and a read of a stream other than those two that the host made
+/// larger than 1 MiB fails with STATUS_ACCESS_DENIED. Reads of a resource
+/// fork stop at 4 GiB. An
+/// overwrite or supersede of a file removes every attribute it lists as a
+/// stream, `com.apple.quarantine` and others the host set included. A
+/// share on a volume that keeps extended attributes only in `._` files,
+/// such as FAT or exFAT, has no named streams.
+///
+/// Windows has no named streams.
 pub struct LocalFsBackend {
     root: Arc<Dir>,
     /// Device of the share root; see `file_index`.
@@ -110,8 +144,8 @@ pub struct LocalFsBackend {
     hub: Option<Arc<super::inotify::Hub>>,
     /// The named streams open through the backend; `None` when the share
     /// has none.
-    #[cfg(target_os = "linux")]
-    streams: Option<Arc<super::streams::OpenStreams>>,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    streams: Option<Arc<super::open_streams::OpenStreams>>,
     /// Where streams too large for an extended attribute go; `None` when
     /// the share has no named streams.
     #[cfg(target_os = "linux")]
@@ -131,6 +165,8 @@ impl LocalFsBackend {
         let root = Arc::new(dir);
         #[cfg(target_os = "linux")]
         let streams = super::streams::supported(&root).then(Arc::default);
+        #[cfg(target_os = "macos")]
+        let streams = super::macos_streams::supported(&root).then(Arc::default);
         #[cfg(target_os = "linux")]
         let store = streams
             .is_some()
@@ -142,7 +178,7 @@ impl LocalFsBackend {
             case_sensitive,
             #[cfg(target_os = "linux")]
             hub: Some(Arc::default()),
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             streams,
             #[cfg(target_os = "linux")]
             store,
@@ -1408,9 +1444,9 @@ impl ShareBackend for LocalFsBackend {
         BackendCapabilities {
             is_read_only: self.read_only,
             case_sensitive: self.case_sensitive,
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             named_streams: self.streams.is_some(),
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             named_streams: false,
         }
     }
@@ -1425,7 +1461,7 @@ impl ShareBackend for LocalFsBackend {
             .map_err(io_to_smb)
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     async fn open_stream(
         &self,
         file: Box<dyn Handle>,
@@ -1451,7 +1487,7 @@ impl ShareBackend for LocalFsBackend {
             .await
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     async fn remove_stream(
         &self,
         path: &SmbPath,
@@ -1466,7 +1502,7 @@ impl ShareBackend for LocalFsBackend {
             .await
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     async fn rename_stream(
         &self,
         path: &SmbPath,
@@ -1490,8 +1526,9 @@ impl ShareBackend for LocalFsBackend {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl LocalFsBackend {
+    #[cfg(target_os = "linux")]
     fn stream_place(&self) -> SmbResult<super::streams::Place> {
         Ok(super::streams::Place {
             root: Arc::clone(&self.root),
@@ -1499,6 +1536,16 @@ impl LocalFsBackend {
             read_only: self.read_only,
             open: self.streams.clone().ok_or(SmbError::NotSupported)?,
             store: self.store.clone().ok_or(SmbError::NotSupported)?,
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    fn stream_place(&self) -> SmbResult<super::macos_streams::Place> {
+        Ok(super::macos_streams::Place {
+            root: Arc::clone(&self.root),
+            root_dev: self.root_dev,
+            read_only: self.read_only,
+            open: self.streams.clone().ok_or(SmbError::NotSupported)?,
         })
     }
 }
@@ -1880,6 +1927,26 @@ impl Handle for LocalHandle {
             _ => return Ok(Vec::new()),
         };
         listed.map_err(join_to_io).map_err(io_to_smb)?
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn streams(&self) -> SmbResult<Vec<crate::stream::StreamInfo>> {
+        match self {
+            LocalHandle::File { file, .. } => {
+                let file = Arc::clone(file);
+                spawn_blocking(move || super::macos_streams::list_smb(&file)).await
+            }
+            LocalHandle::Dir { dir_handle, .. } => {
+                let dir_handle = Arc::clone(dir_handle);
+                spawn_blocking(move || {
+                    let fd = dir_as_file(&dir_handle).map_err(io_to_smb)?;
+                    super::macos_streams::list_smb(&fd)
+                })
+                .await
+            }
+        }
+        .map_err(join_to_io)
+        .map_err(io_to_smb)?
     }
 }
 

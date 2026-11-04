@@ -177,6 +177,54 @@ pub(crate) fn parse_stream_target(units: &[u16]) -> Result<StreamTarget, u32> {
     Ok(StreamTarget { stream, kind })
 }
 
+/// The characters macOS clients send as U+F020 to U+F027 in names, in that
+/// order. U+F001 to U+F01F stand for 0x01 to 0x1F, and U+F028 and U+F029
+/// for a space and a `.` that end a name.
+#[cfg(any(all(feature = "localfs", target_os = "macos"), test))]
+const SFM_CHARS: [char; 8] = ['"', '*', ':', '<', '>', '?', '\\', '|'];
+
+/// The name macOS means by the stream name `name`. macOS clients send the
+/// characters NTFS names cannot hold as private-use characters, in the
+/// mapping of Services for Macintosh: `:` as U+F022, for example, and a
+/// trailing space as U+F028. Each becomes the character it stands for
+/// again; U+F028 and U+F029 only at the end of the name.
+#[cfg(any(all(feature = "localfs", target_os = "macos"), test))]
+pub(crate) fn from_sfm(name: &str) -> String {
+    let last = name.chars().count().saturating_sub(1);
+    name.chars()
+        .enumerate()
+        .map(|(i, c)| match u32::from(c) {
+            n @ 0xF001..=0xF01F => char::from_u32(n - 0xF000).unwrap_or(c),
+            n @ 0xF020..=0xF027 => SFM_CHARS[(n - 0xF020) as usize],
+            0xF028 if i == last => ' ',
+            0xF029 if i == last => '.',
+            _ => c,
+        })
+        .collect()
+}
+
+/// The stream name for the name `name`, the inverse of [`from_sfm`]: the
+/// characters it maps back are sent as macOS clients send them. A name
+/// that already holds one of the private-use characters `from_sfm` maps,
+/// where it maps it, has no stream name, and comes back changed.
+#[cfg(any(all(feature = "localfs", target_os = "macos"), test))]
+pub(crate) fn to_sfm(name: &str) -> String {
+    let last = name.chars().count().saturating_sub(1);
+    name.chars()
+        .enumerate()
+        .map(|(i, c)| match c {
+            '\u{1}'..='\u{1F}' => char::from_u32(0xF000 + u32::from(c)).unwrap_or(c),
+            ' ' if i == last => '\u{F028}',
+            '.' if i == last => '\u{F029}',
+            c => SFM_CHARS
+                .iter()
+                .position(|&m| m == c)
+                .and_then(|at| char::from_u32(0xF020 + at as u32))
+                .unwrap_or(c),
+        })
+        .collect()
+}
+
 /// The error a stream request on a share that stores named streams answers
 /// for `e`. macOS keeps an extended attribute in a `._` file instead when a
 /// stream request fails with STATUS_NOT_SUPPORTED, and would then look for
@@ -464,6 +512,57 @@ mod tests {
             stream_error(SmbError::DiskFull),
             SmbError::DiskFull
         ));
+    }
+
+    #[test]
+    fn private_use_characters_from_macos_map_back() {
+        assert_eq!(
+            from_sfm("com.apple.metadata\u{F022}_kMDItemUserTags"),
+            "com.apple.metadata:_kMDItemUserTags"
+        );
+        let sent: String = (0xF001..=0xF027)
+            .map(|n| char::from_u32(n).unwrap())
+            .collect();
+        let meant: String = (1..=0x1F)
+            .map(|n| char::from_u32(n).unwrap())
+            .chain("\"*:<>?\\|".chars())
+            .collect();
+        assert_eq!(from_sfm(&sent), meant);
+        assert_eq!(from_sfm("tag\u{F028}"), "tag ");
+        assert_eq!(from_sfm("tag\u{F029}"), "tag.");
+        for kept in [
+            "\u{F000}",
+            "\u{F02A}",
+            "a\u{F028}b",
+            "a\u{F029}b",
+            "a*b",
+            "\u{1F600}",
+        ] {
+            assert_eq!(from_sfm(kept), kept);
+        }
+    }
+
+    #[test]
+    fn names_map_to_stream_names_and_back() {
+        let name = to_sfm("com.apple.metadata:kMDItemFinderComment");
+        assert_eq!(name, "com.apple.metadata\u{F022}kMDItemFinderComment");
+        assert!(name.parse::<StreamName>().is_ok());
+        assert_eq!(to_sfm("a*?\\b"), "a\u{F021}\u{F025}\u{F026}b");
+        assert_eq!(to_sfm("a. b "), "a. b\u{F028}");
+        assert_eq!(to_sfm("x\u{1}."), "x\u{F001}\u{F029}");
+        for name in ["a:b\\c", "trailing. ", "a*?<>|\"\u{1}.", "plain", ""] {
+            assert_eq!(from_sfm(&to_sfm(name)), name);
+            assert!(!to_sfm(name).contains(['*', ':', '\\']));
+        }
+        // A name holding a private-use character where it would map comes
+        // back as another name.
+        for name in ["a\u{F021}b", "tag\u{F028}"] {
+            assert_ne!(from_sfm(&to_sfm(name)), name);
+        }
+        // Literal characters do not round-trip.
+        for literal in ["a*b", "tag ", "x\u{1}"] {
+            assert_ne!(to_sfm(&from_sfm(literal)), literal);
+        }
     }
 
     #[test]

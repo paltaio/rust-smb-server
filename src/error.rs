@@ -42,6 +42,10 @@ pub enum SmbError {
     DiskFull,
     #[error("disk quota exceeded")]
     QuotaExceeded,
+    /// The request carries a value the backend does not take, such as data
+    /// a stream with a fixed layout cannot hold.
+    #[error("invalid parameter")]
+    InvalidParameter,
 }
 
 impl SmbError {
@@ -62,6 +66,7 @@ impl SmbError {
             SmbError::Io(_) => ntstatus::STATUS_UNEXPECTED_IO_ERROR,
             SmbError::DiskFull => ntstatus::STATUS_DISK_FULL,
             SmbError::QuotaExceeded => ntstatus::STATUS_DISK_QUOTA_EXCEEDED,
+            SmbError::InvalidParameter => ntstatus::STATUS_INVALID_PARAMETER,
         }
     }
 }
@@ -83,6 +88,7 @@ mod tests {
         assert_eq!(SmbError::Sharing.to_nt_status(), 0xC000_0043);
         assert_eq!(SmbError::NotSupported.to_nt_status(), 0xC000_00BB);
         assert_eq!(SmbError::NotSameDevice.to_nt_status(), 0xC000_00D4);
+        assert_eq!(SmbError::InvalidParameter.to_nt_status(), 0xC000_000D);
 
         let io_err = SmbError::Io(std::io::Error::other("boom"));
         assert_eq!(io_err.to_nt_status(), 0xC000_00E9);
