@@ -57,11 +57,19 @@ SmbServer::builder()
 //! What the protocol layer does around the backend calls:
 //!
 //! - Paths arrive as [`SmbPath`], relative to the share root. `.` components
-//!   are dropped; `..`, empty components, `<>:"|?*`, control characters and
-//!   named streams are rejected before the backend sees them. A name ending
-//!   in `::$DATA` opens the file with [`OpenOptions::non_directory`] set,
-//!   and one ending in `::$INDEX_ALLOCATION` the directory with
-//!   [`OpenOptions::directory`] set. The empty path is the share root.
+//!   are dropped; `..`, empty components, `<>:"|?*` and control characters
+//!   are rejected before the backend sees them. A name ending in `::$DATA`
+//!   opens the file with [`OpenOptions::non_directory`] set, and one ending
+//!   in `::$INDEX_ALLOCATION` the directory with [`OpenOptions::directory`]
+//!   set. The empty path is the share root.
+//! - A named stream (`file.txt:name`) arrives as a [`StreamName`] beside
+//!   the file's path, on shares whose backend reports
+//!   [`BackendCapabilities::named_streams`]: CREATE opens the file with
+//!   `open`, creating it when the disposition allows, then the stream with
+//!   [`ShareBackend::open_stream`], which gets the file's handle. An
+//!   overwrite of the file removes its named streams through
+//!   [`ShareBackend::remove_stream`], each once no open is on it. Elsewhere
+//!   named streams are rejected before the backend sees them.
 //! - `open` fails with [`SmbError::PathNotFound`] when a directory on the
 //!   way to the path is missing, and with [`SmbError::NotFound`] when only
 //!   the last component is. Clients see STATUS_OBJECT_PATH_NOT_FOUND and
@@ -76,7 +84,10 @@ SmbServer::builder()
 //! - Share modes, byte-range locks and the delete-pending flag are kept by
 //!   the protocol layer per share, across every connection, keyed by
 //!   [`FileInfo::file_index`], or by path when it is 0. Two shares over
-//!   the same directory do not see each other's opens. A CREATE that would
+//!   the same directory do not see each other's opens. Each named stream
+//!   of a file has its own share modes, byte-range locks and
+//!   delete-pending flag, and the last close of a stream marked for
+//!   deletion calls [`ShareBackend::remove_stream`]. A CREATE that would
 //!   truncate first opens the file without truncating it, for reading or,
 //!   when reading is refused, with the access the CREATE was granted. It
 //!   runs the checks, enters the open in the table and waits for lease
@@ -344,6 +355,7 @@ mod tests {
     mod notify;
     pub(crate) mod peer;
     mod pipes;
+    mod streams;
 }
 mod utils;
 mod wildcard;
@@ -366,6 +378,7 @@ pub use fs::LocalFsBackend;
 pub use path::SmbPath;
 pub use proto::auth::ntlm::Identity;
 pub use server::{ConfigError, ConfigHandle, ShareMode, ShutdownHandle, SmbServer};
+pub use stream::{StreamInfo, StreamName};
 
 pub mod wire {
     pub use crate::proto::header;

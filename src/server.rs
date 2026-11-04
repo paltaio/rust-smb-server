@@ -97,6 +97,9 @@ pub struct ShareBindings {
     pub(crate) files: crate::files::FileTable,
     /// CHANGE_NOTIFY is answered on the share.
     pub(crate) change_notify: bool,
+    /// Named streams are served: the share allows them and the backend
+    /// stores them.
+    pub(crate) named_streams: bool,
     /// The directories clients watch for changes, on any connection.
     pub(crate) watches: crate::files::WatchTable,
 }
@@ -112,6 +115,7 @@ impl ShareBindings {
         durable_handles: bool,
     ) -> Arc<Self> {
         let watches = crate::files::WatchTable::new(backend.capabilities().case_sensitive);
+        let backend_streams = backend.capabilities().named_streams;
         Arc::new(Self {
             name,
             backend,
@@ -124,12 +128,14 @@ impl ShareBindings {
             remark: String::new(),
             files: crate::files::FileTable::default(),
             change_notify: !is_ipc,
+            named_streams: !is_ipc && backend_streams,
             watches,
         })
     }
 
     pub(crate) fn from_share(share: Share) -> Arc<Self> {
-        let watches = crate::files::WatchTable::new(share.backend.capabilities().case_sensitive);
+        let capabilities = share.backend.capabilities();
+        let watches = crate::files::WatchTable::new(capabilities.case_sensitive);
         Arc::new(Self {
             name: share.name,
             backend: share.backend,
@@ -145,6 +151,7 @@ impl ShareBindings {
             remark: share.remark,
             files: crate::files::FileTable::default(),
             change_notify: share.change_notify,
+            named_streams: share.named_streams && capabilities.named_streams,
             watches,
         })
     }

@@ -5,6 +5,7 @@
 //! info).
 
 use crate::backend::{DirEntry, FileInfo};
+use crate::stream::StreamInfo;
 use crate::utils::utf16le;
 
 // ---------------------------------------------------------------------------
@@ -171,23 +172,80 @@ pub fn encode_file_network_open_information(info: &FileInfo) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
-// FileStreamInformation (MS-FSCC §2.4.43) - for non-directories, one default
-// stream entry (`::$DATA`); for directories, empty buffer.
+// FileStreamInformation (MS-FSCC 2.4.49)
 // ---------------------------------------------------------------------------
 
-pub fn encode_file_stream_information(info: &FileInfo) -> Vec<u8> {
-    if info.is_directory {
-        return Vec::new();
+/// FILE_STREAM_INFORMATION entries for the default stream, with its size
+/// and allocation size when the file has one, then for each named stream
+/// as `:name:$DATA`. Entries start on 8-byte boundaries; the last is not
+/// padded. A directory with no named streams gives an empty buffer.
+pub fn encode_file_stream_information(
+    default: Option<(u64, u64)>,
+    streams: &[StreamInfo],
+) -> Vec<u8> {
+    let mut entries: Vec<(Vec<u8>, u64, u64)> = Vec::with_capacity(streams.len() + 1);
+    if let Some((size, allocation)) = default {
+        entries.push((utf16le("::$DATA"), size, allocation));
     }
-    let stream_name = utf16le("::$DATA");
-    let stream_name_len = stream_name.len() as u32;
+    for stream in streams {
+        let name = utf16le(&format!(":{}:$DATA", stream.name.as_str()));
+        entries.push((name, stream.size, stream.allocation_size));
+    }
     let mut out = Vec::new();
-    out.extend_from_slice(&0u32.to_le_bytes()); // NextEntryOffset = 0
-    out.extend_from_slice(&stream_name_len.to_le_bytes()); // StreamNameLength
-    out.extend_from_slice(&info.end_of_file.to_le_bytes()); // StreamSize
-    out.extend_from_slice(&info.allocation_size.to_le_bytes()); // StreamAllocationSize
-    out.extend_from_slice(&stream_name);
+    let count = entries.len();
+    for (at, (name, size, allocation)) in entries.into_iter().enumerate() {
+        let start = out.len();
+        let len = STREAM_ENTRY_HEADER + name.len();
+        let next = if at + 1 == count {
+            0
+        } else {
+            len.next_multiple_of(8)
+        };
+        out.extend_from_slice(&(next as u32).to_le_bytes());
+        out.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        out.extend_from_slice(&size.to_le_bytes());
+        out.extend_from_slice(&allocation.to_le_bytes());
+        out.extend_from_slice(&name);
+        if next != 0 {
+            out.resize(start + next, 0);
+        }
+    }
     out
+}
+
+/// Bytes of a FILE_STREAM_INFORMATION entry before its name.
+const STREAM_ENTRY_HEADER: usize = 24;
+
+/// Cuts FILE_STREAM_INFORMATION entries down to the whole entries that fit
+/// in `cap` bytes, the last of them unpadded with NextEntryOffset 0
+/// (MS-SMB2 3.3.5.20.1). No entry may fit.
+pub fn fit_stream_entries(buf: &mut Vec<u8>, cap: usize) {
+    let field = |buf: &[u8], at: usize| {
+        buf.get(at..at + 4).map_or(0, |b| {
+            u32::from_le_bytes(b.try_into().expect("four bytes")) as usize
+        })
+    };
+    let mut at = 0;
+    let mut kept = None;
+    while at + STREAM_ENTRY_HEADER <= buf.len() {
+        let end = at + STREAM_ENTRY_HEADER + field(buf, at + 4);
+        if end > cap {
+            break;
+        }
+        kept = Some((at, end));
+        let next = field(buf, at);
+        if next == 0 {
+            break;
+        }
+        at += next;
+    }
+    match kept {
+        Some((last, end)) => {
+            buf.truncate(end);
+            buf[last..last + 4].copy_from_slice(&0u32.to_le_bytes());
+        }
+        None => buf.clear(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -474,5 +532,31 @@ mod tests {
         let bytes = encode_fs_sector_size_information(4096);
         assert_eq!(bytes.len(), 28);
         assert_eq!(bytes[0..4], 4096u32.to_le_bytes());
+    }
+
+    #[test]
+    fn stream_information_aligns_entries_and_leaves_the_last_unpadded() {
+        let stream = |name: &str, size| StreamInfo::new(name.parse().unwrap(), size, 8);
+        let buf = encode_file_stream_information(
+            Some((5, 4096)),
+            &[stream("s", 3), stream("\u{F022}x", 0)],
+        );
+        // `::$DATA` is 38 bytes, `:s:$DATA` 40, `:\u{F022}x:$DATA` 42.
+        assert_eq!(buf.len(), 40 + 40 + 42);
+        assert_eq!(buf[0..4], 40u32.to_le_bytes());
+        assert_eq!(buf[4..8], 14u32.to_le_bytes());
+        assert_eq!(buf[8..16], 5u64.to_le_bytes());
+        assert_eq!(buf[16..24], 4096u64.to_le_bytes());
+        assert_eq!(buf[24..38], utf16le("::$DATA")[..]);
+        assert_eq!(buf[38..40], [0, 0]);
+        assert_eq!(buf[40..44], 40u32.to_le_bytes());
+        assert_eq!(buf[64..80], utf16le(":s:$DATA")[..]);
+        assert_eq!(buf[80..84], 0u32.to_le_bytes());
+        assert_eq!(buf[104..], utf16le(":\u{F022}x:$DATA")[..]);
+
+        assert!(encode_file_stream_information(None, &[]).is_empty());
+        let dir = encode_file_stream_information(None, &[stream("s", 3)]);
+        assert_eq!(dir.len(), 40);
+        assert_eq!(dir[0..4], 0u32.to_le_bytes());
     }
 }

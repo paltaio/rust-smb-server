@@ -5,12 +5,14 @@ use std::sync::Arc;
 use crate::proto::header::Smb2Header;
 use crate::proto::messages::{Dialect, InfoType, QueryInfoRequest, QueryInfoResponse};
 
+use crate::backend::{FileInfo, Handle, OpenOptions};
 use crate::conn::state::{Connection, Open};
 use crate::dispatch::HandlerResponse;
 use crate::handlers::shared::{lookup_open, lookup_session_tree};
 use crate::info_class as ic;
 use crate::ntstatus;
 use crate::server::{ServerState, ShareBindings};
+use crate::stream::{StreamInfo, stream_error, unsupported};
 
 const FILE_DEVICE_DISK: u32 = 0x0000_0007;
 const FILE_REMOTE_DEVICE: u32 = 0x0000_0010;
@@ -19,6 +21,7 @@ const FILE_REMOTE_DEVICE: u32 = 0x0000_0010;
 const FILE_CASE_SENSITIVE_SEARCH: u32 = 0x0000_0001;
 const FILE_CASE_PRESERVED_NAMES: u32 = 0x0000_0002;
 const FILE_UNICODE_ON_DISK: u32 = 0x0000_0004;
+const FILE_NAMED_STREAMS: u32 = 0x0004_0000;
 
 // Access mask bits (MS-SMB2 2.2.13.1.1)
 const FILE_READ_EA: u32 = 0x0000_0008;
@@ -65,11 +68,22 @@ pub async fn handle(
     let smb311 = *conn.dialect.read().await == Some(Dialect::Smb311);
     let cap = req.output_buffer_length as usize;
 
+    let share = Arc::clone(&tree_arc.read().await.share);
+    // FileStreamInformation of a named stream opens its file by name, with
+    // no rename in between. The names lock comes before the open's.
+    let _names = if matches!(info_type, InfoType::File)
+        && req.file_information_class == ic::FILE_STREAM_INFORMATION
+        && share.named_streams
+    {
+        Some(share.files.names_lock().await)
+    } else {
+        None
+    };
     let open = open_arc.read().await;
+    let on_stream = open.stream.is_some();
     let result = match info_type {
-        InfoType::File => query_file(&open, req.file_information_class, cap).await,
+        InfoType::File => query_file(&open, &share, req.file_information_class, cap).await,
         InfoType::FileSystem => {
-            let share = Arc::clone(&tree_arc.read().await.share);
             query_filesystem(&open, &share, req.file_information_class, cap).await
         }
         // MS-FSA 2.1.5.14: the store keeps no security descriptors.
@@ -80,6 +94,7 @@ pub async fn handle(
     let (mut buf, overflow) = match result {
         Ok(reply) => reply,
         Err(ntstatus::STATUS_INFO_LENGTH_MISMATCH) => return info_length_mismatch(smb311),
+        Err(ntstatus::STATUS_NOT_SUPPORTED) => return HandlerResponse::err(unsupported(on_stream)),
         Err(status) => return HandlerResponse::err(status),
     };
 
@@ -88,7 +103,7 @@ pub async fn handle(
         match overflow {
             Overflow::Never => return info_length_mismatch(smb311),
             Overflow::Truncate => buf.truncate(cap),
-            Overflow::WholeEntries => buf.clear(),
+            Overflow::WholeEntries => ic::fit_stream_entries(&mut buf, cap),
         }
         status = ntstatus::STATUS_BUFFER_OVERFLOW;
     }
@@ -129,7 +144,9 @@ pub(super) fn info_length_mismatch(smb311: bool) -> HandlerResponse {
 type Reply = Result<(Vec<u8>, Overflow), u32>;
 
 /// SMB2_0_INFO_FILE (MS-SMB2 3.3.5.20.1) for an OutputBufferLength of `cap`.
-async fn query_file(open: &Open, class: u8, cap: usize) -> Reply {
+/// On an open of a named stream, the sizes are the stream's and the rest is
+/// the file's.
+async fn query_file(open: &Open, share: &ShareBindings, class: u8, cap: usize) -> Reply {
     let (min_len, overflow, access) = match class {
         ic::FILE_BASIC_INFORMATION => (40, Overflow::Never, FILE_READ_ATTRIBUTES),
         ic::FILE_STANDARD_INFORMATION => (24, Overflow::Never, 0),
@@ -159,6 +176,7 @@ async fn query_file(open: &Open, class: u8, cap: usize) -> Reply {
     let handle = open.handle.as_ref().ok_or(ntstatus::STATUS_FILE_CLOSED)?;
     let info = handle.stat().await.map_err(|e| e.to_nt_status())?;
     let buf = match class {
+        ic::FILE_STREAM_INFORMATION => stream_information(open, share, info).await?,
         ic::FILE_BASIC_INFORMATION => ic::encode_file_basic_information(&info),
         ic::FILE_STANDARD_INFORMATION | ic::FILE_ALL_INFORMATION => {
             let links = handle.link_count().await.map_err(|e| e.to_nt_status())?;
@@ -180,13 +198,54 @@ async fn query_file(open: &Open, class: u8, cap: usize) -> Reply {
         ic::FILE_MODE_INFORMATION => ic::encode_file_mode_information(0),
         ic::FILE_ALIGNMENT_INFORMATION => ic::encode_file_alignment_information(),
         ic::FILE_NETWORK_OPEN_INFORMATION => ic::encode_file_network_open_information(&info),
-        ic::FILE_STREAM_INFORMATION => ic::encode_file_stream_information(&info),
         ic::FILE_FULL_EA_INFORMATION => return Err(ntstatus::STATUS_NO_EAS_ON_FILE),
         // MS-FSA 2.1.5.12.4. Files here have no 8.3 short name.
         ic::FILE_ALTERNATE_NAME_INFORMATION => return Err(ntstatus::STATUS_OBJECT_NAME_NOT_FOUND),
         _ => unreachable!("class checked above"),
     };
     Ok((buf, overflow))
+}
+
+/// FileStreamInformation (MS-FSA 2.1.5.12.29): every stream of the file
+/// `open` is on, whichever stream that is, the default stream first unless
+/// the file is a directory. A share without named streams lists the
+/// default stream alone. The handle lists the named streams; on an open of
+/// a named stream, the default stream's size comes from a new open of the
+/// file. The caller holds the share's names lock, so no rename moves the
+/// file in between.
+async fn stream_information(
+    open: &Open,
+    share: &ShareBindings,
+    info: FileInfo,
+) -> Result<Vec<u8>, u32> {
+    let default =
+        |info: &FileInfo| (!info.is_directory).then_some((info.end_of_file, info.allocation_size));
+    if !share.named_streams {
+        return Ok(ic::encode_file_stream_information(default(&info), &[]));
+    }
+    let handle = open.handle.as_deref().ok_or(ntstatus::STATUS_FILE_CLOSED)?;
+    let streams = streams_of(handle).await?;
+    if open.stream.is_none() {
+        return Ok(ic::encode_file_stream_information(default(&info), &streams));
+    }
+    let path = open.path().ok_or(ntstatus::STATUS_FILE_CLOSED)?;
+    let (file, _) = share
+        .backend
+        .open(&path, OpenOptions::default())
+        .await
+        .map_err(|e| stream_error(e).to_nt_status())?;
+    let info = file.stat().await;
+    let _ = file.close().await;
+    let info = info.map_err(|e| stream_error(e).to_nt_status())?;
+    Ok(ic::encode_file_stream_information(default(&info), &streams))
+}
+
+/// The named streams `handle` lists.
+async fn streams_of(handle: &dyn Handle) -> Result<Vec<StreamInfo>, u32> {
+    handle
+        .streams()
+        .await
+        .map_err(|e| stream_error(e).to_nt_status())
 }
 
 /// SMB2_0_INFO_FILESYSTEM (MS-SMB2 3.3.5.20.2) for an OutputBufferLength
@@ -236,8 +295,13 @@ async fn query_filesystem(open: &Open, share: &ShareBindings, class: u8, cap: us
             } else {
                 0
             };
+            let named_streams = if share.named_streams {
+                FILE_NAMED_STREAMS
+            } else {
+                0
+            };
             ic::encode_fs_attribute_information(
-                case_sensitive | FILE_CASE_PRESERVED_NAMES | FILE_UNICODE_ON_DISK,
+                case_sensitive | named_streams | FILE_CASE_PRESERVED_NAMES | FILE_UNICODE_ON_DISK,
                 volume.max_name_length,
                 "NTFS",
             )

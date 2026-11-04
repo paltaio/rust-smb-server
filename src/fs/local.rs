@@ -821,6 +821,7 @@ impl ShareBackend for LocalFsBackend {
         BackendCapabilities {
             is_read_only: self.read_only,
             case_sensitive: self.case_sensitive,
+            named_streams: false,
         }
     }
 

@@ -1,8 +1,12 @@
-//! Stream suffixes in CREATE names: `file:name`, `file:name:$DATA`,
-//! `file::$DATA` (MS-FSCC 2.1.5).
+//! Named streams: the suffixes of CREATE names (`file:name`,
+//! `file:name:$DATA`, `file::$DATA`, MS-FSCC 2.1.5), the stream list a
+//! backend reports, and the handle of a stream open.
 
 use std::str::FromStr;
 
+use async_trait::async_trait;
+
+use crate::backend::{DirEntry, DirWatch, FileInfo, FileTimes, Handle};
 use crate::error::{SmbError, SmbResult};
 use crate::path::SmbPath;
 
@@ -10,13 +14,45 @@ use crate::path::SmbPath;
 ///
 /// 1 to 255 UTF-16 code units, none of them `\`, `/`, `:` or NUL
 /// (MS-FSCC 2.1.5.3). Control characters and `" * < > ? |` are allowed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `==` compares the names as spelled; [`StreamName::matches`] tells
+/// whether two names select the same stream.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct StreamName(String);
 
 impl StreamName {
     /// The name as the client sent it.
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// True if `self` and `other` name the same stream: stream names
+    /// compare without regard to case.
+    pub fn matches(&self, other: &StreamName) -> bool {
+        self.0 == other.0 || self.0.to_lowercase() == other.0.to_lowercase()
+    }
+}
+
+/// A named stream of a file, as [`Handle::streams`] lists it. Built with
+/// [`StreamInfo::new`]; every field is public.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct StreamInfo {
+    /// Name of the stream.
+    pub name: StreamName,
+    /// Size of the stream in bytes.
+    pub size: u64,
+    /// Space the stream takes, which may be `size`.
+    pub allocation_size: u64,
+}
+
+impl StreamInfo {
+    /// The stream `name` with `size` bytes in `allocation_size` bytes.
+    pub fn new(name: StreamName, size: u64, allocation_size: u64) -> Self {
+        Self {
+            name,
+            size,
+            allocation_size,
+        }
     }
 }
 
@@ -84,6 +120,95 @@ pub(crate) fn parse_create_name(units: &[u16]) -> SmbResult<(SmbPath, StreamPart
         (stream, true) => StreamPart::NamedDirectory(stream.parse()?),
     };
     Ok((path, part))
+}
+
+/// The error a stream request on a share that stores named streams answers
+/// for `e`. macOS keeps an extended attribute in a `._` file instead when a
+/// stream request fails with STATUS_NOT_SUPPORTED, and would then look for
+/// it in the stream and not find it; such a backend error becomes
+/// STATUS_ACCESS_DENIED.
+pub(crate) fn stream_error(e: SmbError) -> SmbError {
+    match e {
+        SmbError::NotSupported => SmbError::AccessDenied,
+        e => e,
+    }
+}
+
+/// The status for a request the server does not serve:
+/// STATUS_NOT_SUPPORTED, or STATUS_INVALID_PARAMETER on a named stream
+/// (`on_stream`), for the reason [`stream_error`] gives.
+pub(crate) fn unsupported(on_stream: bool) -> u32 {
+    if on_stream {
+        crate::ntstatus::STATUS_INVALID_PARAMETER
+    } else {
+        crate::ntstatus::STATUS_NOT_SUPPORTED
+    }
+}
+
+/// The handle of a named stream open, which answers every backend error as
+/// [`stream_error`] does.
+pub(crate) struct StreamHandle(pub(crate) Box<dyn Handle>);
+
+#[async_trait]
+impl Handle for StreamHandle {
+    async fn read(&self, offset: u64, len: u32) -> SmbResult<bytes::Bytes> {
+        self.0.read(offset, len).await.map_err(stream_error)
+    }
+
+    async fn write(&self, offset: u64, data: &[u8]) -> SmbResult<u32> {
+        self.0.write(offset, data).await.map_err(stream_error)
+    }
+
+    async fn write_owned(&self, offset: u64, data: Vec<u8>) -> SmbResult<u32> {
+        self.0.write_owned(offset, data).await.map_err(stream_error)
+    }
+
+    async fn flush(&self) -> SmbResult<()> {
+        self.0.flush().await.map_err(stream_error)
+    }
+
+    async fn stat(&self) -> SmbResult<FileInfo> {
+        self.0.stat().await.map_err(stream_error)
+    }
+
+    async fn set_times(&self, times: FileTimes) -> SmbResult<()> {
+        self.0.set_times(times).await.map_err(stream_error)
+    }
+
+    async fn set_attributes(&self, attributes: u32) -> SmbResult<()> {
+        self.0
+            .set_attributes(attributes)
+            .await
+            .map_err(stream_error)
+    }
+
+    async fn truncate(&self, len: u64) -> SmbResult<()> {
+        self.0.truncate(len).await.map_err(stream_error)
+    }
+
+    async fn list_dir(&self, pattern: Option<&str>) -> SmbResult<Vec<DirEntry>> {
+        self.0.list_dir(pattern).await.map_err(stream_error)
+    }
+
+    async fn close(self: Box<Self>) -> SmbResult<()> {
+        self.0.close().await.map_err(stream_error)
+    }
+
+    async fn link_count(&self) -> SmbResult<u32> {
+        self.0.link_count().await.map_err(stream_error)
+    }
+
+    async fn dir_is_empty(&self) -> SmbResult<bool> {
+        self.0.dir_is_empty().await.map_err(stream_error)
+    }
+
+    async fn watch(&self) -> SmbResult<Option<Box<dyn DirWatch>>> {
+        self.0.watch().await.map_err(stream_error)
+    }
+
+    async fn streams(&self) -> SmbResult<Vec<StreamInfo>> {
+        self.0.streams().await.map_err(stream_error)
+    }
 }
 
 #[cfg(test)]
@@ -207,6 +332,27 @@ mod tests {
         let mut units: Vec<u16> = "f:s".encode_utf16().collect();
         units.push(0xD800);
         assert!(parse_create_name(&units).is_err());
+    }
+
+    #[test]
+    fn stream_names_match_without_case() {
+        let name = |s: &str| s.parse::<StreamName>().unwrap();
+        assert!(name("Zone.Identifier").matches(&name("zone.IDENTIFIER")));
+        assert!(name("\u{C9}t\u{E9}").matches(&name("\u{E9}T\u{C9}")));
+        assert!(!name("a").matches(&name("b")));
+        assert_ne!(name("A"), name("a"));
+    }
+
+    #[test]
+    fn stream_errors_never_say_not_supported() {
+        assert!(matches!(
+            stream_error(SmbError::NotSupported),
+            SmbError::AccessDenied
+        ));
+        assert!(matches!(
+            stream_error(SmbError::DiskFull),
+            SmbError::DiskFull
+        ));
     }
 
     #[test]

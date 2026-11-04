@@ -52,6 +52,7 @@ pub struct Share {
     pub(crate) leases: bool,
     pub(crate) durable_handles: bool,
     pub(crate) change_notify: bool,
+    pub(crate) named_streams: bool,
     pub(crate) listed: bool,
     pub(crate) remark: String,
 }
@@ -68,6 +69,7 @@ impl Share {
             leases: true,
             durable_handles: true,
             change_notify: true,
+            named_streams: true,
             listed: true,
             remark: String::new(),
         }
@@ -167,6 +169,19 @@ impl Share {
     /// STATUS_NOT_SUPPORTED. On by default.
     pub fn change_notify(mut self, enabled: bool) -> Self {
         self.change_notify = enabled;
+        self
+    }
+
+    /// Serve named streams (`file.txt:name`) on the share when its backend
+    /// stores them ([`BackendCapabilities::named_streams`]). The share then
+    /// reports FILE_NAMED_STREAMS, and macOS clients keep extended
+    /// attributes, Finder tags and resource forks in streams rather than in
+    /// `._` files. When off, a CREATE that names a stream fails with
+    /// STATUS_OBJECT_NAME_INVALID. On by default.
+    ///
+    /// [`BackendCapabilities::named_streams`]: crate::BackendCapabilities::named_streams
+    pub fn named_streams(mut self, enabled: bool) -> Self {
+        self.named_streams = enabled;
         self
     }
 

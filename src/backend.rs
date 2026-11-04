@@ -9,6 +9,7 @@ use std::time::SystemTime;
 
 use crate::error::{SmbError, SmbResult};
 use crate::path::SmbPath;
+use crate::stream::{StreamInfo, StreamName};
 
 // ---------------------------------------------------------------------------
 // OpenOptions
@@ -217,6 +218,14 @@ pub struct BackendCapabilities {
     pub is_read_only: bool,
     /// True iff the backend treats names case-sensitively.
     pub case_sensitive: bool,
+    /// The backend stores named streams (`file.txt:name`), served by
+    /// [`ShareBackend::open_stream`], [`ShareBackend::remove_stream`] and
+    /// [`Handle::streams`]. On a share that leaves
+    /// [`Share::named_streams`](crate::Share::named_streams) on,
+    /// FileFsAttributeInformation then reports FILE_NAMED_STREAMS. Without
+    /// it, a CREATE that names a stream fails with
+    /// STATUS_OBJECT_NAME_INVALID before the backend is called.
+    pub named_streams: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -235,6 +244,13 @@ pub trait ShareBackend: Send + Sync + 'static {
     /// Fail with [`SmbError::PathNotFound`] when a directory on the way to
     /// `path` is missing and [`SmbError::NotFound`] when only the last
     /// component is.
+    ///
+    /// A backend that reports [`BackendCapabilities::named_streams`] keeps
+    /// the named streams of a file that [`OpenIntent::Truncate`] or
+    /// [`OpenIntent::OverwriteOrCreate`] overwrites: the protocol layer
+    /// removes them with [`ShareBackend::remove_stream`], each once no open
+    /// is on it. `unlink` removes them with the file, and `rename` keeps
+    /// them with it.
     async fn open(
         &self,
         path: &SmbPath,
@@ -262,6 +278,47 @@ pub trait ShareBackend: Send + Sync + 'static {
     /// [`VolumeInfo::default`].
     async fn volume_info(&self) -> SmbResult<VolumeInfo> {
         Ok(VolumeInfo::default())
+    }
+
+    /// Open or create the named stream `stream` of the file or directory at
+    /// `path`. `file` is the handle `open` just gave for `path`, opened for
+    /// reading. The backend owns it and closes it, also when this fails; it
+    /// may keep it for as long as the stream's handle lasts, so the stream
+    /// follows the file through renames. `opts.intent` applies to the
+    /// stream; `opts.directory` and `opts.non_directory` are false. The
+    /// handle reads and writes the stream: its `stat` reports the file's
+    /// times, attributes and id with the stream's sizes, `set_times` and
+    /// `set_attributes` change the file, and `truncate` the stream.
+    ///
+    /// Stream names compare without regard to case: an existing stream
+    /// opens under any spelling of its name, and a new one keeps the
+    /// spelling of `stream`. An open that would write or create a stream of
+    /// a read-only file fails with STATUS_ACCESS_DENIED before this is
+    /// called.
+    ///
+    /// Called only when [`BackendCapabilities::named_streams`] is set. The
+    /// protocol layer answers [`SmbError::NotSupported`] from this, from
+    /// [`ShareBackend::remove_stream`] and from a stream's handle with
+    /// STATUS_ACCESS_DENIED: macOS stores an extended attribute in a `._`
+    /// file when a stream request fails with STATUS_NOT_SUPPORTED. The
+    /// default closes `file` and returns [`SmbError::NotSupported`].
+    async fn open_stream(
+        &self,
+        file: Box<dyn Handle>,
+        _path: &SmbPath,
+        _stream: &StreamName,
+        _opts: OpenOptions,
+    ) -> SmbResult<(Box<dyn Handle>, OpenAction)> {
+        let _ = file.close().await;
+        Err(SmbError::NotSupported)
+    }
+
+    /// Remove the named stream of the file or directory at `path` that
+    /// `stream` names, whatever the case of its spelling. Fail with
+    /// [`SmbError::NotFound`] when the file has no such stream. The default
+    /// returns [`SmbError::NotSupported`].
+    async fn remove_stream(&self, _path: &SmbPath, _stream: &StreamName) -> SmbResult<()> {
+        Err(SmbError::NotSupported)
     }
 }
 
@@ -362,6 +419,15 @@ pub trait Handle: Send + Sync {
     async fn watch(&self) -> SmbResult<Option<Box<dyn DirWatch>>> {
         Ok(None)
     }
+
+    /// The named streams of the file or directory this handle is on,
+    /// whichever of its streams the handle is open on, in the order
+    /// FileStreamInformation lists them. The default stream is not listed.
+    /// Called only when [`BackendCapabilities::named_streams`] is set. The
+    /// default returns none.
+    async fn streams(&self) -> SmbResult<Vec<StreamInfo>> {
+        Ok(Vec::new())
+    }
 }
 
 /// What a backend saw happen to an entry of a watched directory.
@@ -451,6 +517,7 @@ impl ShareBackend for NotSupportedBackend {
         BackendCapabilities {
             is_read_only: true,
             case_sensitive: false,
+            named_streams: false,
         }
     }
 }

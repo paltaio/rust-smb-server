@@ -14,6 +14,7 @@ use crate::handlers::negotiate::{select_dialect, server_capabilities, server_sec
 use crate::handlers::shared::{lookup_open, lookup_session_tree};
 use crate::ntstatus;
 use crate::server::ServerState;
+use crate::stream::unsupported;
 
 /// Size of the fixed part of an IOCTL request, before Buffer.
 const IOCTL_FIXED_LEN: usize = 56;
@@ -83,7 +84,13 @@ pub async fn handle(
         Fsctl::DfsGetReferrals | Fsctl::DfsGetReferralsEx => {
             HandlerResponse::err(ntstatus::STATUS_FS_DRIVER_REQUIRED)
         }
-        _ => HandlerResponse::err(ntstatus::STATUS_NOT_SUPPORTED),
+        _ => {
+            let on_stream = match open {
+                Some(open) => open.read().await.stream.is_some(),
+                None => false,
+            };
+            HandlerResponse::err(unsupported(on_stream))
+        }
     }
 }
 

@@ -468,6 +468,8 @@ mod tests {
             lease,
             overwrite: false,
             break_handles: false,
+            stream: None,
+            supersede: false,
         };
         FileRef::register(share, &info, &p(name), req).unwrap().0
     }
@@ -507,6 +509,8 @@ mod tests {
             lease: Some(id(n)),
             overwrite: false,
             break_handles: true,
+            stream: None,
+            supersede: false,
         };
         let mut file = FileRef::register(share, &info, &p("f"), req).unwrap().0;
         let (granted, _) = table
@@ -536,6 +540,8 @@ mod tests {
             lease: None,
             overwrite: false,
             break_handles: true,
+            stream: None,
+            supersede: false,
         };
         FileRef::register(share, &info, &p("f"), req).err().unwrap()
     }
@@ -654,6 +660,8 @@ mod tests {
             lease: None,
             overwrite: false,
             break_handles: true,
+            stream: None,
+            supersede: false,
         };
         let (other, wait) = FileRef::register(&s, &info, &p("f"), request).unwrap();
         assert!(wait.is_some());

@@ -821,6 +821,7 @@ mod tests {
                 handle: Some(handle),
                 granted_access: FILE_READ_DATA | FILE_WRITE_DATA,
                 is_directory: false,
+                stream: None,
                 delete_on_close: false,
                 search_state: None,
                 fixed_times: FileTimes::default(),

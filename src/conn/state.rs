@@ -22,6 +22,7 @@ use crate::files::{
 use crate::path::SmbPath;
 use crate::rpc::pipe::{Pipe, PipeBudget};
 use crate::server::ShareBindings;
+use crate::stream::StreamName;
 
 /// In-flight NTLM acceptor + a `is_raw_ntlmssp` flag (true = raw, false =
 /// SPNEGO-wrapped). The handler hands the second-round response back in the
@@ -428,7 +429,10 @@ pub struct Open {
     pub handle: Option<Box<dyn Handle>>,
     /// Open.GrantedAccess: access mask bits, generic rights already mapped.
     pub granted_access: u32,
+    /// The open is on a directory, and not on one of its named streams.
     pub is_directory: bool,
+    /// The named stream the open is on.
+    pub(crate) stream: Option<StreamName>,
     /// FILE_DELETE_ON_CLOSE was set on CREATE (MS-FSA Open.Mode): the file
     /// becomes delete-pending when this open closes.
     pub delete_on_close: bool,
@@ -465,10 +469,13 @@ impl Open {
         self.file.as_ref().map(FileRef::path)
     }
 
-    /// Whether the file is delete-pending (MS-FSA Link.IsDeleted), as
+    /// Whether the stream the open is on is delete-pending (MS-FSA
+    /// Link.IsDeleted, or Stream.IsDeleted on a named stream), as
     /// FileStandardInformation reports it.
     pub fn delete_pending(&self) -> bool {
-        self.file.as_ref().is_some_and(FileRef::delete_pending)
+        self.file
+            .as_ref()
+            .is_some_and(FileRef::stream_delete_pending)
     }
 }
 

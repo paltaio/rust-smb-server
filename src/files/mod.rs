@@ -62,7 +62,11 @@ impl Closing {
     /// whenever they arrive.
     pub(crate) fn announce(open: &Open, restores_times: bool) -> Self {
         let fixed = open.fixed_times;
-        let closing = if open.wrote.load(Ordering::Acquire) {
+        // Changes to a named stream are not reported as changes of the
+        // file.
+        let closing = if open.stream.is_some() {
+            Self::ReadOnly
+        } else if open.wrote.load(Ordering::Acquire) {
             Self::Wrote
         } else if restores_times
             && (fixed.last_access_time.is_some() || fixed.last_write_time.is_some())
@@ -303,6 +307,7 @@ mod tests {
             handle: Some(handle),
             granted_access: DELETE,
             is_directory: directory,
+            stream: None,
             delete_on_close: true,
             search_state: None,
             fixed_times: FileTimes::default(),

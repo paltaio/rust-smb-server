@@ -1,7 +1,10 @@
 //! Opens of each file on a share, across every connection, keyed by file
-//! identity. This holds the state MS-FSA keeps per file rather than per
-//! open: sharing modes (2.1.5.1.2.2), the delete-pending flag (2.1.5.15.3),
-//! byte-range locks (2.1.5.8) and leases (MS-SMB2 3.3.1.4).
+//! identity. This holds the state MS-FSA keeps per file or per stream
+//! rather than per open: sharing modes (2.1.5.1.2.1, 2.1.5.1.2.2), the
+//! delete-pending flags (2.1.5.15.3), byte-range locks (2.1.5.8) and
+//! leases (MS-SMB2 3.3.1.4). An open on a named stream is on the file's
+//! node with the stream's name; leases are granted on the default stream
+//! only, and opens of named streams break none.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -21,6 +24,7 @@ use crate::proto::messages::change_notify::{
     FILE_ACTION_REMOVED, FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME,
 };
 use crate::server::ShareBindings;
+use crate::stream::{StreamName, stream_error};
 
 use super::durable::DurableTable;
 use super::lease::{
@@ -78,7 +82,7 @@ pub(crate) struct Sharing {
 }
 
 impl Sharing {
-    /// True if this open and `other` cannot both be open on one file.
+    /// True if this open and `other` cannot both be open on one stream.
     fn conflicts_with(self, other: Sharing) -> bool {
         let denies = |access: u32, share: u32| {
             (access & READ_ACCESS != 0 && share & FILE_SHARE_READ == 0)
@@ -113,11 +117,16 @@ struct FileState {
     /// The node holding this state.
     me: Weak<FileNode>,
     key: FileKey,
+    /// The name the file was last opened by, moved by renames.
+    name: SmbPath,
     is_directory: bool,
     opens: Vec<OpenEntry>,
     /// The name to remove once the last open closes, while the file is
     /// delete-pending.
     delete_pending: Option<SmbPath>,
+    /// Named streams marked for deletion, each removed once the last open
+    /// on it closes (MS-FSA Stream.IsDeleted).
+    deleted_streams: Vec<StreamName>,
     locks: Vec<RangeLock>,
     /// Leases held by the opens, one per LeaseId.
     leases: Vec<FileLease>,
@@ -130,6 +139,11 @@ struct OpenEntry {
     id: u64,
     sharing: Sharing,
     path: SmbPath,
+    /// The named stream the open is on; `None` for the default stream or
+    /// the directory.
+    stream: Option<StreamName>,
+    /// The open supersedes the file.
+    supersedes: bool,
     /// The lease the open holds.
     lease: Option<LeaseId>,
     /// The connection the open belongs to, where breaks of its lease go.
@@ -159,6 +173,9 @@ pub(crate) struct DurableMark {
 #[derive(Default)]
 pub(crate) struct OpenRequest {
     pub sharing: Sharing,
+    /// The named stream to open; `None` for the default stream or the
+    /// directory.
+    pub stream: Option<StreamName>,
     /// The connection the open belongs to.
     pub owner: Weak<Outbound>,
     /// The lease the CREATE asks for. Its own lease is not broken by the
@@ -166,6 +183,9 @@ pub(crate) struct OpenRequest {
     pub lease: Option<LeaseId>,
     /// The CREATE supersedes or overwrites the file.
     pub overwrite: bool,
+    /// The CREATE supersedes the file, which the opens of its named
+    /// streams have to share delete access for.
+    pub supersede: bool,
     /// On a sharing violation, break the handle caching of the leases on
     /// the file so their clients can close the handles they keep open
     /// (MS-FSA 2.1.5.1.2). Without it, a violation still waits while such a
@@ -198,9 +218,12 @@ impl From<Sharing> for OpenRequest {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct RangeLock {
     owner: u64,
+    /// The stream of the owner, whose locks conflict only with locks and
+    /// I/O on the same stream.
+    stream: Option<StreamName>,
     offset: u64,
     length: u64,
     exclusive: bool,
@@ -208,6 +231,39 @@ struct RangeLock {
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// True if `a` and `b` name the same stream of a file.
+fn same_stream(a: Option<&StreamName>, b: Option<&StreamName>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a.matches(b),
+        _ => false,
+    }
+}
+
+/// MS-FSA 2.1.5.1.2.1: deleting the default stream deletes every stream of
+/// the file, so an open that may delete it, `deleter` on the default stream
+/// when `on_default`, and an open on any stream of the file that does not
+/// share delete access and uses its data or deletes, `other`, exclude each
+/// other.
+fn blocks_deletion(deleter: Sharing, on_default: bool, other: Sharing) -> bool {
+    on_default
+        && deleter.access & DELETE != 0
+        && other.share & FILE_SHARE_DELETE == 0
+        && other.access & SHARED_ACCESS != 0
+}
+
+impl OpenEntry {
+    /// True if this open and the open `sharing` describes, on `stream`,
+    /// cannot both be open on the file: the share modes conflict on one
+    /// stream (MS-FSA 2.1.5.1.2.2), or one of them may delete the file
+    /// while the other does not allow it (MS-FSA 2.1.5.1.2.1).
+    fn conflicts_with(&self, sharing: Sharing, stream: Option<&StreamName>) -> bool {
+        (same_stream(self.stream.as_ref(), stream) && self.sharing.conflicts_with(sharing))
+            || blocks_deletion(self.sharing, self.stream.is_none(), sharing)
+            || blocks_deletion(sharing, stream.is_none(), self.sharing)
+    }
 }
 
 impl FileNode {
@@ -355,21 +411,50 @@ impl FileNode {
 }
 
 impl FileState {
-    /// MS-FSA 2.1.5.1: a delete-pending file opens for nobody; otherwise the
-    /// sharing check of 2.1.5.1.2.2 runs against every open on the file.
-    /// Waiting CREATEs and the open `except` take no part.
-    fn admit(&self, sharing: Sharing, except: Option<u64>) -> Result<(), u32> {
-        if self.delete_pending.is_some() {
+    /// MS-FSA 2.1.5.1: a delete-pending file, or a named stream marked for
+    /// deletion, opens for nobody; otherwise the sharing checks of
+    /// 2.1.5.1.2.1 and 2.1.5.1.2.2 run against every open on the file for
+    /// an open on `stream`. Waiting CREATEs and the open `except` take no
+    /// part.
+    ///
+    /// A supersede also fails while an open of a named stream does not
+    /// share delete access; an overwrite does not.
+    fn admit(
+        &self,
+        sharing: Sharing,
+        stream: Option<&StreamName>,
+        supersede: bool,
+        except: Option<u64>,
+    ) -> Result<(), u32> {
+        if self.delete_pending.is_some() || stream.is_some_and(|s| self.stream_deleted(s)) {
             return Err(ntstatus::STATUS_DELETE_PENDING);
         }
-        if self
-            .opens
-            .iter()
-            .any(|e| !e.waiting && Some(e.id) != except && e.sharing.conflicts_with(sharing))
-        {
+        let blocks_supersede = |e: &OpenEntry| {
+            supersede
+                && e.stream.is_some()
+                && e.sharing.access & SHARED_ACCESS != 0
+                && e.sharing.share & FILE_SHARE_DELETE == 0
+        };
+        if self.opens.iter().any(|e| {
+            !e.waiting
+                && Some(e.id) != except
+                && (e.conflicts_with(sharing, stream) || blocks_supersede(e))
+        }) {
             return Err(ntstatus::STATUS_SHARING_VIOLATION);
         }
         Ok(())
+    }
+
+    /// Whether the named stream `stream` is marked for deletion.
+    fn stream_deleted(&self, stream: &StreamName) -> bool {
+        self.deleted_streams.iter().any(|s| s.matches(stream))
+    }
+
+    /// Whether an open is on the named stream `stream`.
+    fn stream_open(&self, stream: &StreamName) -> bool {
+        self.opens
+            .iter()
+            .any(|e| e.stream.as_ref().is_some_and(|s| s.matches(stream)))
     }
 
     fn entry(&self, id: u64) -> Option<&OpenEntry> {
@@ -532,12 +617,14 @@ impl FileState {
         BreakWait::new(self.changed.subscribe())
     }
 
-    /// MS-FSA 2.1.4.10: whether the range conflicts with a lock. `exclusive`
-    /// is the intent of the access (a write, or an exclusive lock) and
-    /// `lock_intent` tells a lock request from a read or write.
+    /// MS-FSA 2.1.4.10: whether the range of `stream` conflicts with a
+    /// lock. `exclusive` is the intent of the access (a write, or an
+    /// exclusive lock) and `lock_intent` tells a lock request from a read or
+    /// write.
     fn range_conflicts(
         &self,
         owner: u64,
+        stream: Option<&StreamName>,
         offset: u64,
         length: u64,
         exclusive: bool,
@@ -547,7 +634,8 @@ impl FileState {
             return false;
         }
         self.locks.iter().any(|l| {
-            overlaps(l.offset, l.length, offset, length)
+            same_stream(l.stream.as_ref(), stream)
+                && overlaps(l.offset, l.length, offset, length)
                 && if l.exclusive {
                     l.owner != owner || (exclusive && lock_intent)
                 } else {
@@ -637,6 +725,33 @@ impl FileTable {
                         .any(|e| same_path(&e.path, path, case_sensitive))
             })
         })
+    }
+
+    /// Whether the file `info` describes, reached through `path`, has an
+    /// open on the share.
+    pub(crate) fn has_opens(&self, info: &FileInfo, path: &SmbPath, case_sensitive: bool) -> bool {
+        let key = FileKey::new(info.file_index, path, case_sensitive);
+        self.files()
+            .get(&key)
+            .is_some_and(|node| !node.state().opens.is_empty())
+    }
+
+    /// Whether a new open of the named stream `stream` of the file `info`
+    /// describes, reached through `path`, is refused because the file or
+    /// the stream is marked for deletion.
+    pub(crate) fn stream_delete_pending(
+        &self,
+        info: &FileInfo,
+        path: &SmbPath,
+        stream: &StreamName,
+        case_sensitive: bool,
+    ) -> bool {
+        let key = FileKey::new(info.file_index, path, case_sensitive);
+        let Some(node) = self.files().get(&key).cloned() else {
+            return false;
+        };
+        let state = node.state();
+        state.delete_pending.is_some() || state.stream_deleted(stream)
     }
 
     /// Breaks the handle caching of the leases on the file open as `path`,
@@ -758,6 +873,9 @@ impl FileTable {
             {
                 state.delete_pending = Some(path);
             }
+            if let Some(path) = rebase(&state.name, from, to, case_sensitive) {
+                state.name = path;
+            }
             if matches!(state.key, FileKey::Path(_))
                 && let Some(entry) = state.opens.first()
             {
@@ -817,9 +935,11 @@ impl FileRef {
                     state: Mutex::new(FileState {
                         me: me.clone(),
                         key,
+                        name: path.clone(),
                         is_directory: info.is_directory,
                         opens: Vec::new(),
                         delete_pending: None,
+                        deleted_streams: Vec::new(),
                         locks: Vec::new(),
                         leases: Vec::new(),
                         changed: tokio::sync::watch::Sender::new(0),
@@ -828,10 +948,12 @@ impl FileRef {
             })
             .clone();
         let mut state = node.state();
-        if let Err(status) = state.admit(req.sharing, None) {
+        if let Err(status) = state.admit(req.sharing, req.stream.as_ref(), req.supersede, None) {
             let mut wait = None;
             let mut notices = Notices::default();
-            if status == ntstatus::STATUS_SHARING_VIOLATION {
+            // MS-FSA 2.1.5.1.2: a violation breaks the handle caching of
+            // the stream being opened, and no lease is on a named stream.
+            if status == ntstatus::STATUS_SHARING_VIOLATION && req.stream.is_none() {
                 if req.break_handles {
                     let (sent, waits) = state.break_for(Trigger::SharingViolation, req.lease);
                     notices = sent;
@@ -846,16 +968,19 @@ impl FileRef {
             return Err(Refused { status, wait });
         }
         let id = table.next_open.fetch_add(1, Ordering::Relaxed);
+        let named = req.stream.is_some();
         state.opens.push(OpenEntry {
             id,
             sharing: req.sharing,
             path: path.clone(),
+            stream: req.stream,
+            supersedes: req.supersede,
             lease: req.lease,
             owner: req.owner,
             waiting: false,
             durable: None,
         });
-        let (notices, wait) = if stat_only(req.sharing.access) {
+        let (notices, wait) = if stat_only(req.sharing.access) || named {
             (Notices::default(), None)
         } else {
             let trigger = Trigger::Open {
@@ -890,11 +1015,12 @@ impl FileRef {
         let Some(entry) = state.entry(self.id) else {
             return Err(ntstatus::STATUS_FILE_CLOSED);
         };
-        let (lease, sharing) = (entry.lease, entry.sharing);
+        let (lease, sharing, stream) = (entry.lease, entry.sharing, entry.stream.clone());
+        let supersede = entry.supersedes;
         if state.write_break_pending(lease) {
             return Ok(Some(state.wait()));
         }
-        state.admit(sharing, Some(self.id))?;
+        state.admit(sharing, stream.as_ref(), supersede, Some(self.id))?;
         if let Some(entry) = state.opens.iter_mut().find(|e| e.id == self.id) {
             entry.waiting = false;
         }
@@ -929,9 +1055,12 @@ impl FileRef {
             entry.lease = Some(req.id);
             sender = entry.owner.clone();
         }
+        // Leases cache the default stream: opens and locks of named streams
+        // take no part.
         let opens: Vec<OpenView> = state
             .opens
             .iter()
+            .filter(|e| e.stream.is_none())
             .map(|e| OpenView {
                 lease: e.lease,
                 stat_only: stat_only(e.sharing.access),
@@ -942,7 +1071,7 @@ impl FileRef {
         let file = FileView {
             opens: &opens,
             leases: &leases,
-            has_locks: !state.locks.is_empty(),
+            has_locks: state.locks.iter().any(|l| l.stream.is_none()),
             delete_pending: state.delete_pending.is_some(),
         };
         let existing = state.leases.iter().position(|l| l.id == req.id);
@@ -1087,12 +1216,17 @@ impl FileRef {
 
     /// Breaks the leases on the file that `trigger` through this open
     /// conflicts with: every lease but the one this open holds, whichever
-    /// client holds it.
+    /// client holds it. An open on a named stream breaks none.
     pub(crate) fn break_leases(&self, trigger: Trigger) {
         let notices = {
             let mut state = self.node.state();
-            let exempt = state.entry(self.id).and_then(|e| e.lease);
-            state.break_for(trigger, exempt).0
+            match state.entry(self.id) {
+                Some(entry) if entry.stream.is_none() => {
+                    let exempt = entry.lease;
+                    state.break_for(trigger, exempt).0
+                }
+                _ => Notices::default(),
+            }
         };
         drop(notices);
     }
@@ -1141,9 +1275,22 @@ impl FileRef {
         self.node.state().delete_pending.is_some()
     }
 
-    /// Sets or clears the delete-pending flag of the file (MS-FSA
-    /// 2.1.5.15.3). The file is removed under this open's name when its last
-    /// open closes.
+    /// Whether the stream this open is on is marked for deletion: the
+    /// file for an open on its default stream or directory, the named
+    /// stream for an open on one (MS-FSA Stream.IsDeleted).
+    pub(crate) fn stream_delete_pending(&self) -> bool {
+        let state = self.node.state();
+        match state.entry(self.id).and_then(|e| e.stream.as_ref()) {
+            Some(stream) => state.stream_deleted(stream),
+            None => state.delete_pending.is_some(),
+        }
+    }
+
+    /// Sets or clears the delete-pending flag of the stream this open is on
+    /// (MS-FSA 2.1.5.15.3). On the default stream or the directory that is
+    /// the file's flag: the file is removed under this open's name when its
+    /// last open closes. A named stream is removed when the last open on it
+    /// closes.
     ///
     /// Marking the file breaks the handle caching of its leases, all but
     /// this open's, under the same lock, so no lease caches handles to a
@@ -1151,17 +1298,70 @@ impl FileRef {
     pub(crate) fn set_delete_pending(&self, delete: bool) {
         let notices = {
             let mut state = self.node.state();
-            if delete {
-                let entry = state.entry(self.id).map(|e| (e.lease, e.path.clone()));
-                let exempt = entry.as_ref().and_then(|e| e.0);
-                state.delete_pending = entry.map(|e| e.1);
-                state.break_for(Trigger::Handle, exempt).0
-            } else {
-                state.delete_pending = None;
-                Notices::default()
+            let Some(entry) = state.entry(self.id) else {
+                return;
+            };
+            let (lease, path, stream) = (entry.lease, entry.path.clone(), entry.stream.clone());
+            match stream {
+                Some(stream) => {
+                    state.deleted_streams.retain(|s| !s.matches(&stream));
+                    if delete {
+                        state.deleted_streams.push(stream);
+                    }
+                    Notices::default()
+                }
+                None if delete => {
+                    state.delete_pending = Some(path);
+                    state.break_for(Trigger::Handle, lease).0
+                }
+                None => {
+                    state.delete_pending = None;
+                    Notices::default()
+                }
             }
         };
         drop(notices);
+    }
+
+    /// Marks the named streams `streams` of the file for deletion, as an
+    /// overwrite of the file through this open does on Windows: one an open
+    /// is on goes when the last open on it closes, and keeps serving the
+    /// opens already on it meanwhile. Returns the streams no open is on,
+    /// for [`FileRef::remove_streams`].
+    pub(crate) fn delete_streams(&self, streams: Vec<StreamName>) -> Vec<StreamName> {
+        let mut state = self.node.state();
+        let mut unopened = Vec::new();
+        for stream in streams {
+            if !state.stream_deleted(&stream) {
+                state.deleted_streams.push(stream.clone());
+            }
+            if !state.stream_open(&stream) {
+                unopened.push(stream);
+            }
+        }
+        unopened
+    }
+
+    /// Removes the named streams `streams`, which
+    /// [`FileRef::delete_streams`] marked, from the file. No CREATE runs
+    /// meanwhile, so none can make a stream again before its mark is
+    /// cleared.
+    pub(crate) async fn remove_streams(&self, streams: Vec<StreamName>) {
+        if streams.is_empty() {
+            return;
+        }
+        let _renames = self.share.files.rename_lock().await;
+        let path = self.path();
+        for stream in &streams {
+            if let Err(e) = self.share.backend.remove_stream(&path, stream).await {
+                let e = stream_error(e);
+                debug!(error = %e, path = %path, stream = ?stream.as_str(), "stream removal failed");
+            }
+        }
+        let mut state = self.node.state();
+        state
+            .deleted_streams
+            .retain(|d| !streams.iter().any(|s| s.matches(d)));
     }
 
     /// Takes a byte-range lock for this open (MS-FSA 2.1.5.8). Fails with
@@ -1183,8 +1383,21 @@ impl FileRef {
         if state.locks.iter().filter(|l| l.owner == self.id).count() >= limit {
             return Err(ntstatus::STATUS_INSUFFICIENT_RESOURCES);
         }
-        if state.range_conflicts(self.id, offset, length, exclusive, true) {
+        let stream = state.entry(self.id).and_then(|e| e.stream.clone());
+        if state.range_conflicts(self.id, stream.as_ref(), offset, length, exclusive, true) {
             return Err(ntstatus::STATUS_LOCK_NOT_GRANTED);
+        }
+        // A lock on a named stream leaves the leases, which cache the
+        // default stream, alone.
+        if stream.is_some() {
+            state.locks.push(RangeLock {
+                owner: self.id,
+                stream,
+                offset,
+                length,
+                exclusive,
+            });
+            return Ok(());
         }
         // MS-FSA 2.1.5.8: a lock breaks the leases on the file, all but the
         // one this open holds, wherever the range lies. Under the same lock
@@ -1201,6 +1414,7 @@ impl FileRef {
         if !caching_writes {
             state.locks.push(RangeLock {
                 owner: self.id,
+                stream: None,
                 offset,
                 length,
                 exclusive,
@@ -1253,11 +1467,9 @@ impl FileRef {
     /// `write`) of the range through this open conflicts with a byte-range
     /// lock (MS-FSA 2.1.5.3, 2.1.5.4).
     pub(crate) fn check_io(&self, offset: u64, length: u64, write: bool) -> Result<(), u32> {
-        if self
-            .node
-            .state()
-            .range_conflicts(self.id, offset, length, write, false)
-        {
+        let state = self.node.state();
+        let stream = state.entry(self.id).and_then(|e| e.stream.as_ref());
+        if state.range_conflicts(self.id, stream, offset, length, write, false) {
             return Err(ntstatus::STATUS_FILE_LOCK_CONFLICT);
         }
         Ok(())
@@ -1294,22 +1506,38 @@ impl FileRef {
         if entry.is_some() {
             state.bump();
         }
-        if delete_on_close && let Some(entry) = entry {
-            state.delete_pending = Some(entry.path);
+        let entry = entry?;
+        if delete_on_close {
+            match &entry.stream {
+                Some(stream) if !state.stream_deleted(stream) => {
+                    state.deleted_streams.push(stream.clone());
+                }
+                Some(_) => {}
+                None => state.delete_pending = Some(entry.path.clone()),
+            }
         }
-        if !state.opens.is_empty() {
+        let is_directory = state.is_directory;
+        let pending = |path, stream| PendingDelete {
+            share: Arc::clone(&self.share),
+            node: Arc::clone(&self.node),
+            path,
+            stream,
+            is_directory,
+        };
+        if state.opens.is_empty()
+            && let Some(path) = state.delete_pending.clone()
+        {
+            return Some(pending(path, None));
+        }
+        if let Some(stream) = entry.stream
+            && state.stream_deleted(&stream)
+            && !state.stream_open(&stream)
+        {
+            return Some(pending(entry.path, Some(stream)));
+        }
+        // A stream removal still running keeps the node until it is done.
+        if !state.opens.is_empty() || !state.deleted_streams.is_empty() {
             return None;
-        }
-        if let Some(path) = state.delete_pending.clone() {
-            let is_directory = state.is_directory;
-            drop(state);
-            drop(files);
-            return Some(PendingDelete {
-                share: Arc::clone(&self.share),
-                node: Arc::clone(&self.node),
-                path,
-                is_directory,
-            });
         }
         let key = state.key.clone();
         drop(state);
@@ -1344,12 +1572,15 @@ fn remove_node(files: &mut HashMap<FileKey, Arc<FileNode>>, key: &FileKey, node:
     }
 }
 
-/// A delete-pending file whose last open has closed. Dropping it frees the
-/// name in the table, whether or not the removal ran.
+/// A delete-pending file whose last open has closed, or a named stream
+/// marked for deletion whose last open has closed. Dropping it frees the
+/// name, or the stream, in the table, whether or not the removal ran.
 pub(crate) struct PendingDelete {
     share: Arc<ShareBindings>,
     node: Arc<FileNode>,
     path: SmbPath,
+    /// The named stream to remove; `None` to remove the file.
+    stream: Option<StreamName>,
     is_directory: bool,
 }
 
@@ -1357,8 +1588,22 @@ impl PendingDelete {
     /// Removes the file from the share, reports the removal to the share's
     /// watchers (MS-FSA 2.1.5.5), then frees its name in the table. A
     /// failed delete does not fail the close (MS-SMB2 3.3.4.17); a
-    /// directory that gained entries stays (MS-FSA 2.1.5.5).
+    /// directory that gained entries stays (MS-FSA 2.1.5.5). A named
+    /// stream is removed from the file its opens are on.
     pub(crate) async fn run(self) {
+        if let Some(stream) = self.stream.clone() {
+            // No CREATE runs until the mark is cleared, so none can make the
+            // stream again in between, and no rename moves the file.
+            let share = Arc::clone(&self.share);
+            let _renames = share.files.rename_lock().await;
+            let path = self.node.state().name.clone();
+            if let Err(e) = share.backend.remove_stream(&path, &stream).await {
+                let e = stream_error(e);
+                debug!(error = %e, path = %path, stream = ?stream.as_str(), "stream removal failed");
+            }
+            drop(self);
+            return;
+        }
         let _names = self.share.files.names_lock().await;
         // A rename that ran while this waited moved the name.
         let path = self
@@ -1392,7 +1637,18 @@ impl PendingDelete {
 impl Drop for PendingDelete {
     fn drop(&mut self) {
         let mut files = self.share.files.files();
-        let key = self.node.state().key.clone();
+        let mut state = self.node.state();
+        if let Some(stream) = &self.stream {
+            state.deleted_streams.retain(|s| !s.matches(stream));
+            if !state.opens.is_empty()
+                || state.delete_pending.is_some()
+                || !state.deleted_streams.is_empty()
+            {
+                return;
+            }
+        }
+        let key = state.key.clone();
+        drop(state);
         remove_node(&mut files, &key, &self.node);
     }
 }

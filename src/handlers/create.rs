@@ -28,7 +28,7 @@ use crate::backend::{
 use crate::conn::pending::{Stop, stopped};
 use crate::conn::state::{Connection, Open};
 use crate::dispatch::HandlerResponse;
-use crate::error::{SmbError, SmbResult};
+use crate::error::SmbError;
 use crate::files::{
     BreakWait, CONTENT_CHANGED, Change, Durability, FileRef, Granted, LeaseId, LeaseRef,
     LeaseRequest, LeaseState, LeaseVersion, MAX_BREAK_WAIT, OpenRequest, OpenSlot, Refused,
@@ -42,7 +42,9 @@ use crate::ntstatus;
 use crate::path::SmbPath;
 use crate::proto::auth::ntlm::Identity;
 use crate::server::{ServerState, ShareBindings};
-use crate::stream::{StreamPart, parse_create_name};
+use crate::stream::{
+    StreamHandle, StreamName, StreamPart, parse_create_name, stream_error, unsupported,
+};
 use crate::utils::utf16le_to_units;
 
 // CreateOptions
@@ -321,6 +323,8 @@ pub(super) fn lease_response(granted: &Granted) -> CreateContext {
 /// A validated CREATE request: what each attempt to open needs.
 struct CreateArgs {
     path: SmbPath,
+    /// The named stream to open.
+    stream: Option<StreamName>,
     intent: OpenIntent,
     options: u32,
     create_disposition: u32,
@@ -396,9 +400,10 @@ impl CreateArgs {
         let units = utf16le_to_units(&req.name).ok_or(ntstatus::STATUS_INVALID_PARAMETER)?;
         let (path, stream) =
             parse_create_name(&units).map_err(|_| ntstatus::STATUS_OBJECT_NAME_INVALID)?;
-        // No share stores named streams.
-        if let StreamPart::Named(name) | StreamPart::NamedDirectory(name) = &stream {
-            debug!(path = %path, stream = ?name.as_str(), "named stream refused");
+        if let StreamPart::Named(name) | StreamPart::NamedDirectory(name) = &stream
+            && !share.named_streams
+        {
+            debug!(path = %path, stream = ?name.as_str(), "share without named streams");
             return Err(ntstatus::STATUS_OBJECT_NAME_INVALID);
         }
 
@@ -414,7 +419,8 @@ impl CreateArgs {
 
         let options = req.create_options;
         if options & (FILE_OPEN_BY_FILE_ID | FILE_RESERVE_OPFILTER) != 0 {
-            return Err(ntstatus::STATUS_NOT_SUPPORTED);
+            let on_stream = matches!(stream, StreamPart::Named(_) | StreamPart::NamedDirectory(_));
+            return Err(unsupported(on_stream));
         }
         let mut directory = options & FILE_DIRECTORY_FILE != 0;
         let mut non_directory = options & FILE_NON_DIRECTORY_FILE != 0;
@@ -429,8 +435,9 @@ impl CreateArgs {
         }
         // MS-FSA 2.1.5.1 phase 7, after the option checks of phase 1, which
         // look at FILE_DIRECTORY_FILE only: `::$DATA` opens the data of a
-        // file and `::$INDEX_ALLOCATION` a directory. The backend never gets
-        // both `directory` and `non_directory`.
+        // file, `::$INDEX_ALLOCATION` a directory, and a named stream the
+        // stream of a file or directory. The backend never gets both
+        // `directory` and `non_directory`.
         match &stream {
             StreamPart::Data if directory => return Err(ntstatus::STATUS_NOT_A_DIRECTORY),
             StreamPart::Data => non_directory = true,
@@ -438,18 +445,32 @@ impl CreateArgs {
                 directory = true;
                 non_directory = false;
             }
-            _ => {}
+            StreamPart::NamedDirectory(_) => return Err(ntstatus::STATUS_INVALID_PARAMETER),
+            StreamPart::Named(_) if directory => return Err(ntstatus::STATUS_NOT_A_DIRECTORY),
+            StreamPart::Named(_) | StreamPart::None => {}
         }
+        let named = match &stream {
+            StreamPart::Named(name) => Some(name.clone()),
+            _ => None,
+        };
 
         if queries.timewarp {
             // There are no snapshots, so none matches the token.
             return Err(ntstatus::STATUS_OBJECT_NAME_NOT_FOUND);
         }
         if queries.ea_buffer {
+            // Extended attributes belong to the file, not to a stream.
+            if named.is_some() {
+                return Err(ntstatus::STATUS_INVALID_PARAMETER);
+            }
             return Err(ntstatus::STATUS_EAS_NOT_SUPPORTED);
         }
-        // Directories get no lease, and neither do shares that turn leases off.
-        let lease = if req.requested_oplock_level == OplockLevel::Lease as u8 && share.leases {
+        // Directories get no lease, and neither do named streams nor shares
+        // that turn leases off.
+        let lease = if req.requested_oplock_level == OplockLevel::Lease as u8
+            && share.leases
+            && named.is_none()
+        {
             lease_request(
                 queries.lease.as_deref(),
                 dialect,
@@ -521,6 +542,7 @@ impl CreateArgs {
         };
         Ok(Request::Open(Self {
             path,
+            stream: named,
             intent,
             options,
             create_disposition: req.create_disposition,
@@ -720,11 +742,14 @@ async fn attempt(
     // carry the name the file had.
     let names = share.files.names_lock().await;
 
+    let stream = args.stream.as_ref();
     let open_request = |overwrite, break_handles| OpenRequest {
         sharing: args.sharing,
+        stream: args.stream.clone(),
         owner: Arc::downgrade(&conn.outbound),
         lease: args.lease.map(|l| l.id),
         overwrite,
+        supersede: args.create_disposition == FILE_SUPERSEDE && stream.is_none(),
         break_handles,
     };
     let break_handles = stage.break_handles();
@@ -733,13 +758,15 @@ async fn attempt(
         None => fail(refused.status),
     };
 
-    let open_failed = |e: SmbError| {
-        debug!(error = %e, path = %path, "backend open failed");
+    let open_failed = |e: Failed| {
+        debug!(error = ?e, path = %path, "backend open failed");
         let case_sensitive = backend.capabilities().case_sensitive;
-        if matches!(e, SmbError::Exists) && share.files.delete_pending_at(path, case_sensitive) {
+        if matches!(e, Failed::Backend(SmbError::Exists))
+            && share.files.delete_pending_at(path, case_sensitive)
+        {
             return fail(ntstatus::STATUS_DELETE_PENDING);
         }
-        fail(e.to_nt_status())
+        fail(e.status())
     };
 
     let (slot, lease_ref, reserved, opened, registered) = match stage {
@@ -792,7 +819,7 @@ async fn attempt(
                     break (None, None);
                 }
                 let request = open_request(true, break_handles);
-                match reserve_existing(&share, path, args.opts, request).await {
+                match reserve_existing(&share, path, stream, args.opts, request).await {
                     Ok(Probe::Reserved(file, Some(wait))) => {
                         let reserved = Reserved {
                             file,
@@ -811,9 +838,9 @@ async fn attempt(
                             intent: OpenIntent::Create,
                             ..args.opts
                         };
-                        match open_reported(&share, path, create).await {
+                        match open_reported(&share, path, stream, create).await {
                             Ok(opened) => break (None, Some(opened)),
-                            Err(SmbError::Exists) if tries < 2 => tries += 1,
+                            Err(Failed::Backend(SmbError::Exists)) if tries < 2 => tries += 1,
                             Err(e) => return open_failed(e),
                         }
                     }
@@ -827,7 +854,7 @@ async fn attempt(
     // The open this attempt made, or the one a waiting CREATE kept.
     let (handle, action) = match opened {
         Some(opened) => opened,
-        None => match open_reported(&share, path, args.opts).await {
+        None => match open_reported(&share, path, stream, args.opts).await {
             Ok(opened) => opened,
             Err(e) => return open_failed(e),
         },
@@ -870,7 +897,15 @@ async fn attempt(
             }
         }
     };
+    // The streams are marked before another CREATE can open one, and the
+    // ones made after the overwrite are left alone.
+    let unopened = if action == OpenAction::Overwritten && stream.is_none() && share.named_streams {
+        mark_streams(&file, handle.as_ref()).await
+    } else {
+        Vec::new()
+    };
     drop(names);
+    file.remove_streams(unopened).await;
     let mut granted = None;
     let mut after_send = None;
     if let (Some(lease), Some(lease_ref)) = (args.lease, lease_ref)
@@ -934,7 +969,9 @@ async fn attempt(
         file.break_leases(Trigger::Open { overwrite: true });
     }
 
+    // A stream created on a file leaves the file's attributes alone.
     if action != OpenAction::Opened
+        && stream.is_none()
         && args.new_attributes != 0
         && args.new_attributes != info.attributes() & VALID_SET_ATTRIBUTES
     {
@@ -976,7 +1013,8 @@ async fn attempt(
         file_id,
         handle: Some(handle),
         granted_access: args.open_access,
-        is_directory: info.is_directory,
+        is_directory: info.is_directory && stream.is_none(),
+        stream: args.stream.clone(),
         delete_on_close: args.delete_on_close,
         search_state: None,
         fixed_times: FileTimes::default(),
@@ -1033,17 +1071,19 @@ async fn attempt(
     Step::Done(response)
 }
 
-/// Opens `path` on the backend with `opts` and tells the watchers of
-/// `share` when that created or overwrote it (MS-FSA 2.1.5.1.1,
-/// 2.1.5.1.2). The report goes out right after the backend call, so a
-/// CREATE that then waits for a lease break, or fails, reports the change
-/// it made once. A creation is noted before the call, so the backend's own
-/// report of it is left out whenever it arrives.
+/// Opens `path`, or its named stream `stream`, on the backend with `opts`
+/// and tells the watchers of `share` when that created the file or
+/// overwrote it (MS-FSA 2.1.5.1.1, 2.1.5.1.2). The report goes out right
+/// after the backend call, so a CREATE that then waits for a lease break,
+/// or fails, reports the change it made once. A creation is noted before
+/// the call, so the backend's own report of it is left out whenever it
+/// arrives.
 async fn open_reported(
     share: &ShareBindings,
     path: &SmbPath,
+    stream: Option<&StreamName>,
     opts: OpenOptions,
-) -> SmbResult<(Box<dyn Handle>, OpenAction)> {
+) -> Result<(Box<dyn Handle>, OpenAction), Failed> {
     let names = if opts.directory {
         FILE_NOTIFY_CHANGE_DIR_NAME
     } else {
@@ -1057,18 +1097,191 @@ async fn open_reported(
     }];
     let may_create = !matches!(opts.intent, OpenIntent::Open | OpenIntent::Truncate);
     let expected = may_create.then(|| share.watches.expect(&added, None));
-    let opened = share.backend.open(path, opts).await;
+    let (created, opened) = backend_open(share, path, stream, opts).await;
     match (&opened, expected) {
-        (Ok((_, OpenAction::Created)), Some(expected)) => expected.report(&share.watches, &added),
-        (Ok((_, OpenAction::Overwritten)), _) => share.watches.report(&[Change {
-            path,
-            action: FILE_ACTION_MODIFIED,
-            filter: CONTENT_CHANGED,
-            seen: true,
-        }]),
+        (_, Some(expected)) if created => expected.report(&share.watches, &added),
+        (Ok((_, OpenAction::Overwritten)), _) if stream.is_none() => {
+            share.watches.report(&[Change {
+                path,
+                action: FILE_ACTION_MODIFIED,
+                filter: CONTENT_CHANGED,
+                seen: true,
+            }])
+        }
         _ => {}
     }
     opened
+}
+
+/// Why a backend open for a CREATE failed.
+#[derive(Debug)]
+enum Failed {
+    Backend(SmbError),
+    /// The status the share's opens refuse it with before the backend
+    /// opens it.
+    Refused(u32),
+}
+
+impl From<SmbError> for Failed {
+    fn from(e: SmbError) -> Self {
+        Self::Backend(e)
+    }
+}
+
+impl Failed {
+    fn status(&self) -> u32 {
+        match self {
+            Self::Backend(e) => e.to_nt_status(),
+            Self::Refused(status) => *status,
+        }
+    }
+
+    /// No file or directory is at the path, or on the way to it.
+    fn is_missing(&self) -> bool {
+        matches!(
+            self,
+            Self::Backend(SmbError::NotFound | SmbError::PathNotFound)
+        )
+    }
+}
+
+/// Opens `path`, or its named stream `stream`, on the backend of `share`
+/// with `opts`, and tells whether that created the file. A stream is opened
+/// through its file, as MS-FSA 2.1.5.1 finds the File before the Stream:
+/// the file is opened for reading, and created when the disposition may
+/// create the stream, then the stream through the file's handle. A stream
+/// that comes with a new file counts as created; a file made for a stream
+/// that then fails to open is removed again. The caller holds the share's
+/// names lock.
+async fn backend_open(
+    share: &ShareBindings,
+    path: &SmbPath,
+    stream: Option<&StreamName>,
+    opts: OpenOptions,
+) -> (bool, Result<(Box<dyn Handle>, OpenAction), Failed>) {
+    let backend = share.backend.as_ref();
+    let Some(stream) = stream else {
+        let opened = backend.open(path, opts).await;
+        let created = matches!(opened, Ok((_, OpenAction::Created)));
+        return (created, opened.map_err(Failed::from));
+    };
+    let file_opts = OpenOptions {
+        read: true,
+        write: false,
+        write_attributes: false,
+        intent: match opts.intent {
+            OpenIntent::Open | OpenIntent::Truncate => OpenIntent::Open,
+            _ => OpenIntent::OpenOrCreate,
+        },
+        directory: false,
+        non_directory: false,
+        delete_on_close: false,
+    };
+    let (file, action) = match backend.open(path, file_opts).await {
+        Ok(opened) => opened,
+        Err(e) => return (false, Err(stream_error(e).into())),
+    };
+    let created = action == OpenAction::Created;
+    let case_sensitive = backend.capabilities().case_sensitive;
+    let (info, refused) = match file.stat().await {
+        Ok(info) => {
+            let refused = stream_refusal(share, &info, path, stream, opts);
+            (Some(info), refused)
+        }
+        Err(e) => (None, Some(Failed::from(stream_error(e)))),
+    };
+    let opened = match refused {
+        Some(refused) => {
+            if let Err(e) = file.close().await {
+                debug!(error = %e, path = %path, "backend close failed");
+            }
+            Err(refused)
+        }
+        None => {
+            // On a read-only file a stream is not made, also by FILE_OPEN_IF.
+            let read_only = info
+                .as_ref()
+                .is_some_and(|info| info.read_only && !info.is_directory);
+            let intent = match opts.intent {
+                OpenIntent::OpenOrCreate if read_only => OpenIntent::Open,
+                intent => intent,
+            };
+            let stream_opts = OpenOptions {
+                intent,
+                directory: false,
+                non_directory: false,
+                ..opts
+            };
+            match backend.open_stream(file, path, stream, stream_opts).await {
+                Err(SmbError::NotFound) if intent != opts.intent => {
+                    Err(Failed::Refused(ntstatus::STATUS_ACCESS_DENIED))
+                }
+                opened => opened.map_err(|e| stream_error(e).into()),
+            }
+        }
+    };
+    match opened {
+        Ok((handle, action)) => {
+            let handle: Box<dyn Handle> = Box::new(StreamHandle(handle));
+            (
+                created,
+                Ok((handle, if created { OpenAction::Created } else { action })),
+            )
+        }
+        Err(failed) => {
+            // A CREATE of the file itself may have opened it meanwhile; the
+            // file then stays.
+            let opened_elsewhere = info
+                .as_ref()
+                .is_none_or(|info| share.files.has_opens(info, path, case_sensitive));
+            if created
+                && !opened_elsewhere
+                && let Err(e) = backend.unlink(path).await
+            {
+                debug!(error = %e, path = %path, "file made for a stream not removed");
+            }
+            (false, Err(failed))
+        }
+    }
+}
+
+/// Why the share refuses to open the named stream `stream` of the file
+/// `info` describes at `path`, with `opts`, before the backend opens it:
+/// the file or the stream is marked for deletion (MS-FSA 2.1.5.1), or the
+/// file is read-only, which keeps every stream of it from being written
+/// or made (MS-FSA 2.1.5.1.2.1).
+fn stream_refusal(
+    share: &ShareBindings,
+    info: &FileInfo,
+    path: &SmbPath,
+    stream: &StreamName,
+    opts: OpenOptions,
+) -> Option<Failed> {
+    let case_sensitive = share.backend.capabilities().case_sensitive;
+    if share
+        .files
+        .stream_delete_pending(info, path, stream, case_sensitive)
+    {
+        return Some(Failed::Refused(ntstatus::STATUS_DELETE_PENDING));
+    }
+    let writes = opts.write || !matches!(opts.intent, OpenIntent::Open | OpenIntent::OpenOrCreate);
+    if info.read_only && !info.is_directory && writes {
+        return Some(Failed::Refused(ntstatus::STATUS_ACCESS_DENIED));
+    }
+    None
+}
+
+/// Marks the named streams of the file `handle` just overwrote for
+/// deletion, and returns those no open is on, which go at once; the others
+/// go when the last open on each closes.
+async fn mark_streams(file: &FileRef, handle: &dyn Handle) -> Vec<StreamName> {
+    match handle.streams().await {
+        Ok(streams) => file.delete_streams(streams.into_iter().map(|s| s.name).collect()),
+        Err(e) => {
+            debug!(error = %stream_error(e), "streams of an overwritten file not listed");
+            Vec::new()
+        }
+    }
 }
 
 /// The CREATE response body for an open of a file with `info`, holding a
@@ -1113,28 +1326,26 @@ pub(super) fn encode_response(
     buf
 }
 
-fn is_missing(e: &SmbError) -> bool {
-    matches!(e, SmbError::NotFound | SmbError::PathNotFound)
-}
-
 /// What the check before a truncating CREATE found.
 enum Probe {
     /// No file at the path; the error the open reported.
-    Missing(SmbError),
+    Missing(Failed),
     /// The open is in the table, with a wait when clients caching writes
     /// have to write back first.
     Reserved(FileRef, Option<BreakWait>),
 }
 
-/// Before a CREATE that truncates the file at `path`, opens the existing
-/// file without truncating it, checks it against delete-on-close and the
-/// opens already on it, and enters the new open in the share's table. That
-/// open asks for reading, and for the access the CREATE was granted when
-/// reading is refused. Only a missing file passes without an entry; any
-/// other failure fails the CREATE, as the truncating open would.
+/// Before a CREATE that truncates the file at `path`, or its named stream
+/// `stream`, opens the existing file or stream without truncating it,
+/// checks it against delete-on-close and the opens already on it, and
+/// enters the new open in the share's table. That open asks for reading,
+/// and for the access the CREATE was granted when reading is refused. Only
+/// a missing file or stream passes without an entry; any other failure
+/// fails the CREATE, as the truncating open would.
 async fn reserve_existing(
     share: &Arc<ShareBindings>,
     path: &SmbPath,
+    stream: Option<&StreamName>,
     opts: OpenOptions,
     req: OpenRequest,
 ) -> Result<Probe, Refused> {
@@ -1149,14 +1360,14 @@ async fn reserve_existing(
         write_attributes: false,
         ..probe
     };
-    let mut opened = share.backend.open(path, read_only).await;
-    if matches!(opened, Err(ref e) if !is_missing(e)) && probe.write {
-        opened = share.backend.open(path, probe).await;
+    let mut opened = backend_open(share, path, stream, read_only).await.1;
+    if matches!(opened, Err(ref e) if !e.is_missing()) && probe.write {
+        opened = backend_open(share, path, stream, probe).await.1;
     }
     let handle = match opened {
         Ok((handle, _)) => handle,
-        Err(e) if is_missing(&e) => return Ok(Probe::Missing(e)),
-        Err(e) => return Err(e.to_nt_status().into()),
+        Err(e) if e.is_missing() => return Ok(Probe::Missing(e)),
+        Err(e) => return Err(e.status().into()),
     };
     let result = match handle.stat().await {
         Ok(info) if opts.delete_on_close && info.read_only => {
@@ -1454,5 +1665,77 @@ mod tests {
         go.add_permits(1);
         assert_eq!(truncating.await.unwrap(), ntstatus::STATUS_SUCCESS);
         assert_eq!(probe.stat().await.unwrap().end_of_file, 0);
+    }
+    /// A memory backend that claims named streams and opens none.
+    struct NoStreams(MemFsBackend);
+
+    #[async_trait]
+    impl ShareBackend for NoStreams {
+        async fn open(
+            &self,
+            path: &SmbPath,
+            opts: OpenOptions,
+        ) -> SmbResult<(Box<dyn Handle>, OpenAction)> {
+            self.0.open(path, opts).await
+        }
+
+        async fn unlink(&self, path: &SmbPath) -> SmbResult<()> {
+            self.0.unlink(path).await
+        }
+
+        async fn rename(&self, from: &SmbPath, to: &SmbPath, replace: bool) -> SmbResult<()> {
+            self.0.rename(from, to, replace).await
+        }
+
+        fn capabilities(&self) -> BackendCapabilities {
+            self.0.capabilities()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_file_made_for_a_failed_stream_stays_while_it_is_open() {
+        let share = crate::server::ShareBindings::new(
+            "s".to_string(),
+            Arc::new(NoStreams(MemFsBackend::new())),
+            crate::server::ShareMode::Public,
+            std::collections::HashMap::new(),
+            false,
+            true,
+            true,
+        );
+        let path: SmbPath = "new".parse().unwrap();
+        let stream: StreamName = "s".parse().unwrap();
+        let opts = OpenOptions {
+            intent: OpenIntent::OpenOrCreate,
+            ..OpenOptions::default()
+        };
+        let exists = || async {
+            share
+                .backend
+                .open(&path, OpenOptions::default())
+                .await
+                .is_ok()
+        };
+
+        let (created, opened) = backend_open(&share, &path, Some(&stream), opts).await;
+        assert!(!created);
+        assert_eq!(
+            opened.err().map(|e| e.status()),
+            Some(ntstatus::STATUS_ACCESS_DENIED)
+        );
+        assert!(!exists().await, "taken back");
+
+        // Another CREATE has the new file open by the time the stream fails.
+        let sharing = Sharing {
+            access: FILE_READ_DATA,
+            share: 0x7,
+        };
+        let other = FileRef::register(&share, &FileInfo::new("new"), &path, sharing.into())
+            .unwrap()
+            .0;
+        let (created, opened) = backend_open(&share, &path, Some(&stream), opts).await;
+        assert!(!created && opened.is_err());
+        assert!(exists().await, "left to the other open");
+        drop(other);
     }
 }

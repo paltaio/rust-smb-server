@@ -7,11 +7,14 @@ use crate::backend::{
 };
 use crate::error::{SmbError, SmbResult};
 use crate::path::SmbPath;
+use crate::stream::{StreamInfo, StreamName};
 use async_trait::async_trait;
 use bytes::Bytes;
 
 /// In-memory backend for unit tests. Files and directories are keyed by
-/// backslash-joined path. Clones share the same files.
+/// backslash-joined path. Clones share the same files. Files and
+/// directories have named streams, unless made with
+/// [`MemFsBackend::without_streams`].
 #[derive(Clone)]
 pub struct MemFsBackend {
     inner: std::sync::Arc<Mutex<MemInner>>,
@@ -27,8 +30,89 @@ struct MemInner {
     times: HashMap<String, [u64; 4]>,
     /// Entries marked read-only.
     read_only: std::collections::HashSet<String>,
+    /// The id of each entry that has had named streams; a rename moves it
+    /// with the entry.
+    ids: HashMap<String, u64>,
+    next_id: u64,
+    /// Named streams of each entry by id, in creation order, with the name
+    /// each was created under.
+    streams: HashMap<u64, Vec<(String, Vec<u8>)>>,
+    /// The backend reports no named streams.
+    no_streams: bool,
     /// Handles opened and not yet closed.
     open_handles: usize,
+}
+
+impl MemInner {
+    /// The id of the entry `key`, given one if it has none.
+    fn id_of(&mut self, key: &str) -> u64 {
+        if let Some(&id) = self.ids.get(key) {
+            return id;
+        }
+        self.next_id += 1;
+        self.ids.insert(key.to_string(), self.next_id);
+        self.next_id
+    }
+
+    /// The name of the entry with the id `id`.
+    fn path_of(&self, id: u64) -> Option<String> {
+        self.ids
+            .iter()
+            .find(|&(_, &i)| i == id)
+            .map(|(key, _)| key.clone())
+    }
+
+    /// Where the stream `name` of the entry `id` is in its list.
+    fn stream_at(&self, id: u64, name: &str) -> Option<usize> {
+        let name = name.to_lowercase();
+        self.streams
+            .get(&id)?
+            .iter()
+            .position(|(n, _)| n.to_lowercase() == name)
+    }
+
+    /// The data of the stream `name` of the entry `id`.
+    fn stream_mut(&mut self, id: u64, name: &str) -> SmbResult<&mut Vec<u8>> {
+        let at = self.stream_at(id, name).ok_or(SmbError::NotFound)?;
+        Ok(&mut self.streams.get_mut(&id).expect("listed")[at].1)
+    }
+
+    /// The streams of the entry `key`.
+    fn streams_of(&self, key: &str) -> &[(String, Vec<u8>)] {
+        self.ids
+            .get(key)
+            .and_then(|id| self.streams.get(id))
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
+    /// Drops the entry `key`'s id and streams.
+    fn forget(&mut self, key: &str) {
+        if let Some(id) = self.ids.remove(key) {
+            self.streams.remove(&id);
+        }
+    }
+
+    /// Moves the ids of `from`, and of the entries below it, to `to`.
+    fn move_ids(&mut self, from: &str, to: &str) {
+        let below = format!("{from}\\");
+        let moved: Vec<(String, String)> = self
+            .ids
+            .keys()
+            .filter_map(|key| {
+                if key == from {
+                    Some((key.clone(), to.to_string()))
+                } else {
+                    key.strip_prefix(&below)
+                        .map(|rest| (key.clone(), format!("{to}\\{rest}")))
+                }
+            })
+            .collect();
+        for (old, new) in moved {
+            let id = self.ids.remove(&old).expect("listed");
+            self.ids.insert(new, id);
+        }
+    }
 }
 
 impl Default for MemFsBackend {
@@ -57,6 +141,23 @@ impl MemFsBackend {
             g.files.insert(path.to_string(), contents.to_vec());
         }
         self
+    }
+
+    /// A backend that reports no named streams.
+    pub fn without_streams(self) -> Self {
+        self.inner.lock().unwrap().no_streams = true;
+        self
+    }
+
+    /// The names of the named streams of `path`, in creation order.
+    pub fn stream_names(&self, path: &str) -> Vec<String> {
+        let g = self.inner.lock().unwrap();
+        g.streams_of(path).iter().map(|(n, _)| n.clone()).collect()
+    }
+
+    /// The contents of the file `path`.
+    pub fn contents(&self, path: &str) -> Option<Vec<u8>> {
+        self.inner.lock().unwrap().files.get(path).cloned()
     }
 }
 
@@ -100,7 +201,20 @@ impl ShareBackend for MemFsBackend {
         }
 
         if exists_dir {
-            return Err(SmbError::IsDirectory);
+            if opts.non_directory {
+                return Err(SmbError::IsDirectory);
+            }
+            return match opts.intent {
+                OpenIntent::Open | OpenIntent::OpenOrCreate => {
+                    g.open_handles += 1;
+                    Ok((
+                        Box::new(MemHandle::dir(self.inner.clone(), k)),
+                        OpenAction::Opened,
+                    ))
+                }
+                OpenIntent::Create => Err(SmbError::Exists),
+                _ => Err(SmbError::IsDirectory),
+            };
         }
         let action = match opts.intent {
             OpenIntent::Open => {
@@ -147,10 +261,8 @@ impl ShareBackend for MemFsBackend {
     async fn unlink(&self, path: &SmbPath) -> SmbResult<()> {
         let k = key(path);
         let mut g = self.inner.lock().unwrap();
-        if g.files.remove(&k).is_some() {
-            return Ok(());
-        }
-        if g.dirs.remove(&k).is_some() {
+        if g.files.remove(&k).is_some() || g.dirs.remove(&k).is_some() {
+            g.forget(&k);
             return Ok(());
         }
         Err(SmbError::NotFound)
@@ -169,6 +281,10 @@ impl ShareBackend for MemFsBackend {
             }
         }
         if let Some(data) = g.files.remove(&kf) {
+            if kf != kt {
+                g.forget(&kt);
+            }
+            g.move_ids(&kf, &kt);
             g.files.insert(kt, data);
             return Ok(());
         }
@@ -189,6 +305,7 @@ impl ShareBackend for MemFsBackend {
                 g.dirs.remove(&old);
                 g.dirs.insert(new, ());
             }
+            g.move_ids(&kf, &kt);
             g.dirs.insert(kt, ());
             return Ok(());
         }
@@ -199,7 +316,60 @@ impl ShareBackend for MemFsBackend {
         BackendCapabilities {
             is_read_only: false,
             case_sensitive: false,
+            named_streams: !self.inner.lock().unwrap().no_streams,
         }
+    }
+
+    async fn open_stream(
+        &self,
+        file: Box<dyn Handle>,
+        path: &SmbPath,
+        stream: &StreamName,
+        opts: OpenOptions,
+    ) -> SmbResult<(Box<dyn Handle>, OpenAction)> {
+        // Stream handles find their file by id, so they need no handle of
+        // it.
+        file.close().await?;
+        let k = key(path);
+        let mut g = self.inner.lock().unwrap();
+        if !g.files.contains_key(&k) && !g.dirs.contains_key(&k) {
+            return Err(SmbError::NotFound);
+        }
+        let id = g.id_of(&k);
+        let at = g.stream_at(id, stream.as_str());
+        let list = g.streams.entry(id).or_default();
+        let (name, action) = match (opts.intent, at) {
+            (OpenIntent::Open | OpenIntent::Truncate, None) => return Err(SmbError::NotFound),
+            (OpenIntent::Create, Some(_)) => return Err(SmbError::Exists),
+            (OpenIntent::Open | OpenIntent::OpenOrCreate, Some(at)) => {
+                (list[at].0.clone(), OpenAction::Opened)
+            }
+            (_, Some(at)) => {
+                list[at].1.clear();
+                (list[at].0.clone(), OpenAction::Overwritten)
+            }
+            (_, None) => {
+                list.push((stream.as_str().to_string(), Vec::new()));
+                (stream.as_str().to_string(), OpenAction::Created)
+            }
+        };
+        let is_dir = g.dirs.contains_key(&k);
+        g.open_handles += 1;
+        let handle = MemHandle {
+            inner: self.inner.clone(),
+            key: k,
+            is_dir,
+            stream: Some((id, name)),
+        };
+        Ok((Box::new(handle), action))
+    }
+
+    async fn remove_stream(&self, path: &SmbPath, stream: &StreamName) -> SmbResult<()> {
+        let mut g = self.inner.lock().unwrap();
+        let id = *g.ids.get(&key(path)).ok_or(SmbError::NotFound)?;
+        let at = g.stream_at(id, stream.as_str()).ok_or(SmbError::NotFound)?;
+        g.streams.get_mut(&id).expect("listed").remove(at);
+        Ok(())
     }
 }
 
@@ -207,6 +377,9 @@ pub struct MemHandle {
     inner: std::sync::Arc<Mutex<MemInner>>,
     key: String,
     is_dir: bool,
+    /// The id of the file and the name of the named stream the handle is
+    /// on. Its file is found by id, so the handle follows renames.
+    stream: Option<(u64, String)>,
 }
 
 impl MemHandle {
@@ -215,6 +388,7 @@ impl MemHandle {
             inner,
             key,
             is_dir: false,
+            stream: None,
         }
     }
 
@@ -223,6 +397,24 @@ impl MemHandle {
             inner,
             key,
             is_dir: true,
+            stream: None,
+        }
+    }
+
+    /// The data the handle reads and writes: its stream's, or the file's.
+    fn data<'a>(&self, g: &'a mut MemInner) -> SmbResult<&'a mut Vec<u8>> {
+        match &self.stream {
+            Some((id, stream)) => g.stream_mut(*id, stream),
+            None if self.is_dir => Err(SmbError::IsDirectory),
+            None => g.files.get_mut(&self.key).ok_or(SmbError::NotFound),
+        }
+    }
+
+    /// The name of the file the handle is on.
+    fn path(&self, g: &MemInner) -> SmbResult<String> {
+        match &self.stream {
+            Some((id, _)) => g.path_of(*id).ok_or(SmbError::NotFound),
+            None => Ok(self.key.clone()),
         }
     }
 }
@@ -230,11 +422,8 @@ impl MemHandle {
 #[async_trait]
 impl Handle for MemHandle {
     async fn read(&self, offset: u64, len: u32) -> SmbResult<Bytes> {
-        if self.is_dir {
-            return Err(SmbError::IsDirectory);
-        }
-        let g = self.inner.lock().unwrap();
-        let data = g.files.get(&self.key).ok_or(SmbError::NotFound)?;
+        let mut g = self.inner.lock().unwrap();
+        let data = self.data(&mut g)?;
         let start = offset as usize;
         if start >= data.len() {
             return Ok(Bytes::new());
@@ -244,11 +433,8 @@ impl Handle for MemHandle {
     }
 
     async fn write(&self, offset: u64, data: &[u8]) -> SmbResult<u32> {
-        if self.is_dir {
-            return Err(SmbError::IsDirectory);
-        }
         let mut g = self.inner.lock().unwrap();
-        let buf = g.files.get_mut(&self.key).ok_or(SmbError::NotFound)?;
+        let buf = self.data(&mut g)?;
         let needed = (offset as usize) + data.len();
         if buf.len() < needed {
             buf.resize(needed, 0);
@@ -262,17 +448,17 @@ impl Handle for MemHandle {
     }
 
     async fn stat(&self) -> SmbResult<FileInfo> {
-        let g = self.inner.lock().unwrap();
-        let size = if self.is_dir {
+        let mut g = self.inner.lock().unwrap();
+        let size = if self.is_dir && self.stream.is_none() {
             0
         } else {
-            g.files.get(&self.key).ok_or(SmbError::NotFound)?.len() as u64
+            self.data(&mut g)?.len() as u64
         };
-        let name = self
-            .key
+        let key = self.path(&g)?;
+        let name = key
             .rsplit_once('\\')
             .map(|(_, n)| n.to_string())
-            .unwrap_or_else(|| self.key.clone());
+            .unwrap_or_else(|| key.clone());
         let [
             creation_time,
             last_access_time,
@@ -280,7 +466,7 @@ impl Handle for MemHandle {
             change_time,
         ] = g
             .times
-            .get(&self.key)
+            .get(&key)
             .copied()
             .unwrap_or([0x01D9_0000_0000_0000; 4]);
         Ok(FileInfo {
@@ -292,17 +478,15 @@ impl Handle for MemHandle {
             last_write_time,
             change_time,
             is_directory: self.is_dir,
-            read_only: g.read_only.contains(&self.key),
+            read_only: g.read_only.contains(&key),
             file_index: 0,
         })
     }
 
     async fn set_times(&self, times: FileTimes) -> SmbResult<()> {
         let mut g = self.inner.lock().unwrap();
-        let stored = g
-            .times
-            .entry(self.key.clone())
-            .or_insert([0x01D9_0000_0000_0000; 4]);
+        let key = self.path(&g)?;
+        let stored = g.times.entry(key).or_insert([0x01D9_0000_0000_0000; 4]);
         let wanted = [
             times.creation_time,
             times.last_access_time,
@@ -325,26 +509,24 @@ impl Handle for MemHandle {
             return Err(SmbError::NotSupported);
         }
         let mut g = self.inner.lock().unwrap();
+        let key = self.path(&g)?;
         if attributes & READONLY != 0 {
-            g.read_only.insert(self.key.clone());
+            g.read_only.insert(key);
         } else {
-            g.read_only.remove(&self.key);
+            g.read_only.remove(&key);
         }
         Ok(())
     }
 
     async fn truncate(&self, len: u64) -> SmbResult<()> {
-        if self.is_dir {
-            return Err(SmbError::IsDirectory);
-        }
         let mut g = self.inner.lock().unwrap();
-        let buf = g.files.get_mut(&self.key).ok_or(SmbError::NotFound)?;
+        let buf = self.data(&mut g)?;
         buf.resize(len as usize, 0);
         Ok(())
     }
 
     async fn list_dir(&self, _pattern: Option<&str>) -> SmbResult<Vec<DirEntry>> {
-        if !self.is_dir {
+        if !self.is_dir || self.stream.is_some() {
             return Err(SmbError::NotADirectory);
         }
         let g = self.inner.lock().unwrap();
@@ -401,5 +583,16 @@ impl Handle for MemHandle {
     async fn close(self: Box<Self>) -> SmbResult<()> {
         self.inner.lock().unwrap().open_handles -= 1;
         Ok(())
+    }
+
+    async fn streams(&self) -> SmbResult<Vec<StreamInfo>> {
+        let g = self.inner.lock().unwrap();
+        g.streams_of(&self.path(&g)?)
+            .iter()
+            .map(|(name, data)| {
+                let size = data.len() as u64;
+                Ok(StreamInfo::new(name.parse()?, size, size))
+            })
+            .collect()
     }
 }

@@ -28,7 +28,7 @@ use crate::proto::messages::change_notify::{
     FILE_NOTIFY_CHANGE_LAST_WRITE,
 };
 use crate::server::{ServerState, ShareBindings};
-use crate::stream::{StreamPart, parse_create_name};
+use crate::stream::{StreamPart, parse_create_name, unsupported};
 use crate::utils::utf16le_to_units;
 use tokio::sync::RwLock;
 use tracing::warn;
@@ -87,8 +87,11 @@ async fn set(
         Some(t) => t,
         None => return Ok(HandlerResponse::err(ntstatus::STATUS_INVALID_INFO_CLASS)),
     };
+    // A link of a named stream fails with STATUS_INVALID_PARAMETER (MS-FSA
+    // 2.1.5.15.7), as does everything else not served on one.
+    let unsupported = unsupported(open_arc.read().await.stream.is_some());
     if !matches!(info_type, InfoType::File) {
-        return Ok(HandlerResponse::err(ntstatus::STATUS_NOT_SUPPORTED));
+        return Ok(HandlerResponse::err(unsupported));
     }
 
     // MS-SMB2 3.3.5.21.1: access each class needs from Open.GrantedAccess.
@@ -101,7 +104,7 @@ async fn set(
         ic::FILE_END_OF_FILE_INFORMATION => (Class::EndOfFile, FILE_WRITE_DATA),
         ic::FILE_ALLOCATION_INFORMATION => (Class::Allocation, FILE_WRITE_DATA),
         class if SETTABLE_CLASSES.contains(&class) => {
-            return Ok(HandlerResponse::err(ntstatus::STATUS_NOT_SUPPORTED));
+            return Ok(HandlerResponse::err(unsupported));
         }
         _ => return Ok(HandlerResponse::err(ntstatus::STATUS_INVALID_INFO_CLASS)),
     };
@@ -204,6 +207,11 @@ async fn set(
                 Ok((p, StreamPart::None)) => p,
                 _ => return Ok(HandlerResponse::err(ntstatus::STATUS_OBJECT_NAME_INVALID)),
             };
+            // A named stream is renamed only to another stream name of its
+            // file.
+            if open_arc.read().await.stream.is_some() {
+                return Ok(HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER));
+            }
             let rename = Rename {
                 file_id: req.file_id,
                 to: new_path,
@@ -243,9 +251,10 @@ async fn report_modified(share: &ShareBindings, open_arc: &RwLock<Open>, filter:
 }
 
 /// Reports a size change through `open_arc` when `resized`, once; Windows
-/// reports a truncation twice.
+/// reports a truncation twice. The size of a named stream is not the
+/// file's.
 async fn report_resized(share: &ShareBindings, open_arc: &RwLock<Open>, resized: bool) {
-    if resized {
+    if resized && open_arc.read().await.stream.is_none() {
         report_modified(share, open_arc, CONTENT_CHANGED).await;
     }
 }
@@ -569,14 +578,18 @@ fn rename_changes(
 /// before and after shows it: the attributes and each time but the change
 /// time (MS-FSA 2.1.5.15.2).
 async fn set_basic_info(open: &mut Open, times: [i64; 4], attributes: u32) -> Result<u32, u32> {
-    if times.iter().any(|&t| t < -2)
-        || (attributes & FILE_ATTRIBUTE_DIRECTORY != 0 && !open.is_directory)
-        || (attributes & FILE_ATTRIBUTE_TEMPORARY != 0 && open.is_directory)
-    {
+    if times.iter().any(|&t| t < -2) {
         return Err(ntstatus::STATUS_INVALID_PARAMETER);
     }
     let handle = open.handle.as_ref().ok_or(ntstatus::STATUS_FILE_CLOSED)?;
     let current = handle.stat().await.map_err(|e| e.to_nt_status())?;
+    // The attributes are the file's, also through an open of a named
+    // stream of a directory.
+    if (attributes & FILE_ATTRIBUTE_DIRECTORY != 0 && !current.is_directory)
+        || (attributes & FILE_ATTRIBUTE_TEMPORARY != 0 && current.is_directory)
+    {
+        return Err(ntstatus::STATUS_INVALID_PARAMETER);
+    }
 
     let mut passed = false;
     let wanted_attributes = attributes & VALID_SET_ATTRIBUTES;
@@ -861,6 +874,7 @@ mod tests {
                 handle: Some(handle),
                 granted_access: DELETE,
                 is_directory: directory,
+                stream: None,
                 delete_on_close: false,
                 search_state: None,
                 fixed_times: FileTimes::default(),
