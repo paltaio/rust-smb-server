@@ -172,8 +172,9 @@ async fn sleep_until_due(due: Option<tokio::time::Instant>) {
 struct Echo {
     /// Changes the server reported, each hiding one backend report:
     /// additions, removals and renames, and as MODIFIED the close of a file
-    /// that could be written and was not.
-    reported: VecDeque<(Instant, u32, String)>,
+    /// that could be written and was not. The flag is set when a backend
+    /// report takes the change.
+    reported: VecDeque<(Instant, u32, String, Arc<AtomicBool>)>,
     /// Entries the server changed, hiding modifications.
     touched: VecDeque<(Instant, String)>,
 }
@@ -189,13 +190,18 @@ impl Echo {
         }
     }
 
-    fn report(&mut self, action: u32, name: String) {
+    /// Records the server's report of `action` on `name`. The flag
+    /// returned is set when a backend report takes it.
+    fn report(&mut self, action: u32, name: String) -> Arc<AtomicBool> {
         let now = Instant::now();
         self.prune(now);
         if self.reported.len() == ECHO_LIMIT {
             self.reported.pop_front();
         }
-        self.reported.push_back((now, action, name));
+        let taken = Arc::new(AtomicBool::new(false));
+        self.reported
+            .push_back((now, action, name, Arc::clone(&taken)));
+        taken
     }
 
     fn closed(&mut self, name: String) {
@@ -215,8 +221,28 @@ impl Echo {
         let found = self
             .reported
             .iter()
-            .position(|(_, a, n)| *a == action && n == name);
-        found.map(|at| self.reported.remove(at)).is_some()
+            .position(|(_, a, n, _)| *a == action && n == name);
+        let Some((.., taken)) = found.and_then(|at| self.reported.remove(at)) else {
+            return false;
+        };
+        taken.store(true, Ordering::Release);
+        true
+    }
+
+    /// Takes back the report `taken` was returned for. True if a backend
+    /// report took it first.
+    fn withdraw(&mut self, taken: &Arc<AtomicBool>) -> bool {
+        match self
+            .reported
+            .iter()
+            .position(|(.., t)| Arc::ptr_eq(t, taken))
+        {
+            Some(at) => {
+                self.reported.remove(at);
+                false
+            }
+            None => taken.load(Ordering::Acquire),
+        }
     }
 
     /// Takes the server's report of any of `actions` on `name`, the first
@@ -350,7 +376,9 @@ impl Host {
 /// directories they happen in before the backend can report them. Dropped
 /// without [`Expected::report`], as when the change failed, the notes are
 /// taken back; a note a backend report already took stood for a change
-/// someone else made, which is then reported as theirs.
+/// someone else made, which is then reported as theirs. A note no backend
+/// report took, because it expired or was pushed out first, is dropped
+/// without a report.
 pub(crate) struct Expected {
     marks: Vec<Mark>,
 }
@@ -361,8 +389,9 @@ struct Mark {
     /// Index of the change among those expected; `None` for the rename of
     /// the watched directory itself.
     change: Option<usize>,
-    /// The action noted to hide one backend report, if any.
-    action: Option<u32>,
+    /// The action noted to hide one backend report, if any, with the flag
+    /// set when a backend report takes it.
+    noted: Option<(u32, Arc<AtomicBool>)>,
     /// The entry's name as the table compares names.
     key: String,
     /// The entry's name as spelled, and the change's filter.
@@ -389,8 +418,9 @@ impl Drop for Expected {
             let taken = {
                 let mut echo = lock(&mark.host.echo);
                 echo.untouch(&mark.key);
-                mark.action
-                    .is_some_and(|action| !echo.take(action, &mark.key))
+                mark.noted
+                    .as_ref()
+                    .is_some_and(|(_, taken)| echo.withdraw(taken))
             };
             let Some(share) = mark.host.share.upgrade() else {
                 continue;
@@ -398,7 +428,7 @@ impl Drop for Expected {
             if taken {
                 let _order = lock(&mark.host.waiting);
                 let heard = [(
-                    mark.action.unwrap_or_default(),
+                    mark.noted.as_ref().map_or(0, |(action, _)| *action),
                     mark.name.as_str(),
                     mark.filter,
                 )];
@@ -738,12 +768,12 @@ impl WatchTable {
         let dirs = lock(&self.dirs);
         for (at, change) in changes.iter().enumerate() {
             if let Some((host, key)) = self.host_of(&dirs, change.path) {
-                let action = self.note(&host, change, &key);
+                let noted = self.note(&host, change, &key);
                 let name = change.path.file_name().unwrap_or_default().to_string();
                 marks.push(Mark {
                     host,
                     change: Some(at),
-                    action,
+                    noted,
                     key,
                     name,
                     filter: change.filter,
@@ -757,11 +787,11 @@ impl WatchTable {
                 .filter(|host| !host.idle.load(Ordering::Acquire))
         });
         if let Some(host) = renamed {
-            lock(&host.echo).report(RENAMED_SELF, String::new());
+            let taken = lock(&host.echo).report(RENAMED_SELF, String::new());
             marks.push(Mark {
                 host,
                 change: None,
-                action: Some(RENAMED_SELF),
+                noted: Some((RENAMED_SELF, taken)),
                 key: String::new(),
                 name: String::new(),
                 filter: 0,
@@ -788,8 +818,9 @@ impl WatchTable {
     }
 
     /// Notes `change` to the entry `name` in `host`'s echo. Returns the
-    /// action noted to hide one backend report, if any.
-    fn note(&self, host: &Host, change: &Change<'_>, name: &str) -> Option<u32> {
+    /// action noted to hide one backend report, if any, with the flag set
+    /// when a backend report takes it.
+    fn note(&self, host: &Host, change: &Change<'_>, name: &str) -> Option<(u32, Arc<AtomicBool>)> {
         let named = matches!(
             change.action,
             FILE_ACTION_ADDED
@@ -800,8 +831,8 @@ impl WatchTable {
         let mut echo = lock(&host.echo);
         echo.touch(name.to_string());
         if named && change.seen {
-            echo.report(change.action, name.to_string());
-            return Some(change.action);
+            let taken = echo.report(change.action, name.to_string());
+            return Some((change.action, taken));
         }
         None
     }
@@ -1865,6 +1896,74 @@ mod tests {
         );
         assert!(reg.gone() && names_reg.gone());
         assert!(share.watches.is_empty());
+    }
+
+    /// A share with a watch of `d` for names, whose directory hears the
+    /// backend, and the server's expected addition of `d\x`.
+    fn expecting_x() -> (Arc<ShareBindings>, WatchReg, Arc<Host>, Expected) {
+        let budget: Arc<NotifyBudget> = Arc::default();
+        let share = ShareBindings::new(
+            "s".to_string(),
+            Arc::new(MemFsBackend::new()),
+            ShareMode::Public,
+            HashMap::new(),
+            false,
+            true,
+            true,
+        );
+        let reg = WatchReg::arm(&share, p("d"), NAMES, false, 4096, &budget).unwrap();
+        let host = Arc::new(Host::new(p("d"), &share));
+        lock(&share.watches.dirs)
+            .get_mut(&dir_key(p("d").components(), false))
+            .unwrap()
+            .host = Some(Arc::clone(&host));
+        let expected = share.watches.expect(
+            &[Change {
+                path: &p("d\\x"),
+                action: FILE_ACTION_ADDED,
+                filter: FILE_NOTIFY_CHANGE_FILE_NAME,
+                seen: true,
+            }],
+            None,
+        );
+        (share, reg, host, expected)
+    }
+
+    #[test]
+    fn a_failed_change_whose_note_expired_reports_nothing() {
+        let (_share, reg, host, expected) = expecting_x();
+        let mut echo = lock(&host.echo);
+        let past = Instant::now().checked_sub(ECHO_TIME).unwrap();
+        echo.reported.iter_mut().for_each(|(at, ..)| *at = past);
+        echo.prune(Instant::now());
+        assert!(echo.reported.is_empty());
+        drop(echo);
+        drop(expected);
+        assert_eq!(names(reg.watch()), None);
+    }
+
+    #[test]
+    fn a_failed_change_whose_note_a_backend_report_took_is_reported_once() {
+        let (share, reg, host, expected) = expecting_x();
+        let take = |changes| share.watches.take_host_changes(&share, &host, changes);
+        take(vec![DirChange::new("x", DirChangeKind::Added, false)]);
+        assert_eq!(names(reg.watch()), None);
+        drop(expected);
+        assert_eq!(names(reg.watch()).unwrap(), ["x"]);
+        assert_eq!(names(reg.watch()), None);
+    }
+
+    #[test]
+    fn a_failed_change_whose_note_was_pushed_out_reports_nothing() {
+        let (_share, reg, host, expected) = expecting_x();
+        let mut echo = lock(&host.echo);
+        for i in 0..ECHO_LIMIT {
+            echo.report(FILE_ACTION_ADDED, format!("y{i}"));
+        }
+        assert!(!echo.reported.iter().any(|(_, _, name, _)| name == "x"));
+        drop(echo);
+        drop(expected);
+        assert_eq!(names(reg.watch()), None);
     }
 
     #[test]
