@@ -17,7 +17,9 @@ use crate::backend::{FileInfo, Handle};
 use crate::conn::state::Open;
 use crate::handlers::shared::restore_fixed_times;
 use crate::ntstatus;
-use crate::proto::messages::change_notify::FILE_ACTION_MODIFIED;
+use crate::proto::messages::change_notify::{
+    FILE_ACTION_MODIFIED, FILE_ACTION_MODIFIED_STREAM, FILE_NOTIFY_CHANGE_LAST_WRITE,
+};
 
 pub(crate) use durable::{Claim, Durability, DurableReg, DurableTable, Unclaimed, v2_timeout};
 pub use durable::{DEFAULT_DURABLE_HANDLE_TIMEOUT, DEFAULT_MAX_DISCONNECTED_OPENS};
@@ -28,7 +30,9 @@ pub(crate) use leases::{AfterSend, BreakWait, LeaseRef, LeaseTable, MAX_BREAK_WA
 pub(crate) use table::{FileRef, FileTable, OpenRequest, Refused, Sharing};
 #[cfg(test)]
 pub(crate) use watch::MAX_WATCHES_PER_CONNECTION;
-pub(crate) use watch::{Answer, CONTENT_CHANGED, Change, NotifyBudget, WatchReg, WatchTable};
+pub(crate) use watch::{
+    Answer, CONTENT_CHANGED, Change, NotifyBudget, STREAM_CHANGED, WatchReg, WatchTable,
+};
 
 /// Default for
 /// [`SmbServerBuilder::max_opens_per_connection`](crate::SmbServerBuilder::max_opens_per_connection)
@@ -53,6 +57,12 @@ pub(crate) enum Closing {
     RestoresTimes,
     /// A WRITE through the open changed the file.
     Wrote,
+    /// A WRITE through the open changed the named stream it is on, or the
+    /// open moved the file's data into it (`moved`).
+    StreamWrote { moved: bool },
+    /// The named stream the open is on was overwritten or resized through
+    /// it, and not written.
+    StreamResized,
 }
 
 impl Closing {
@@ -62,11 +72,18 @@ impl Closing {
     /// whenever they arrive.
     pub(crate) fn announce(open: &Open, restores_times: bool) -> Self {
         let fixed = open.fixed_times;
-        // Changes to a named stream are not reported as changes of the
-        // file.
+        let wrote = open.wrote.load(Ordering::Acquire);
         let closing = if open.on_stream {
-            Self::ReadOnly
-        } else if open.wrote.load(Ordering::Acquire) {
+            if wrote || open.moved_data {
+                Self::StreamWrote {
+                    moved: open.moved_data,
+                }
+            } else if open.resized.load(Ordering::Acquire) {
+                Self::StreamResized
+            } else {
+                Self::ReadOnly
+            }
+        } else if wrote {
             Self::Wrote
         } else if restores_times
             && (fixed.last_access_time.is_some() || fixed.last_write_time.is_some())
@@ -84,7 +101,10 @@ impl Closing {
             match closing {
                 Self::ReadOnly => {}
                 Self::Unwritten => watches.closed(&file.path()),
-                Self::RestoresTimes | Self::Wrote => watches.touch(&file.path()),
+                Self::RestoresTimes
+                | Self::Wrote
+                | Self::StreamWrote { .. }
+                | Self::StreamResized => watches.touch(&file.path()),
             }
         }
         closing
@@ -149,7 +169,8 @@ pub(crate) async fn close_open(open_arc: &Arc<RwLock<Open>>, want_attrs: bool) -
 /// delete-pending, unless it is a directory with entries (MS-FSA 2.1.5.5
 /// phase 1), and is removed when this was its last open. An open that
 /// wrote and leaves the file in place reports the new contents to the
-/// share's watchers, once. A directory this leaves delete-pending, open
+/// share's watchers, once, and one that changed or deleted the named
+/// stream it is on reports that. A directory this leaves delete-pending, open
 /// elsewhere, ends its watches with STATUS_DELETE_PENDING. Every path that
 /// ends an open goes through here.
 pub(crate) async fn finish_close(
@@ -159,7 +180,22 @@ pub(crate) async fn finish_close(
     is_directory: bool,
     closing: Closing,
 ) {
-    let wrote = closing == Closing::Wrote;
+    // A close reports new contents of the file, and a change of the named
+    // stream the open is on, as which a deletion on close of a stream not
+    // yet marked for deletion is reported too.
+    let file_filter = match closing {
+        Closing::Wrote | Closing::StreamWrote { moved: true } => Some(CONTENT_CHANGED),
+        Closing::StreamWrote { moved: false } => Some(FILE_NOTIFY_CHANGE_LAST_WRITE),
+        _ => None,
+    };
+    let on_stream = file.as_ref().is_some_and(|f| f.stream().is_some());
+    let deletes = delete_on_close && !file.as_ref().is_some_and(FileRef::stream_delete_pending);
+    let stream_changed = on_stream
+        && (deletes
+            || matches!(
+                closing,
+                Closing::StreamWrote { .. } | Closing::StreamResized
+            ));
     let share = file.as_ref().map(|f| Arc::clone(f.share()));
     // A directory is checked for entries and marked with no CREATE or
     // rename running, so it is still empty when it becomes delete-pending.
@@ -192,26 +228,48 @@ pub(crate) async fn finish_close(
     };
     // The name is read and reported with no rename in between, when anyone
     // on the share may hear it.
-    let names = if exclusive.is_none() && wrote && !share.watches.is_empty() {
+    let reports = file_filter.is_some() || stream_changed;
+    let names = if exclusive.is_none() && reports && !share.watches.is_empty() {
         Some(share.files.names_lock().await)
     } else {
         None
     };
+    let heard = names.is_some() || exclusive.is_some();
     let path = file.path();
+    let stream = file.stream();
+    let mut changes = Vec::new();
+    if let Some(filter) = file_filter {
+        changes.push(Change {
+            path: &path,
+            stream: None,
+            action: FILE_ACTION_MODIFIED,
+            filter,
+            seen: true,
+        });
+    }
+    if stream_changed {
+        changes.push(Change {
+            path: &path,
+            stream: stream.as_ref(),
+            action: FILE_ACTION_MODIFIED_STREAM,
+            filter: STREAM_CHANGED,
+            seen: false,
+        });
+    }
     match file.release(delete_on_close) {
         Some(pending) => {
+            // The removal of a file reports itself; that of a stream does
+            // not.
+            if heard && pending.is_stream() && !changes.is_empty() {
+                share.watches.report(&changes);
+            }
             drop(names);
             drop(exclusive);
             pending.run().await;
         }
         None => {
-            if wrote && (names.is_some() || exclusive.is_some()) {
-                share.watches.report(&[Change {
-                    path: &path,
-                    action: FILE_ACTION_MODIFIED,
-                    filter: CONTENT_CHANGED,
-                    seen: true,
-                }]);
+            if heard && !changes.is_empty() {
+                share.watches.report(&changes);
             }
             for path in &marked {
                 share.watches.end_at(path, ntstatus::STATUS_DELETE_PENDING);
@@ -327,6 +385,8 @@ mod tests {
             wrote: Default::default(),
             created: false,
             marked_deleted: Default::default(),
+            resized: Default::default(),
+            moved_data: false,
         });
         let in_table = || {
             share.files.path_is_open(&path, false) || share.files.delete_pending_at(&path, false)

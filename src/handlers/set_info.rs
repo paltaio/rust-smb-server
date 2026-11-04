@@ -17,7 +17,7 @@ use crate::conn::pending::{Stop, stopped};
 use crate::conn::state::{Connection, Open};
 use crate::dispatch::HandlerResponse;
 use crate::error::{SmbError, SmbResult};
-use crate::files::{BreakWait, CONTENT_CHANGED, Change, MAX_BREAK_WAIT, Trigger};
+use crate::files::{BreakWait, CONTENT_CHANGED, Change, MAX_BREAK_WAIT, STREAM_CHANGED, Trigger};
 use crate::handlers::shared::{lookup_open, lookup_session_tree, restore_fixed_times};
 use crate::handlers::{Outcome, Pending};
 use crate::info_class as ic;
@@ -25,10 +25,10 @@ use crate::ntstatus;
 use crate::path::{SmbPath, same_path};
 use crate::proto::messages::FileId;
 use crate::proto::messages::change_notify::{
-    FILE_ACTION_ADDED, FILE_ACTION_MODIFIED, FILE_ACTION_REMOVED, FILE_ACTION_RENAMED_NEW_NAME,
-    FILE_ACTION_RENAMED_OLD_NAME, FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_CREATION,
-    FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_ACCESS,
-    FILE_NOTIFY_CHANGE_LAST_WRITE,
+    FILE_ACTION_ADDED, FILE_ACTION_MODIFIED, FILE_ACTION_MODIFIED_STREAM, FILE_ACTION_REMOVED,
+    FILE_ACTION_RENAMED_NEW_NAME, FILE_ACTION_RENAMED_OLD_NAME, FILE_NOTIFY_CHANGE_ATTRIBUTES,
+    FILE_NOTIFY_CHANGE_CREATION, FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME,
+    FILE_NOTIFY_CHANGE_LAST_ACCESS, FILE_NOTIFY_CHANGE_LAST_WRITE,
 };
 use crate::server::{ServerState, ShareBindings};
 use crate::stream::{
@@ -179,9 +179,17 @@ async fn set(
                 None
             };
             let open = open_arc.read().await;
+            let marks_stream = delete && open.on_stream && !open.delete_pending();
             let result = set_disposition(&open, delete).await;
             if result.is_ok() && names.is_some() {
                 end_watches_of_deleted(&share, &open);
+            }
+            drop(open);
+            drop(names);
+            // The deletion of a named stream is reported once, as a change
+            // of the stream, when it is marked.
+            if result.is_ok() && marks_stream {
+                report_stream(&share, &open_arc, None).await;
             }
             result
         }
@@ -254,6 +262,7 @@ async fn report_modified(share: &ShareBindings, open_arc: &RwLock<Open>, filter:
     if let Some(path) = path {
         share.watches.report(&[Change {
             path: &path,
+            stream: None,
             action: FILE_ACTION_MODIFIED,
             filter,
             seen: true,
@@ -262,12 +271,56 @@ async fn report_modified(share: &ShareBindings, open_arc: &RwLock<Open>, filter:
 }
 
 /// Reports a size change through `open_arc` when `resized`, once; Windows
-/// reports a truncation twice. The size of a named stream is not the
-/// file's.
+/// reports a truncation twice. A named stream resized reports a change of
+/// the stream, and of the file's last write time, and again as the open
+/// closes.
 async fn report_resized(share: &ShareBindings, open_arc: &RwLock<Open>, resized: bool) {
-    if resized && !open_arc.read().await.on_stream {
+    if !resized {
+        return;
+    }
+    if open_arc.read().await.on_stream {
+        report_stream(share, open_arc, Some(FILE_NOTIFY_CHANGE_LAST_WRITE)).await;
+    } else {
         report_modified(share, open_arc, CONTENT_CHANGED).await;
     }
+}
+
+/// Reports a change of the named stream `open_arc` is on as
+/// MODIFIED_STREAM, after a change of the file that matches `file_filter`
+/// as MODIFIED, when the share has watches. The names are read under the
+/// share's names lock, taken with the open unlocked, so they are current.
+async fn report_stream(share: &ShareBindings, open_arc: &RwLock<Open>, file_filter: Option<u32>) {
+    if share.watches.is_empty() {
+        return;
+    }
+    let _names = share.files.names_lock().await;
+    let named = open_arc
+        .read()
+        .await
+        .file
+        .as_ref()
+        .map(|file| (file.path(), file.stream()));
+    let Some((path, stream @ Some(_))) = named else {
+        return;
+    };
+    let mut changes = Vec::with_capacity(2);
+    if let Some(filter) = file_filter {
+        changes.push(Change {
+            path: &path,
+            stream: None,
+            action: FILE_ACTION_MODIFIED,
+            filter,
+            seen: true,
+        });
+    }
+    changes.push(Change {
+        path: &path,
+        stream: stream.as_ref(),
+        action: FILE_ACTION_MODIFIED_STREAM,
+        filter: STREAM_CHANGED,
+        seen: false,
+    });
+    share.watches.report(&changes);
 }
 
 /// A FileRenameInformation request.
@@ -434,6 +487,7 @@ async fn rename_attempt(
         .iter()
         .map(|(path, action, filter, seen)| Change {
             path,
+            stream: None,
             action: *action,
             filter: *filter,
             seen: *seen,
@@ -661,12 +715,32 @@ async fn rename_stream(
             }
         }
     }
-    if from.is_some() && to.is_some() {
+    if let (Some(old), Some(new)) = (&from, &to) {
         backend
-            .rename_stream(&path, from.as_ref(), to.as_ref(), replace)
+            .rename_stream(&path, Some(old), Some(new), replace)
             .await
             .map_err(status)?;
-        file.rename_stream(from.as_ref(), to.as_ref());
+        file.rename_stream(Some(old), Some(new));
+        // A stream rename is reported as changes of both names and of the
+        // file's last write time.
+        let of_stream = |stream| Change {
+            path: &path,
+            stream: Some(stream),
+            action: FILE_ACTION_MODIFIED_STREAM,
+            filter: STREAM_CHANGED,
+            seen: false,
+        };
+        share.watches.report(&[
+            of_stream(old),
+            Change {
+                path: &path,
+                stream: None,
+                action: FILE_ACTION_MODIFIED,
+                filter: FILE_NOTIFY_CHANGE_LAST_WRITE,
+                seen: true,
+            },
+            of_stream(new),
+        ]);
         return Ok(());
     }
     if file.others_on(from.as_ref()) {
@@ -721,6 +795,21 @@ async fn rename_stream(
         }
     };
     file.rename_stream(from.as_ref(), to.as_ref());
+    // Data moved out of a named stream reports that stream's change now,
+    // and the file's at close; data moved into one, the file's and the
+    // stream's at close.
+    if let Some(from) = &from {
+        share.watches.report(&[Change {
+            path: &path,
+            stream: Some(from),
+            action: FILE_ACTION_MODIFIED_STREAM,
+            filter: STREAM_CHANGED,
+            seen: false,
+        }]);
+        open.wrote.store(true, Ordering::Release);
+    } else {
+        open.moved_data = true;
+    }
     open.on_stream = to.is_some();
     open.durable = None;
     let old = std::mem::replace(&mut open.handle, reopened);
@@ -943,6 +1032,10 @@ async fn truncate(open: &Open, size: u64, allocation: bool, measure: bool) -> Re
     let result = handle.truncate(size).await;
     break_leases();
     result.map_err(|e| e.to_nt_status())?;
+    // The close of an open whose stream it resized reports the stream.
+    if open.on_stream {
+        open.resized.store(true, Ordering::Release);
+    }
     restore_fixed_times(open).await;
     if !measure {
         return Ok(false);
@@ -1130,6 +1223,8 @@ mod tests {
                 wrote: Default::default(),
                 created: false,
                 marked_deleted: Default::default(),
+                resized: Default::default(),
+                moved_data: false,
             };
             tree.opens
                 .write()

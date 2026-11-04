@@ -1674,6 +1674,11 @@ pub(crate) struct PendingDelete {
 }
 
 impl PendingDelete {
+    /// Whether this removes a named stream, not the file.
+    pub(crate) fn is_stream(&self) -> bool {
+        self.stream.is_some()
+    }
+
     /// Removes the file from the share, reports the removal to the share's
     /// watchers (MS-FSA 2.1.5.5), then frees its name in the table. A
     /// failed delete does not fail the close (MS-SMB2 3.3.4.17); a
@@ -1708,6 +1713,7 @@ impl PendingDelete {
         };
         let removed = [Change {
             path: &path,
+            stream: None,
             action: FILE_ACTION_REMOVED,
             filter,
             seen: true,

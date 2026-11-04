@@ -288,7 +288,9 @@ pub trait ShareBackend: Send + Sync + 'static {
     /// stream; `opts.directory` and `opts.non_directory` are false. The
     /// handle reads and writes the stream: its `stat` reports the file's
     /// times, attributes and id with the stream's sizes, `set_times` and
-    /// `set_attributes` change the file, and `truncate` the stream.
+    /// `set_attributes` change the file, and `truncate` the stream. A
+    /// write or size change of the stream updates the file's last write
+    /// time, which the protocol layer reports as a change of the file.
     ///
     /// Stream names compare without regard to case: an existing stream
     /// opens under any spelling of its name, and a new one keeps the
@@ -347,8 +349,9 @@ pub trait ShareBackend: Send + Sync + 'static {
     /// and writing it under its new name. A rename to or from the default
     /// stream comes from the only open on the stream it renames, whose
     /// handle the protocol layer replaces with a new one; the old handle
-    /// still has to close cleanly. Updating the file's times for the
-    /// rename is left to the backend.
+    /// still has to close cleanly. The rename updates the file's last
+    /// write time, which the protocol layer reports as a change of the
+    /// file.
     ///
     /// The default returns [`SmbError::NotSupported`].
     async fn rename_stream(

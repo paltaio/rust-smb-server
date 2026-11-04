@@ -20,9 +20,10 @@ use crate::proto::messages::change_notify::{
     FILE_ACTION_ADDED, FILE_ACTION_MODIFIED, FILE_ACTION_REMOVED, FILE_ACTION_RENAMED_NEW_NAME,
     FILE_ACTION_RENAMED_OLD_NAME, FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_DIR_NAME,
     FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE,
-    entries_len, push_entry,
+    FILE_NOTIFY_CHANGE_STREAM_SIZE, FILE_NOTIFY_CHANGE_STREAM_WRITE, entries_len, push_entry,
 };
 use crate::server::ShareBindings;
+use crate::stream::StreamName;
 
 /// Most bytes one watch buffers, whatever OutputBufferLength asked for.
 pub(crate) const MAX_NOTIFY_BUFFER: u32 = 64 * 1024;
@@ -43,10 +44,19 @@ pub(crate) const MAX_WATCHES_PER_CONNECTION: usize = 4096;
 pub(crate) const CONTENT_CHANGED: u32 =
     FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_ATTRIBUTES;
 
-/// One change to report: `action` (FILE_ACTION_*) happened at `path`, and
-/// it matches the FILE_NOTIFY_CHANGE_* bits `filter`.
+/// Filter of a change to a named stream: a write, a size change, an
+/// overwrite, a rename or a deletion of the stream, each reported as
+/// MODIFIED_STREAM.
+pub(crate) const STREAM_CHANGED: u32 =
+    FILE_NOTIFY_CHANGE_STREAM_SIZE | FILE_NOTIFY_CHANGE_STREAM_WRITE;
+
+/// One change to report: `action` (FILE_ACTION_*) happened at `path`, or
+/// at its named stream `stream`, and it matches the FILE_NOTIFY_CHANGE_*
+/// bits `filter`.
 pub(crate) struct Change<'a> {
     pub path: &'a SmbPath,
+    /// Reported as `path:stream`.
+    pub stream: Option<&'a StreamName>,
     pub action: u32,
     pub filter: u32,
     /// A backend that reports changes sees this addition, removal or rename
@@ -858,6 +868,11 @@ impl WatchTable {
             {
                 self.note(&host, change, &name);
             }
+            // MS-SMB2 3.2.5.16: a client fails a whole response that names a
+            // stream with `"`, so changes to such a stream go unreported.
+            if change.stream.is_some_and(|s| s.as_str().contains('"')) {
+                continue;
+            }
             let top = if deep { 0 } else { parent };
             for depth in (top..=parent).rev() {
                 let Some(watched) = dirs.get(&dir_key(&components[..depth], self.case_sensitive))
@@ -879,10 +894,12 @@ impl WatchTable {
                     }
                     let name = name
                         .get_or_insert_with(|| {
-                            components[depth..]
-                                .join("\\")
-                                .encode_utf16()
-                                .collect::<Vec<u16>>()
+                            let mut name = components[depth..].join("\\");
+                            if let Some(stream) = change.stream {
+                                name.push(':');
+                                name.push_str(stream.as_str());
+                            }
+                            name.encode_utf16().collect::<Vec<u16>>()
                         })
                         .clone();
                     let slot = *slots.entry(Arc::as_ptr(watch)).or_insert_with(|| {
@@ -1389,6 +1406,7 @@ mod tests {
     fn added(table: &WatchTable, path: &str) {
         table.report(&[Change {
             path: &p(path),
+            stream: None,
             action: FILE_ACTION_ADDED,
             filter: FILE_NOTIFY_CHANGE_FILE_NAME,
             seen: true,
@@ -1548,6 +1566,7 @@ mod tests {
         let watch = Arc::clone(reg.watch());
         share.watches.report(&[Change {
             path: &p("d\\ab"),
+            stream: None,
             action: FILE_ACTION_REMOVED,
             filter: FILE_NOTIFY_CHANGE_FILE_NAME,
             seen: true,
@@ -1557,6 +1576,7 @@ mod tests {
         assert_eq!(budget.bytes(), 0);
         share.watches.report(&[Change {
             path: &p("d\\ab"),
+            stream: None,
             action: FILE_ACTION_ADDED,
             filter: FILE_NOTIFY_CHANGE_FILE_NAME,
             seen: true,
@@ -1724,12 +1744,14 @@ mod tests {
         table.report(&[
             Change {
                 path: &from,
+                stream: None,
                 action: FILE_ACTION_RENAMED_OLD_NAME,
                 filter: FILE_NOTIFY_CHANGE_FILE_NAME,
                 seen: true,
             },
             Change {
                 path: &to,
+                stream: None,
                 action: FILE_ACTION_RENAMED_NEW_NAME,
                 filter: FILE_NOTIFY_CHANGE_FILE_NAME,
                 seen: true,
@@ -1780,6 +1802,7 @@ mod tests {
         let server = |action, path: &str, seen| {
             share.watches.report(&[Change {
                 path: &p(path),
+                stream: None,
                 action,
                 filter: FILE_NOTIFY_CHANGE_FILE_NAME,
                 seen,
@@ -1920,6 +1943,7 @@ mod tests {
         let expected = share.watches.expect(
             &[Change {
                 path: &p("d\\x"),
+                stream: None,
                 action: FILE_ACTION_ADDED,
                 filter: FILE_NOTIFY_CHANGE_FILE_NAME,
                 seen: true,

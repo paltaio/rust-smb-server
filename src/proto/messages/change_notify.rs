@@ -29,6 +29,9 @@ pub const FILE_ACTION_REMOVED: u32 = 2;
 pub const FILE_ACTION_MODIFIED: u32 = 3;
 pub const FILE_ACTION_RENAMED_OLD_NAME: u32 = 4;
 pub const FILE_ACTION_RENAMED_NEW_NAME: u32 = 5;
+pub const FILE_ACTION_ADDED_STREAM: u32 = 6;
+pub const FILE_ACTION_REMOVED_STREAM: u32 = 7;
+pub const FILE_ACTION_MODIFIED_STREAM: u32 = 8;
 
 /// Bytes of a FILE_NOTIFY_INFORMATION entry before its name.
 const ENTRY_HEADER_LEN: usize = 12;

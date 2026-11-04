@@ -452,8 +452,15 @@ pub struct Open {
     /// The change notification watch the first CHANGE_NOTIFY on the open
     /// armed.
     pub(crate) watch: Option<WatchReg>,
-    /// A WRITE through the open changed the file; its close reports that.
+    /// A WRITE through the open changed the file or the stream it is on;
+    /// its close reports that.
     pub(crate) wrote: AtomicBool,
+    /// The named stream the open is on was overwritten or resized through
+    /// it; its close reports that.
+    pub(crate) resized: AtomicBool,
+    /// The open moved the file's data into the named stream it is on; its
+    /// close reports that as a change of the file's contents.
+    pub(crate) moved_data: bool,
     /// The CREATE that made the open created or overwrote the file.
     pub(crate) created: bool,
     /// FileDispositionInformation through the open marked its directory

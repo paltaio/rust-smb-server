@@ -345,10 +345,15 @@ impl Client {
     /// Sends a CHANGE_NOTIFY on the directory `dir` for `filter`, which
     /// has to wait; returns its AsyncId.
     async fn watch(&mut self, dir: FileId, filter: u32) -> u64 {
+        self.watch_with(dir, filter, 0).await
+    }
+
+    /// Sends a CHANGE_NOTIFY as [`Client::watch`] does, with `flags`.
+    async fn watch_with(&mut self, dir: FileId, filter: u32, flags: u16) -> u64 {
         let mut body = Vec::new();
         ChangeNotifyRequest {
             structure_size: 32,
-            flags: 0,
+            flags,
             output_buffer_length: 4096,
             file_id: dir,
             completion_filter: filter,
@@ -367,6 +372,13 @@ impl Client {
     /// The names the final response to the CHANGE_NOTIFY `async_id`
     /// reports.
     async fn changes(&mut self, async_id: u64) -> Vec<String> {
+        let events = self.events(async_id).await;
+        events.into_iter().map(|(_, name)| name).collect()
+    }
+
+    /// The actions and names the final response to the CHANGE_NOTIFY
+    /// `async_id` reports.
+    async fn events(&mut self, async_id: u64) -> Vec<(u32, String)> {
         let frame = tokio::time::timeout(std::time::Duration::from_secs(5), self.peer.next())
             .await
             .expect("a final response in time");
@@ -375,7 +387,7 @@ impl Client {
         let buf = ChangeNotifyResponse::parse(&frame[SMB2_HEADER_LEN..])
             .expect("notify response")
             .buffer;
-        let mut names = Vec::new();
+        let mut events = Vec::new();
         let mut at = 0;
         loop {
             let next = u32_at(&buf, at) as usize;
@@ -384,9 +396,9 @@ impl Client {
                 .chunks_exact(2)
                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                 .collect();
-            names.push(String::from_utf16(&units).unwrap());
+            events.push((u32_at(&buf, at + 4), String::from_utf16(&units).unwrap()));
             if next == 0 {
-                return names;
+                return events;
             }
             at += next;
         }
@@ -1629,41 +1641,341 @@ async fn a_file_with_a_stream_open_is_not_replaced() {
     assert_eq!(files.contents("f.txt"), None);
 }
 
+const ADDED: u32 = 1;
+const REMOVED: u32 = 2;
+const MODIFIED: u32 = 3;
+const ADDED_STREAM: u32 = 6;
+const REMOVED_STREAM: u32 = 7;
+const MODIFIED_STREAM: u32 = 8;
+
+/// (action, name) for each of `events`.
+fn heard(events: &[(u32, &str)]) -> Vec<(u32, String)> {
+    events.iter().map(|&(a, n)| (a, n.to_string())).collect()
+}
+
+/// The directory `name` opened by `c` to watch.
+async fn watched(c: &mut Client, name: &str) -> FileId {
+    c.open(
+        Create::new(name)
+            .access(READ, SHARE_ALL)
+            .options(FILE_DIRECTORY_FILE),
+    )
+    .await
+}
+
 #[tokio::test]
-async fn stream_changes_are_not_reported_as_changes_of_the_file() {
+async fn stream_changes_name_the_stream_after_its_file() {
     let files = MemFsBackend::new();
     let state = server(&files).await;
     let mut watcher = Client::new(&state).await;
     let mut a = Client::new(&state).await;
     make(&mut a, "f.txt:s", b"abc").await;
-    let root = watcher
-        .open(
-            Create::new("")
-                .access(READ, SHARE_ALL)
-                .options(FILE_DIRECTORY_FILE),
-        )
-        .await;
+    let root = watched(&mut watcher, "").await;
 
-    // Names, attributes, size, times and EAs.
-    let watch = watcher.watch(root, 0xFF).await;
+    // A new stream, then a write through an open of it, at close.
+    let w = watcher.watch(root, 0xFFF).await;
+    let t = a
+        .open(Create::new("f.txt:t").disposition(FILE_CREATE))
+        .await;
+    a.close(t).await;
+    assert_eq!(watcher.events(w).await, heard(&[(ADDED_STREAM, "f.txt:t")]));
+    let w = watcher.watch(root, 0xFFF).await;
     let s = a.open(Create::new("f.txt:s")).await;
     assert_eq!(a.write(s, 0, b"abcdef").await, 0);
+    a.close(s).await;
+    let written = heard(&[(MODIFIED, "f.txt"), (MODIFIED_STREAM, "f.txt:s")]);
+    assert_eq!(watcher.events(w).await, written);
+
+    // An overwrite and a resize report as they happen and at close.
+    for resize in [false, true] {
+        let w = watcher.watch(root, 0xFFF).await;
+        let s = if resize {
+            let s = a.open(Create::new("f.txt:s")).await;
+            assert_eq!(
+                a.set_info(s, END_OF_FILE, vec![2, 0, 0, 0, 0, 0, 0, 0])
+                    .await,
+                0
+            );
+            s
+        } else {
+            a.open(Create::new("f.txt:s").disposition(FILE_OVERWRITE_IF))
+                .await
+        };
+        assert_eq!(watcher.events(w).await, written, "resize {resize}");
+        let w = watcher.watch(root, 0xFFF).await;
+        a.close(s).await;
+        let closed = heard(&[(MODIFIED_STREAM, "f.txt:s")]);
+        assert_eq!(watcher.events(w).await, closed, "resize {resize}");
+    }
+
+    // A rename reports both names and the file.
+    let w = watcher.watch(root, 0xFFF).await;
+    let s = a
+        .open(Create::new("f.txt:s").access(RW | DELETE, SHARE_ALL))
+        .await;
+    assert_eq!(a.rename(s, ":u", false).await, 0);
+    let renamed = heard(&[
+        (MODIFIED_STREAM, "f.txt:s"),
+        (MODIFIED, "f.txt"),
+        (MODIFIED_STREAM, "f.txt:u"),
+    ]);
+    assert_eq!(watcher.events(w).await, renamed);
+
+    // A deletion is a change of the stream: as it is marked, or at the
+    // close that deletes it.
+    let w = watcher.watch(root, 0xFFF).await;
+    assert_eq!(a.set_info(s, DISPOSITION, vec![1]).await, 0);
     assert_eq!(
-        a.set_info(s, END_OF_FILE, 2u64.to_le_bytes().to_vec())
+        watcher.events(w).await,
+        heard(&[(MODIFIED_STREAM, "f.txt:u")])
+    );
+    let w = watcher.watch(root, 0xFFF).await;
+    assert_eq!(a.set_info(s, DISPOSITION, vec![1]).await, 0, "marked again");
+    let marker = a.open(Create::new("m.txt").disposition(FILE_CREATE)).await;
+    a.close(marker).await;
+    assert_eq!(watcher.events(w).await, heard(&[(ADDED, "m.txt")]));
+    let w = watcher.watch(root, 0xFFF).await;
+    a.close(s).await;
+    let t = a
+        .open(
+            Create::new("f.txt:t")
+                .access(READ | DELETE, SHARE_ALL)
+                .options(FILE_DELETE_ON_CLOSE),
+        )
+        .await;
+    a.close(t).await;
+    assert_eq!(
+        watcher.events(w).await,
+        heard(&[(MODIFIED_STREAM, "f.txt:t")])
+    );
+    assert!(files.stream_names("f.txt").is_empty());
+
+    // A stream that comes with its file, and one of a directory.
+    let w = watcher.watch(root, 0xFFF).await;
+    let n = a
+        .open(Create::new("n.txt:s").disposition(FILE_OPEN_IF))
+        .await;
+    let added = heard(&[(ADDED, "n.txt"), (ADDED_STREAM, "n.txt:s")]);
+    assert_eq!(watcher.events(w).await, added);
+    let w = watcher.watch(root, 0xFFF).await;
+    assert_eq!(a.write(n, 0, b"x").await, 0);
+    a.close(n).await;
+    let written = heard(&[(MODIFIED, "n.txt"), (MODIFIED_STREAM, "n.txt:s")]);
+    assert_eq!(watcher.events(w).await, written);
+    let w = watcher.watch(root, 0xFFF).await;
+    let ds = a.open(Create::new("d:ds").disposition(FILE_CREATE)).await;
+    a.close(ds).await;
+    let first = heard(&[(MODIFIED, "d"), (ADDED_STREAM, "d:ds")]);
+    assert_eq!(watcher.events(w).await, first);
+    let w = watcher.watch(root, 0xFFF).await;
+    let ds = a.open(Create::new("d:ds2").disposition(FILE_CREATE)).await;
+    a.close(ds).await;
+    assert_eq!(watcher.events(w).await, heard(&[(ADDED_STREAM, "d:ds2")]));
+
+    // An overwrite of the file removes its streams; a deletion of the file
+    // reports the file alone. A new watch leaves out the changes made to
+    // set them up.
+    make(&mut a, "n.txt:t", b"y").await;
+    let root = watched(&mut watcher, "").await;
+    let w = watcher.watch(root, 0xFFF).await;
+    let n = a
+        .open(Create::new("n.txt").disposition(FILE_OVERWRITE_IF))
+        .await;
+    let overwritten = heard(&[
+        (REMOVED_STREAM, "n.txt:s"),
+        (REMOVED_STREAM, "n.txt:t"),
+        (MODIFIED, "n.txt"),
+    ]);
+    assert_eq!(watcher.events(w).await, overwritten);
+    a.close(n).await;
+    make(&mut a, "n.txt:s", b"z").await;
+    let root = watched(&mut watcher, "").await;
+    let w = watcher.watch(root, 0xFFF).await;
+    let n = a
+        .open(
+            Create::new("n.txt")
+                .access(READ | DELETE, SHARE_ALL)
+                .options(FILE_DELETE_ON_CLOSE),
+        )
+        .await;
+    a.close(n).await;
+    assert_eq!(watcher.events(w).await, heard(&[(REMOVED, "n.txt")]));
+}
+
+#[tokio::test]
+async fn stream_resizes_drops_and_overwrites_report_once() {
+    let files = MemFsBackend::new();
+    let state = server(&files).await;
+    let mut watcher = Client::new(&state).await;
+    let mut a = Client::new(&state).await;
+    let mut b = Client::new(&state).await;
+    make(&mut a, "d\\g.txt", b"").await;
+    make(&mut a, "f.txt:s", b"abcdef").await;
+
+    // A resize with no watch on the share yet reports the stream at close.
+    let s = a.open(Create::new("f.txt:s")).await;
+    assert_eq!(
+        a.set_info(s, END_OF_FILE, vec![4, 0, 0, 0, 0, 0, 0, 0])
             .await,
         0
     );
+    let root = watched(&mut watcher, "").await;
+    let w = watcher.watch(root, 0xFFF).await;
     a.close(s).await;
-    make(&mut a, "marker.txt", b"").await;
-    assert_eq!(watcher.changes(watch).await, ["marker.txt"]);
+    assert_eq!(
+        watcher.events(w).await,
+        heard(&[(MODIFIED_STREAM, "f.txt:s")])
+    );
 
-    // A stream that comes with its file reports the file.
-    let watch = watcher.watch(root, 0x1).await;
-    let s = a
-        .open(Create::new("new.txt:s").disposition(FILE_OPEN_IF))
-        .await;
+    // An allocation below the size resizes the stream.
+    let s = a.open(Create::new("f.txt:s")).await;
+    let w = watcher.watch(root, 0xFFF).await;
+    assert_eq!(
+        a.set_info(s, ALLOCATION, vec![2, 0, 0, 0, 0, 0, 0, 0])
+            .await,
+        0
+    );
+    let resized = heard(&[(MODIFIED, "f.txt"), (MODIFIED_STREAM, "f.txt:s")]);
+    assert_eq!(watcher.events(w).await, resized);
+    let w = watcher.watch(root, 0xFFF).await;
     a.close(s).await;
-    assert_eq!(watcher.changes(watch).await, ["new.txt"]);
+    assert_eq!(
+        watcher.events(w).await,
+        heard(&[(MODIFIED_STREAM, "f.txt:s")])
+    );
+
+    // The close of an open whose connection ends reports its write.
+    let mut c = Client::new(&state).await;
+    let s = c.open(Create::new("f.txt:s")).await;
+    assert_eq!(c.write(s, 0, b"x").await, 0);
+    let w = watcher.watch(root, 0xFFF).await;
+    c.peer.drop_connection(&state).await;
+    assert_eq!(watcher.events(w).await, resized);
+
+    // A watch of the tree names the stream under its directory.
+    let tree = watched(&mut watcher, "").await;
+    let w = watcher
+        .watch_with(tree, 0xFFF, ChangeNotifyRequest::FLAG_WATCH_TREE)
+        .await;
+    let g = a
+        .open(Create::new("d\\g.txt:s").disposition(FILE_CREATE))
+        .await;
+    a.close(g).await;
+    assert_eq!(
+        watcher.events(w).await,
+        heard(&[(ADDED_STREAM, "d\\g.txt:s")])
+    );
+
+    // An overwrite of a file whose stream is open elsewhere removes it
+    // too, and a later overwrite does not report it again.
+    make(&mut a, "n.txt:s", b"1").await;
+    make(&mut a, "n.txt:t", b"2").await;
+    let held = b.open(Create::new("n.txt:s").access(READ, SHARE_ALL)).await;
+    let root = watched(&mut watcher, "").await;
+    let w = watcher.watch(root, 0xFFF).await;
+    let n = a
+        .open(Create::new("n.txt").disposition(FILE_OVERWRITE_IF))
+        .await;
+    let overwritten = heard(&[
+        (REMOVED_STREAM, "n.txt:s"),
+        (REMOVED_STREAM, "n.txt:t"),
+        (MODIFIED, "n.txt"),
+    ]);
+    assert_eq!(watcher.events(w).await, overwritten);
+    a.close(n).await;
+    make(&mut a, "n.txt:u", b"3").await;
+    let root = watched(&mut watcher, "").await;
+    let w = watcher.watch(root, 0xFFF).await;
+    let n = a
+        .open(Create::new("n.txt").disposition(FILE_OVERWRITE_IF))
+        .await;
+    let again = heard(&[(REMOVED_STREAM, "n.txt:u"), (MODIFIED, "n.txt")]);
+    assert_eq!(watcher.events(w).await, again);
+    a.close(n).await;
+    b.close(held).await;
+    assert!(files.stream_names("n.txt").is_empty());
+}
+
+#[tokio::test]
+async fn stream_changes_match_the_stream_filters() {
+    let files = MemFsBackend::new();
+    let state = server(&files).await;
+    let mut a = Client::new(&state).await;
+    make(&mut a, "d\\f.txt", b"").await;
+    let cases = [
+        (0x200, ADDED_STREAM, true),
+        (0x400, MODIFIED_STREAM, true),
+        (0x800, MODIFIED_STREAM, true),
+        (0x10, MODIFIED, false),
+    ];
+    for (n, (filter, action, on_stream)) in cases.into_iter().enumerate() {
+        let mut watcher = Client::new(&state).await;
+        let d = watched(&mut watcher, "d").await;
+        let w = watcher.watch(d, filter).await;
+        let stream = format!("f.txt:s{n}");
+        let s = a
+            .open(Create::new(&format!("d\\{stream}")).disposition(FILE_CREATE))
+            .await;
+        assert_eq!(a.write(s, 0, b"x").await, 0);
+        a.close(s).await;
+        let name = if on_stream {
+            stream
+        } else {
+            "f.txt".to_string()
+        };
+        assert_eq!(watcher.events(w).await, [(action, name)], "{filter:#x}");
+    }
+}
+
+#[tokio::test]
+async fn changes_to_streams_named_with_a_quote_go_unreported() {
+    let files = MemFsBackend::new();
+    let state = server(&files).await;
+    let mut watcher = Client::new(&state).await;
+    let mut a = Client::new(&state).await;
+    let root = watched(&mut watcher, "").await;
+    let w = watcher.watch(root, 0xFFF).await;
+    let q = a
+        .open(Create::new("f.txt:q\"x").disposition(FILE_CREATE))
+        .await;
+    assert_eq!(a.write(q, 0, b"x").await, 0);
+    a.close(q).await;
+    assert_eq!(watcher.events(w).await, heard(&[(MODIFIED, "f.txt")]));
+}
+
+#[tokio::test]
+async fn data_moved_between_streams_reports_where_it_went() {
+    let files = MemFsBackend::new();
+    let state = server(&files).await;
+    let mut watcher = Client::new(&state).await;
+    let mut a = Client::new(&state).await;
+    let root = watched(&mut watcher, "").await;
+
+    // Written to the file, then moved into a stream: both at close.
+    let f = a
+        .open(Create::new("f.txt").access(RW | DELETE, SHARE_ALL))
+        .await;
+    assert_eq!(a.write(f, 0, b"BASE").await, 0);
+    let w = watcher.watch(root, 0xFFF).await;
+    assert_eq!(a.rename(f, ":m", false).await, 0);
+    a.close(f).await;
+    let moved = heard(&[(MODIFIED, "f.txt"), (MODIFIED_STREAM, "f.txt:m")]);
+    assert_eq!(watcher.events(w).await, moved);
+
+    // Moved back: the stream as it moves, the file at close.
+    let m = a
+        .open(Create::new("f.txt:m").access(RW | DELETE, SHARE_ALL))
+        .await;
+    let w = watcher.watch(root, 0xFFF).await;
+    assert_eq!(a.rename(m, "::$DATA", true).await, 0);
+    assert_eq!(
+        watcher.events(w).await,
+        heard(&[(MODIFIED_STREAM, "f.txt:m")])
+    );
+    let w = watcher.watch(root, 0xFFF).await;
+    a.close(m).await;
+    assert_eq!(watcher.events(w).await, heard(&[(MODIFIED, "f.txt")]));
+    assert_eq!(files.contents("f.txt"), Some(b"BASE".to_vec()));
 }
 
 #[tokio::test]

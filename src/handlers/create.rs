@@ -1,12 +1,13 @@
 //! CREATE handler: open or create a file/directory and allocate a FileId.
 
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::proto::header::{SMB2_FLAGS_REPLAY_OPERATION, Smb2Header};
 use crate::proto::messages::change_notify::{
-    FILE_ACTION_ADDED, FILE_ACTION_MODIFIED, FILE_NOTIFY_CHANGE_DIR_NAME,
-    FILE_NOTIFY_CHANGE_FILE_NAME,
+    FILE_ACTION_ADDED, FILE_ACTION_ADDED_STREAM, FILE_ACTION_MODIFIED, FILE_ACTION_MODIFIED_STREAM,
+    FILE_ACTION_REMOVED_STREAM, FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_DIR_NAME,
+    FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_STREAM_NAME,
 };
 use crate::proto::messages::{
     CreateContext, CreateRequest, CreateResponse, Dialect, DurableReconnect, DurableReconnectV2,
@@ -32,7 +33,7 @@ use crate::error::SmbError;
 use crate::files::{
     BreakWait, CONTENT_CHANGED, Change, Durability, FileRef, Granted, LeaseId, LeaseRef,
     LeaseRequest, LeaseState, LeaseVersion, MAX_BREAK_WAIT, OpenRequest, OpenSlot, Refused,
-    Sharing, Trigger, v2_timeout,
+    STREAM_CHANGED, Sharing, Trigger, v2_timeout,
 };
 use crate::handlers::reconnect::{self, Reconnect};
 use crate::handlers::shared::{lookup_session, lookup_session_tree};
@@ -1026,6 +1027,8 @@ async fn attempt(
         wrote: Default::default(),
         created: action != OpenAction::Opened,
         marked_deleted: Default::default(),
+        resized: AtomicBool::new(stream.is_some() && action == OpenAction::Overwritten),
+        moved_data: false,
     };
     let open_arc = Arc::new(tokio::sync::RwLock::new(open));
     tree.opens.get_mut().insert(file_id, open_arc);
@@ -1091,6 +1094,7 @@ async fn open_reported(
     };
     let added = [Change {
         path,
+        stream: None,
         action: FILE_ACTION_ADDED,
         filter: names,
         seen: true,
@@ -1098,16 +1102,90 @@ async fn open_reported(
     let may_create = !matches!(opts.intent, OpenIntent::Open | OpenIntent::Truncate);
     let expected = may_create.then(|| share.watches.expect(&added, None));
     let (created, opened) = backend_open(share, path, stream, opts).await;
-    match (&opened, expected) {
-        (_, Some(expected)) if created => expected.report(&share.watches, &added),
-        (Ok((_, OpenAction::Overwritten)), _) if stream.is_none() => {
-            share.watches.report(&[Change {
-                path,
-                action: FILE_ACTION_MODIFIED,
-                filter: CONTENT_CHANGED,
-                seen: true,
-            }])
+    let action = opened.as_ref().ok().map(|(_, action)| *action);
+    let heard = share.named_streams && !share.watches.is_empty();
+    // An overwrite of the file reports the removal of each of its named
+    // streams first, but for those whose deletion was reported already.
+    let removed = match &opened {
+        Ok((handle, OpenAction::Overwritten)) if stream.is_none() && heard => {
+            let case_sensitive = share.backend.capabilities().case_sensitive;
+            match (handle.stat().await, handle.streams().await) {
+                (Ok(info), Ok(streams)) => streams
+                    .into_iter()
+                    .map(|s| s.name)
+                    .filter(|name| {
+                        !share
+                            .files
+                            .stream_delete_pending(&info, path, name, case_sensitive)
+                    })
+                    .collect(),
+                (Err(e), _) | (_, Err(e)) => {
+                    debug!(error = %stream_error(e), "streams of an overwritten file not listed");
+                    Vec::new()
+                }
+            }
         }
+        _ => Vec::new(),
+    };
+    // The first named stream of a directory changes its attributes.
+    let first_of_directory = match &opened {
+        Ok((handle, OpenAction::Created)) if stream.is_some() && heard => {
+            handle.stat().await.is_ok_and(|info| info.is_directory)
+                && handle
+                    .streams()
+                    .await
+                    .is_ok_and(|streams| streams.len() == 1)
+        }
+        _ => false,
+    };
+    let mut changes: Vec<Change<'_>> = removed
+        .iter()
+        .map(|name| Change {
+            path,
+            stream: Some(name),
+            action: FILE_ACTION_REMOVED_STREAM,
+            filter: FILE_NOTIFY_CHANGE_STREAM_NAME,
+            seen: false,
+        })
+        .collect();
+    let modified = |filter| Change {
+        path,
+        stream: None,
+        action: FILE_ACTION_MODIFIED,
+        filter,
+        seen: true,
+    };
+    let of_stream = |action, filter| Change {
+        path,
+        stream,
+        action,
+        filter,
+        seen: false,
+    };
+    match (action, stream) {
+        (Some(OpenAction::Overwritten), None) => changes.push(modified(CONTENT_CHANGED)),
+        (Some(OpenAction::Overwritten), Some(_)) => {
+            changes.push(modified(FILE_NOTIFY_CHANGE_LAST_WRITE));
+            changes.push(of_stream(FILE_ACTION_MODIFIED_STREAM, STREAM_CHANGED));
+        }
+        (Some(OpenAction::Created), Some(_)) => {
+            if first_of_directory {
+                changes.push(modified(FILE_NOTIFY_CHANGE_ATTRIBUTES));
+            }
+            changes.push(of_stream(
+                FILE_ACTION_ADDED_STREAM,
+                FILE_NOTIFY_CHANGE_STREAM_NAME,
+            ));
+        }
+        _ => {}
+    }
+    match expected {
+        Some(expected) if created => {
+            let mut all = Vec::from(added);
+            all.append(&mut changes);
+            expected.report(&share.watches, &all);
+        }
+        _ if !changes.is_empty() => share.watches.report(&changes),
         _ => {}
     }
     opened
