@@ -20,6 +20,14 @@ pub struct MemFsBackend {
     inner: std::sync::Arc<Mutex<MemInner>>,
 }
 
+/// A named stream: its id, which a rename keeps, its name as created or
+/// renamed to, and its data.
+struct MemStream {
+    id: u64,
+    name: String,
+    data: Vec<u8>,
+}
+
 #[derive(Default)]
 struct MemInner {
     files: HashMap<String, Vec<u8>>,
@@ -34,9 +42,8 @@ struct MemInner {
     /// with the entry.
     ids: HashMap<String, u64>,
     next_id: u64,
-    /// Named streams of each entry by id, in creation order, with the name
-    /// each was created under.
-    streams: HashMap<u64, Vec<(String, Vec<u8>)>>,
+    /// Named streams of each entry by id, in creation order.
+    streams: HashMap<u64, Vec<MemStream>>,
     /// The backend reports no named streams.
     no_streams: bool,
     /// Handles opened and not yet closed.
@@ -68,17 +75,20 @@ impl MemInner {
         self.streams
             .get(&id)?
             .iter()
-            .position(|(n, _)| n.to_lowercase() == name)
+            .position(|s| s.name.to_lowercase() == name)
     }
 
-    /// The data of the stream `name` of the entry `id`.
-    fn stream_mut(&mut self, id: u64, name: &str) -> SmbResult<&mut Vec<u8>> {
-        let at = self.stream_at(id, name).ok_or(SmbError::NotFound)?;
-        Ok(&mut self.streams.get_mut(&id).expect("listed")[at].1)
+    /// The data of the stream with the id `stream` of the entry `id`.
+    fn stream_mut(&mut self, id: u64, stream: u64) -> SmbResult<&mut Vec<u8>> {
+        self.streams
+            .get_mut(&id)
+            .and_then(|list| list.iter_mut().find(|s| s.id == stream))
+            .map(|s| &mut s.data)
+            .ok_or(SmbError::NotFound)
     }
 
     /// The streams of the entry `key`.
-    fn streams_of(&self, key: &str) -> &[(String, Vec<u8>)] {
+    fn streams_of(&self, key: &str) -> &[MemStream] {
         self.ids
             .get(key)
             .and_then(|id| self.streams.get(id))
@@ -152,7 +162,7 @@ impl MemFsBackend {
     /// The names of the named streams of `path`, in creation order.
     pub fn stream_names(&self, path: &str) -> Vec<String> {
         let g = self.inner.lock().unwrap();
-        g.streams_of(path).iter().map(|(n, _)| n.clone()).collect()
+        g.streams_of(path).iter().map(|s| s.name.clone()).collect()
     }
 
     /// The contents of the file `path`.
@@ -337,20 +347,26 @@ impl ShareBackend for MemFsBackend {
         }
         let id = g.id_of(&k);
         let at = g.stream_at(id, stream.as_str());
+        g.next_id += 1;
+        let new_id = g.next_id;
         let list = g.streams.entry(id).or_default();
-        let (name, action) = match (opts.intent, at) {
+        let (stream_id, action) = match (opts.intent, at) {
             (OpenIntent::Open | OpenIntent::Truncate, None) => return Err(SmbError::NotFound),
             (OpenIntent::Create, Some(_)) => return Err(SmbError::Exists),
             (OpenIntent::Open | OpenIntent::OpenOrCreate, Some(at)) => {
-                (list[at].0.clone(), OpenAction::Opened)
+                (list[at].id, OpenAction::Opened)
             }
             (_, Some(at)) => {
-                list[at].1.clear();
-                (list[at].0.clone(), OpenAction::Overwritten)
+                list[at].data.clear();
+                (list[at].id, OpenAction::Overwritten)
             }
             (_, None) => {
-                list.push((stream.as_str().to_string(), Vec::new()));
-                (stream.as_str().to_string(), OpenAction::Created)
+                list.push(MemStream {
+                    id: new_id,
+                    name: stream.as_str().to_string(),
+                    data: Vec::new(),
+                });
+                (new_id, OpenAction::Created)
             }
         };
         let is_dir = g.dirs.contains_key(&k);
@@ -359,7 +375,7 @@ impl ShareBackend for MemFsBackend {
             inner: self.inner.clone(),
             key: k,
             is_dir,
-            stream: Some((id, name)),
+            stream: Some((id, stream_id)),
         };
         Ok((Box::new(handle), action))
     }
@@ -371,15 +387,70 @@ impl ShareBackend for MemFsBackend {
         g.streams.get_mut(&id).expect("listed").remove(at);
         Ok(())
     }
+
+    async fn rename_stream(
+        &self,
+        path: &SmbPath,
+        from: Option<&StreamName>,
+        to: Option<&StreamName>,
+        replace_if_exists: bool,
+    ) -> SmbResult<()> {
+        let k = key(path);
+        let mut g = self.inner.lock().unwrap();
+        if !g.files.contains_key(&k) && !g.dirs.contains_key(&k) {
+            return Err(SmbError::NotFound);
+        }
+        let id = g.id_of(&k);
+        let stream_id = |g: &MemInner, name: &StreamName| {
+            g.stream_at(id, name.as_str())
+                .map(|at| g.streams[&id][at].id)
+        };
+        let source = match from {
+            Some(from) => Some(stream_id(&g, from).ok_or(SmbError::NotFound)?),
+            None => None,
+        };
+        let target = to.and_then(|to| stream_id(&g, to));
+        if (to.is_none() || target.is_some()) && !replace_if_exists {
+            return Err(SmbError::Exists);
+        }
+        let data = match source {
+            Some(source) => std::mem::take(g.stream_mut(id, source)?),
+            None => std::mem::take(g.files.get_mut(&k).ok_or(SmbError::IsDirectory)?),
+        };
+        g.next_id += 1;
+        let new_id = g.next_id;
+        let list = g.streams.entry(id).or_default();
+        list.retain(|s| Some(s.id) != target);
+        match (source, to) {
+            (Some(source), Some(to)) => {
+                let stream = list.iter_mut().find(|s| s.id == source).expect("listed");
+                stream.name = to.as_str().to_string();
+                stream.data = data;
+            }
+            (None, Some(to)) => list.push(MemStream {
+                id: new_id,
+                name: to.as_str().to_string(),
+                data,
+            }),
+            (Some(source), None) => {
+                list.retain(|s| s.id != source);
+                g.files.insert(k, data);
+            }
+            (None, None) => {
+                g.files.insert(k, data);
+            }
+        }
+        Ok(())
+    }
 }
 
 pub struct MemHandle {
     inner: std::sync::Arc<Mutex<MemInner>>,
     key: String,
     is_dir: bool,
-    /// The id of the file and the name of the named stream the handle is
-    /// on. Its file is found by id, so the handle follows renames.
-    stream: Option<(u64, String)>,
+    /// The ids of the file and of the named stream the handle is on, so the
+    /// handle follows renames of either.
+    stream: Option<(u64, u64)>,
 }
 
 impl MemHandle {
@@ -404,7 +475,7 @@ impl MemHandle {
     /// The data the handle reads and writes: its stream's, or the file's.
     fn data<'a>(&self, g: &'a mut MemInner) -> SmbResult<&'a mut Vec<u8>> {
         match &self.stream {
-            Some((id, stream)) => g.stream_mut(*id, stream),
+            Some((id, stream)) => g.stream_mut(*id, *stream),
             None if self.is_dir => Err(SmbError::IsDirectory),
             None => g.files.get_mut(&self.key).ok_or(SmbError::NotFound),
         }
@@ -589,9 +660,9 @@ impl Handle for MemHandle {
         let g = self.inner.lock().unwrap();
         g.streams_of(&self.path(&g)?)
             .iter()
-            .map(|(name, data)| {
-                let size = data.len() as u64;
-                Ok(StreamInfo::new(name.parse()?, size, size))
+            .map(|s| {
+                let size = s.data.len() as u64;
+                Ok(StreamInfo::new(s.name.parse()?, size, size))
             })
             .collect()
     }

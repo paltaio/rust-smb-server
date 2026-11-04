@@ -80,7 +80,7 @@ pub async fn handle(
         None
     };
     let open = open_arc.read().await;
-    let on_stream = open.stream.is_some();
+    let on_stream = open.on_stream;
     let result = match info_type {
         InfoType::File => query_file(&open, &share, req.file_information_class, cap).await,
         InfoType::FileSystem => {
@@ -225,7 +225,7 @@ async fn stream_information(
     }
     let handle = open.handle.as_deref().ok_or(ntstatus::STATUS_FILE_CLOSED)?;
     let streams = streams_of(handle).await?;
-    if open.stream.is_none() {
+    if !open.on_stream {
         return Ok(ic::encode_file_stream_information(default(&info), &streams));
     }
     let path = open.path().ok_or(ntstatus::STATUS_FILE_CLOSED)?;

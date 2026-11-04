@@ -1014,7 +1014,7 @@ async fn attempt(
         handle: Some(handle),
         granted_access: args.open_access,
         is_directory: info.is_directory && stream.is_none(),
-        stream: args.stream.clone(),
+        on_stream: stream.is_some(),
         delete_on_close: args.delete_on_close,
         search_state: None,
         fixed_times: FileTimes::default(),

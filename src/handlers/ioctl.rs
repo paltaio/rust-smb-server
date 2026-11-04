@@ -86,7 +86,7 @@ pub async fn handle(
         }
         _ => {
             let on_stream = match open {
-                Some(open) => open.read().await.stream.is_some(),
+                Some(open) => open.read().await.on_stream,
                 None => false,
             };
             HandlerResponse::err(unsupported(on_stream))

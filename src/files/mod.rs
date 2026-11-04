@@ -64,7 +64,7 @@ impl Closing {
         let fixed = open.fixed_times;
         // Changes to a named stream are not reported as changes of the
         // file.
-        let closing = if open.stream.is_some() {
+        let closing = if open.on_stream {
             Self::ReadOnly
         } else if open.wrote.load(Ordering::Acquire) {
             Self::Wrote
@@ -127,13 +127,15 @@ pub(crate) async fn close_open(open_arc: &Arc<RwLock<Open>>, want_attrs: bool) -
     drop(open.watch.take());
     let closing = Closing::announce(&open, true);
     restore_fixed_times(&open).await;
-    let handle = open.handle.take()?;
-    let info = if want_attrs {
-        handle.stat().await.ok()
-    } else {
-        None
-    };
+    let handle = open.handle.take();
     let file = open.file.take();
+    if handle.is_none() && file.is_none() {
+        return None;
+    }
+    let info = match &handle {
+        Some(handle) if want_attrs => handle.stat().await.ok(),
+        _ => None,
+    };
     open.slot.take();
     let delete_on_close = open.delete_on_close;
     let is_directory = open.is_directory;
@@ -151,7 +153,7 @@ pub(crate) async fn close_open(open_arc: &Arc<RwLock<Open>>, want_attrs: bool) -
 /// elsewhere, ends its watches with STATUS_DELETE_PENDING. Every path that
 /// ends an open goes through here.
 pub(crate) async fn finish_close(
-    handle: Box<dyn Handle>,
+    handle: Option<Box<dyn Handle>>,
     file: Option<FileRef>,
     delete_on_close: bool,
     is_directory: bool,
@@ -165,9 +167,15 @@ pub(crate) async fn finish_close(
         Some(share) if delete_on_close && is_directory => Some(share.files.rename_lock().await),
         _ => None,
     };
-    let delete_on_close =
-        delete_on_close && (!is_directory || handle.dir_is_empty().await.unwrap_or(false));
-    if let Err(e) = handle.close().await {
+    let delete_on_close = delete_on_close
+        && (!is_directory
+            || match &handle {
+                Some(handle) => handle.dir_is_empty().await.unwrap_or(false),
+                None => false,
+            });
+    if let Some(handle) = handle
+        && let Err(e) = handle.close().await
+    {
         let path = file.as_ref().map(FileRef::path).unwrap_or_default();
         debug!(error = %e, path = %path, "backend close failed");
     }
@@ -307,7 +315,7 @@ mod tests {
             handle: Some(handle),
             granted_access: DELETE,
             is_directory: directory,
-            stream: None,
+            on_stream: false,
             delete_on_close: true,
             search_state: None,
             fixed_times: FileTimes::default(),

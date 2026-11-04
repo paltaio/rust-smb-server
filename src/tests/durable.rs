@@ -22,7 +22,8 @@ use crate::proto::header::SMB2_FLAGS_REPLAY_OPERATION;
 use crate::proto::header::{Command, SMB2_HEADER_LEN};
 use crate::proto::messages::{
     CreateContext, CreateRequest, CreateResponse, FileId, LeaseBreakAck, LeaseBreakNotification,
-    LeaseContext, LockElement, LockRequest, ReadRequest, ReadResponse, WriteRequest,
+    LeaseContext, LockElement, LockRequest, ReadRequest, ReadResponse, SetInfoRequest,
+    WriteRequest,
 };
 use crate::server::ServerState;
 use crate::tests::memfs::MemFsBackend;
@@ -936,6 +937,49 @@ async fn a_reconnect_just_before_the_deadline_keeps_the_open() {
         "a reconnected open does not expire"
     );
     assert!(f_is_open(&state).await);
+}
+
+#[tokio::test]
+async fn an_open_whose_data_moves_into_a_stream_is_no_longer_durable() {
+    let (state, files) = server().await;
+    let mut peer = Peer::from_client(&state, true, CLIENT).await;
+    let open = Open {
+        access: READ_WRITE | DELETE,
+        ..Open::durable(RWH)
+    };
+    let resp = create(&mut peer, &state, open).await;
+    assert!(is_durable(&resp));
+    assert_eq!(state.durable.registered(), 1);
+    let name = crate::utils::utf16le(":x");
+    let mut buffer = vec![0; 16];
+    buffer.extend_from_slice(&(name.len() as u32).to_le_bytes());
+    buffer.extend_from_slice(&name);
+    let mut body = Vec::new();
+    SetInfoRequest {
+        structure_size: 33,
+        info_type: 1,
+        file_information_class: 0x0A,
+        buffer_length: buffer.len() as u32,
+        buffer_offset: 0x60,
+        reserved: 0,
+        additional_information: 0,
+        file_id: resp.file_id,
+        buffer,
+    }
+    .write_to(&mut body)
+    .expect("set info");
+    let (_, reply) = peer.request(&state, Command::SetInfo, &body).await;
+    assert_eq!(status(&reply), 0);
+    assert_eq!(state.durable.registered(), 0);
+    peer.drop_connection(&state).await;
+    settle().await;
+    assert_eq!(files.open_handles(), 0, "not kept");
+
+    let mut new = Peer::from_client(&state, true, CLIENT).await;
+    let body = Open::reconnect(resp.file_id, RWH).body();
+    let (_, reply) = new.request(&state, Command::Create, &body).await;
+    assert_eq!(status(&reply), ntstatus::STATUS_OBJECT_NAME_NOT_FOUND);
+    assert_eq!(files.stream_names("f.txt"), ["x"]);
 }
 
 #[tokio::test(start_paused = true)]

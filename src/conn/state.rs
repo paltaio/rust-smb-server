@@ -22,7 +22,6 @@ use crate::files::{
 use crate::path::SmbPath;
 use crate::rpc::pipe::{Pipe, PipeBudget};
 use crate::server::ShareBindings;
-use crate::stream::StreamName;
 
 /// In-flight NTLM acceptor + a `is_raw_ntlmssp` flag (true = raw, false =
 /// SPNEGO-wrapped). The handler hands the second-round response back in the
@@ -431,8 +430,8 @@ pub struct Open {
     pub granted_access: u32,
     /// The open is on a directory, and not on one of its named streams.
     pub is_directory: bool,
-    /// The named stream the open is on.
-    pub(crate) stream: Option<StreamName>,
+    /// The open is on a named stream, which `FileRef::stream` names.
+    pub(crate) on_stream: bool,
     /// FILE_DELETE_ON_CLOSE was set on CREATE (MS-FSA Open.Mode): the file
     /// becomes delete-pending when this open closes.
     pub delete_on_close: bool,
@@ -484,9 +483,10 @@ impl Drop for Open {
     /// CLOSE would, delete-on-close included. Without a runtime the handle
     /// and the table entry are dropped and the file stays.
     fn drop(&mut self) {
-        let Some(handle) = self.handle.take() else {
+        let handle = self.handle.take();
+        if handle.is_none() && self.file.is_none() {
             return;
-        };
+        }
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };

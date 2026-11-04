@@ -6,14 +6,17 @@ use std::sync::atomic::Ordering;
 use crate::proto::header::Smb2Header;
 use crate::proto::messages::{InfoType, SetInfoRequest, SetInfoResponse};
 
-use crate::access_mask::{DELETE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA};
+use crate::access_mask::{
+    DELETE, FILE_APPEND_DATA, FILE_READ_DATA, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA,
+};
 use crate::backend::{
-    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_TEMPORARY, FileInfo, FileTimes, OpenOptions,
+    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_TEMPORARY, FileInfo, FileTimes, Handle, OpenOptions,
     ShareBackend, VALID_SET_ATTRIBUTES,
 };
 use crate::conn::pending::{Stop, stopped};
 use crate::conn::state::{Connection, Open};
 use crate::dispatch::HandlerResponse;
+use crate::error::{SmbError, SmbResult};
 use crate::files::{BreakWait, CONTENT_CHANGED, Change, MAX_BREAK_WAIT, Trigger};
 use crate::handlers::shared::{lookup_open, lookup_session_tree, restore_fixed_times};
 use crate::handlers::{Outcome, Pending};
@@ -28,10 +31,13 @@ use crate::proto::messages::change_notify::{
     FILE_NOTIFY_CHANGE_LAST_WRITE,
 };
 use crate::server::{ServerState, ShareBindings};
-use crate::stream::{StreamPart, parse_create_name, unsupported};
+use crate::stream::{
+    StreamHandle, StreamName, StreamPart, StreamType, parse_create_name, parse_stream_target,
+    stream_error, unsupported,
+};
 use crate::utils::utf16le_to_units;
 use tokio::sync::RwLock;
-use tracing::warn;
+use tracing::{debug, warn};
 
 /// Classes MS-FSCC 2.4 lists as settable: Basic, Rename, Link, Disposition,
 /// Position, FullEa, Mode, Allocation, EndOfFile, Pipe, Quota,
@@ -89,7 +95,7 @@ async fn set(
     };
     // A link of a named stream fails with STATUS_INVALID_PARAMETER (MS-FSA
     // 2.1.5.15.7), as does everything else not served on one.
-    let unsupported = unsupported(open_arc.read().await.stream.is_some());
+    let unsupported = unsupported(open_arc.read().await.on_stream);
     if !matches!(info_type, InfoType::File) {
         return Ok(HandlerResponse::err(unsupported));
     }
@@ -203,23 +209,28 @@ async fn set(
                 Some(u) => u,
                 None => return Ok(HandlerResponse::err(ntstatus::STATUS_OBJECT_NAME_INVALID)),
             };
-            let new_path = match parse_create_name(&units) {
-                Ok((p, StreamPart::None)) => p,
-                _ => return Ok(HandlerResponse::err(ntstatus::STATUS_OBJECT_NAME_INVALID)),
-            };
-            // A named stream is renamed only to another stream name of its
-            // file.
-            if open_arc.read().await.stream.is_some() {
+            let replace = buffer[0] != 0;
+            // MS-FSA 2.1.5.15.12: a name that starts with `:` renames a
+            // stream of the file, and a named stream is renamed to nothing
+            // else.
+            if share.named_streams && units.first() == Some(&u16::from(b':')) {
+                rename_stream(&share, &open_arc, &units, replace).await
+            } else if open_arc.read().await.on_stream {
                 return Ok(HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER));
-            }
-            let rename = Rename {
-                file_id: req.file_id,
-                to: new_path,
-                replace: buffer[0] != 0,
-            };
-            match rename_attempt(conn, hdr, &rename, Stage::Start).await {
-                Renamed::Done(result) => result,
-                Renamed::Wait(wait) => return Err((wait, rename)),
+            } else {
+                let new_path = match parse_create_name(&units) {
+                    Ok((p, StreamPart::None)) => p,
+                    _ => return Ok(HandlerResponse::err(ntstatus::STATUS_OBJECT_NAME_INVALID)),
+                };
+                let rename = Rename {
+                    file_id: req.file_id,
+                    to: new_path,
+                    replace,
+                };
+                match rename_attempt(conn, hdr, &rename, Stage::Start).await {
+                    Renamed::Done(result) => result,
+                    Renamed::Wait(wait) => return Err((wait, rename)),
+                }
             }
         }
     };
@@ -254,7 +265,7 @@ async fn report_modified(share: &ShareBindings, open_arc: &RwLock<Open>, filter:
 /// reports a truncation twice. The size of a named stream is not the
 /// file's.
 async fn report_resized(share: &ShareBindings, open_arc: &RwLock<Open>, resized: bool) {
-    if resized && open_arc.read().await.stream.is_none() {
+    if resized && !open_arc.read().await.on_stream {
         report_modified(share, open_arc, CONTENT_CHANGED).await;
     }
 }
@@ -569,6 +580,209 @@ fn rename_changes(
     changes
 }
 
+/// A FileRenameInformation name that starts with `:`, on a share that
+/// serves named streams (MS-FSA 2.1.5.15.12.1): renames the stream the
+/// open is on to another stream of its file. A target of another stream
+/// type fails with STATUS_OBJECT_TYPE_MISMATCH; an existing target, the
+/// default stream included, with STATUS_OBJECT_NAME_COLLISION, or with
+/// STATUS_INVALID_PARAMETER when `replace` is set and the target is open
+/// or holds data; a rename of a directory, or to the default stream that
+/// a directory lacks, with STATUS_INVALID_PARAMETER. A rename to the
+/// stream's own name does nothing, also from the default stream with
+/// `replace`.
+///
+/// A named stream renamed to another name takes every open on it along.
+/// A rename from or to the default stream moves data between the file and
+/// the stream; the open renaming it then is on its new stream, with a new
+/// handle, and is no longer durable. While other opens are on the stream,
+/// the rename fails with STATUS_INVALID_PARAMETER. On the default stream
+/// the open has to pass the sharing checks against the file's other opens,
+/// or the rename fails with STATUS_SHARING_VIOLATION.
+async fn rename_stream(
+    share: &ShareBindings,
+    open_arc: &RwLock<Open>,
+    units: &[u16],
+    replace: bool,
+) -> Result<(), u32> {
+    let target = parse_stream_target(units)?;
+    // No CREATE runs meanwhile, so no open of the target or stream of
+    // that name appears after the checks.
+    let _renames = share.files.rename_lock().await;
+    let mut open = open_arc.write().await;
+    let file = open.file.as_ref().ok_or(ntstatus::STATUS_FILE_CLOSED)?;
+    let handle = open.handle.as_ref().ok_or(ntstatus::STATUS_FILE_CLOSED)?;
+    // The type is checked first, then any rename of a directory refused.
+    let kind = if open.is_directory {
+        StreamType::Directory
+    } else {
+        StreamType::Data
+    };
+    if target.kind.is_some_and(|k| k != kind) {
+        return Err(ntstatus::STATUS_OBJECT_TYPE_MISMATCH);
+    }
+    if open.is_directory {
+        return Err(ntstatus::STATUS_INVALID_PARAMETER);
+    }
+    let (from, to) = (file.stream(), target.stream);
+    match (&from, &to) {
+        (Some(from), Some(to)) if from.matches(to) => return Ok(()),
+        (None, None) if replace => return Ok(()),
+        (None, None) => return Err(ntstatus::STATUS_OBJECT_NAME_COLLISION),
+        _ => {}
+    }
+    let path = file.path();
+    let backend = share.backend.as_ref();
+    let status = |e: SmbError| stream_error(e).to_nt_status();
+    match &to {
+        Some(to) => {
+            let streams = handle.streams().await.map_err(status)?;
+            let existing = streams.iter().find(|s| s.name.matches(to));
+            let in_use = file.stream_in_use(to);
+            if existing.is_some() || in_use {
+                if !replace {
+                    return Err(ntstatus::STATUS_OBJECT_NAME_COLLISION);
+                }
+                if in_use || existing.is_some_and(|s| s.size != 0) {
+                    return Err(ntstatus::STATUS_INVALID_PARAMETER);
+                }
+            }
+        }
+        None => {
+            if handle.stat().await.map_err(status)?.is_directory {
+                return Err(ntstatus::STATUS_INVALID_PARAMETER);
+            }
+            if !replace {
+                return Err(ntstatus::STATUS_OBJECT_NAME_COLLISION);
+            }
+            if file.others_on(None) || default_size(backend, &path).await? != 0 {
+                return Err(ntstatus::STATUS_INVALID_PARAMETER);
+            }
+        }
+    }
+    if from.is_some() && to.is_some() {
+        backend
+            .rename_stream(&path, from.as_ref(), to.as_ref(), replace)
+            .await
+            .map_err(status)?;
+        file.rename_stream(from.as_ref(), to.as_ref());
+        return Ok(());
+    }
+    if file.others_on(from.as_ref()) {
+        return Err(ntstatus::STATUS_INVALID_PARAMETER);
+    }
+    if to.is_none() && !file.admitted_on_default() {
+        return Err(ntstatus::STATUS_SHARING_VIOLATION);
+    }
+    let access = open.granted_access;
+    let reopened = match &to {
+        // The default stream exists, so its handle is opened before the
+        // data moves into it, and a failure leaves everything as it was.
+        None => {
+            let reopened = reopen(backend, &path, None, access).await.map_err(status)?;
+            if let Err(e) = backend
+                .rename_stream(&path, from.as_ref(), None, true)
+                .await
+            {
+                close(reopened, &path).await;
+                return Err(status(e));
+            }
+            Some(reopened)
+        }
+        Some(to) => {
+            backend
+                .rename_stream(&path, None, Some(to), replace)
+                .await
+                .map_err(status)?;
+            match reopen(backend, &path, Some(to), access).await {
+                Ok(reopened) => Some(reopened),
+                Err(e) => match backend.rename_stream(&path, Some(to), None, true).await {
+                    Ok(()) => return Err(status(e)),
+                    // The data stays in the stream, and so does the open,
+                    // which has no handle left to use.
+                    Err(back) => {
+                        warn!(error = %e, undo = %back, path = %path, "a moved stream has no handle");
+                        None
+                    }
+                },
+            }
+        }
+    };
+    file.rename_stream(from.as_ref(), to.as_ref());
+    open.on_stream = to.is_some();
+    open.durable = None;
+    let old = std::mem::replace(&mut open.handle, reopened);
+    if let Some(old) = old {
+        close(old, &path).await;
+    }
+    Ok(())
+}
+
+/// Closes a backend handle the open no longer uses.
+async fn close(handle: Box<dyn Handle>, path: &SmbPath) {
+    if let Err(e) = handle.close().await {
+        debug!(error = %e, path = %path, "backend close failed");
+    }
+}
+
+/// The size of the default stream of the file at `path`.
+async fn default_size(backend: &dyn ShareBackend, path: &SmbPath) -> Result<u64, u32> {
+    let status = |e: SmbError| stream_error(e).to_nt_status();
+    let (file, _) = backend
+        .open(path, OpenOptions::default())
+        .await
+        .map_err(status)?;
+    let info = file.stat().await;
+    close(file, path).await;
+    Ok(info.map_err(status)?.end_of_file)
+}
+
+/// A new backend handle on `stream` of the file at `path`, the default
+/// stream when `None`, for an open granted `access`. When the backend
+/// refuses the data access granted, for example to write a file made
+/// read-only since, the handle reads only, as the stream's attributes
+/// allow.
+async fn reopen(
+    backend: &dyn ShareBackend,
+    path: &SmbPath,
+    stream: Option<&StreamName>,
+    access: u32,
+) -> SmbResult<Box<dyn Handle>> {
+    let write = access & (FILE_WRITE_DATA | FILE_APPEND_DATA) != 0;
+    let granted = OpenOptions {
+        read: access & FILE_READ_DATA != 0 || !write,
+        write,
+        write_attributes: access & FILE_WRITE_ATTRIBUTES != 0,
+        non_directory: stream.is_none(),
+        ..OpenOptions::default()
+    };
+    let opened = open_data(backend, path, stream, granted).await;
+    if opened.is_ok() || !write {
+        return opened;
+    }
+    let reading = OpenOptions {
+        read: true,
+        write: false,
+        ..granted
+    };
+    open_data(backend, path, stream, reading).await
+}
+
+/// Opens `stream` of the file at `path`, the default stream when `None`,
+/// with `opts`.
+async fn open_data(
+    backend: &dyn ShareBackend,
+    path: &SmbPath,
+    stream: Option<&StreamName>,
+    opts: OpenOptions,
+) -> SmbResult<Box<dyn Handle>> {
+    let Some(stream) = stream else {
+        return Ok(backend.open(path, opts).await?.0);
+    };
+    let (file, _) = backend.open(path, OpenOptions::default()).await?;
+    let (handle, _) = backend.open_stream(file, path, stream, opts).await?;
+    Ok(Box::new(StreamHandle(handle)))
+}
+
 /// FileBasicInformation (MS-FSA 2.1.5.15.2, MS-FSCC 2.4.7). A time of 0
 /// or -1 leaves it alone. For the access and write times, -1 also keeps the
 /// time fixed against later changes made through this open, -2 lets those
@@ -874,7 +1088,7 @@ mod tests {
                 handle: Some(handle),
                 granted_access: DELETE,
                 is_directory: directory,
-                stream: None,
+                on_stream: false,
                 delete_on_close: false,
                 search_state: None,
                 fixed_times: FileTimes::default(),

@@ -598,6 +598,12 @@ impl DurableTable {
         }))
     }
 
+    /// How many durable opens the table holds.
+    #[cfg(test)]
+    pub(crate) fn registered(&self) -> usize {
+        self.inner().entries.len()
+    }
+
     /// Whether a durable open of `client` that a replayed CREATE could
     /// name has `create_guid` (MS-SMB2 3.3.5.9.10, Open.IsReplayEligible).
     pub(crate) fn create_guid_in_use(&self, client: Uuid, create_guid: [u8; 16]) -> bool {
@@ -821,7 +827,7 @@ mod tests {
                 handle: Some(handle),
                 granted_access: FILE_READ_DATA | FILE_WRITE_DATA,
                 is_directory: false,
-                stream: None,
+                on_stream: false,
                 delete_on_close: false,
                 search_state: None,
                 fixed_times: FileTimes::default(),

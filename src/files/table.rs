@@ -1286,6 +1286,95 @@ impl FileRef {
         }
     }
 
+    /// The named stream this open is on, under its current name; `None`
+    /// for the default stream or the directory.
+    pub(crate) fn stream(&self) -> Option<StreamName> {
+        self.node
+            .state()
+            .entry(self.id)
+            .and_then(|e| e.stream.clone())
+    }
+
+    /// Whether an open is on the named stream `stream` of the file, or the
+    /// stream is marked for deletion.
+    pub(crate) fn stream_in_use(&self, stream: &StreamName) -> bool {
+        let state = self.node.state();
+        state.stream_open(stream) || state.stream_deleted(stream)
+    }
+
+    /// Whether an open other than this one is on `stream` of the file, the
+    /// default stream when `None`.
+    pub(crate) fn others_on(&self, stream: Option<&StreamName>) -> bool {
+        self.node
+            .state()
+            .opens
+            .iter()
+            .any(|e| e.id != self.id && same_stream(e.stream.as_ref(), stream))
+    }
+
+    /// Whether this open, moved onto the default stream, passes the
+    /// sharing checks against the file's other opens (MS-FSA 2.1.5.1.2.1,
+    /// 2.1.5.1.2.2).
+    pub(crate) fn admitted_on_default(&self) -> bool {
+        let state = self.node.state();
+        let Some(sharing) = state.entry(self.id).map(|e| e.sharing) else {
+            return false;
+        };
+        !state
+            .opens
+            .iter()
+            .any(|e| e.id != self.id && !e.waiting && e.conflicts_with(sharing, None))
+    }
+
+    /// Moves the opens on the stream `from` of the file, their byte-range
+    /// locks and the stream's mark for deletion to `to`, which the backend
+    /// just renamed it to; `None` is the default stream (MS-FSA
+    /// 2.1.5.15.12.1). A named stream renamed to the default stream leaves
+    /// its mark behind: the file is not deleted for it.
+    ///
+    /// An open moved off the default stream is no longer durable, and the
+    /// lease it holds, which caches the default stream, breaks to NONE:
+    /// the file it cached is empty now.
+    pub(crate) fn rename_stream(&self, from: Option<&StreamName>, to: Option<&StreamName>) {
+        let notices = {
+            let mut state = self.node.state();
+            let state = &mut *state;
+            let moved = |stream: &Option<StreamName>| same_stream(stream.as_ref(), from);
+            let mut leases = Vec::new();
+            for entry in state.opens.iter_mut().filter(|e| moved(&e.stream)) {
+                entry.stream = to.cloned();
+                leases.extend(entry.lease);
+                if from.is_none() {
+                    entry.durable = None;
+                }
+            }
+            for lock in state.locks.iter_mut().filter(|l| moved(&l.stream)) {
+                lock.stream = to.cloned();
+            }
+            if let Some(from) = from {
+                let marked = state.stream_deleted(from);
+                state.deleted_streams.retain(|s| !s.matches(from));
+                if let Some(to) = to.filter(|_| marked) {
+                    state.deleted_streams.push(to.clone());
+                }
+            }
+            let mut notices = Notices::default();
+            if from.is_none() {
+                for id in leases {
+                    let Some(at) = state.leases.iter().position(|l| l.id == id) else {
+                        continue;
+                    };
+                    match &mut state.leases[at].breaking {
+                        Some(breaking) => breaking.required = LeaseState::NONE,
+                        None => state.start_break(at, LeaseState::NONE, &mut notices),
+                    }
+                }
+            }
+            notices
+        };
+        drop(notices);
+    }
+
     /// Sets or clears the delete-pending flag of the stream this open is on
     /// (MS-FSA 2.1.5.15.3). On the default stream or the directory that is
     /// the file's flag: the file is removed under this open's name when its

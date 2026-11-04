@@ -219,9 +219,9 @@ pub struct BackendCapabilities {
     /// True iff the backend treats names case-sensitively.
     pub case_sensitive: bool,
     /// The backend stores named streams (`file.txt:name`), served by
-    /// [`ShareBackend::open_stream`], [`ShareBackend::remove_stream`] and
-    /// [`Handle::streams`]. On a share that leaves
-    /// [`Share::named_streams`](crate::Share::named_streams) on,
+    /// [`ShareBackend::open_stream`], [`ShareBackend::remove_stream`],
+    /// [`ShareBackend::rename_stream`] and [`Handle::streams`]. On a share
+    /// that leaves [`Share::named_streams`](crate::Share::named_streams) on,
     /// FileFsAttributeInformation then reports FILE_NAMED_STREAMS. Without
     /// it, a CREATE that names a stream fails with
     /// STATUS_OBJECT_NAME_INVALID before the backend is called.
@@ -298,10 +298,11 @@ pub trait ShareBackend: Send + Sync + 'static {
     ///
     /// Called only when [`BackendCapabilities::named_streams`] is set. The
     /// protocol layer answers [`SmbError::NotSupported`] from this, from
-    /// [`ShareBackend::remove_stream`] and from a stream's handle with
-    /// STATUS_ACCESS_DENIED: macOS stores an extended attribute in a `._`
-    /// file when a stream request fails with STATUS_NOT_SUPPORTED. The
-    /// default closes `file` and returns [`SmbError::NotSupported`].
+    /// [`ShareBackend::remove_stream`], from [`ShareBackend::rename_stream`]
+    /// and from a stream's handle with STATUS_ACCESS_DENIED: macOS stores
+    /// an extended attribute in a `._` file when a stream request fails
+    /// with STATUS_NOT_SUPPORTED. The default closes `file` and returns
+    /// [`SmbError::NotSupported`].
     async fn open_stream(
         &self,
         file: Box<dyn Handle>,
@@ -318,6 +319,45 @@ pub trait ShareBackend: Send + Sync + 'static {
     /// [`SmbError::NotFound`] when the file has no such stream. The default
     /// returns [`SmbError::NotSupported`].
     async fn remove_stream(&self, _path: &SmbPath, _stream: &StreamName) -> SmbResult<()> {
+        Err(SmbError::NotSupported)
+    }
+
+    /// Rename a stream of the file or directory at `path`: the named
+    /// stream `from` names, or the default stream when `from` is `None`,
+    /// to the named stream `to`, or to the default stream when `to` is
+    /// `None`. Names compare without regard to case, and a renamed stream
+    /// takes the spelling of `to`. `from` and `to` never name the same
+    /// stream, and a directory, which has no default stream, only renames
+    /// a named stream to another.
+    ///
+    /// When `to` names an existing stream, fail with [`SmbError::Exists`]
+    /// unless `replace_if_exists` is set; then that stream is replaced,
+    /// and the protocol layer has checked that it is empty and that no
+    /// open is on it. That holds for the default stream too, which a
+    /// rename to it always replaces.
+    ///
+    /// A rename from the default stream moves the file's data into the
+    /// named stream and leaves the default stream empty; a rename to it
+    /// moves the stream's data into the file and removes the stream. A
+    /// rename that fails leaves both streams as they were, a replaced one
+    /// included.
+    ///
+    /// Stream handles track their stream itself, not its name: every
+    /// handle open on a named stream renamed to another name keeps reading
+    /// and writing it under its new name. A rename to or from the default
+    /// stream comes from the only open on the stream it renames, whose
+    /// handle the protocol layer replaces with a new one; the old handle
+    /// still has to close cleanly. Updating the file's times for the
+    /// rename is left to the backend.
+    ///
+    /// The default returns [`SmbError::NotSupported`].
+    async fn rename_stream(
+        &self,
+        _path: &SmbPath,
+        _from: Option<&StreamName>,
+        _to: Option<&StreamName>,
+        _replace_if_exists: bool,
+    ) -> SmbResult<()> {
         Err(SmbError::NotSupported)
     }
 }

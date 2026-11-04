@@ -1,6 +1,6 @@
 //! Named streams over the dispatcher, on a memory backend that stores
 //! them: CREATE dispositions, share modes and locks per stream, deletion,
-//! the stream list, and shares that serve none.
+//! renames, the stream list, and shares that serve none.
 
 use std::sync::Arc;
 
@@ -14,10 +14,12 @@ use crate::path::SmbPath;
 use crate::proto::header::{Command, SMB2_HEADER_LEN};
 use crate::proto::messages::{
     ChangeNotifyRequest, ChangeNotifyResponse, CloseRequest, CreateContext, CreateRequest,
-    CreateResponse, FileId, IoctlRequest, LeaseContext, LockElement, LockRequest, QueryInfoRequest,
-    QueryInfoResponse, ReadRequest, ReadResponse, SetInfoRequest, WriteRequest,
+    CreateResponse, FileId, IoctlRequest, LeaseBreakNotification, LeaseContext, LockElement,
+    LockRequest, QueryInfoRequest, QueryInfoResponse, ReadRequest, ReadResponse, SetInfoRequest,
+    WriteRequest,
 };
 use crate::server::ServerState;
+use crate::stream::StreamName;
 use crate::tests::memfs::MemFsBackend;
 use crate::tests::peer::{Peer, header, status};
 use crate::{Share, SmbServer};
@@ -28,7 +30,12 @@ const RW: u32 = READ | WRITE;
 const DELETE: u32 = 0x0001_0000;
 const SHARE_READ: u32 = 0x1;
 const SHARE_WRITE: u32 = 0x2;
+const SHARE_DELETE: u32 = 0x4;
 const SHARE_ALL: u32 = 0x7;
+
+const COLLISION: u32 = ntstatus::STATUS_OBJECT_NAME_COLLISION;
+const INVALID: u32 = ntstatus::STATUS_INVALID_PARAMETER;
+const MISMATCH: u32 = ntstatus::STATUS_OBJECT_TYPE_MISMATCH;
 
 const FILE_SUPERSEDE: u32 = 0;
 const FILE_OPEN: u32 = 1;
@@ -266,6 +273,16 @@ impl Client {
         .write_to(&mut body)
         .expect("set info");
         self.send(Command::SetInfo, &body).await.0
+    }
+
+    /// Renames `file_id` to `to` with FileRenameInformation.
+    async fn rename(&mut self, file_id: FileId, to: &str, replace: bool) -> u32 {
+        let buffer = if replace {
+            rename_over(to)
+        } else {
+            rename_to(to)
+        };
+        self.set_info(file_id, RENAME, buffer).await
     }
 
     async fn query(
@@ -861,6 +878,14 @@ async fn a_read_only_file_keeps_its_streams() {
         a.close(s).await;
     }
     assert_eq!(files.stream_names("f.txt"), ["s"]);
+
+    // A stream of the file is renamed all the same.
+    let s = a
+        .open(Create::new("f.txt:s").access(READ | DELETE, SHARE_ALL))
+        .await;
+    assert_eq!(a.rename(s, ":t", false).await, 0);
+    a.close(s).await;
+    assert_eq!(files.stream_names("f.txt"), ["t"]);
 }
 
 #[tokio::test]
@@ -960,6 +985,13 @@ fn rename_to(to: &str) -> Vec<u8> {
     buffer
 }
 
+/// A FileRenameInformation buffer naming `to`, with ReplaceIfExists set.
+fn rename_over(to: &str) -> Vec<u8> {
+    let mut buffer = rename_to(to);
+    buffer[0] = 1;
+    buffer
+}
+
 #[tokio::test]
 async fn a_renamed_file_takes_its_open_streams_along() {
     let files = MemFsBackend::new();
@@ -1001,6 +1033,560 @@ async fn a_renamed_file_takes_its_open_streams_along() {
     }
     assert_eq!(files.stream_names("g.txt"), ["s"]);
     assert_eq!(files.stream_names("e"), ["ds"]);
+}
+
+#[tokio::test]
+async fn a_stream_is_renamed_with_every_open_on_it() {
+    let files = MemFsBackend::new();
+    let state = server(&files).await;
+    let mut a = Client::new(&state).await;
+    let mut b = Client::new(&state).await;
+    make(&mut a, "f.txt:s", b"sdata").await;
+
+    let s = a
+        .open(Create::new("f.txt:s").access(RW | DELETE, SHARE_READ | SHARE_DELETE))
+        .await;
+    let reader = b.open(Create::new("f.txt:S").access(READ, SHARE_ALL)).await;
+    assert_eq!(b.lock(reader, 100, 10).await, 0);
+    for to in [":t", ":u:$DATA", ":v:$data"] {
+        assert_eq!(a.rename(s, to, false).await, 0, "{to}");
+    }
+    // Its own name, in any case, leaves the stream as it is.
+    assert_eq!(a.rename(s, ":V", false).await, 0);
+    assert_eq!(files.stream_names("f.txt"), ["v"]);
+    assert_eq!(files.contents("f.txt"), Some(b"data".to_vec()));
+    assert_eq!(a.read(s, 0, 64).await.unwrap(), b"sdata");
+    assert_eq!(b.read(reader, 0, 64).await.unwrap(), b"sdata");
+
+    // The opens, their share modes and their locks are the new name's.
+    assert_eq!(
+        b.create(Create::new("f.txt:s")).await.err(),
+        Some(ntstatus::STATUS_OBJECT_NAME_NOT_FOUND)
+    );
+    assert_eq!(
+        b.create(Create::new("f.txt:V").access(RW, SHARE_ALL))
+            .await
+            .err(),
+        Some(ntstatus::STATUS_SHARING_VIOLATION)
+    );
+    let other = b.open(Create::new("f.txt:v").access(READ, SHARE_ALL)).await;
+    assert_eq!(
+        b.lock(other, 100, 1).await,
+        ntstatus::STATUS_LOCK_NOT_GRANTED
+    );
+    let fresh = b
+        .open(
+            Create::new("f.txt:s")
+                .access(RW, 0)
+                .disposition(FILE_CREATE),
+        )
+        .await;
+    assert_eq!(b.lock(fresh, 100, 10).await, 0);
+    for id in [other, fresh, reader] {
+        b.close(id).await;
+    }
+    a.close(s).await;
+    assert_eq!(files.stream_names("f.txt"), ["v", "s"]);
+}
+
+#[tokio::test]
+async fn stream_renames_refuse_taken_mistyped_and_malformed_targets() {
+    let files = MemFsBackend::new();
+    let state = server(&files).await;
+    let mut a = Client::new(&state).await;
+    let mut b = Client::new(&state).await;
+    make(&mut a, "f.txt:s", b"sdata").await;
+    make(&mut a, "f.txt:full", b"x").await;
+    make(&mut a, "f.txt:empty", b"").await;
+    make(&mut a, "f.txt:busy", b"").await;
+    let busy = b
+        .open(Create::new("f.txt:busy").access(READ, SHARE_ALL))
+        .await;
+    let s = a
+        .open(Create::new("f.txt:s").access(RW | DELETE, SHARE_ALL))
+        .await;
+
+    let cases = [
+        (":full", false, COLLISION),
+        (":FULL", true, INVALID),
+        (":busy", false, COLLISION),
+        (":busy", true, INVALID),
+        (":empty", false, COLLISION),
+        ("::$DATA", false, COLLISION),
+        ("::$DATA", true, INVALID),
+        (":x:$INDEX_ALLOCATION", false, MISMATCH),
+        (":x:$FOO", false, MISMATCH),
+        (":x:", false, INVALID),
+        (":a:b:c", false, INVALID),
+        (":a\\b", false, INVALID),
+        (":", false, INVALID),
+        ("g.txt", false, INVALID),
+        ("f.txt:x", false, INVALID),
+        ("\\g.txt", false, INVALID),
+    ];
+    for (to, replace, expected) in cases {
+        assert_eq!(a.rename(s, to, replace).await, expected, "{to} {replace}");
+    }
+    assert_eq!(files.stream_names("f.txt"), ["s", "full", "empty", "busy"]);
+    assert_eq!(files.contents("g.txt"), None);
+
+    // An empty stream no open is on is replaced.
+    assert_eq!(a.rename(s, ":EMPTY", true).await, 0);
+    assert_eq!(files.stream_names("f.txt"), ["EMPTY", "full", "busy"]);
+    assert_eq!(a.read(s, 0, 64).await.unwrap(), b"sdata");
+    b.close(busy).await;
+
+    // A rename needs DELETE access.
+    let reader = a
+        .open(Create::new("f.txt:full").access(RW, SHARE_ALL))
+        .await;
+    assert_eq!(
+        a.rename(reader, ":y", false).await,
+        ntstatus::STATUS_ACCESS_DENIED
+    );
+}
+
+#[tokio::test]
+async fn a_directory_renames_only_its_named_streams() {
+    let files = MemFsBackend::new();
+    let state = server(&files).await;
+    let mut a = Client::new(&state).await;
+    make(&mut a, "d:ds", b"dir").await;
+
+    let d = a
+        .open(
+            Create::new("d")
+                .access(READ | DELETE, SHARE_ALL)
+                .options(FILE_DIRECTORY_FILE),
+        )
+        .await;
+    let f = a
+        .open(Create::new("f.txt").access(RW | DELETE, SHARE_ALL))
+        .await;
+    let cases = [
+        (d, ":x", false, INVALID),
+        (d, ":x:$DATA", false, MISMATCH),
+        (d, ":x:$INDEX_ALLOCATION", false, INVALID),
+        (d, "::$DATA", false, MISMATCH),
+        (d, "::$INDEX_ALLOCATION", false, INVALID),
+        (f, ":x:$INDEX_ALLOCATION", false, MISMATCH),
+    ];
+    for (id, to, replace, expected) in cases {
+        assert_eq!(a.rename(id, to, replace).await, expected, "{to} {replace}");
+    }
+    assert_eq!(files.contents("f.txt"), Some(b"data".to_vec()));
+    assert!(files.stream_names("f.txt").is_empty());
+    a.close(d).await;
+    a.close(f).await;
+
+    // A directory's named stream has no default stream to go to.
+    let ds = a
+        .open(Create::new("d:ds").access(RW | DELETE, SHARE_ALL))
+        .await;
+    assert_eq!(a.rename(ds, "::$DATA", false).await, INVALID);
+    assert_eq!(a.rename(ds, ":de", false).await, 0);
+    a.close(ds).await;
+    assert_eq!(files.stream_names("d"), ["de"]);
+}
+
+#[tokio::test]
+async fn the_default_stream_moves_into_a_named_stream() {
+    let files = MemFsBackend::new();
+    let state = server(&files).await;
+    let mut a = Client::new(&state).await;
+    let mut b = Client::new(&state).await;
+    make(&mut a, "f.txt:full", b"x").await;
+    make(&mut a, "f.txt:empty", b"").await;
+
+    let f = a
+        .open(Create::new("f.txt").access(RW | DELETE, SHARE_READ | SHARE_DELETE))
+        .await;
+    let cases = [
+        (":full", false, COLLISION),
+        (":full", true, INVALID),
+        (":empty", false, COLLISION),
+        ("::$DATA", false, COLLISION),
+        ("::$DATA", true, 0),
+    ];
+    for (to, replace, expected) in cases {
+        assert_eq!(a.rename(f, to, replace).await, expected, "{to} {replace}");
+    }
+    // Refused while the default stream has other opens.
+    let other = b.open(Create::new("f.txt").access(0x80, SHARE_ALL)).await;
+    assert_eq!(a.rename(f, ":x", false).await, INVALID);
+    b.close(other).await;
+    assert_eq!(files.contents("f.txt"), Some(b"data".to_vec()));
+
+    assert_eq!(a.lock(f, 100, 10).await, 0);
+    assert_eq!(a.rename(f, ":EMPTY", true).await, 0);
+    assert_eq!(files.contents("f.txt"), Some(Vec::new()));
+    assert_eq!(files.stream_names("f.txt"), ["full", "EMPTY"]);
+    assert_eq!(a.read(f, 0, 64).await.unwrap(), b"data");
+    assert_eq!(a.write(f, 0, b"ZZ").await, 0);
+    assert_eq!(u64_at(&a.file_info(f, STANDARD).await, 8), 4, "EndOfFile");
+
+    // The open, its share mode and its lock are the stream's now.
+    let base = b.open(Create::new("f.txt").access(RW, SHARE_ALL)).await;
+    assert_eq!(b.read(base, 0, 64).await, Err(ntstatus::STATUS_END_OF_FILE));
+    assert_eq!(b.lock(base, 100, 10).await, 0);
+    assert_eq!(
+        b.create(Create::new("f.txt:empty").access(RW, SHARE_ALL))
+            .await
+            .err(),
+        Some(ntstatus::STATUS_SHARING_VIOLATION)
+    );
+    let stream = b
+        .open(Create::new("f.txt:empty").access(READ, SHARE_ALL))
+        .await;
+    assert_eq!(b.read(stream, 0, 64).await.unwrap(), b"ZZta");
+    assert_eq!(
+        b.lock(stream, 100, 1).await,
+        ntstatus::STATUS_LOCK_NOT_GRANTED
+    );
+    for id in [base, stream] {
+        b.close(id).await;
+    }
+
+    // Back again, moving the data into the empty default stream.
+    assert_eq!(a.rename(f, "::$DATA", true).await, 0);
+    a.close(f).await;
+    assert_eq!(files.contents("f.txt"), Some(b"ZZta".to_vec()));
+    assert_eq!(files.stream_names("f.txt"), ["full"]);
+}
+
+/// What a [`Picky`] backend refuses.
+const ACCEPT: u8 = 0;
+const REFUSE_WRITES: u8 = 1;
+const REFUSE_OPENS: u8 = 2;
+const REFUSE_OPENS_AND_MOVES_BACK: u8 = 3;
+
+/// A memory backend that, as `mode` says, refuses opens for writing, every
+/// open, or every open and every rename into the default stream, with
+/// STATUS_ACCESS_DENIED.
+struct Picky {
+    inner: MemFsBackend,
+    mode: Arc<std::sync::atomic::AtomicU8>,
+}
+
+impl Picky {
+    fn check(&self, opts: &OpenOptions) -> SmbResult<()> {
+        match self.mode.load(std::sync::atomic::Ordering::SeqCst) {
+            REFUSE_WRITES if opts.write => Err(crate::SmbError::AccessDenied),
+            REFUSE_OPENS | REFUSE_OPENS_AND_MOVES_BACK => Err(crate::SmbError::AccessDenied),
+            _ => Ok(()),
+        }
+    }
+}
+
+#[async_trait]
+impl ShareBackend for Picky {
+    async fn open(
+        &self,
+        path: &SmbPath,
+        opts: OpenOptions,
+    ) -> SmbResult<(Box<dyn Handle>, OpenAction)> {
+        self.check(&opts)?;
+        self.inner.open(path, opts).await
+    }
+
+    async fn unlink(&self, path: &SmbPath) -> SmbResult<()> {
+        self.inner.unlink(path).await
+    }
+
+    async fn rename(&self, from: &SmbPath, to: &SmbPath, replace: bool) -> SmbResult<()> {
+        self.inner.rename(from, to, replace).await
+    }
+
+    fn capabilities(&self) -> BackendCapabilities {
+        self.inner.capabilities()
+    }
+
+    async fn open_stream(
+        &self,
+        file: Box<dyn Handle>,
+        path: &SmbPath,
+        stream: &StreamName,
+        opts: OpenOptions,
+    ) -> SmbResult<(Box<dyn Handle>, OpenAction)> {
+        if let Err(e) = self.check(&opts) {
+            let _ = file.close().await;
+            return Err(e);
+        }
+        self.inner.open_stream(file, path, stream, opts).await
+    }
+
+    async fn rename_stream(
+        &self,
+        path: &SmbPath,
+        from: Option<&StreamName>,
+        to: Option<&StreamName>,
+        replace: bool,
+    ) -> SmbResult<()> {
+        let mode = self.mode.load(std::sync::atomic::Ordering::SeqCst);
+        if mode == REFUSE_OPENS_AND_MOVES_BACK && to.is_none() {
+            return Err(crate::SmbError::AccessDenied);
+        }
+        self.inner.rename_stream(path, from, to, replace).await
+    }
+}
+
+#[tokio::test]
+async fn a_moved_stream_gets_a_new_handle_or_moves_back() {
+    let files = MemFsBackend::new().with_file("f.txt", b"data");
+    let mode = Arc::new(std::sync::atomic::AtomicU8::new(ACCEPT));
+    let picky = Picky {
+        inner: files.clone(),
+        mode: Arc::clone(&mode),
+    };
+    let state = server_on(Share::new("home", picky).public());
+    let mut a = Client::new(&state).await;
+    let set = |m| mode.store(m, std::sync::atomic::Ordering::SeqCst);
+
+    // A file made read-only after the open: the new handle reads only.
+    let f = a
+        .open(Create::new("f.txt").access(RW | DELETE, SHARE_ALL))
+        .await;
+    let mut basic = vec![0; 40];
+    basic[32] = 0x1;
+    assert_eq!(a.set_info(f, BASIC, basic).await, 0);
+    set(REFUSE_WRITES);
+    assert_eq!(a.rename(f, ":x", false).await, 0);
+    assert_eq!(files.contents("f.txt"), Some(Vec::new()));
+    assert_eq!(files.stream_names("f.txt"), ["x"]);
+    assert_eq!(a.read(f, 0, 64).await.unwrap(), b"data");
+    assert_eq!(a.rename(f, "::$DATA", true).await, 0);
+    assert_eq!(files.contents("f.txt"), Some(b"data".to_vec()));
+    assert_eq!(a.read(f, 0, 64).await.unwrap(), b"data");
+
+    // No new handle: the data moves back, and the open keeps its handle.
+    set(REFUSE_OPENS);
+    assert_eq!(
+        a.rename(f, ":y", false).await,
+        ntstatus::STATUS_ACCESS_DENIED
+    );
+    assert_eq!(files.contents("f.txt"), Some(b"data".to_vec()));
+    assert!(files.stream_names("f.txt").is_empty());
+    assert_eq!(a.read(f, 0, 64).await.unwrap(), b"data");
+
+    // Nor a way back: the rename stands, and the open has no handle.
+    set(REFUSE_OPENS_AND_MOVES_BACK);
+    assert_eq!(a.rename(f, ":z", false).await, 0);
+    assert_eq!(files.stream_names("f.txt"), ["z"]);
+    assert_eq!(a.read(f, 0, 64).await, Err(ntstatus::STATUS_FILE_CLOSED));
+    a.close(f).await;
+    set(ACCEPT);
+    let z = a.open(Create::new("f.txt:z").access(READ, 0)).await;
+    assert_eq!(a.read(z, 0, 64).await.unwrap(), b"data");
+    a.close(z).await;
+    assert_eq!(files.open_handles(), 0);
+}
+
+#[tokio::test]
+async fn a_stream_moved_onto_the_default_stream_shares_as_the_file_requires() {
+    let files = MemFsBackend::new();
+    let state = server(&files).await;
+    let mut a = Client::new(&state).await;
+    let mut b = Client::new(&state).await;
+    make(&mut a, "f.txt:s", b"sdata").await;
+    make(&mut a, "f.txt:t", b"x").await;
+    let base = a.open(Create::new("f.txt").access(RW, SHARE_ALL)).await;
+    assert_eq!(a.set_info(base, END_OF_FILE, vec![0; 8]).await, 0);
+    a.close(base).await;
+
+    // On the default stream an open holding DELETE excludes opens of
+    // other streams that do not share delete access.
+    let s = a
+        .open(Create::new("f.txt:s").access(RW | DELETE, SHARE_ALL))
+        .await;
+    let t = b
+        .open(Create::new("f.txt:t").access(READ, SHARE_READ))
+        .await;
+    assert_eq!(
+        a.rename(s, "::$DATA", true).await,
+        ntstatus::STATUS_SHARING_VIOLATION
+    );
+    assert_eq!(files.stream_names("f.txt"), ["s", "t"]);
+    assert_eq!(a.read(s, 0, 64).await.unwrap(), b"sdata");
+    b.close(t).await;
+    assert_eq!(a.rename(s, "::$DATA", true).await, 0);
+    assert_eq!(files.contents("f.txt"), Some(b"sdata".to_vec()));
+    a.close(s).await;
+}
+
+#[tokio::test]
+async fn a_named_stream_moves_into_an_empty_default_stream() {
+    let files = MemFsBackend::new();
+    let state = server(&files).await;
+    let mut a = Client::new(&state).await;
+    let mut b = Client::new(&state).await;
+    make(&mut a, "f.txt:s", b"sdata").await;
+
+    let s = a
+        .open(Create::new("f.txt:s").access(RW | DELETE, SHARE_READ | SHARE_DELETE))
+        .await;
+    assert_eq!(a.rename(s, "::$DATA", true).await, INVALID, "data");
+    let base = b.open(Create::new("f.txt").access(RW, SHARE_ALL)).await;
+    assert_eq!(b.set_info(base, END_OF_FILE, vec![0; 8]).await, 0);
+    b.close(base).await;
+    let other = b.open(Create::new("f.txt").access(0x80, SHARE_ALL)).await;
+    assert_eq!(a.rename(s, "::$DATA", true).await, INVALID, "open");
+    b.close(other).await;
+    let other = b.open(Create::new("f.txt:s").access(READ, SHARE_ALL)).await;
+    assert_eq!(a.rename(s, "::$DATA", true).await, INVALID, "stream open");
+    b.close(other).await;
+    assert_eq!(a.rename(s, "::$DATA", false).await, COLLISION);
+
+    // A mark for deletion stays behind with the stream's name.
+    assert_eq!(a.set_info(s, DISPOSITION, vec![1]).await, 0);
+    assert_eq!(a.rename(s, "::$DATA", true).await, 0);
+    assert_eq!(files.contents("f.txt"), Some(b"sdata".to_vec()));
+    assert!(files.stream_names("f.txt").is_empty());
+    assert_eq!(a.read(s, 0, 64).await.unwrap(), b"sdata");
+    assert_eq!(a.file_info(s, STANDARD).await[20], 0, "DeletePending");
+    assert_eq!(
+        b.create(Create::new("f.txt").access(RW, SHARE_ALL))
+            .await
+            .err(),
+        Some(ntstatus::STATUS_SHARING_VIOLATION)
+    );
+    assert_eq!(
+        b.create(Create::new("f.txt:s").access(READ, SHARE_ALL))
+            .await
+            .err(),
+        Some(ntstatus::STATUS_OBJECT_NAME_NOT_FOUND)
+    );
+    a.close(s).await;
+    assert_eq!(files.contents("f.txt"), Some(b"sdata".to_vec()));
+}
+
+#[tokio::test]
+async fn a_lease_on_the_default_stream_breaks_when_its_data_moves() {
+    let files = MemFsBackend::new();
+    let state = server(&files).await;
+    let mut a = Client::from_client(&state, Uuid::from_u128(1)).await;
+    let leased = a
+        .create(Create {
+            lease: true,
+            ..Create::new("f.txt").access(RW | DELETE, SHARE_ALL)
+        })
+        .await
+        .unwrap();
+    assert_eq!(leased.oplock_level, 0xFF);
+    assert_eq!(a.rename(leased.file_id, ":x", false).await, 0);
+    let notice = tokio::time::timeout(std::time::Duration::from_secs(5), a.peer.next())
+        .await
+        .expect("a lease break");
+    assert_eq!(header(&notice).command, Command::OplockBreak);
+    let n = LeaseBreakNotification::parse(&notice[SMB2_HEADER_LEN..]).expect("break");
+    assert_eq!((n.current_lease_state, n.new_lease_state), (0x7, 0));
+    assert_eq!(a.read(leased.file_id, 0, 64).await.unwrap(), b"data");
+    a.close(leased.file_id).await;
+    assert_eq!(files.stream_names("f.txt"), ["x"]);
+}
+
+#[tokio::test]
+async fn a_stream_keeps_its_mark_for_deletion_through_a_rename() {
+    let files = MemFsBackend::new();
+    let state = server(&files).await;
+    let mut a = Client::new(&state).await;
+    let mut b = Client::new(&state).await;
+    make(&mut a, "f.txt:s", b"sdata").await;
+    make(&mut a, "f.txt:t", b"").await;
+
+    let s = a
+        .open(Create::new("f.txt:s").access(READ | DELETE, SHARE_ALL))
+        .await;
+    assert_eq!(a.set_info(s, DISPOSITION, vec![1]).await, 0);
+    assert_eq!(a.rename(s, ":gone", false).await, 0);
+    assert_eq!(
+        b.create(Create::new("f.txt:gone")).await.err(),
+        Some(ntstatus::STATUS_DELETE_PENDING)
+    );
+    let again = b
+        .open(Create::new("f.txt:s").disposition(FILE_CREATE))
+        .await;
+    b.close(again).await;
+    a.close(s).await;
+    assert_eq!(files.stream_names("f.txt"), ["t", "s"]);
+
+    // A target marked for deletion is still there while it is open.
+    let t = b
+        .open(Create::new("f.txt:t").access(READ | DELETE, SHARE_ALL))
+        .await;
+    assert_eq!(b.set_info(t, DISPOSITION, vec![1]).await, 0);
+    let s = a
+        .open(Create::new("f.txt:s").access(READ | DELETE, SHARE_ALL))
+        .await;
+    assert_eq!(a.rename(s, ":t", false).await, COLLISION);
+    assert_eq!(a.rename(s, ":t", true).await, INVALID);
+    b.close(t).await;
+    assert_eq!(a.rename(s, ":t", false).await, 0);
+    a.close(s).await;
+    assert_eq!(files.stream_names("f.txt"), ["t"]);
+}
+
+#[tokio::test]
+async fn a_file_keeps_its_streams_pending_removal_through_a_rename() {
+    let files = MemFsBackend::new();
+    let state = server(&files).await;
+    let mut a = Client::new(&state).await;
+    let mut b = Client::new(&state).await;
+    make(&mut a, "f.txt:s", b"sdata").await;
+    make(&mut a, "f.txt:t", b"x").await;
+
+    let s = a
+        .open(Create::new("f.txt:s").access(READ | DELETE, SHARE_ALL))
+        .await;
+    assert_eq!(a.set_info(s, DISPOSITION, vec![1]).await, 0);
+    let renamer = b
+        .open(Create::new("f.txt").access(READ | DELETE, SHARE_ALL))
+        .await;
+    assert_eq!(b.rename(renamer, "g.txt", false).await, 0);
+    b.close(renamer).await;
+    a.close(s).await;
+    assert_eq!(files.stream_names("g.txt"), ["t"]);
+
+    // A file deleted while a stream of it is open goes with its streams
+    // once that closes, under the name a rename gave it.
+    let t = a.open(Create::new("g.txt:t").access(READ, SHARE_ALL)).await;
+    let deleter = b
+        .open(Create::new("g.txt").access(READ | DELETE, SHARE_ALL))
+        .await;
+    assert_eq!(b.set_info(deleter, DISPOSITION, vec![1]).await, 0);
+    b.close(deleter).await;
+    assert_eq!(
+        a.create(Create::new("g.txt:t")).await.err(),
+        Some(ntstatus::STATUS_DELETE_PENDING)
+    );
+    a.close(t).await;
+    assert_eq!(files.contents("g.txt"), None);
+    assert!(files.stream_names("g.txt").is_empty());
+}
+
+#[tokio::test]
+async fn a_file_with_a_stream_open_is_not_replaced() {
+    let files = MemFsBackend::new();
+    let state = server(&files).await;
+    let mut a = Client::new(&state).await;
+    let mut b = Client::new(&state).await;
+    make(&mut a, "f.txt:s", b"mine").await;
+    make(&mut a, "h.txt:old", b"theirs").await;
+
+    let held = b
+        .open(Create::new("h.txt:old").access(READ, SHARE_ALL))
+        .await;
+    let renamer = a
+        .open(Create::new("f.txt").access(READ | DELETE, SHARE_ALL))
+        .await;
+    assert_eq!(
+        a.rename(renamer, "h.txt", true).await,
+        ntstatus::STATUS_ACCESS_DENIED
+    );
+    b.close(held).await;
+    assert_eq!(a.rename(renamer, "h.txt", true).await, 0);
+    a.close(renamer).await;
+    assert_eq!(files.stream_names("h.txt"), ["s"]);
+    assert_eq!(files.contents("f.txt"), None);
 }
 
 #[tokio::test]
@@ -1360,6 +1946,43 @@ impl ShareBackend for Unfinished {
     }
 }
 
+/// A backend that stores named streams and leaves their rename at its
+/// default.
+struct Unrenamed(MemFsBackend);
+
+#[async_trait]
+impl ShareBackend for Unrenamed {
+    async fn open(
+        &self,
+        path: &SmbPath,
+        opts: OpenOptions,
+    ) -> SmbResult<(Box<dyn Handle>, OpenAction)> {
+        self.0.open(path, opts).await
+    }
+
+    async fn unlink(&self, path: &SmbPath) -> SmbResult<()> {
+        self.0.unlink(path).await
+    }
+
+    async fn rename(&self, from: &SmbPath, to: &SmbPath, replace: bool) -> SmbResult<()> {
+        self.0.rename(from, to, replace).await
+    }
+
+    fn capabilities(&self) -> BackendCapabilities {
+        self.0.capabilities()
+    }
+
+    async fn open_stream(
+        &self,
+        file: Box<dyn Handle>,
+        path: &SmbPath,
+        stream: &StreamName,
+        opts: OpenOptions,
+    ) -> SmbResult<(Box<dyn Handle>, OpenAction)> {
+        self.0.open_stream(file, path, stream, opts).await
+    }
+}
+
 #[tokio::test]
 async fn stream_requests_never_answer_not_supported() {
     let files = MemFsBackend::new();
@@ -1446,20 +2069,19 @@ async fn stream_requests_never_answer_not_supported() {
         Some(ntstatus::STATUS_INVALID_PARAMETER)
     );
 
-    let state = server_on(
-        Share::new(
-            "home",
-            Unfinished(MemFsBackend::new().with_file("f.txt", b"")),
-        )
-        .public(),
-    );
+    let files = MemFsBackend::new().with_file("f.txt", b"");
+    let state = server_on(Share::new("home", Unrenamed(files.clone())).public());
     let mut a = Client::new(&state).await;
-    for disposition in [FILE_OPEN, FILE_OPEN_IF, FILE_OVERWRITE_IF] {
-        let create = Create::new("f.txt:s").disposition(disposition);
-        assert_eq!(
-            a.create(create).await.err(),
-            Some(ntstatus::STATUS_ACCESS_DENIED),
-            "{disposition}"
-        );
-    }
+    let s = a
+        .open(
+            Create::new("f.txt:s")
+                .access(RW | DELETE, SHARE_ALL)
+                .disposition(FILE_OPEN_IF),
+        )
+        .await;
+    assert_eq!(
+        a.rename(s, ":t", false).await,
+        ntstatus::STATUS_ACCESS_DENIED
+    );
+    assert_eq!(files.stream_names("f.txt"), ["s"]);
 }

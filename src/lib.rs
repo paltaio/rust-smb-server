@@ -68,8 +68,9 @@ SmbServer::builder()
 //!   `open`, creating it when the disposition allows, then the stream with
 //!   [`ShareBackend::open_stream`], which gets the file's handle. An
 //!   overwrite of the file removes its named streams through
-//!   [`ShareBackend::remove_stream`], each once no open is on it. Elsewhere
-//!   named streams are rejected before the backend sees them.
+//!   [`ShareBackend::remove_stream`], each once no open is on it. A rename
+//!   to `:name` or `::$DATA` goes to [`ShareBackend::rename_stream`].
+//!   Elsewhere named streams are rejected before the backend sees them.
 //! - `open` fails with [`SmbError::PathNotFound`] when a directory on the
 //!   way to the path is missing, and with [`SmbError::NotFound`] when only
 //!   the last component is. Clients see STATUS_OBJECT_PATH_NOT_FOUND and
@@ -431,13 +432,27 @@ pub mod fuzzing {
     /// with one, the text before the first `:` parses as the path, a suffix
     /// that selects no named stream is `::$DATA`, `::$INDEX_ALLOCATION` or
     /// `:$I30:$INDEX_ALLOCATION`, and the path and stream put back together
-    /// parse to the same result.
+    /// parse to the same result. A data stream that a stream rename target
+    /// names is the one CREATE opens for `f` followed by the target.
     pub fn create_name(data: &[u8]) {
-        use crate::stream::{StreamPart, parse_create_name};
+        use crate::stream::{StreamPart, StreamType, parse_create_name, parse_stream_target};
         let units: Vec<u16> = data
             .chunks_exact(2)
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect();
+        if let Ok(target) = parse_stream_target(&units) {
+            let part = match (target.stream, target.kind) {
+                (Some(stream), None | Some(StreamType::Data)) => Some(StreamPart::Named(stream)),
+                (None, Some(StreamType::Data)) => Some(StreamPart::Data),
+                _ => None,
+            };
+            if let Some(part) = part {
+                let mut file: Vec<u16> = "f".encode_utf16().collect();
+                file.extend_from_slice(&units);
+                let expected = ("f".parse().expect("a valid path"), part);
+                assert_eq!(parse_create_name(&file).ok(), Some(expected));
+            }
+        }
         let parsed = parse_create_name(&units);
         let Ok(name) = String::from_utf16(&units) else {
             assert!(parsed.is_err());

@@ -122,6 +122,61 @@ pub(crate) fn parse_create_name(units: &[u16]) -> SmbResult<(SmbPath, StreamPart
     Ok((path, part))
 }
 
+/// What a FileRenameInformation name that starts with `:` renames the
+/// open's stream to: `:name`, `:name:type` or `::type`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StreamTarget {
+    /// The new name; `None` for the default stream.
+    pub stream: Option<StreamName>,
+    /// The stream type the name gives, if it gives one.
+    pub kind: Option<StreamType>,
+}
+
+/// A stream type in a stream rename target, compared case-insensitively.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StreamType {
+    /// `$DATA`.
+    Data,
+    /// `$INDEX_ALLOCATION`.
+    Directory,
+    /// Any other type.
+    Other,
+}
+
+/// Parses a stream rename target, a name that starts with `:` (MS-FSA
+/// 2.1.5.15.12.1). One that ends in `:`, has a third `:`, or has a name or
+/// type MS-FSCC 2.1.5.3 and 2.1.5.4 refuse fails with
+/// STATUS_INVALID_PARAMETER.
+pub(crate) fn parse_stream_target(units: &[u16]) -> Result<StreamTarget, u32> {
+    let invalid = crate::ntstatus::STATUS_INVALID_PARAMETER;
+    let name = String::from_utf16(units).map_err(|_| invalid)?;
+    let rest = name.strip_prefix(':').ok_or(invalid)?;
+    if name.ends_with(':') {
+        return Err(invalid);
+    }
+    let (stream, kind) = match rest.split_once(':') {
+        Some((stream, kind)) => (stream, Some(kind)),
+        None => (rest, None),
+    };
+    if kind.is_some_and(|k| k.contains(['\\', '/', ':', '\0'])) {
+        return Err(invalid);
+    }
+    let stream = match stream {
+        "" => None,
+        stream => Some(stream.parse().map_err(|_| invalid)?),
+    };
+    let kind = kind.map(|kind| {
+        if kind.eq_ignore_ascii_case("$DATA") {
+            StreamType::Data
+        } else if kind.eq_ignore_ascii_case("$INDEX_ALLOCATION") {
+            StreamType::Directory
+        } else {
+            StreamType::Other
+        }
+    });
+    Ok(StreamTarget { stream, kind })
+}
+
 /// The error a stream request on a share that stores named streams answers
 /// for `e`. macOS keeps an extended attribute in a `._` file instead when a
 /// stream request fails with STATUS_NOT_SUPPORTED, and would then look for
@@ -332,6 +387,62 @@ mod tests {
         let mut units: Vec<u16> = "f:s".encode_utf16().collect();
         units.push(0xD800);
         assert!(parse_create_name(&units).is_err());
+    }
+
+    fn target(s: &str) -> Result<StreamTarget, u32> {
+        parse_stream_target(&s.encode_utf16().collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn rename_targets_name_a_stream_and_maybe_its_type() {
+        let cases = [
+            (":t", Some("t"), None),
+            (":t:$DATA", Some("t"), Some(StreamType::Data)),
+            (":t:$data", Some("t"), Some(StreamType::Data)),
+            (
+                ":t:$INDEX_ALLOCATION",
+                Some("t"),
+                Some(StreamType::Directory),
+            ),
+            (":t:$FOO", Some("t"), Some(StreamType::Other)),
+            ("::$DATA", None, Some(StreamType::Data)),
+            ("::$INDEX_ALLOCATION", None, Some(StreamType::Directory)),
+            (":a\"b*?", Some("a\"b*?"), None),
+        ];
+        for (name, stream, kind) in cases {
+            let expected = StreamTarget {
+                stream: stream.map(|s| s.parse().unwrap()),
+                kind,
+            };
+            assert_eq!(target(name), Ok(expected), "{name}");
+        }
+        let longest = format!(":{}", "x".repeat(255));
+        assert!(target(&longest).is_ok());
+    }
+
+    #[test]
+    fn malformed_rename_targets_are_invalid_parameters() {
+        let long = format!(":{}", "x".repeat(256));
+        for name in [
+            ":",
+            "::",
+            ":t:",
+            "::$DATA:",
+            ":a:b:c",
+            ":t:$DATA:$DATA",
+            ":a\\b",
+            ":a/b",
+            ":t:$DA\\TA",
+            ":a\0",
+            "t",
+            long.as_str(),
+        ] {
+            assert_eq!(
+                target(name),
+                Err(crate::ntstatus::STATUS_INVALID_PARAMETER),
+                "{name:?}"
+            );
+        }
     }
 
     #[test]
