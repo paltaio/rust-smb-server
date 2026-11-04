@@ -2,17 +2,20 @@
 //!
 //! Each named stream of a file or directory is one of its extended
 //! attributes, named `user.DosStream.<name>:$DATA` and holding the
-//! stream's data followed by one NUL byte. Writes read and rewrite the
-//! whole value, so a stream holds at most 65535 bytes, and less where the
-//! filesystem has less room for extended attributes.
+//! stream's data followed by one NUL byte, or, once it outgrows what an
+//! extended attribute holds there, a file in the stream store (see
+//! [`spill`]). A spilled stream stays in the store until it is removed or
+//! truncated to zero.
 //!
 //! A stream handle keeps a descriptor of its file, so it follows the file
 //! through renames, and the stream itself through renames of the stream.
 
+mod spill;
+
 use std::collections::HashMap;
 use std::fs::File;
 use std::io;
-use std::os::unix::fs::FileExt as _;
+use std::os::unix::fs::{FileExt as _, MetadataExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
@@ -24,6 +27,8 @@ use rustix::io::Errno;
 use tokio::task::spawn_blocking;
 use tracing::debug;
 
+pub(super) use spill::Store;
+
 use super::local::{
     file_index, file_info_from_metadata, file_key, host_file_times, io_to_smb, join_to_io,
     link_count, set_read_only,
@@ -34,6 +39,7 @@ use crate::backend::{
 };
 use crate::error::{SmbError, SmbResult};
 use crate::stream::{StreamInfo, StreamName};
+use spill::{MAX_COPY, Spilled, fill};
 
 const PREFIX: &str = "user.DosStream.";
 const SUFFIX: &str = ":$DATA";
@@ -76,6 +82,15 @@ fn to_smb(e: io::Error) -> SmbError {
     }
 }
 
+/// True if `e` says an extended attribute has no room for a value.
+fn is_full(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::StorageFull
+        || matches!(
+            e.raw_os_error().map(Errno::from_raw_os_error),
+            Some(Errno::TOOBIG | Errno::NOSPC)
+        )
+}
+
 /// A value read with `read` into a buffer of the size `query` reports,
 /// again if it grew in between.
 fn read_sized(
@@ -99,8 +114,9 @@ fn read_sized(
     Err(Errno::RANGE.into())
 }
 
-/// The named streams of the file `fd` is open on, spelled as stored.
-/// Attributes whose names are not valid stream names are left out.
+/// The named streams kept in extended attributes of the file `fd` is open
+/// on, spelled as stored. Attributes whose names are not valid stream
+/// names are left out.
 fn stream_names(fd: &File) -> io::Result<Vec<StreamName>> {
     let list = read_sized(
         || rustix::fs::flistxattr_query(fd),
@@ -116,51 +132,6 @@ fn stream_names(fd: &File) -> io::Result<Vec<StreamName>> {
             name.parse().ok()
         })
         .collect())
-}
-
-/// One named stream as stored: the attributes whose names differ only in
-/// case. Of those, the one whose name sorts first in byte order is the
-/// stream; the others stay out of sight, and go when the name is freed.
-struct Stored {
-    name: StreamName,
-    others: Vec<StreamName>,
-}
-
-/// The named streams of the file `fd` is open on, in the order the
-/// filesystem lists them.
-fn streams_of(fd: &File) -> io::Result<Vec<Stored>> {
-    let mut out: Vec<Stored> = Vec::new();
-    for name in stream_names(fd)? {
-        match out.iter_mut().find(|s| s.name.matches(&name)) {
-            Some(stored) => {
-                let mut name = name;
-                if name.as_str() < stored.name.as_str() {
-                    std::mem::swap(&mut stored.name, &mut name);
-                }
-                stored.others.push(name);
-            }
-            None => out.push(Stored {
-                name,
-                others: Vec::new(),
-            }),
-        }
-    }
-    Ok(out)
-}
-
-/// The stream of `stored` that `stream` names, whatever its case.
-fn find<'a>(stored: &'a [Stored], stream: &StreamName) -> Option<&'a Stored> {
-    stored.iter().find(|s| s.name.matches(stream))
-}
-
-/// Removes the attributes `stored` hides behind its stream. One that
-/// fails to go is logged.
-fn remove_others(fd: &File, stored: &Stored) {
-    for other in &stored.others {
-        if let Err(e) = attr_name(other.as_str()).and_then(|attr| remove(fd, &attr)) {
-            debug!(error = %e, stream = other.as_str(), "attribute of a removed stream left");
-        }
-    }
 }
 
 /// The data of the stream kept in `attr`: its value without the last byte.
@@ -221,19 +192,153 @@ pub(super) fn supported(root: &Dir) -> bool {
     )
 }
 
+// ---------------------------------------------------------------------------
+// Streams as stored
+// ---------------------------------------------------------------------------
+
+/// Most named streams one file has. Past it, the rest are not listed, and
+/// a new stream fails with STATUS_DISK_FULL.
+const MAX_STREAMS: usize = 4096;
+
+/// Where one name of a stream is kept: an extended attribute, or a file
+/// in the spill store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Variant {
+    name: StreamName,
+    spilled: bool,
+}
+
+/// One named stream as stored: the names that differ only in case. Of
+/// those, the one that sorts first in byte order is the stream, a spilled
+/// one before an attribute spelled the same; the others stay out of
+/// sight, and go when the name is freed.
+struct Stored {
+    main: Variant,
+    others: Vec<Variant>,
+}
+
+/// The named streams of one file and where they are kept.
+struct View {
+    stored: Vec<Stored>,
+    /// Where each stream is in `stored`, by its name in lowercase.
+    at: HashMap<String, usize>,
+    spilled: Option<Spilled>,
+}
+
+impl View {
+    /// The streams of the file `fd` is open on, its attributes in the
+    /// order the filesystem lists them, then the spilled streams of
+    /// `spilled`.
+    fn load(fd: &File, spilled: Option<Spilled>) -> io::Result<Self> {
+        let attrs = stream_names(fd)?;
+        let spilled_names = spilled
+            .as_ref()
+            .map(|s| s.names.clone())
+            .unwrap_or_default();
+        let variants = attrs
+            .into_iter()
+            .map(|name| Variant {
+                name,
+                spilled: false,
+            })
+            .chain(spilled_names.into_iter().map(|name| Variant {
+                name,
+                spilled: true,
+            }));
+        let mut stored: Vec<Stored> = Vec::new();
+        let mut at: HashMap<String, usize> = HashMap::new();
+        for variant in variants {
+            let key = variant.name.as_str().to_lowercase();
+            match at.get(&key) {
+                Some(&i) => {
+                    let group = &mut stored[i];
+                    let mut variant = variant;
+                    let first = variant.name.as_str() < group.main.name.as_str()
+                        || (variant.name == group.main.name && variant.spilled);
+                    if first {
+                        std::mem::swap(&mut group.main, &mut variant);
+                    }
+                    group.others.push(variant);
+                }
+                None if stored.len() < MAX_STREAMS => {
+                    at.insert(key, stored.len());
+                    stored.push(Stored {
+                        main: variant,
+                        others: Vec::new(),
+                    });
+                }
+                None => {}
+            }
+        }
+        if stored.len() == MAX_STREAMS {
+            debug!("named streams of a file past {MAX_STREAMS} left out");
+        }
+        Ok(Self {
+            stored,
+            at,
+            spilled,
+        })
+    }
+
+    /// The stream that `stream` names, whatever its case.
+    fn find(&self, stream: &StreamName) -> Option<&Stored> {
+        let at = *self.at.get(&stream.as_str().to_lowercase())?;
+        Some(&self.stored[at])
+    }
+
+    fn spilled(&self) -> io::Result<&Spilled> {
+        self.spilled.as_ref().ok_or(io::ErrorKind::NotFound.into())
+    }
+
+    /// Size and allocation size of the stream kept as `v`.
+    fn size(&self, fd: &File, v: &Variant) -> io::Result<(u64, u64)> {
+        if v.spilled {
+            let md = self.spilled()?.open(&v.name, false)?.metadata()?;
+            Ok((md.len(), md.blocks() * 512))
+        } else {
+            let size = size(fd, &attr_name(v.name.as_str())?)?;
+            Ok((size, size))
+        }
+    }
+
+    /// Removes the stream kept as `v`.
+    fn remove(&self, fd: &File, v: &Variant) -> io::Result<()> {
+        if v.spilled {
+            self.spilled()?.remove(&v.name)
+        } else {
+            remove(fd, &attr_name(v.name.as_str())?)
+        }
+    }
+
+    /// Removes the hidden names of `stored`. One that fails to go is
+    /// logged.
+    fn remove_others(&self, fd: &File, stored: &Stored) {
+        for other in &stored.others {
+            if let Err(e) = self.remove(fd, other) {
+                debug!(error = %e, stream = other.name.as_str(), "name of a removed stream left");
+            }
+        }
+    }
+}
+
 /// The named streams of the file `fd` is open on, none where its
 /// filesystem has no extended attributes.
-pub(super) fn list(fd: &File) -> io::Result<Vec<StreamInfo>> {
-    let stored = match streams_of(fd) {
+pub(super) fn list(fd: &File, store: &Store) -> io::Result<Vec<StreamInfo>> {
+    let access = Access::new(fd, store);
+    let view = match access.view() {
         Err(e) if e.raw_os_error() == Some(Errno::NOTSUP.raw_os_error()) => return Ok(Vec::new()),
-        stored => stored?,
+        view => view?,
     };
-    let mut out = Vec::with_capacity(stored.len());
-    for Stored { name, .. } in stored {
-        match size(fd, &attr_name(name.as_str())?) {
-            Ok(size) => out.push(StreamInfo::new(name, size, size)),
+    let mut out = Vec::with_capacity(view.stored.len());
+    for stored in &view.stored {
+        match view.size(fd, &stored.main) {
+            Ok((size, allocation)) => {
+                out.push(StreamInfo::new(stored.main.name.clone(), size, allocation));
+            }
             // Removed since the names were read.
-            Err(e) if e.raw_os_error() == Some(Errno::NODATA.raw_os_error()) => {}
+            Err(e)
+                if e.kind() == io::ErrorKind::NotFound
+                    || e.raw_os_error() == Some(Errno::NODATA.raw_os_error()) => {}
             Err(e) => return Err(e),
         }
     }
@@ -241,8 +346,270 @@ pub(super) fn list(fd: &File) -> io::Result<Vec<StreamInfo>> {
 }
 
 /// Like [`list`], with a backend error.
-pub(super) fn list_smb(fd: &File) -> SmbResult<Vec<StreamInfo>> {
-    list(fd).map_err(to_smb)
+pub(super) fn list_smb(fd: &File, store: &Store) -> SmbResult<Vec<StreamInfo>> {
+    list(fd, store).map_err(to_smb)
+}
+
+/// Reads and changes the streams of one file, with its entry among the
+/// open streams locked. The store is held from its first use to the end.
+struct Access<'a> {
+    fd: &'a File,
+    store: &'a Store,
+    held: std::cell::OnceCell<spill::Held>,
+}
+
+impl<'a> Access<'a> {
+    fn new(fd: &'a File, store: &'a Store) -> Self {
+        Self {
+            fd,
+            store,
+            held: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// The store, held, made with `create`. `None` when it is missing, or
+    /// for reading (`!create`) when it cannot be used.
+    fn held(&self, create: bool) -> io::Result<Option<&spill::Held>> {
+        if let Some(held) = self.held.get() {
+            return Ok(Some(held));
+        }
+        let held = match self.store.hold(create) {
+            Ok(held) => held,
+            // A store that cannot be used leaves streams in extended
+            // attributes: reads see none spilled, and spills fail.
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                spill::warn_unusable(&e);
+                if create {
+                    return Err(io::ErrorKind::StorageFull.into());
+                }
+                None
+            }
+            Err(e) => return Err(e),
+        };
+        Ok(held.map(|held| self.held.get_or_init(|| held)))
+    }
+
+    /// The streams as stored, the spilled ones where the file's record
+    /// points, also for a copy without an entry of its own.
+    fn view(&self) -> io::Result<View> {
+        let spilled = match self.held(false)? {
+            Some(held) => self.store.find(held, self.fd, MAX_STREAMS)?,
+            None => None,
+        };
+        View::load(self.fd, spilled)
+    }
+
+    /// The streams as stored, the spilled ones in an entry of the file's
+    /// own: a copy claims one first.
+    fn own_view(&self) -> io::Result<View> {
+        let spilled = match self.held(false)? {
+            Some(held) => self.store.find_own(held, self.fd, MAX_STREAMS)?,
+            None => None,
+        };
+        View::load(self.fd, spilled)
+    }
+
+    /// The file's own store entry, made if it has none.
+    fn own(&self) -> io::Result<Spilled> {
+        let held = self.held(true)?.ok_or(io::ErrorKind::NotFound)?;
+        self.store.own(held, self.fd, MAX_STREAMS)
+    }
+
+    /// Moves the stream `stream`, an attribute holding `data`, to the
+    /// store, and returns its file there.
+    fn spill(&self, stream: &StreamName, data: &[u8]) -> io::Result<File> {
+        let own = self.own()?;
+        let file = own.put(stream, |file| file.write_all_at(data, 0))?;
+        if let Err(e) = remove(self.fd, &attr_name(stream.as_str())?) {
+            let _ = own.remove(stream);
+            return Err(e);
+        }
+        Ok(file)
+    }
+
+    /// Makes the stream `stream` holding `data`: an attribute where one
+    /// holds it, else a file in the store. True if it went to the store.
+    fn create(&self, stream: &StreamName, data: Vec<u8>) -> io::Result<bool> {
+        let attr = attr_name(stream.as_str())?;
+        match set(self.fd, &attr, data.clone(), XattrFlags::CREATE) {
+            Ok(()) => Ok(false),
+            Err(e) if is_full(&e) => {
+                self.own()?
+                    .put(stream, |file| file.write_all_at(&data, 0))?;
+                Ok(true)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Makes the new stream `stream`, empty, on a file with room for one
+    /// more.
+    fn create_new(&self, view: &View, stream: &StreamName) -> io::Result<()> {
+        if view.stored.len() >= MAX_STREAMS {
+            return Err(io::ErrorKind::StorageFull.into());
+        }
+        self.create(stream, Vec::new()).map(drop)
+    }
+
+    /// Removes the stream `stream` [`Access::create`] made.
+    fn uncreate(&self, stream: &StreamName, spilled: bool) {
+        let removed = if spilled {
+            self.own().and_then(|own| own.remove(stream))
+        } else {
+            attr_name(stream.as_str()).and_then(|attr| remove(self.fd, &attr))
+        };
+        if let Err(e) = removed {
+            debug!(error = %e, stream = stream.as_str(), "stream rename not undone");
+        }
+    }
+
+    /// Writes `data` at `offset` of the stream `stream`.
+    fn write(&self, stream: &StreamName, offset: u64, data: &[u8]) -> io::Result<()> {
+        let view = self.view()?;
+        let main = &view.find(stream).ok_or(io::ErrorKind::NotFound)?.main;
+        if main.spilled {
+            let view = self.own_view()?;
+            let main = &view.find(stream).ok_or(io::ErrorKind::NotFound)?.main;
+            view.spilled()?
+                .open(&main.name, true)?
+                .write_all_at(data, offset)?;
+        } else {
+            let attr = attr_name(main.name.as_str())?;
+            let value = get(self.fd, &attr)?;
+            let end = offset
+                .checked_add(data.len() as u64)
+                .ok_or(io::ErrorKind::StorageFull)?;
+            let stored = match usize::try_from(end).ok().filter(|&end| end <= MAX_STREAM) {
+                Some(end) => {
+                    let mut new = value.clone();
+                    if new.len() < end {
+                        new.resize(end, 0);
+                    }
+                    new[offset as usize..end].copy_from_slice(data);
+                    set(self.fd, &attr, new, XattrFlags::REPLACE)
+                }
+                None => Err(io::ErrorKind::StorageFull.into()),
+            };
+            match stored {
+                Ok(()) => {}
+                Err(e) if is_full(&e) => {
+                    self.spill(&main.name, &value)?.write_all_at(data, offset)?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        touch(self.fd);
+        Ok(())
+    }
+
+    /// Sets the size of the stream `stream` to `len`. A spilled stream cut
+    /// to zero goes back to an attribute where one holds it.
+    fn truncate(&self, stream: &StreamName, len: u64) -> io::Result<()> {
+        let view = self.view()?;
+        let main = &view.find(stream).ok_or(io::ErrorKind::NotFound)?.main;
+        if main.spilled {
+            let view = self.own_view()?;
+            let main = &view.find(stream).ok_or(io::ErrorKind::NotFound)?.main;
+            let spilled = view.spilled()?;
+            spilled.open(&main.name, true)?.set_len(len)?;
+            if len == 0 {
+                let attr = attr_name(main.name.as_str())?;
+                match set(self.fd, &attr, Vec::new(), XattrFlags::empty()) {
+                    Ok(()) => {
+                        if let Err(e) = spilled.remove(&main.name) {
+                            debug!(error = %e, "emptied stream left in the store");
+                        }
+                    }
+                    Err(e) if is_full(&e) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+        } else {
+            let attr = attr_name(main.name.as_str())?;
+            let value = get(self.fd, &attr)?;
+            let stored = match usize::try_from(len).ok().filter(|&len| len <= MAX_STREAM) {
+                Some(len) => {
+                    let mut new = value.clone();
+                    new.resize(len, 0);
+                    set(self.fd, &attr, new, XattrFlags::REPLACE)
+                }
+                None => Err(io::ErrorKind::StorageFull.into()),
+            };
+            match stored {
+                Ok(()) => {}
+                Err(e) if is_full(&e) => self.spill(&main.name, &value)?.set_len(len)?,
+                Err(e) => return Err(e),
+            }
+        }
+        touch(self.fd);
+        Ok(())
+    }
+}
+
+/// The names of a stream a rename replaces, set aside until the rename is
+/// done, so a failed rename puts them back.
+struct Aside {
+    attrs: Vec<(StreamName, Vec<u8>)>,
+    spilled: Vec<StreamName>,
+}
+
+impl Aside {
+    /// Sets aside every name of `stored`, if any; one that exists is
+    /// replaced only with `replace`.
+    fn take(fd: &File, view: &View, stored: Option<&Stored>, replace: bool) -> io::Result<Self> {
+        let mut aside = Self {
+            attrs: Vec::new(),
+            spilled: Vec::new(),
+        };
+        let Some(stored) = stored else {
+            return Ok(aside);
+        };
+        if !replace {
+            return Err(io::ErrorKind::AlreadyExists.into());
+        }
+        for v in std::iter::once(&stored.main).chain(&stored.others) {
+            let taken = if v.spilled {
+                view.spilled()
+                    .and_then(|s| s.set_aside(&v.name))
+                    .map(|()| aside.spilled.push(v.name.clone()))
+            } else {
+                attr_name(v.name.as_str()).and_then(|attr| {
+                    let value = get(fd, &attr)?;
+                    remove(fd, &attr)?;
+                    aside.attrs.push((v.name.clone(), value));
+                    Ok(())
+                })
+            };
+            if let Err(e) = taken {
+                aside.put_back(fd, view);
+                return Err(e);
+            }
+        }
+        Ok(aside)
+    }
+
+    fn put_back(&self, fd: &File, view: &View) {
+        for (name, value) in &self.attrs {
+            let restored = attr_name(name.as_str())
+                .and_then(|attr| set(fd, &attr, value.clone(), XattrFlags::empty()));
+            if let Err(e) = restored {
+                debug!(error = %e, stream = name.as_str(), "replaced stream not put back");
+            }
+        }
+        for name in &self.spilled {
+            if let Err(e) = view.spilled().and_then(|s| s.restore(name)) {
+                debug!(error = %e, stream = name.as_str(), "replaced stream not put back");
+            }
+        }
+    }
+
+    fn drop_all(&self, view: &View) {
+        for name in &self.spilled {
+            if let Err(e) = view.spilled().and_then(|s| s.drop_aside(name)) {
+                debug!(error = %e, stream = name.as_str(), "replaced stream left in the store");
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -275,9 +642,10 @@ impl OpenStreams {
 
 /// One file with named streams open or being changed. Its lock is held
 /// over every read and change of the file's streams, so a write's
-/// read-modify-write of a value and a rename see each other whole. An
-/// entry lives as long as a handle on one of the file's streams, which
-/// holds the file open, so its host identity stays the file's.
+/// read-modify-write of a value, a move to the store and a rename see each
+/// other whole. An entry lives as long as a handle on one of the file's
+/// streams, which holds the file open, so its host identity stays the
+/// file's.
 struct StreamFile {
     key: (u64, u64),
     owner: Weak<OpenStreams>,
@@ -331,13 +699,14 @@ fn open_base(root: &Dir, rel: &Path, write: bool) -> io::Result<(File, Metadata,
     Ok((file, md, key))
 }
 
-/// Where a backend keeps the files of its share.
+/// Where a backend keeps the files of its share and their streams.
 #[derive(Clone)]
 pub(super) struct Place {
     pub root: Arc<Dir>,
     pub root_dev: Option<u64>,
     pub read_only: bool,
     pub open: Arc<OpenStreams>,
+    pub store: Arc<Store>,
 }
 
 impl Place {
@@ -370,31 +739,33 @@ impl Place {
         spawn_blocking(move || -> io::Result<_> {
             let (base, md, file) = self.base(&rel, id, false)?;
             let mut open = lock(&file.open);
-            let stored = streams_of(&base)?;
-            let existing = find(&stored, &stream).map(|s| s.name.clone());
-            let attr = attr_name(existing.as_ref().unwrap_or(&stream).as_str())?;
+            let access = Access::new(&base, &self.store);
+            let view = access.view()?;
+            let existing = view.find(&stream).map(|s| s.main.name.clone());
             let action = match (intent, &existing) {
                 (OpenIntent::Open | OpenIntent::Truncate, None) => {
                     return Err(io::ErrorKind::NotFound.into());
                 }
                 (OpenIntent::Create, Some(_)) => return Err(io::ErrorKind::AlreadyExists.into()),
                 (OpenIntent::Open | OpenIntent::OpenOrCreate, Some(_)) => OpenAction::Opened,
-                (_, Some(_)) => {
-                    set(&base, &attr, Vec::new(), XattrFlags::REPLACE)?;
-                    touch(&base);
+                (_, Some(existing)) => {
+                    access.truncate(existing, 0)?;
                     OpenAction::Overwritten
                 }
                 (_, None) => {
-                    set(&base, &attr, Vec::new(), XattrFlags::CREATE)?;
+                    access.create_new(&view, &stream)?;
                     OpenAction::Created
                 }
             };
+            drop(view);
+            drop(access);
             let handle_id = open.add(existing.unwrap_or(stream));
             drop(open);
             let handle: Box<dyn Handle> = Box::new(StreamHandle {
                 file,
                 id: handle_id,
                 base: Arc::new(base),
+                store: Arc::clone(&self.store),
                 is_dir: md.is_dir(),
                 name,
                 root_dev: self.root_dev,
@@ -419,10 +790,16 @@ impl Place {
         spawn_blocking(move || -> io::Result<()> {
             let (base, _, file) = self.base(&rel, id, false)?;
             let _open = lock(&file.open);
-            let stored = streams_of(&base)?;
-            let found = find(&stored, &stream).ok_or(io::ErrorKind::NotFound)?;
-            remove(&base, &attr_name(found.name.as_str())?)?;
-            remove_others(&base, found);
+            let access = Access::new(&base, &self.store);
+            let view = access.view()?;
+            let found = view.find(&stream).ok_or(io::ErrorKind::NotFound)?;
+            let spilled = std::iter::once(&found.main)
+                .chain(&found.others)
+                .any(|v| v.spilled);
+            let view = if spilled { access.own_view()? } else { view };
+            let found = view.find(&stream).ok_or(io::ErrorKind::NotFound)?;
+            view.remove(&base, &found.main)?;
+            view.remove_others(&base, found);
             Ok(())
         })
         .await
@@ -446,54 +823,100 @@ impl Place {
             let moves_data = from.is_none() || to.is_none();
             let (base, md, file) = self.base(&rel, id, moves_data)?;
             let mut open = lock(&file.open);
-            let stored = streams_of(&base)?;
+            let access = Access::new(&base, &self.store);
+            // A rename may change any spilled stream of the file, so a copy
+            // takes an entry of its own first.
+            let view = access.own_view()?;
             let source = match &from {
-                Some(from) => Some(find(&stored, from).ok_or(io::ErrorKind::NotFound)?),
+                Some(from) => Some(view.find(from).ok_or(io::ErrorKind::NotFound)?),
                 None => None,
             };
             match (source, to) {
                 (Some(source), Some(to)) => {
-                    let target = Target::new(&base, &stored, to, replace)?;
-                    let data = get(&base, &attr_name(source.name.as_str())?)?;
-                    target.fill(&base, data)?;
-                    if let Err(e) = remove(&base, &attr_name(source.name.as_str())?) {
-                        target.undo(&base);
+                    let aside = Aside::take(&base, &view, view.find(&to), replace)?;
+                    let src = &source.main;
+                    let moved = if src.spilled {
+                        view.spilled().and_then(|s| s.rename(&src.name, &to))
+                    } else {
+                        attr_name(src.name.as_str()).and_then(|attr| {
+                            let data = get(&base, &attr)?;
+                            let spilled = access.create(&to, data)?;
+                            if let Err(e) = remove(&base, &attr) {
+                                access.uncreate(&to, spilled);
+                                return Err(e);
+                            }
+                            Ok(())
+                        })
+                    };
+                    if let Err(e) = moved {
+                        aside.put_back(&base, &view);
                         return Err(e);
                     }
-                    remove_others(&base, source);
-                    open.rename(&source.name, &target.name);
+                    view.remove_others(&base, source);
+                    aside.drop_all(&view);
+                    open.rename(&src.name, &to);
                 }
                 (None, Some(to)) => {
-                    let target = Target::new(&base, &stored, to, replace)?;
-                    let len = usize::try_from(md.len())
+                    if view.find(&to).is_none() && view.stored.len() >= MAX_STREAMS {
+                        return Err(io::ErrorKind::StorageFull.into());
+                    }
+                    let aside = Aside::take(&base, &view, view.find(&to), replace)?;
+                    let made = match usize::try_from(md.len())
                         .ok()
                         .filter(|&len| len <= MAX_STREAM)
-                        .ok_or(io::ErrorKind::StorageFull)?;
-                    let mut data = vec![0; len];
-                    base.read_exact_at(&mut data, 0)?;
-                    target.fill(&base, data)?;
+                    {
+                        Some(len) => {
+                            let mut data = vec![0; len];
+                            base.read_exact_at(&mut data, 0)
+                                .and_then(|()| access.create(&to, data))
+                        }
+                        None => access
+                            .own()
+                            .and_then(|own| {
+                                own.put(&to, |file| fill(file, &base, Some(MAX_COPY)).map(drop))
+                            })
+                            .map(|_| true),
+                    };
+                    let spilled = match made {
+                        Ok(spilled) => spilled,
+                        Err(e) => {
+                            aside.put_back(&base, &view);
+                            return Err(e);
+                        }
+                    };
                     if let Err(e) = base.set_len(0) {
-                        target.undo(&base);
+                        access.uncreate(&to, spilled);
+                        aside.put_back(&base, &view);
                         return Err(e);
                     }
+                    aside.drop_all(&view);
                 }
                 (Some(source), None) => {
                     if !replace {
                         return Err(io::ErrorKind::AlreadyExists.into());
                     }
-                    let attr = attr_name(source.name.as_str())?;
-                    let data = get(&base, &attr)?;
-                    let moved = base
-                        .write_all_at(&data, 0)
-                        .and_then(|()| base.set_len(data.len() as u64))
-                        .and_then(|()| remove(&base, &attr));
+                    let src = &source.main;
+                    let written = if src.spilled {
+                        view.spilled()
+                            .and_then(|s| s.open(&src.name, false))
+                            .and_then(|from| fill(&base, &from, Some(MAX_COPY)))
+                    } else {
+                        attr_name(src.name.as_str())
+                            .and_then(|attr| get(&base, &attr))
+                            .and_then(|data| {
+                                base.write_all_at(&data, 0).map(|()| data.len() as u64)
+                            })
+                    };
+                    let moved = written
+                        .and_then(|len| base.set_len(len))
+                        .and_then(|()| view.remove(&base, src));
                     if let Err(e) = moved {
                         if let Err(e) = base.set_len(0) {
                             debug!(error = %e, "default stream not emptied again");
                         }
                         return Err(e);
                     }
-                    remove_others(&base, source);
+                    view.remove_others(&base, source);
                 }
                 (None, None) => return Ok(()),
             }
@@ -504,72 +927,6 @@ impl Place {
         .map_err(join_to_io)
         .map_err(to_smb)?
         .map_err(to_smb)
-    }
-}
-
-/// The named stream a rename moves data into: `name`, replacing the
-/// attributes of a stream of that name, if any, kept in `replaced` with
-/// their values so a failed rename puts them back.
-struct Target {
-    name: StreamName,
-    replaced: Vec<(StreamName, Vec<u8>)>,
-}
-
-impl Target {
-    /// The target `to` among the streams `stored` of the file `fd` is open
-    /// on; one that exists is replaced only with `replace`.
-    fn new(fd: &File, stored: &[Stored], to: StreamName, replace: bool) -> io::Result<Self> {
-        let mut replaced = Vec::new();
-        if let Some(existing) = find(stored, &to) {
-            if !replace {
-                return Err(io::ErrorKind::AlreadyExists.into());
-            }
-            for name in std::iter::once(&existing.name).chain(&existing.others) {
-                let value = get(fd, &attr_name(name.as_str())?)?;
-                replaced.push((name.clone(), value));
-            }
-        }
-        Ok(Self { name: to, replaced })
-    }
-
-    /// True if an attribute of the replaced stream has the target's name.
-    fn reuses_name(&self) -> bool {
-        self.replaced.iter().any(|(name, _)| *name == self.name)
-    }
-
-    /// Keeps `data` in the target, and removes the replaced stream's other
-    /// attributes.
-    fn fill(&self, fd: &File, data: Vec<u8>) -> io::Result<()> {
-        let flags = if self.reuses_name() {
-            XattrFlags::REPLACE
-        } else {
-            XattrFlags::CREATE
-        };
-        set(fd, &attr_name(self.name.as_str())?, data, flags)?;
-        for (name, _) in self.replaced.iter().filter(|(name, _)| *name != self.name) {
-            if let Err(e) = attr_name(name.as_str()).and_then(|attr| remove(fd, &attr)) {
-                self.undo(fd);
-                return Err(e);
-            }
-        }
-        Ok(())
-    }
-
-    /// Puts back what [`Target::fill`] changed.
-    fn undo(&self, fd: &File) {
-        if !self.reuses_name() {
-            let removed = attr_name(self.name.as_str()).and_then(|attr| remove(fd, &attr));
-            if let Err(e) = removed {
-                debug!(error = %e, stream = self.name.as_str(), "stream rename not undone");
-            }
-        }
-        for (name, value) in &self.replaced {
-            let restored = attr_name(name.as_str())
-                .and_then(|attr| set(fd, &attr, value.clone(), XattrFlags::empty()));
-            if let Err(e) = restored {
-                debug!(error = %e, stream = name.as_str(), "replaced stream not put back");
-            }
-        }
     }
 }
 
@@ -584,6 +941,7 @@ struct StreamHandle {
     id: u64,
     /// The file or directory the stream belongs to, open for reading.
     base: Arc<File>,
+    store: Arc<Store>,
     is_dir: bool,
     /// The file's name, as `FileInfo` reports it.
     name: String,
@@ -599,19 +957,20 @@ impl Drop for StreamHandle {
 }
 
 impl StreamHandle {
-    /// Runs `f` on the file and the attribute of the handle's stream, with
-    /// the file's streams locked.
+    /// Runs `f` on the file's streams and the handle's stream, with the
+    /// file's streams locked.
     async fn locked<T: Send + 'static>(
         &self,
-        f: impl FnOnce(&File, &str) -> io::Result<T> + Send + 'static,
+        f: impl FnOnce(&Access<'_>, &StreamName) -> io::Result<T> + Send + 'static,
     ) -> SmbResult<T> {
         let file = Arc::clone(&self.file);
         let base = Arc::clone(&self.base);
+        let store = Arc::clone(&self.store);
         let id = self.id;
         spawn_blocking(move || {
             let open = lock(&file.open);
             let stream = open.names.get(&id).ok_or(io::ErrorKind::NotFound)?;
-            f(&base, &attr_name(stream.as_str())?)
+            f(&Access::new(&base, &store), stream)
         })
         .await
         .map_err(join_to_io)
@@ -636,8 +995,19 @@ impl StreamHandle {
 #[async_trait]
 impl Handle for StreamHandle {
     async fn read(&self, offset: u64, len: u32) -> SmbResult<Bytes> {
-        self.locked(move |fd, attr| {
-            let data = get(fd, attr)?;
+        self.locked(move |access, stream| {
+            let view = access.view()?;
+            let main = &view.find(stream).ok_or(io::ErrorKind::NotFound)?.main;
+            if main.spilled {
+                let mut buf = vec![0; len as usize];
+                let n = view
+                    .spilled()?
+                    .open(&main.name, false)?
+                    .read_at(&mut buf, offset)?;
+                buf.truncate(n);
+                return Ok(Bytes::from(buf));
+            }
+            let data = get(access.fd, &attr_name(main.name.as_str())?)?;
             let start = usize::try_from(offset)
                 .unwrap_or(usize::MAX)
                 .min(data.len());
@@ -658,36 +1028,34 @@ impl Handle for StreamHandle {
         if data.is_empty() {
             return Ok(0);
         }
-        self.locked(move |fd, attr| {
-            let start = usize::try_from(offset)
-                .ok()
-                .filter(|&start| start.saturating_add(data.len()) <= MAX_STREAM)
-                .ok_or(io::ErrorKind::StorageFull)?;
-            let end = start + data.len();
-            let mut value = get(fd, attr)?;
-            if value.len() < end {
-                value.resize(end, 0);
-            }
-            value[start..end].copy_from_slice(&data);
-            set(fd, attr, value, XattrFlags::REPLACE)?;
-            touch(fd);
+        self.locked(move |access, stream| {
+            access.write(stream, offset, &data)?;
             Ok(data.len() as u32)
         })
         .await
     }
 
     async fn flush(&self) -> SmbResult<()> {
-        self.on_base(|fd| fd.sync_all()).await
+        self.locked(|access, stream| {
+            let view = access.view()?;
+            let main = &view.find(stream).ok_or(io::ErrorKind::NotFound)?.main;
+            if main.spilled {
+                view.spilled()?.open(&main.name, false)?.sync_data()?;
+            }
+            access.fd.sync_all()
+        })
+        .await
     }
 
     async fn stat(&self) -> SmbResult<FileInfo> {
         let name = self.name.clone();
         let root_dev = self.root_dev;
-        self.locked(move |fd, attr| {
-            let md = Metadata::from_file(fd)?;
+        self.locked(move |access, stream| {
+            let md = Metadata::from_file(access.fd)?;
             let mut info = file_info_from_metadata(name, &md, root_dev);
-            info.end_of_file = size(fd, attr)?;
-            info.allocation_size = info.end_of_file;
+            let view = access.view()?;
+            let main = &view.find(stream).ok_or(io::ErrorKind::NotFound)?.main;
+            (info.end_of_file, info.allocation_size) = view.size(access.fd, main)?;
             Ok(info)
         })
         .await
@@ -720,18 +1088,8 @@ impl Handle for StreamHandle {
         if self.read_only {
             return Err(SmbError::AccessDenied);
         }
-        self.locked(move |fd, attr| {
-            let len = usize::try_from(len)
-                .ok()
-                .filter(|&len| len <= MAX_STREAM)
-                .ok_or(io::ErrorKind::StorageFull)?;
-            let mut value = get(fd, attr)?;
-            value.resize(len, 0);
-            set(fd, attr, value, XattrFlags::REPLACE)?;
-            touch(fd);
-            Ok(())
-        })
-        .await
+        self.locked(move |access, stream| access.truncate(stream, len))
+            .await
     }
 
     async fn list_dir(&self, _pattern: Option<&str>) -> SmbResult<Vec<DirEntry>> {
@@ -758,7 +1116,8 @@ impl Handle for StreamHandle {
 
     async fn streams(&self) -> SmbResult<Vec<StreamInfo>> {
         let base = Arc::clone(&self.base);
-        spawn_blocking(move || list(&base))
+        let store = Arc::clone(&self.store);
+        spawn_blocking(move || list(&base, &store))
             .await
             .map_err(join_to_io)
             .map_err(to_smb)?

@@ -61,13 +61,38 @@ use crate::wildcard::Pattern;
 /// On Linux, a file's or directory's named streams are its extended
 /// attributes named `user.DosStream.<name>:$DATA`, each holding the
 /// stream's data followed by one NUL byte. A share moves between this
-/// server and Samba 4.22's `vfs_streams_xattr` with its streams. Of
-/// attributes whose names differ only in case, the one that sorts first
-/// in byte order is the stream; removing or replacing the stream removes
-/// them all. A stream holds at most 65535 bytes, and less where the
-/// filesystem limits extended attributes, such as ext4, where all of a
-/// file's extended attributes share one block; a write past the limit
-/// fails with STATUS_DISK_FULL.
+/// server and Samba's `vfs_streams_xattr` with its streams. Of attributes
+/// whose names differ only in case, the one that sorts first in byte order
+/// is the stream; removing or replacing the stream removes them all.
+///
+/// A stream that outgrows its extended attribute, past 65535 bytes or past
+/// the room the filesystem gives a file's extended attributes (one block
+/// for all of them on ext4), moves to the stream store, and stays there
+/// until it is removed or cut to zero. The store is the directory
+/// `.smb-streams` in the share root, mode 0700, or the one
+/// [`LocalFsBackend::stream_store`] names, made with the first request to a
+/// writable share. Clients cannot open, list or rename into it under any
+/// name, and cannot create its name in the share root; with a store, paths
+/// are looked up one name at a time from the share root, each directory
+/// opened from the one before. The store has a directory per file, named by
+/// a random id that the file keeps in the extended attribute
+/// `user.smb-server.streams` (its record) with its identity, so its streams
+/// follow it through renames and hard links. A file that carries another
+/// file's record, as a copy with its extended attributes does, reads that
+/// file's streams, and gets an id of its own with a copy of them before any
+/// of them changes. The identity is the file handle where the filesystem
+/// gives one, else the inode number and birth time; on filesystems whose
+/// inode numbers or handles change, such as some FUSE filesystems, every
+/// file looks like a copy and copies its streams once more each time, and a
+/// file in a snapshot reads the live file's streams in the store. A record
+/// of another store is left alone, and that file's streams stay in extended
+/// attributes. Removed files leave their streams in the store until
+/// [`LocalFsBackend::sweep_streams`] removes them. A stream whose name
+/// takes more than 126 bytes in UTF-8 cannot move to the store, and a
+/// write past what its extended attribute holds fails with
+/// STATUS_DISK_FULL, as does a new stream on a file with 4096. A rename
+/// between the default stream and a named one copies at most 64 MiB where
+/// the filesystem cannot clone the data.
 ///
 /// Whether the share has named streams is decided once, by probing the
 /// share root for user extended attributes. Below the root, a mount
@@ -87,6 +112,13 @@ pub struct LocalFsBackend {
     /// has none.
     #[cfg(target_os = "linux")]
     streams: Option<Arc<super::streams::OpenStreams>>,
+    /// Where streams too large for an extended attribute go; `None` when
+    /// the share has no named streams.
+    #[cfg(target_os = "linux")]
+    store: Option<Arc<super::streams::Store>>,
+    /// Runs between the lookup of a path and its open.
+    #[cfg(test)]
+    after_locate: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl LocalFsBackend {
@@ -96,10 +128,15 @@ impl LocalFsBackend {
         let dir = Dir::open_ambient_dir(path, ambient_authority())?;
         let root_dev = file_key(&dir.dir_metadata()?).map(|(dev, _)| dev);
         let case_sensitive = volume::is_case_sensitive(&dir);
+        let root = Arc::new(dir);
         #[cfg(target_os = "linux")]
-        let streams = super::streams::supported(&dir).then(Arc::default);
+        let streams = super::streams::supported(&root).then(Arc::default);
+        #[cfg(target_os = "linux")]
+        let store = streams
+            .is_some()
+            .then(|| Arc::new(super::streams::Store::in_share(Arc::clone(&root))));
         Ok(Self {
-            root: Arc::new(dir),
+            root,
             root_dev,
             read_only: false,
             case_sensitive,
@@ -107,7 +144,19 @@ impl LocalFsBackend {
             hub: Some(Arc::default()),
             #[cfg(target_os = "linux")]
             streams,
+            #[cfg(target_os = "linux")]
+            store,
+            #[cfg(test)]
+            after_locate: None,
         })
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn after_locate(self, f: impl Fn() + Send + Sync + 'static) -> Self {
+        Self {
+            after_locate: Some(Arc::new(f)),
+            ..self
+        }
     }
 
     /// Mark the backend as read-only. All write-class opens and writes return
@@ -143,6 +192,357 @@ impl LocalFsBackend {
             self
         }
     }
+
+    /// Keep the named streams that do not fit in an extended attribute in
+    /// the directory `path` instead of `.smb-streams` in the share root.
+    /// The directory must exist, lie outside the share, belong to the
+    /// server's user and give no access to group or others. Space taken
+    /// there does not count against the share's filesystem or its quotas
+    /// when it is on another filesystem. Backends that name the same
+    /// directory share it, and [`LocalFsBackend::sweep_streams`] on one of
+    /// them removes what none of its own files refers to, so each needs
+    /// its own directory unless their shares are swept together. Linux
+    /// only; elsewhere the directory is opened and not used.
+    pub fn stream_store(self, path: impl AsRef<Path>) -> io::Result<Self> {
+        let dir = Dir::open_ambient_dir(path, ambient_authority())?;
+        #[cfg(target_os = "linux")]
+        {
+            let store = self
+                .streams
+                .as_ref()
+                .map(|_| super::streams::Store::at(dir, &self.root).map(Arc::new))
+                .transpose()?;
+            Ok(Self { store, ..self })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            drop(dir);
+            Ok(self)
+        }
+    }
+
+    /// Remove what the stream store keeps for files that are gone: files
+    /// deleted, through the server or on the host, or replaced without
+    /// their extended attributes. Returns how many files' streams went.
+    ///
+    /// An entry of the store goes once two sweeps in a row found no file
+    /// referring to it and no request used it in between, so a file moved
+    /// while one sweep walked the share keeps its streams; space a deleted
+    /// file took comes back after the second sweep. The walk reads an
+    /// extended attribute of every file and directory of the share and
+    /// holds nothing; the pass over the store that follows makes stream
+    /// requests that use the store wait until it is done, a pause that
+    /// grows with the number of entries and with the size of those it
+    /// removes. Any `user.smb-server.streams` attribute keeps the entry it
+    /// names. A file or directory the walk cannot read fails the sweep
+    /// before anything is removed; a failure in the pass over the store
+    /// leaves the entries it had not reached yet. Linux only; elsewhere it
+    /// removes nothing.
+    pub async fn sweep_streams(&self) -> io::Result<usize> {
+        #[cfg(target_os = "linux")]
+        {
+            let Some(store) = self.store.clone() else {
+                return Ok(0);
+            };
+            if self.read_only {
+                return Err(io::ErrorKind::PermissionDenied.into());
+            }
+            let root = Arc::clone(&self.root);
+            spawn_blocking(move || store.sweep(&root))
+                .await
+                .map_err(join_to_io)?
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Ok(0)
+        }
+    }
+
+    /// True if `path` is the name the stream store takes in the share
+    /// root, which no client may make.
+    fn reserves(&self, path: &SmbPath) -> bool {
+        #[cfg(target_os = "linux")]
+        if let Some(hidden) = self.store.as_ref().and_then(|store| store.hidden_name()) {
+            return matches!(path.components(), [name] if is_hidden(name, hidden, self.case_sensitive));
+        }
+        let _ = path;
+        false
+    }
+
+    /// Makes the stream store of a writable share, so it exists before a
+    /// client could take its name.
+    async fn prepare_store(&self) {
+        #[cfg(target_os = "linux")]
+        if !self.read_only
+            && let Some(store) = self.store.clone()
+            && !store.prepared()
+        {
+            let _ = spawn_blocking(move || store.prepare()).await;
+        }
+    }
+
+    /// [`LocalFsBackend::locate`], once more when a directory on the way
+    /// moved during the lookup; moved again, the path is not found.
+    async fn locate_again(&self, path: &SmbPath, follow_last: bool) -> io::Result<Located> {
+        match self.locate(path, follow_last).await {
+            Err(e) if is_changed(&e) => match self.locate(path, follow_last).await {
+                Err(e) if is_changed(&e) => Err(io::ErrorKind::NotFound.into()),
+                located => located,
+            },
+            located => located,
+        }
+    }
+
+    /// Where `path` is: a directory, open, and the path in it. With a
+    /// stream store, the path is resolved one name at a time from the share
+    /// root, each directory on the way opened from the one before, so the
+    /// result is a directory that is not the store or below it, and the
+    /// last name in it; a path that leads into the store fails with
+    /// [`in_store`]. A symlink as the last name is followed only with
+    /// `follow_last`. Without a store, it is the share root and the whole
+    /// path.
+    async fn locate(&self, path: &SmbPath, follow_last: bool) -> io::Result<Located> {
+        #[cfg(target_os = "linux")]
+        if let Some(store) = self.store.clone() {
+            let root = Arc::clone(&self.root);
+            let rel = to_rel_path(path);
+            return spawn_blocking(move || match store.key() {
+                Some(key) => resolve(&root, &rel, key, follow_last),
+                None => Ok(Located {
+                    base: root,
+                    rel,
+                    checked: false,
+                }),
+            })
+            .await
+            .map_err(join_to_io)?;
+        }
+        let _ = follow_last;
+        Ok(Located {
+            base: Arc::clone(&self.root),
+            rel: to_rel_path(path),
+            checked: false,
+        })
+    }
+}
+
+/// A path below the share root, as [`LocalFsBackend::locate`] found it.
+#[derive(Clone)]
+struct Located {
+    /// The directory the path is in.
+    base: Arc<Dir>,
+    /// The path in `base`: one name, or `.` for `base` itself, when
+    /// `checked`.
+    rel: PathBuf,
+    /// `base` was reached one name at a time, and none of it is the
+    /// stream store.
+    checked: bool,
+}
+
+impl Located {
+    /// Fails unless the object `opened` is the one the last name of a
+    /// checked path names now, without following a symlink: the name was
+    /// swapped since it was resolved.
+    #[cfg(target_os = "linux")]
+    fn verify(&self, opened: &impl std::os::fd::AsFd) -> io::Result<()> {
+        if self.checked && self.rel != Path::new(".") {
+            let named = rustix::fs::statat(
+                &*self.base,
+                &self.rel,
+                rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+            )?;
+            let opened = rustix::fs::fstat(opened)?;
+            if (named.st_dev, named.st_ino) != (opened.st_dev, opened.st_ino) {
+                return Err(changed());
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn verify<T>(&self, _opened: &T) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The error for a path that leads into the stream store.
+#[cfg(target_os = "linux")]
+fn in_store() -> io::Error {
+    io::Error::new(io::ErrorKind::NotFound, InStore)
+}
+
+/// The error for a name that changed between its lookup and its open.
+#[cfg(target_os = "linux")]
+fn changed() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Interrupted,
+        "a name changed while it was looked up",
+    )
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct InStore;
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Display for InStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the path leads into the stream store")
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::error::Error for InStore {}
+
+/// True if `e` says a path leads into the stream store.
+fn is_in_store(e: &io::Error) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        e.kind() == io::ErrorKind::NotFound
+            && e.get_ref().is_some_and(|inner| inner.is::<InStore>())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = e;
+        false
+    }
+}
+
+/// True if `e` says a name changed between its lookup and its open.
+fn is_changed(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::Interrupted
+}
+
+/// Resolves `rel` below `root` one name at a time, as
+/// [`LocalFsBackend::locate`] says. Symlinks are followed as the share
+/// follows them: relative ones within the share, absolute ones not at all;
+/// with `follow_last` unset, a symlink as the last name is the result
+/// itself. Only the directory reached so far is held open; a `..` opens
+/// its parent again and checks it is the one it came through.
+#[cfg(target_os = "linux")]
+fn resolve(
+    root: &Arc<Dir>,
+    rel: &Path,
+    store: (u64, u64),
+    follow_last: bool,
+) -> io::Result<Located> {
+    use std::collections::VecDeque;
+    use std::ffi::{OsStr, OsString};
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::path::Component;
+
+    use rustix::fs::{AtFlags, FileType, Mode, OFlags};
+
+    let escape = || {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "a symlink leads outside the share",
+        )
+    };
+    let key = |fd: &dyn std::os::fd::AsFd| -> io::Result<(u64, u64)> {
+        let st = rustix::fs::fstat(fd.as_fd())?;
+        Ok((st.st_dev, st.st_ino))
+    };
+    let dir_flags = OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let mut top: Arc<Dir> = Arc::clone(root);
+    // The device and inode of each directory from the root to `top`.
+    let mut keys = vec![key(&**root)?];
+    let mut pending: VecDeque<OsString> = rel
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(name) => Some(name.to_os_string()),
+            _ => None,
+        })
+        .collect();
+    let mut links = 0;
+    while let Some(name) = pending.pop_front() {
+        if name == ".." {
+            if keys.len() == 1 {
+                return Err(escape());
+            }
+            #[cfg(test)]
+            if let Some(f) = lock_hook().as_ref() {
+                f();
+            }
+            let parent = rustix::fs::openat(&*top, "..", dir_flags, Mode::empty())?;
+            keys.pop();
+            if Some(&key(&parent)?) != keys.last() {
+                return Err(changed());
+            }
+            top = Arc::new(Dir::from_std_file(std::fs::File::from(parent)));
+            continue;
+        }
+        if name == "." {
+            continue;
+        }
+        let st = match rustix::fs::statat(&*top, &name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(st) => Some(st),
+            Err(rustix::io::Errno::NOENT) => None,
+            Err(e) => return Err(e.into()),
+        };
+        let is_link = st
+            .as_ref()
+            .is_some_and(|st| FileType::from_raw_mode(st.st_mode) == FileType::Symlink);
+        match st {
+            Some(_) if is_link && (follow_last || !pending.is_empty()) => {
+                links += 1;
+                if links > 40 {
+                    return Err(rustix::io::Errno::LOOP.into());
+                }
+                let target = rustix::fs::readlinkat(&*top, &name, Vec::new())?;
+                let target = Path::new(OsStr::from_bytes(target.as_bytes()));
+                for c in target.components().rev() {
+                    match c {
+                        Component::Normal(n) => pending.push_front(n.to_os_string()),
+                        Component::ParentDir => pending.push_front("..".into()),
+                        Component::CurDir => {}
+                        Component::RootDir | Component::Prefix(_) => return Err(escape()),
+                    }
+                }
+            }
+            Some(st) if (st.st_dev, st.st_ino) == store => return Err(in_store()),
+            _ if pending.is_empty() => {
+                return Ok(Located {
+                    base: top,
+                    rel: PathBuf::from(name),
+                    checked: true,
+                });
+            }
+            None => return Err(io::ErrorKind::NotFound.into()),
+            Some(_) => {
+                let fd = rustix::fs::openat(&*top, &name, dir_flags, Mode::empty())?;
+                let at = key(&fd)?;
+                if at == store {
+                    return Err(in_store());
+                }
+                keys.push(at);
+                top = Arc::new(Dir::from_std_file(std::fs::File::from(fd)));
+            }
+        }
+    }
+    Ok(Located {
+        base: top,
+        rel: PathBuf::from("."),
+        checked: true,
+    })
+}
+
+/// Runs in [`resolve`] before it goes up a directory.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) static BEFORE_PARENT: std::sync::Mutex<Option<Box<dyn Fn() + Send>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(all(test, target_os = "linux"))]
+fn lock_hook() -> std::sync::MutexGuard<'static, Option<Box<dyn Fn() + Send>>> {
+    BEFORE_PARENT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// True if `name` is `hidden` under the case rule `case_sensitive`.
+#[cfg(target_os = "linux")]
+fn is_hidden(name: &str, hidden: &str, case_sensitive: bool) -> bool {
+    name == hidden || (!case_sensitive && name.to_lowercase() == hidden.to_lowercase())
 }
 
 // ---------------------------------------------------------------------------
@@ -467,11 +867,13 @@ pub(super) fn file_info_from_metadata(
 // ---------------------------------------------------------------------------
 
 /// Entries of `dir` whose names match `pattern`, every entry for `None`.
-/// Names a client could not open again are left out.
+/// Names a client could not open again are left out, and entries that
+/// resolve to the object with the host identity `hidden`.
 fn list_entries(
     dir: &Dir,
     pattern: Option<&str>,
     root_dev: Option<u64>,
+    hidden: Option<(u64, u64)>,
 ) -> io::Result<Vec<SmbDirEntry>> {
     let pattern = pattern
         .filter(|p| !matches!(*p, "" | "*" | "*.*"))
@@ -496,6 +898,9 @@ fn list_entries(
             Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
             Err(e) => return Err(e),
         };
+        if hidden.is_some() && file_key(&md) == hidden {
+            continue;
+        }
         let info = file_info_from_metadata(name.to_owned(), &md, root_dev);
         out.push(SmbDirEntry { info });
     }
@@ -546,6 +951,7 @@ impl LocalFsBackend {
     async fn open_entry(
         &self,
         path: &SmbPath,
+        located: Located,
         opts: OpenOptions,
     ) -> SmbResult<(Box<dyn Handle>, OpenAction)> {
         // 1. Read-only check: any open that requests creation, write access,
@@ -555,8 +961,8 @@ impl LocalFsBackend {
             return Err(SmbError::AccessDenied);
         }
 
-        let rel = to_rel_path(path);
-        let root = Arc::clone(&self.root);
+        let root = Arc::clone(&located.base);
+        let rel = located.rel.clone();
         let read_only = self.read_only;
         let directory = opts.directory;
         let non_directory = opts.non_directory;
@@ -566,6 +972,7 @@ impl LocalFsBackend {
             // Directory CREATE intents: Create / OpenOrCreate / OverwriteOrCreate
             // imply mkdir; Open / Truncate require existing.
             let intent = opts.intent;
+            let located = located.clone();
             let (dir_handle, action) = spawn_blocking(move || -> io::Result<(Dir, OpenAction)> {
                 let action = match intent {
                     OpenIntent::Open => OpenAction::Opened,
@@ -583,7 +990,9 @@ impl LocalFsBackend {
                         return Err(io::Error::from(io::ErrorKind::InvalidInput));
                     }
                 };
-                Ok((open_dir_handle(&root, &rel, write_attributes)?, action))
+                let dir = open_dir_handle(&root, &rel, write_attributes)?;
+                located.verify(&dir)?;
+                Ok((dir, action))
             })
             .await
             .map_err(join_to_io)
@@ -596,12 +1005,14 @@ impl LocalFsBackend {
                 dir_handle: Arc::new(dir_handle),
                 #[cfg(target_os = "linux")]
                 hub: self.hub.clone(),
+                #[cfg(target_os = "linux")]
+                store: self.store.clone(),
             });
             return Ok((handle, action));
         }
 
         let existing_is_dir = {
-            let root = Arc::clone(&self.root);
+            let root = Arc::clone(&root);
             let rel = rel.clone();
             spawn_blocking(move || -> io::Result<bool> {
                 match root.metadata(&rel) {
@@ -621,20 +1032,26 @@ impl LocalFsBackend {
             }
             match opts.intent {
                 OpenIntent::Open | OpenIntent::OpenOrCreate => {
-                    let root = Arc::clone(&self.root);
+                    let root = Arc::clone(&root);
                     let rel = rel.clone();
-                    let dir_handle =
-                        spawn_blocking(move || open_dir_handle(&root, &rel, write_attributes))
-                            .await
-                            .map_err(join_to_io)
-                            .map_err(io_to_smb)?
-                            .map_err(io_to_smb)?;
+                    let located = located.clone();
+                    let dir_handle = spawn_blocking(move || {
+                        let dir = open_dir_handle(&root, &rel, write_attributes)?;
+                        located.verify(&dir)?;
+                        Ok::<_, io::Error>(dir)
+                    })
+                    .await
+                    .map_err(join_to_io)
+                    .map_err(io_to_smb)?
+                    .map_err(io_to_smb)?;
                     let handle: Box<dyn Handle> = Box::new(LocalHandle::Dir {
                         name: file_name_for(path),
                         root_dev: self.root_dev,
                         dir_handle: Arc::new(dir_handle),
                         #[cfg(target_os = "linux")]
                         hub: self.hub.clone(),
+                        #[cfg(target_os = "linux")]
+                        store: self.store.clone(),
                     });
                     return Ok((handle, OpenAction::Opened));
                 }
@@ -646,22 +1063,29 @@ impl LocalFsBackend {
         }
 
         // 2. Open the file for the intent.
-        let (cap_file, action) = spawn_blocking(move || open_file(&root, &rel, opts))
-            .await
-            .map_err(join_to_io)
-            .map_err(io_to_smb)?
-            .map_err(io_to_smb)?;
-
-        // Convert to a `std::fs::File`. We only need cap-std for the safe
-        // *open*; once we hold a verified file handle, std's API gives us
-        // `set_times`, `set_len`, `sync_data`, and `FileExt::{read,write}_at`.
-        let std_file: std::fs::File = cap_file.into_std();
+        let (std_file, action) = spawn_blocking(move || {
+            #[cfg(target_os = "linux")]
+            if located.checked {
+                let (file, action) = open_file_nofollow(&root, &rel, opts)?;
+                located.verify(&file)?;
+                return Ok((file, action));
+            }
+            let (file, action) = open_file(&root, &rel, opts)?;
+            located.verify(&file)?;
+            Ok::<_, io::Error>((file.into_std(), action))
+        })
+        .await
+        .map_err(join_to_io)
+        .map_err(io_to_smb)?
+        .map_err(io_to_smb)?;
 
         let handle: Box<dyn Handle> = Box::new(LocalHandle::File {
             name: file_name_for(path),
             root_dev: self.root_dev,
             file: Arc::new(std_file),
             read_only,
+            #[cfg(target_os = "linux")]
+            store: self.store.clone(),
         });
         Ok((handle, action))
     }
@@ -729,6 +1153,81 @@ fn open_file(
     }
 }
 
+/// Opens the file `name` in `dir` for `opts.intent`, as [`open_file`]
+/// does, without following a symlink: a name that became one since it was
+/// looked up fails as changed, before anything is truncated.
+#[cfg(target_os = "linux")]
+fn open_file_nofollow(
+    dir: &Dir,
+    name: &Path,
+    opts: OpenOptions,
+) -> io::Result<(std::fs::File, OpenAction)> {
+    use rustix::fs::{Mode, OFlags};
+
+    let base = OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let access = |write: bool| match (opts.read, write) {
+        (true, true) => OFlags::RDWR,
+        (false, true) => OFlags::WRONLY,
+        _ => OFlags::RDONLY,
+    };
+    let existing = base
+        | if opts.write {
+            OFlags::RDWR
+        } else {
+            OFlags::RDONLY
+        };
+    let created = base | access(true) | OFlags::CREATE | OFlags::EXCL;
+    let truncated = base | access(true) | OFlags::TRUNC;
+    let open = |flags: OFlags| -> io::Result<std::fs::File> {
+        match rustix::fs::openat(dir, name, flags, Mode::from_raw_mode(0o666)) {
+            Ok(fd) => Ok(std::fs::File::from(fd)),
+            Err(rustix::io::Errno::LOOP) => Err(changed()),
+            Err(e) => Err(e.into()),
+        }
+    };
+    let not_found = |e: &io::Error| e.kind() == io::ErrorKind::NotFound;
+    let exists = |e: &io::Error| e.kind() == io::ErrorKind::AlreadyExists;
+    match opts.intent {
+        OpenIntent::Open => Ok((open(existing)?, OpenAction::Opened)),
+        OpenIntent::Create => Ok((open(created)?, OpenAction::Created)),
+        OpenIntent::Truncate => Ok((open(truncated)?, OpenAction::Overwritten)),
+        // The file can appear or vanish between the two calls, so each pair
+        // is tried a second time.
+        OpenIntent::OpenOrCreate => {
+            let mut attempt = 0;
+            loop {
+                attempt += 1;
+                match open(existing) {
+                    Ok(f) => return Ok((f, OpenAction::Opened)),
+                    Err(e) if not_found(&e) => {}
+                    Err(e) => return Err(e),
+                }
+                match open(created) {
+                    Ok(f) => return Ok((f, OpenAction::Created)),
+                    Err(e) if exists(&e) && attempt < 2 => {}
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        OpenIntent::OverwriteOrCreate => {
+            let mut attempt = 0;
+            loop {
+                attempt += 1;
+                match open(created) {
+                    Ok(f) => return Ok((f, OpenAction::Created)),
+                    Err(e) if exists(&e) => {}
+                    Err(e) => return Err(e),
+                }
+                match open(truncated) {
+                    Ok(f) => return Ok((f, OpenAction::Overwritten)),
+                    Err(e) if not_found(&e) && attempt < 2 => {}
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+    }
+}
+
 /// cap-std options that open an existing file with the access `opts` asks
 /// for.
 fn existing_file_options(opts: &OpenOptions) -> CapOpenOptions {
@@ -754,7 +1253,32 @@ impl ShareBackend for LocalFsBackend {
         path: &SmbPath,
         opts: OpenOptions,
     ) -> SmbResult<(Box<dyn Handle>, OpenAction)> {
-        let result = self.open_entry(path, opts).await;
+        let refused = match opts.intent {
+            OpenIntent::Open | OpenIntent::Truncate => SmbError::NotFound,
+            _ => SmbError::AccessDenied,
+        };
+        if self.reserves(path) {
+            return Err(refused);
+        }
+        self.prepare_store().await;
+        let mut tries = 0;
+        let result = loop {
+            let located = match self.locate_again(path, true).await {
+                Ok(located) => located,
+                Err(e) if is_in_store(&e) => return Err(refused),
+                Err(e) => break Err(io_to_smb(e)),
+            };
+            #[cfg(test)]
+            if let Some(f) = &self.after_locate {
+                f();
+            }
+            match self.open_entry(path, located, opts).await {
+                // The last name changed after it was looked up.
+                Err(SmbError::Io(e)) if is_changed(&e) && tries == 0 => tries += 1,
+                Err(SmbError::Io(e)) if is_changed(&e) => break Err(SmbError::NotFound),
+                result => break result,
+            }
+        };
         if matches!(result, Err(SmbError::NotFound | SmbError::NotADirectory))
             && self.parent_missing(path).await
         {
@@ -771,8 +1295,21 @@ impl ShareBackend for LocalFsBackend {
             // Refusing to delete the share root itself.
             return Err(SmbError::AccessDenied);
         }
-        let rel = to_rel_path(path);
-        let root = Arc::clone(&self.root);
+        if self.reserves(path) {
+            return Err(SmbError::NotFound);
+        }
+        self.prepare_store().await;
+        let located = match self.locate_again(path, false).await {
+            Ok(located) => located,
+            Err(e) if is_in_store(&e) => return Err(SmbError::NotFound),
+            Err(e) => return Err(io_to_smb(e)),
+        };
+        if located.checked && located.rel == Path::new(".") {
+            return Err(SmbError::AccessDenied);
+        }
+        let Located {
+            base: root, rel, ..
+        } = located;
 
         spawn_blocking(move || -> io::Result<()> {
             // Pick the call from the entry itself: the error `remove_file`
@@ -797,14 +1334,37 @@ impl ShareBackend for LocalFsBackend {
         if from.is_root() || to.is_root() {
             return Err(SmbError::NameInvalid);
         }
+        if self.reserves(from) {
+            return Err(SmbError::NotFound);
+        }
+        if self.reserves(to) {
+            return Err(SmbError::AccessDenied);
+        }
+        self.prepare_store().await;
+        let from_at = match self.locate_again(from, false).await {
+            Ok(located) => located,
+            Err(e) if is_in_store(&e) => return Err(SmbError::NotFound),
+            Err(e) => return Err(io_to_smb(e)),
+        };
+        let to_at = match self.locate_again(to, false).await {
+            Ok(located) => located,
+            Err(e) if is_in_store(&e) => return Err(SmbError::AccessDenied),
+            Err(e) if e.kind() == io::ErrorKind::NotFound && self.parent_missing(to).await => {
+                return Err(SmbError::PathNotFound);
+            }
+            Err(e) => return Err(io_to_smb(e)),
+        };
+        let dot = Path::new(".");
+        if (from_at.checked && from_at.rel == dot) || (to_at.checked && to_at.rel == dot) {
+            return Err(SmbError::AccessDenied);
+        }
         let same_name = same_path(from, to, self.capabilities().case_sensitive);
-        let from = to_rel_path(from);
-        let to_path = to_rel_path(to);
-        let root = Arc::clone(&self.root);
+        let (root, from) = (from_at.base, from_at.rel);
+        let (to_root, to_path) = (to_at.base, to_at.rel);
 
         let result = spawn_blocking(move || -> io::Result<()> {
             let from_md = root.symlink_metadata(&from)?;
-            match root.symlink_metadata(&to_path) {
+            match to_root.symlink_metadata(&to_path) {
                 Ok(to_md) => {
                     let from_key = file_key(&from_md);
                     let same_file = from_key.is_some() && from_key == file_key(&to_md);
@@ -830,7 +1390,7 @@ impl ShareBackend for LocalFsBackend {
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e),
             }
-            root.rename(&from, &root, &to_path)
+            root.rename(&from, &to_root, &to_path)
         })
         .await
         .map_err(join_to_io)
@@ -938,6 +1498,7 @@ impl LocalFsBackend {
             root_dev: self.root_dev,
             read_only: self.read_only,
             open: self.streams.clone().ok_or(SmbError::NotSupported)?,
+            store: self.store.clone().ok_or(SmbError::NotSupported)?,
         })
     }
 }
@@ -955,6 +1516,8 @@ enum LocalHandle {
         root_dev: Option<u64>,
         file: Arc<std::fs::File>,
         read_only: bool,
+        #[cfg(target_os = "linux")]
+        store: Option<Arc<super::streams::Store>>,
     },
     Dir {
         name: String,
@@ -962,7 +1525,61 @@ enum LocalHandle {
         dir_handle: Arc<Dir>,
         #[cfg(target_os = "linux")]
         hub: Option<Arc<super::inotify::Hub>>,
+        #[cfg(target_os = "linux")]
+        store: Option<Arc<super::streams::Store>>,
     },
+}
+
+impl LocalHandle {
+    /// The stream store of the share, which listings leave out.
+    #[cfg(target_os = "linux")]
+    fn store(&self) -> Option<Arc<super::streams::Store>> {
+        let (LocalHandle::File { store, .. } | LocalHandle::Dir { store, .. }) = self;
+        store.clone()
+    }
+}
+
+/// The changes of a watch, without those to entries named `hidden`.
+#[cfg(target_os = "linux")]
+struct Hiding {
+    inner: Box<dyn crate::backend::DirWatch>,
+    hidden: &'static str,
+}
+
+#[cfg(target_os = "linux")]
+#[async_trait]
+impl crate::backend::DirWatch for Hiding {
+    async fn next(&mut self) -> Option<Vec<crate::backend::DirChange>> {
+        use crate::backend::{DirChange, DirChangeKind};
+        loop {
+            let changes = self.inner.next().await?;
+            let hidden = |name: &str| name == self.hidden;
+            let kept: Vec<DirChange> = changes
+                .into_iter()
+                .filter_map(|change| match &change.kind {
+                    DirChangeKind::Renamed { from } => match (hidden(from), hidden(&change.name)) {
+                        (false, false) => Some(change),
+                        (true, false) => Some(DirChange::new(
+                            change.name,
+                            DirChangeKind::Added,
+                            change.is_directory,
+                        )),
+                        (false, true) => Some(DirChange::new(
+                            from.clone(),
+                            DirChangeKind::Removed,
+                            change.is_directory,
+                        )),
+                        (true, true) => None,
+                    },
+                    _ if hidden(&change.name) => None,
+                    _ => Some(change),
+                })
+                .collect();
+            if !kept.is_empty() {
+                return Some(kept);
+            }
+        }
+    }
 }
 
 pub(super) fn file_name_for(path: &SmbPath) -> String {
@@ -1157,11 +1774,19 @@ impl Handle for LocalHandle {
                 let dir_handle = Arc::clone(dir_handle);
                 let root_dev = *root_dev;
                 let pat = pattern.map(|s| s.to_owned());
-                spawn_blocking(move || list_entries(&dir_handle, pat.as_deref(), root_dev))
-                    .await
-                    .map_err(join_to_io)
-                    .map_err(io_to_smb)?
-                    .map_err(io_to_smb)
+                #[cfg(target_os = "linux")]
+                let store = self.store();
+                spawn_blocking(move || {
+                    #[cfg(target_os = "linux")]
+                    let hidden = store.and_then(|store| store.key());
+                    #[cfg(not(target_os = "linux"))]
+                    let hidden = None;
+                    list_entries(&dir_handle, pat.as_deref(), root_dev, hidden)
+                })
+                .await
+                .map_err(join_to_io)
+                .map_err(io_to_smb)?
+                .map_err(io_to_smb)
             }
         }
     }
@@ -1173,7 +1798,17 @@ impl Handle for LocalHandle {
                 dir_handle,
                 hub: Some(hub),
                 ..
-            } => Ok(hub.watch(&**dir_handle)),
+            } => {
+                let watch = hub.watch(&**dir_handle);
+                let hidden = self.store().and_then(|store| store.hidden_in(dir_handle));
+                Ok(match (watch, hidden) {
+                    (Some(watch), Some(hidden)) => Some(Box::new(Hiding {
+                        inner: watch,
+                        hidden,
+                    })),
+                    (watch, _) => watch,
+                })
+            }
             _ => Ok(None),
         }
     }
@@ -1222,17 +1857,27 @@ impl Handle for LocalHandle {
     #[cfg(target_os = "linux")]
     async fn streams(&self) -> SmbResult<Vec<crate::stream::StreamInfo>> {
         let listed = match self {
-            LocalHandle::File { file, .. } => {
-                let file = Arc::clone(file);
-                spawn_blocking(move || super::streams::list_smb(&file)).await
+            LocalHandle::File {
+                file,
+                store: Some(store),
+                ..
+            } => {
+                let (file, store) = (Arc::clone(file), Arc::clone(store));
+                spawn_blocking(move || super::streams::list_smb(&file, &store)).await
             }
-            LocalHandle::Dir { dir_handle, .. } => {
-                let dir_handle = Arc::clone(dir_handle);
+            LocalHandle::Dir {
+                dir_handle,
+                store: Some(store),
+                ..
+            } => {
+                let (dir_handle, store) = (Arc::clone(dir_handle), Arc::clone(store));
                 spawn_blocking(move || {
-                    super::streams::list_smb(&dir_as_file(&dir_handle).map_err(io_to_smb)?)
+                    let fd = dir_as_file(&dir_handle).map_err(io_to_smb)?;
+                    super::streams::list_smb(&fd, &store)
                 })
                 .await
             }
+            _ => return Ok(Vec::new()),
         };
         listed.map_err(join_to_io).map_err(io_to_smb)?
     }

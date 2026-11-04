@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use common::client::*;
 use common::notify::*;
-use smb_server::ntstatus::{STATUS_DISK_FULL, STATUS_SUCCESS};
+use smb_server::ntstatus::STATUS_SUCCESS;
 use smb_server::{LocalFsBackend, Share};
 use tempfile::TempDir;
 
@@ -209,26 +209,78 @@ async fn a_stream_on_a_missing_file_creates_the_file() {
 }
 
 #[tokio::test]
-async fn a_write_past_what_an_attribute_holds_is_disk_full() {
+async fn a_stream_past_what_an_attribute_holds_is_served_from_the_store() {
     let Some(td) = root() else {
         return;
     };
     let server = Server::public(LocalFsBackend::new(td.path()).unwrap()).await;
+    let mut watcher = server.client().await;
     let mut c = server.client().await;
-    set_stream(&mut c, "f.txt:s", b"small").await.unwrap();
+    let share = watcher.open_dir("").await;
+    let mid = arm(&mut watcher, share, 4096, NAMES, false).await;
+
+    let data: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
     let created = c
         .create(Create {
-            name: "f.txt:s",
+            name: "f.txt:big",
+            disposition: FILE_OVERWRITE_IF,
             ..Create::default()
         })
         .await
         .unwrap();
-    assert_eq!(
-        c.write(created.file_id, 65535, b"x").await,
-        Err(STATUS_DISK_FULL)
-    );
+    for (at, chunk) in data.chunks(65536).enumerate() {
+        let offset = (at * 65536) as u64;
+        assert_eq!(
+            c.write(created.file_id, offset, chunk).await,
+            Ok(chunk.len() as u32)
+        );
+    }
     c.close(created.file_id).await;
-    assert_eq!(read_stream(&mut c, "f.txt:s").await.unwrap(), b"small");
+    assert!(xattr(&td.path().join("f.txt"), "user.DosStream.big:$DATA").is_none());
+
+    let opened = c
+        .open("f.txt:big", FILE_GENERIC_READ, SHARE_ALL)
+        .await
+        .unwrap();
+    let mut read = Vec::new();
+    while read.len() < data.len() {
+        read.extend(c.read(opened, read.len() as u64, 65536).await.unwrap());
+    }
+    c.close(opened).await;
+    assert_eq!(read, data);
+    let file = c.open("f.txt", FILE_GENERIC_READ, SHARE_ALL).await.unwrap();
+    let info = c
+        .query_file_info(file, FILE_STREAM_INFORMATION)
+        .await
+        .unwrap();
+    c.close(file).await;
+    assert_eq!(
+        stream_entries(&info),
+        [
+            ("::$DATA".to_string(), 4),
+            (":big:$DATA".to_string(), 200_000)
+        ]
+    );
+
+    // The store made in the share root is not a change clients hear of.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    create_file(&mut c, "marker").await;
+    assert_eq!(
+        wait_notify(&mut watcher, mid, 4096).await,
+        (STATUS_SUCCESS, vec![added("marker")])
+    );
+}
+
+async fn create_file(c: &mut Client, name: &str) {
+    let created = c
+        .create(Create {
+            name,
+            disposition: FILE_CREATE,
+            ..Create::default()
+        })
+        .await
+        .unwrap();
+    c.close(created.file_id).await;
 }
 
 /// The changes a watcher of the share root with every attribute, write and

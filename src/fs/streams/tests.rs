@@ -26,6 +26,26 @@ fn backend() -> Option<(TempDir, LocalFsBackend)> {
     Some((td, backend))
 }
 
+/// Bytes that differ from one offset to the next.
+fn pattern(len: usize) -> Vec<u8> {
+    (0..len).map(|i| (i * 7 % 251) as u8).collect()
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The store directory of `path` below `td`, from its record.
+fn entry(td: &TempDir, path: &str) -> std::path::PathBuf {
+    let record = xattr(&td.path().join(path), "user.smb-server.streams").expect("a record");
+    td.path().join(".smb-streams").join(hex(&record[..16]))
+}
+
+/// Where the stream `stream` of `path` below `td` is kept once spilled.
+fn spilled(td: &TempDir, path: &str, stream: &str) -> std::path::PathBuf {
+    entry(td, path).join(hex(stream.as_bytes()))
+}
+
 /// The file id of `path` below `td`, as the backend reports it.
 fn id(td: &TempDir, path: &str) -> u64 {
     use std::os::unix::fs::MetadataExt as _;
@@ -244,34 +264,6 @@ async fn names_too_long_for_an_attribute_are_invalid() {
 }
 
 #[tokio::test]
-async fn writes_past_what_an_attribute_holds_fail_and_change_nothing() {
-    let Some((_td, backend)) = backend() else {
-        return;
-    };
-    let (h, _) = open(&backend, "f.txt", "s", OpenIntent::Create)
-        .await
-        .unwrap();
-    h.write(0, b"abc").await.unwrap();
-    assert!(matches!(
-        h.write(65535, b"x").await,
-        Err(SmbError::DiskFull)
-    ));
-    assert!(matches!(h.truncate(65536).await, Err(SmbError::DiskFull)));
-    assert_eq!(read_all(h.as_ref()).await, b"abc");
-    // Whether a stream this large fits depends on the filesystem: ext4
-    // keeps all of a file's extended attributes in one block.
-    match h.write(0, &[7; 60000]).await {
-        Ok(n) => {
-            assert_eq!(n, 60000);
-            assert_eq!(h.stat().await.unwrap().end_of_file, 60000);
-        }
-        Err(SmbError::DiskFull) => assert_eq!(read_all(h.as_ref()).await, b"abc"),
-        Err(e) => panic!("{e:?}"),
-    }
-    h.close().await.unwrap();
-}
-
-#[tokio::test]
 async fn writes_extend_with_zeros_and_truncate_cuts() {
     let Some((_td, backend)) = backend() else {
         return;
@@ -485,17 +477,22 @@ async fn renames_to_and_from_the_default_stream_move_the_data() {
     assert_eq!(std::fs::read(&f).unwrap(), b"contents");
     assert!(streams(&backend, "f.txt").await.is_empty());
 
-    // A file too large for a stream stays as it is.
-    let big = vec![1u8; 65536];
+    // A file larger than an attribute holds moves to the store and back.
+    let big = pattern(1 << 20);
     std::fs::write(&f, &big).unwrap();
-    assert!(matches!(
-        backend
-            .rename_stream(&p("f.txt"), id(&td, "f.txt"), None, Some(&name("s")), false)
-            .await,
-        Err(SmbError::DiskFull)
-    ));
+    backend
+        .rename_stream(&p("f.txt"), id(&td, "f.txt"), None, Some(&name("s")), false)
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(&f).unwrap(), b"");
+    assert_eq!(std::fs::read(spilled(&td, "f.txt", "s")).unwrap(), big);
+    backend
+        .rename_stream(&p("f.txt"), id(&td, "f.txt"), Some(&name("s")), None, true)
+        .await
+        .unwrap();
     assert_eq!(std::fs::read(&f).unwrap(), big);
     assert!(streams(&backend, "f.txt").await.is_empty());
+    assert!(!spilled(&td, "f.txt", "s").exists());
 }
 
 #[tokio::test]
@@ -730,4 +727,1071 @@ async fn attributes_differing_in_case_are_one_stream() {
         .await
         .unwrap();
     assert!(streams(&backend, "f.txt").await.is_empty());
+}
+
+#[tokio::test]
+async fn a_stream_past_what_an_attribute_holds_moves_to_the_store() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let Some((td, backend)) = backend() else {
+        return;
+    };
+    let f = td.path().join("f.txt");
+    let (h, _) = open(&backend, "f.txt", "s", OpenIntent::Create)
+        .await
+        .unwrap();
+    h.write(0, b"abc").await.unwrap();
+    assert_eq!(h.write(65535, b"x").await.unwrap(), 1);
+    assert!(xattr(&f, "user.DosStream.s:$DATA").is_none());
+    let mut expected = b"abc".to_vec();
+    expected.resize(65535, 0);
+    expected.push(b'x');
+    assert_eq!(std::fs::read(spilled(&td, "f.txt", "s")).unwrap(), expected);
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&td.path().join(".smb-streams")), 0o700);
+    assert_eq!(mode(&entry(&td, "f.txt")), 0o700);
+    assert_eq!(h.stat().await.unwrap().end_of_file, 65536);
+    assert_eq!(&h.read(65534, 10).await.unwrap()[..], b"\0x");
+    assert_eq!(streams(&backend, "f.txt").await, [("s".to_string(), 65536)]);
+
+    // Writes go to the stored file in place.
+    let big = pattern(1 << 20);
+    h.write(0, &big).await.unwrap();
+    assert_eq!(std::fs::read(spilled(&td, "f.txt", "s")).unwrap(), big);
+    h.truncate(10).await.unwrap();
+    assert_eq!(
+        std::fs::read(spilled(&td, "f.txt", "s")).unwrap(),
+        &big[..10]
+    );
+
+    // Cut to zero, it is an attribute again.
+    h.truncate(0).await.unwrap();
+    assert_eq!(xattr(&f, "user.DosStream.s:$DATA").unwrap(), b"\0");
+    assert!(!spilled(&td, "f.txt", "s").exists());
+    h.write(0, b"small").await.unwrap();
+    assert_eq!(xattr(&f, "user.DosStream.s:$DATA").unwrap(), b"small\0");
+    h.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_stream_the_filesystem_has_no_room_for_reads_back_whole() {
+    let Some((_td, backend)) = backend() else {
+        return;
+    };
+    // ext4 keeps all of a file's extended attributes in one block, so
+    // there these go to the store; elsewhere they stay attributes.
+    let data = pattern(8192);
+    create(&backend, "f.txt", "a", &data).await;
+    create(&backend, "f.txt", "b", &data).await;
+    for stream in ["a", "b"] {
+        let (h, _) = open(&backend, "f.txt", stream, OpenIntent::Open)
+            .await
+            .unwrap();
+        assert_eq!(read_all(h.as_ref()).await, data, "{stream}");
+        h.close().await.unwrap();
+    }
+    assert_eq!(
+        streams(&backend, "f.txt").await,
+        [("a".to_string(), 8192), ("b".to_string(), 8192)]
+    );
+}
+
+#[tokio::test]
+async fn spilled_streams_rename_and_remove_like_kept_ones() {
+    let Some((td, backend)) = backend() else {
+        return;
+    };
+    let big = pattern(100_000);
+    create(&backend, "f.txt", "s", &big).await;
+    let (h, _) = open(&backend, "f.txt", "s", OpenIntent::Open)
+        .await
+        .unwrap();
+    backend
+        .rename_stream(
+            &p("f.txt"),
+            id(&td, "f.txt"),
+            Some(&name("s")),
+            Some(&name("T")),
+            false,
+        )
+        .await
+        .unwrap();
+    h.write(0, b"!").await.unwrap();
+    let mut expected = big.clone();
+    expected[0] = b'!';
+    assert_eq!(std::fs::read(spilled(&td, "f.txt", "T")).unwrap(), expected);
+    assert_eq!(
+        streams(&backend, "f.txt").await,
+        [("T".to_string(), 100_000)]
+    );
+    h.close().await.unwrap();
+
+    // A spilled stream renamed over a stream kept in an attribute replaces
+    // it and stays in the store.
+    create(&backend, "f.txt", "small", b"x").await;
+    backend
+        .rename_stream(
+            &p("f.txt"),
+            id(&td, "f.txt"),
+            Some(&name("t")),
+            Some(&name("small")),
+            true,
+        )
+        .await
+        .unwrap();
+    assert!(xattr(&td.path().join("f.txt"), "user.DosStream.small:$DATA").is_none());
+    assert_eq!(
+        std::fs::read(spilled(&td, "f.txt", "small")).unwrap(),
+        expected
+    );
+
+    backend
+        .remove_stream(&p("f.txt"), id(&td, "f.txt"), &name("SMALL"))
+        .await
+        .unwrap();
+    assert!(streams(&backend, "f.txt").await.is_empty());
+    let left: Vec<_> = std::fs::read_dir(entry(&td, "f.txt"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(left, ["owner"]);
+}
+
+/// Gives `to` the record of `from`, as a host copy with extended
+/// attributes does.
+fn copy_record(td: &TempDir, from: &str, to: &str) {
+    let record = xattr(&td.path().join(from), "user.smb-server.streams").unwrap();
+    set_xattr(&td.path().join(to), "user.smb-server.streams", &record);
+}
+
+fn is_root() -> bool {
+    // SAFETY: geteuid has no preconditions.
+    unsafe { libc::geteuid() == 0 }
+}
+
+#[tokio::test]
+async fn removed_files_leave_their_streams_for_a_sweep() {
+    let Some((td, backend)) = backend() else {
+        return;
+    };
+    create(&backend, "a.txt", "s", &pattern(70_000)).await;
+    let dir = entry(&td, "a.txt");
+    // A copy made on the host, with extended attributes, and not used
+    // through the server yet.
+    std::fs::copy(td.path().join("a.txt"), td.path().join("a.bak")).unwrap();
+    copy_record(&td, "a.txt", "a.bak");
+    backend.unlink(&p("a.txt")).await.unwrap();
+    assert!(dir.exists());
+    let (h, _) = open(&backend, "a.bak", "s", OpenIntent::Open)
+        .await
+        .unwrap();
+    assert_eq!(read_all(h.as_ref()).await, pattern(70_000));
+    h.close().await.unwrap();
+    for _ in 0..3 {
+        assert_eq!(backend.sweep_streams().await.unwrap(), 0);
+    }
+    assert!(dir.exists());
+
+    // Once nothing refers to it, the second sweep in a row removes it.
+    std::fs::remove_file(td.path().join("a.bak")).unwrap();
+    assert_eq!(backend.sweep_streams().await.unwrap(), 0);
+    assert!(dir.exists());
+    assert_eq!(backend.sweep_streams().await.unwrap(), 1);
+    assert!(!dir.exists());
+}
+
+#[tokio::test]
+async fn a_copy_made_on_the_host_gets_streams_of_its_own_when_they_change() {
+    let Some((td, backend)) = backend() else {
+        return;
+    };
+    let big = pattern(70_000);
+    create(&backend, "f.txt", "s", &big).await;
+    let (f, g) = (td.path().join("f.txt"), td.path().join("g.txt"));
+    std::fs::copy(&f, &g).unwrap();
+    copy_record(&td, "f.txt", "g.txt");
+
+    // Read, the copy shows the streams it was copied with.
+    assert_eq!(
+        streams(&backend, "g.txt").await,
+        [("s".to_string(), 70_000)]
+    );
+    let (h, _) = open(&backend, "g.txt", "s", OpenIntent::Open)
+        .await
+        .unwrap();
+    assert_eq!(read_all(h.as_ref()).await, big);
+    assert_eq!(entry(&td, "g.txt"), entry(&td, "f.txt"));
+    h.write(0, b"copy").await.unwrap();
+    h.close().await.unwrap();
+    assert_ne!(entry(&td, "g.txt"), entry(&td, "f.txt"));
+    assert_eq!(std::fs::read(spilled(&td, "f.txt", "s")).unwrap(), big);
+    assert_eq!(
+        &std::fs::read(spilled(&td, "g.txt", "s")).unwrap()[..4],
+        b"copy"
+    );
+}
+
+#[tokio::test]
+async fn sweeping_takes_two_passes_and_spares_what_is_used() {
+    let Some((td, backend)) = backend() else {
+        return;
+    };
+    create(&backend, "keep.txt", "s", &pattern(70_000)).await;
+    create(&backend, "gone.txt", "s", &pattern(70_000)).await;
+    std::fs::create_dir(td.path().join("d")).unwrap();
+    create(&backend, "d\\deep.txt", "s", &pattern(70_000)).await;
+    let (keep, gone) = (entry(&td, "keep.txt"), entry(&td, "gone.txt"));
+    std::fs::write(keep.join("~~73"), b"left by a write").unwrap();
+    std::fs::remove_file(td.path().join("gone.txt")).unwrap();
+
+    // The record of keep.txt is out of sight for a sweep, and the stream
+    // is used before the next.
+    let f = td.path().join("keep.txt");
+    let record = xattr(&f, "user.smb-server.streams").unwrap();
+    rustix::fs::removexattr(&f, "user.smb-server.streams").unwrap();
+    assert_eq!(backend.sweep_streams().await.unwrap(), 0);
+    set_xattr(&f, "user.smb-server.streams", &record);
+    let (h, _) = open(&backend, "keep.txt", "s", OpenIntent::Open)
+        .await
+        .unwrap();
+    assert_eq!(read_all(h.as_ref()).await, pattern(70_000));
+    h.close().await.unwrap();
+    rustix::fs::removexattr(&f, "user.smb-server.streams").unwrap();
+    assert_eq!(backend.sweep_streams().await.unwrap(), 1);
+    set_xattr(&f, "user.smb-server.streams", &record);
+    assert!(!gone.exists());
+    let mut kept: Vec<_> = std::fs::read_dir(td.path().join(".smb-streams"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|n| n.len() != 32)
+        .collect();
+    kept.sort();
+    assert_eq!(kept, ["store-id"]);
+    assert!(keep.join("73").exists());
+    assert!(entry(&td, "d/deep.txt").exists());
+    assert_eq!(backend.sweep_streams().await.unwrap(), 0);
+    assert!(!keep.join("~~73").exists());
+
+    // A file an editor replaced with a copy keeps its streams: the copy
+    // takes them over when they change, and the old entry goes.
+    std::fs::write(td.path().join("new.tmp"), b"saved").unwrap();
+    copy_record(&td, "keep.txt", "new.tmp");
+    std::fs::rename(td.path().join("new.tmp"), &f).unwrap();
+    let (h, _) = open(&backend, "keep.txt", "s", OpenIntent::Open)
+        .await
+        .unwrap();
+    h.write(0, b"!").await.unwrap();
+    h.close().await.unwrap();
+    assert_ne!(entry(&td, "keep.txt"), keep);
+    assert_eq!(backend.sweep_streams().await.unwrap(), 0);
+    assert_eq!(backend.sweep_streams().await.unwrap(), 1);
+    assert!(!keep.exists());
+    let mut expected = pattern(70_000);
+    expected[0] = b'!';
+    assert_eq!(
+        std::fs::read(spilled(&td, "keep.txt", "s")).unwrap(),
+        expected
+    );
+}
+
+#[tokio::test]
+async fn a_sweep_walks_wide_trees() {
+    let Some((td, backend)) = backend() else {
+        return;
+    };
+    create(&backend, "f.txt", "s", &pattern(70_000)).await;
+    for i in 0..3000 {
+        let dir = td.path().join(format!("d{i}"));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("x"), b"x").unwrap();
+    }
+    let fds = || std::fs::read_dir("/proc/self/fd").map(Iterator::count).ok();
+    let before = fds();
+    assert_eq!(backend.sweep_streams().await.unwrap(), 0);
+    assert_eq!(backend.sweep_streams().await.unwrap(), 0);
+    assert!(entry(&td, "f.txt").exists());
+    if let (Some(before), Some(after)) = (before, fds()) {
+        assert!(after <= before + 8, "{before} {after}");
+    }
+}
+
+#[tokio::test]
+async fn a_file_a_sweep_cannot_read_stops_it_before_anything_goes() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let Some((td, backend)) = backend() else {
+        return;
+    };
+    if is_root() {
+        eprintln!("skipping: root reads every file");
+        return;
+    }
+    create(&backend, "gone.txt", "s", &pattern(70_000)).await;
+    let gone = entry(&td, "gone.txt");
+    std::fs::remove_file(td.path().join("gone.txt")).unwrap();
+    let locked = td.path().join("locked.txt");
+    std::fs::write(&locked, b"x").unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    for _ in 0..2 {
+        assert!(backend.sweep_streams().await.is_err());
+    }
+    assert!(gone.exists());
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+#[tokio::test]
+async fn forged_and_foreign_records_reach_no_other_file() {
+    let Some((td, backend)) = backend() else {
+        return;
+    };
+    create(&backend, "a.txt", "s", &pattern(70_000)).await;
+    let a_entry = entry(&td, "a.txt");
+    let record = xattr(&td.path().join("a.txt"), "user.smb-server.streams").unwrap();
+    // The id of a.txt's entry with another identity.
+    let mut forged = record[..16].to_vec();
+    forged.extend_from_slice(&[0; 21]);
+    for (file, value) in [("b.txt", forged), ("c.txt", b"not a record".to_vec())] {
+        let path = td.path().join(file);
+        std::fs::write(&path, b"").unwrap();
+        set_xattr(&path, "user.smb-server.streams", &value);
+        assert!(streams(&backend, file).await.is_empty(), "{file}");
+        let (h, _) = open(&backend, file, "s", OpenIntent::Create).await.unwrap();
+        assert!(matches!(
+            h.write(0, &pattern(70_000)).await,
+            Err(SmbError::DiskFull)
+        ));
+        h.write(0, b"small").await.unwrap();
+        h.close().await.unwrap();
+        assert_eq!(
+            xattr(&path, "user.smb-server.streams").unwrap(),
+            value,
+            "{file}"
+        );
+    }
+    assert_eq!(
+        std::fs::read(a_entry.join(hex(b"s"))).unwrap(),
+        pattern(70_000)
+    );
+}
+
+#[tokio::test]
+async fn overlapping_shares_leave_each_others_records_alone() {
+    let Some((td, outer)) = backend() else {
+        return;
+    };
+    std::fs::create_dir(td.path().join("sub")).unwrap();
+    create(&outer, "sub\\f.txt", "s", &pattern(70_000)).await;
+    let f = td.path().join("sub").join("f.txt");
+    let record = xattr(&f, "user.smb-server.streams").unwrap();
+    let inner = LocalFsBackend::new(td.path().join("sub")).unwrap();
+    // The inner share's store has no entry for the record.
+    create(&inner, "other.txt", "t", &pattern(70_000)).await;
+    assert!(streams(&inner, "f.txt").await.is_empty());
+    let (h, _) = open(&inner, "f.txt", "t", OpenIntent::Create)
+        .await
+        .unwrap();
+    assert!(matches!(
+        h.write(0, &pattern(70_000)).await,
+        Err(SmbError::DiskFull)
+    ));
+    h.close().await.unwrap();
+    assert_eq!(inner.sweep_streams().await.unwrap(), 0);
+    assert_eq!(inner.sweep_streams().await.unwrap(), 0);
+    assert_eq!(xattr(&f, "user.smb-server.streams").unwrap(), record);
+    let (h, _) = open(&outer, "sub\\f.txt", "s", OpenIntent::Open)
+        .await
+        .unwrap();
+    assert_eq!(read_all(h.as_ref()).await, pattern(70_000));
+    h.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_stream_left_both_spilled_and_in_an_attribute_reads_the_spilled_one() {
+    let Some((td, backend)) = backend() else {
+        return;
+    };
+    create(&backend, "f.txt", "s", &pattern(70_000)).await;
+    // As a crash between the move to the store and the removal of the
+    // attribute leaves it.
+    let f = td.path().join("f.txt");
+    set_xattr(&f, "user.DosStream.s:$DATA", b"old\0");
+    assert_eq!(
+        streams(&backend, "f.txt").await,
+        [("s".to_string(), 70_000)]
+    );
+    let (h, _) = open(&backend, "f.txt", "s", OpenIntent::Open)
+        .await
+        .unwrap();
+    assert_eq!(read_all(h.as_ref()).await, pattern(70_000));
+    h.truncate(0).await.unwrap();
+    assert!(read_all(h.as_ref()).await.is_empty());
+    h.close().await.unwrap();
+    assert!(!spilled(&td, "f.txt", "s").exists());
+    assert_eq!(xattr(&f, "user.DosStream.s:$DATA").unwrap(), b"\0");
+}
+
+#[tokio::test]
+async fn new_streams_past_the_most_a_file_has_are_disk_full() {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let Some((td, backend)) = backend() else {
+        return;
+    };
+    create(&backend, "f.txt", "s0", &pattern(70_000)).await;
+    let dir = entry(&td, "f.txt");
+    for i in 1..4096 {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(dir.join(hex(format!("s{i}").as_bytes())))
+            .unwrap();
+    }
+    assert_eq!(streams(&backend, "f.txt").await.len(), 4096);
+    assert!(matches!(
+        open(&backend, "f.txt", "new", OpenIntent::Create).await,
+        Err(SmbError::DiskFull)
+    ));
+    std::fs::write(td.path().join("f.txt"), b"data").unwrap();
+    assert!(matches!(
+        backend
+            .rename_stream(
+                &p("f.txt"),
+                id(&td, "f.txt"),
+                None,
+                Some(&name("new")),
+                false
+            )
+            .await,
+        Err(SmbError::DiskFull)
+    ));
+    assert_eq!(std::fs::read(td.path().join("f.txt")).unwrap(), b"data");
+    let (h, _) = open(&backend, "f.txt", "s4095", OpenIntent::Open)
+        .await
+        .unwrap();
+    h.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_store_is_out_of_reach_of_clients_under_any_name() {
+    let Some((td, backend)) = backend() else {
+        return;
+    };
+    create(&backend, "f.txt", "s", &pattern(70_000)).await;
+    let id_dir = entry(&td, "f.txt");
+    let id = id_dir.file_name().unwrap().to_str().unwrap().to_string();
+    std::os::unix::fs::symlink(".smb-streams", td.path().join("link")).unwrap();
+    std::os::unix::fs::symlink(".smb-streams", td.path().join(".SMB-Streams")).unwrap();
+    std::fs::create_dir_all(td.path().join("d").join(".smb-streams")).unwrap();
+    let root = backend
+        .open(
+            &SmbPath::root(),
+            OpenOptions {
+                directory: true,
+                ..opts(OpenIntent::Open, false)
+            },
+        )
+        .await
+        .unwrap()
+        .0;
+    let mut names: Vec<_> = root
+        .list_dir(None)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|e| e.info.name)
+        .collect();
+    names.sort();
+    assert_eq!(names, ["d", "f.txt"]);
+    root.close().await.unwrap();
+    for path in [
+        ".smb-streams".to_string(),
+        "link".to_string(),
+        ".SMB-Streams".to_string(),
+        format!("link\\{id}"),
+        format!(".smb-streams\\{id}\\73"),
+    ] {
+        assert!(
+            matches!(
+                backend.open(&p(&path), opts(OpenIntent::Open, false)).await,
+                Err(SmbError::NotFound)
+            ),
+            "{path}"
+        );
+        assert!(matches!(
+            backend
+                .open(&p(&path), opts(OpenIntent::OpenOrCreate, true))
+                .await,
+            Err(SmbError::AccessDenied)
+        ));
+        if !matches!(path.as_str(), "link" | ".SMB-Streams") {
+            assert!(matches!(
+                backend.unlink(&p(&path)).await,
+                Err(SmbError::NotFound)
+            ));
+        }
+    }
+    assert!(matches!(
+        backend
+            .rename(&p("f.txt"), &p(&format!("link\\{id}\\x")), true)
+            .await,
+        Err(SmbError::AccessDenied)
+    ));
+    assert!(matches!(
+        backend.rename(&p("f.txt"), &p(".smb-streams"), true).await,
+        Err(SmbError::AccessDenied)
+    ));
+    // Elsewhere the name is an ordinary one.
+    backend
+        .open(
+            &p("d\\.smb-streams"),
+            OpenOptions {
+                directory: true,
+                ..opts(OpenIntent::Open, false)
+            },
+        )
+        .await
+        .unwrap()
+        .0
+        .close()
+        .await
+        .unwrap();
+    assert!(id_dir.exists());
+    // Removing a symlink to the store removes the link.
+    backend.unlink(&p("link")).await.unwrap();
+    assert!(td.path().join("link").symlink_metadata().is_err());
+    assert!(id_dir.exists());
+
+    // Before the store exists, clients cannot make its name.
+    let Some((_fresh_td, fresh)) = self::backend() else {
+        return;
+    };
+    assert!(matches!(
+        fresh
+            .open(
+                &p(".smb-streams"),
+                OpenOptions {
+                    directory: true,
+                    ..opts(OpenIntent::Create, true)
+                }
+            )
+            .await,
+        Err(SmbError::AccessDenied)
+    ));
+}
+
+#[tokio::test]
+async fn symlinks_and_links_lead_nowhere_from_the_store() {
+    let Some((td, backend)) = backend() else {
+        return;
+    };
+    // A store that is a symlink to elsewhere is not used.
+    let outside = tempfile::tempdir_in(td.path().parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(outside.path(), td.path().join(".smb-streams")).unwrap();
+    let (h, _) = open(&backend, "f.txt", "s", OpenIntent::Create)
+        .await
+        .unwrap();
+    assert!(h.write(0, &pattern(70_000)).await.is_err());
+    assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+    assert_eq!(h.stat().await.unwrap().end_of_file, 0);
+    h.close().await.unwrap();
+    std::fs::remove_file(td.path().join(".smb-streams")).unwrap();
+
+    // A stream file that is a symlink or a hard link to another file's
+    // stream is refused.
+    create(&backend, "a.txt", "s", &pattern(70_000)).await;
+    for (file, link) in [("b.txt", "sym"), ("c.txt", "hard")] {
+        create(&backend, file, "t", &pattern(70_001)).await;
+        let target = spilled(&td, file, "t");
+        std::fs::remove_file(&target).unwrap();
+        if link == "sym" {
+            std::os::unix::fs::symlink(spilled(&td, "a.txt", "s"), &target).unwrap();
+        } else {
+            std::fs::hard_link(spilled(&td, "a.txt", "s"), &target).unwrap();
+        }
+        let (h, _) = open(&backend, file, "t", OpenIntent::Open).await.unwrap();
+        assert!(h.write(0, b"x").await.is_err(), "{link}");
+        assert!(h.read(0, 10).await.is_err(), "{link}");
+        h.close().await.unwrap();
+    }
+    assert_eq!(
+        std::fs::read(spilled(&td, "a.txt", "s")).unwrap(),
+        pattern(70_000)
+    );
+}
+
+#[tokio::test]
+async fn a_store_others_can_reach_is_not_used() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let Some((td, backend)) = backend() else {
+        return;
+    };
+    create(&backend, "f.txt", "s", &pattern(70_000)).await;
+    let store = td.path().join(".smb-streams");
+    std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(streams(&backend, "f.txt").await.is_empty());
+    let (h, _) = open(&backend, "f.txt", "t", OpenIntent::Create)
+        .await
+        .unwrap();
+    assert!(h.write(0, &pattern(70_000)).await.is_err());
+    h.close().await.unwrap();
+    std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(
+        streams(&backend, "f.txt").await,
+        [("s".to_string(), 70_000), ("t".to_string(), 0)]
+    );
+
+    let open_store = tempfile::tempdir_in(td.path().parent().unwrap()).unwrap();
+    std::fs::set_permissions(open_store.path(), std::fs::Permissions::from_mode(0o750)).unwrap();
+    assert!(
+        LocalFsBackend::new(td.path())
+            .unwrap()
+            .stream_store(open_store.path())
+            .is_err()
+    );
+    std::fs::create_dir(td.path().join("inside")).unwrap();
+    std::fs::set_permissions(
+        td.path().join("inside"),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    assert!(
+        LocalFsBackend::new(td.path())
+            .unwrap()
+            .stream_store(td.path().join("inside"))
+            .is_err()
+    );
+    assert!(
+        LocalFsBackend::new(td.path())
+            .unwrap()
+            .stream_store(td.path())
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn a_store_the_embedder_names_is_used_instead() {
+    let Some((td, backend)) = backend() else {
+        return;
+    };
+    use std::os::unix::fs::PermissionsExt as _;
+
+    drop(backend);
+    let store = tempfile::tempdir_in(td.path().parent().unwrap()).unwrap();
+    std::fs::set_permissions(store.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let backend = LocalFsBackend::new(td.path())
+        .unwrap()
+        .stream_store(store.path())
+        .unwrap();
+    create(&backend, "f.txt", "s", &pattern(70_000)).await;
+    assert!(!td.path().join(".smb-streams").exists());
+    let record = xattr(&td.path().join("f.txt"), "user.smb-server.streams").unwrap();
+    let file = store.path().join(hex(&record[..16])).join(hex(b"s"));
+    assert_eq!(std::fs::read(file).unwrap(), pattern(70_000));
+    std::fs::remove_file(td.path().join("f.txt")).unwrap();
+    assert_eq!(backend.sweep_streams().await.unwrap(), 0);
+    assert_eq!(backend.sweep_streams().await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn a_path_swapped_for_a_symlink_after_its_lookup_stays_out_of_the_store() {
+    let Some((td, backend)) = backend() else {
+        return;
+    };
+    create(&backend, "f.txt", "s", &pattern(70_000)).await;
+    let id = entry(&td, "f.txt").file_name().unwrap().to_owned();
+    // `x\73` and `y` are plain files; between the lookup of a path and its
+    // open, `x` and `y` become symlinks into the store.
+    std::fs::create_dir(td.path().join("x")).unwrap();
+    std::fs::write(td.path().join("x").join("73"), b"real").unwrap();
+    std::fs::write(td.path().join("y"), b"real").unwrap();
+    let root = td.path().to_path_buf();
+    let swaps = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = std::sync::Arc::clone(&swaps);
+    let backend = LocalFsBackend::new(&root).unwrap().after_locate(move || {
+        let store = std::path::Path::new(".smb-streams").join(&id);
+        if root
+            .join("x")
+            .symlink_metadata()
+            .is_ok_and(|md| md.is_dir())
+        {
+            std::fs::rename(root.join("x"), root.join("x.real")).unwrap();
+            std::os::unix::fs::symlink(&store, root.join("x")).unwrap();
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        } else if root
+            .join("y")
+            .symlink_metadata()
+            .is_ok_and(|md| md.is_file())
+        {
+            std::fs::remove_file(root.join("y")).unwrap();
+            std::os::unix::fs::symlink(store.join("73"), root.join("y")).unwrap();
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    });
+    let (h, _) = backend
+        .open(&p("x\\73"), opts(OpenIntent::Open, false))
+        .await
+        .unwrap();
+    assert_eq!(read_all(h.as_ref()).await, b"real");
+    h.close().await.unwrap();
+    assert!(matches!(
+        backend.open(&p("y"), opts(OpenIntent::Open, false)).await,
+        Err(SmbError::NotFound)
+    ));
+    assert_eq!(swaps.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn a_record_of_this_store_whose_entry_is_gone_gets_a_new_one() {
+    let Some((td, backend)) = backend() else {
+        return;
+    };
+    create(&backend, "f.txt", "s", &pattern(70_000)).await;
+    let f = td.path().join("f.txt");
+    let old = xattr(&f, "user.smb-server.streams").unwrap();
+    std::fs::remove_dir_all(entry(&td, "f.txt")).unwrap();
+    assert!(streams(&backend, "f.txt").await.is_empty());
+    create(&backend, "f.txt", "t", &pattern(70_001)).await;
+    let new = xattr(&f, "user.smb-server.streams").unwrap();
+    assert_ne!(new[..16], old[..16]);
+    assert_eq!(new[16..32], old[16..32], "the same store");
+    assert_eq!(
+        streams(&backend, "f.txt").await,
+        [("t".to_string(), 70_001)]
+    );
+}
+
+#[tokio::test]
+async fn a_writable_share_makes_its_store_before_any_client_request() {
+    let Some((td, backend)) = backend() else {
+        return;
+    };
+    let store = td.path().join(".smb-streams");
+    assert!(!store.exists());
+    let read_only = LocalFsBackend::new(td.path()).unwrap().read_only();
+    let _ = read_only
+        .open(&p("missing"), opts(OpenIntent::Open, false))
+        .await;
+    assert!(!store.exists());
+    let _ = backend
+        .open(&p("missing"), opts(OpenIntent::Open, false))
+        .await;
+    assert_eq!(std::fs::read(store.join("store-id")).unwrap().len(), 16);
+}
+
+#[tokio::test]
+async fn an_owner_file_that_cannot_be_read_fails_the_request() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let Some((td, backend)) = backend() else {
+        return;
+    };
+    if is_root() {
+        eprintln!("skipping: root reads every file");
+        return;
+    }
+    create(&backend, "f.txt", "s", &pattern(70_000)).await;
+    let owner = entry(&td, "f.txt").join("owner");
+    std::fs::set_permissions(&owner, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let (file, _) = backend
+        .open(&p("f.txt"), opts(OpenIntent::Open, false))
+        .await
+        .unwrap();
+    assert!(file.streams().await.is_err());
+    file.close().await.unwrap();
+    std::fs::set_permissions(&owner, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(
+        streams(&backend, "f.txt").await,
+        [("s".to_string(), 70_000)]
+    );
+}
+
+#[tokio::test]
+async fn a_sweep_keeps_entries_that_records_of_other_layouts_name() {
+    let Some((td, backend)) = backend() else {
+        return;
+    };
+    create(&backend, "f.txt", "s", &pattern(70_000)).await;
+    let dir = entry(&td, "f.txt");
+    let f = td.path().join("f.txt");
+    let mut later = xattr(&f, "user.smb-server.streams").unwrap()[..16].to_vec();
+    later.extend_from_slice(b"a layout of a later version");
+    set_xattr(&f, "user.smb-server.streams", &later);
+    for _ in 0..3 {
+        assert_eq!(backend.sweep_streams().await.unwrap(), 0);
+    }
+    assert!(dir.exists());
+}
+
+#[tokio::test]
+async fn removing_and_renaming_symlinks_acts_on_the_links() {
+    use std::os::unix::fs::symlink;
+
+    let Some((td, backend)) = backend() else {
+        return;
+    };
+    // The store exists, so paths are looked up one name at a time.
+    create(&backend, "f.txt", "s", &pattern(70_000)).await;
+    let root = td.path();
+    let outside = tempfile::tempdir().unwrap();
+    let t1 = outside.path().join("t1");
+    std::fs::write(&t1, b"t1").unwrap();
+    for name in ["t2", "t3"] {
+        std::fs::write(root.join(name), name).unwrap();
+    }
+    std::fs::write(root.join("a"), b"a").unwrap();
+    symlink(&t1, root.join("l1")).unwrap();
+    symlink("t2", root.join("l2")).unwrap();
+    symlink("t3", root.join("l3")).unwrap();
+
+    backend.unlink(&p("l1")).await.unwrap();
+    assert!(root.join("l1").symlink_metadata().is_err());
+    assert_eq!(std::fs::read(&t1).unwrap(), b"t1");
+
+    backend.rename(&p("l2"), &p("moved"), false).await.unwrap();
+    assert!(root.join("moved").symlink_metadata().unwrap().is_symlink());
+    assert_eq!(std::fs::read(root.join("t2")).unwrap(), b"t2");
+
+    backend.rename(&p("a"), &p("l3"), true).await.unwrap();
+    assert!(root.join("l3").symlink_metadata().unwrap().is_file());
+    assert_eq!(std::fs::read(root.join("l3")).unwrap(), b"a");
+    assert_eq!(std::fs::read(root.join("t3")).unwrap(), b"t3");
+}
+
+#[tokio::test]
+async fn an_overwrite_of_a_name_swapped_after_its_lookup_truncates_nothing() {
+    let Some((td, backend)) = backend() else {
+        return;
+    };
+    create(&backend, "f.txt", "s", &pattern(70_000)).await;
+    let target = spilled(&td, "f.txt", "s");
+    let t = td.path().join("t");
+    let root = td.path().to_path_buf();
+    let link = target.strip_prefix(&root).unwrap().to_path_buf();
+    let backend = LocalFsBackend::new(&root).unwrap().after_locate(move || {
+        if root
+            .join("t")
+            .symlink_metadata()
+            .is_ok_and(|md| md.is_file())
+        {
+            std::fs::remove_file(root.join("t")).unwrap();
+            std::os::unix::fs::symlink(&link, root.join("t")).unwrap();
+        }
+    });
+    for intent in [OpenIntent::Truncate, OpenIntent::OverwriteOrCreate] {
+        if t.symlink_metadata().is_ok() {
+            std::fs::remove_file(&t).unwrap();
+        }
+        std::fs::write(&t, b"real").unwrap();
+        assert!(backend.open(&p("t"), opts(intent, true)).await.is_err());
+        assert!(t.symlink_metadata().unwrap().is_symlink());
+    }
+    assert_eq!(std::fs::read(&target).unwrap(), pattern(70_000));
+}
+
+#[tokio::test]
+async fn deep_paths_resolve_with_few_descriptors() {
+    let Some((td, backend)) = backend() else {
+        return;
+    };
+    create(&backend, "f.txt", "s", &pattern(70_000)).await;
+    let depth = 1500;
+    let rel: std::path::PathBuf = std::iter::repeat_n("a", depth).collect();
+    std::fs::create_dir_all(td.path().join(&rel)).unwrap();
+    std::fs::write(td.path().join(&rel).join("f"), b"deep").unwrap();
+    // Above the usual soft limit of 1024 descriptors, one per level would
+    // run out.
+    let path = format!("{}\\f", vec!["a"; depth].join("\\"));
+    let (h, _) = backend
+        .open(&p(&path), opts(OpenIntent::Open, false))
+        .await
+        .unwrap();
+    assert_eq!(read_all(h.as_ref()).await, b"deep");
+    h.close().await.unwrap();
+    // A symlink to the directory it is in leads up a level and back.
+    std::os::unix::fs::symlink("../a", td.path().join(&rel).join("l")).unwrap();
+    let (h, _) = backend
+        .open(
+            &p(&format!("{}\\l\\f", vec!["a"; depth].join("\\"))),
+            opts(OpenIntent::Open, false),
+        )
+        .await
+        .unwrap();
+    assert_eq!(read_all(h.as_ref()).await, b"deep");
+    h.close().await.unwrap();
+    // Removed one level at a time: a recursive removal holds a descriptor
+    // per level.
+    let mut dir = td.path().join(&rel);
+    std::fs::remove_file(dir.join("f")).unwrap();
+    std::fs::remove_file(dir.join("l")).unwrap();
+    while dir != td.path() {
+        std::fs::remove_dir(&dir).unwrap();
+        dir.pop();
+    }
+}
+
+#[tokio::test]
+async fn backends_starting_together_share_one_store_id() {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let Some((td, _backend)) = backend() else {
+        return;
+    };
+    let root = td.path().to_path_buf();
+    let tasks: Vec<_> = (0..8)
+        .map(|_| {
+            let root = root.clone();
+            tokio::spawn(async move {
+                let backend = LocalFsBackend::new(&root).unwrap();
+                let _ = backend
+                    .open(&p("missing"), opts(OpenIntent::Open, false))
+                    .await;
+            })
+        })
+        .collect();
+    for task in tasks {
+        task.await.unwrap();
+    }
+    let id = root.join(".smb-streams").join("store-id");
+    assert_eq!(std::fs::metadata(&id).unwrap().nlink(), 1);
+    assert_eq!(std::fs::read(&id).unwrap().len(), 16);
+    let names: Vec<_> = std::fs::read_dir(root.join(".smb-streams"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(names, ["store-id"]);
+}
+
+#[tokio::test]
+async fn a_lost_store_id_comes_back_from_the_entries() {
+    let Some((td, backend)) = backend() else {
+        return;
+    };
+    create(&backend, "f.txt", "s", &pattern(70_000)).await;
+    let id_file = td.path().join(".smb-streams").join("store-id");
+    let id = std::fs::read(&id_file).unwrap();
+    std::fs::remove_file(&id_file).unwrap();
+    let backend = LocalFsBackend::new(td.path()).unwrap();
+    assert_eq!(
+        streams(&backend, "f.txt").await,
+        [("s".to_string(), 70_000)]
+    );
+    assert_eq!(std::fs::read(&id_file).unwrap(), id);
+}
+
+#[tokio::test]
+async fn an_unreadable_store_id_leaves_streams_in_attributes() {
+    let Some((td, backend)) = backend() else {
+        return;
+    };
+    create(&backend, "f.txt", "big", &pattern(70_000)).await;
+    create(&backend, "f.txt", "small", b"x").await;
+    std::fs::write(td.path().join(".smb-streams").join("store-id"), b"bad").unwrap();
+    let backend = LocalFsBackend::new(td.path()).unwrap();
+    assert_eq!(streams(&backend, "f.txt").await, [("small".to_string(), 1)]);
+    let (h, _) = open(&backend, "f.txt", "small", OpenIntent::Open)
+        .await
+        .unwrap();
+    assert_eq!(read_all(h.as_ref()).await, b"x");
+    assert!(matches!(
+        h.write(0, &pattern(70_000)).await,
+        Err(SmbError::DiskFull)
+    ));
+    h.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_store_id_is_made_where_renames_cannot_refuse_to_replace() {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let Some((td, backend)) = backend() else {
+        return;
+    };
+    super::spill::NO_RENAME_NOREPLACE.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = backend
+        .open(&p("missing"), opts(OpenIntent::Open, false))
+        .await;
+    let id_file = td.path().join(".smb-streams").join("store-id");
+    let id = std::fs::read(&id_file).unwrap();
+    assert_eq!(id.len(), 16);
+    assert_eq!(std::fs::metadata(&id_file).unwrap().nlink(), 1);
+    create(&backend, "f.txt", "small", b"x").await;
+    // A store id left short in a store no record refers to is made again.
+    std::fs::write(&id_file, b"short").unwrap();
+    let again = LocalFsBackend::new(td.path()).unwrap();
+    let _ = again
+        .open(&p("missing"), opts(OpenIntent::Open, false))
+        .await;
+    super::spill::NO_RENAME_NOREPLACE.store(false, std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(std::fs::read(&id_file).unwrap().len(), 16);
+    assert_eq!(streams(&again, "f.txt").await, [("small".to_string(), 1)]);
+    create(&again, "f.txt", "big", &pattern(70_000)).await;
+    assert_eq!(streams(&again, "f.txt").await.len(), 2);
+}
+
+#[tokio::test]
+async fn an_entry_a_crash_left_empty_does_not_block_store_id_recovery() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let Some((td, backend)) = backend() else {
+        return;
+    };
+    create(&backend, "f.txt", "s", &pattern(70_000)).await;
+    let store = td.path().join(".smb-streams");
+    let id = std::fs::read(store.join("store-id")).unwrap();
+    let empty = store.join("00112233445566778899aabbccddeeff");
+    std::fs::create_dir(&empty).unwrap();
+    std::fs::set_permissions(&empty, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::remove_file(store.join("store-id")).unwrap();
+    let backend = LocalFsBackend::new(td.path()).unwrap();
+    assert_eq!(
+        streams(&backend, "f.txt").await,
+        [("s".to_string(), 70_000)]
+    );
+    assert_eq!(std::fs::read(store.join("store-id")).unwrap(), id);
+    assert_eq!(backend.sweep_streams().await.unwrap(), 0);
+    assert_eq!(backend.sweep_streams().await.unwrap(), 1);
+    assert!(!empty.exists());
+}
+
+#[tokio::test]
+async fn a_directory_moved_while_its_path_is_looked_up_is_not_found() {
+    let Some((td, backend)) = backend() else {
+        return;
+    };
+    create(&backend, "f.txt", "s", &pattern(70_000)).await;
+    let root = td.path().to_path_buf();
+    for op in ["open", "unlink", "rename"] {
+        std::fs::create_dir_all(root.join("p").join("c")).unwrap();
+        std::fs::create_dir_all(root.join("q")).unwrap();
+        std::fs::write(root.join("p").join("f"), b"f").unwrap();
+        std::fs::write(root.join("q").join("f"), b"f").unwrap();
+        std::os::unix::fs::symlink("..", root.join("p").join("c").join("up")).unwrap();
+        // Going up from `c`, the lookup finds it moved to `q`.
+        let (from, to) = (root.join("p").join("c"), root.join("q").join("c"));
+        *crate::fs::local::BEFORE_PARENT.lock().unwrap() = Some(Box::new(move || {
+            if from.exists() {
+                let _ = std::fs::rename(&from, &to);
+            }
+        }));
+        let path = p("p\\c\\up\\f");
+        let result = match op {
+            "open" => backend
+                .open(&path, opts(OpenIntent::Open, false))
+                .await
+                .map(drop),
+            "unlink" => backend.unlink(&path).await,
+            _ => backend.rename(&path, &p("g"), false).await,
+        };
+        *crate::fs::local::BEFORE_PARENT.lock().unwrap() = None;
+        assert!(
+            matches!(result, Err(SmbError::NotFound | SmbError::PathNotFound)),
+            "{op}: {result:?}"
+        );
+        assert!(root.join("p").join("f").exists(), "{op}");
+        assert!(root.join("q").join("f").exists(), "{op}");
+        std::fs::remove_dir_all(root.join("p")).unwrap();
+        std::fs::remove_dir_all(root.join("q")).unwrap();
+    }
 }
