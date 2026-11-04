@@ -23,7 +23,7 @@ pub struct ErrorResponse {
     pub error_context_count: u8,
     pub reserved: u8,
     pub byte_count: u32,
-    #[br(parse_with = super::read_buf, args(if byte_count == 0 { 1 } else { byte_count as usize }))]
+    #[br(parse_with = super::read_buf, args(byte_count as usize))]
     pub error_data: Vec<u8>,
 }
 
@@ -31,16 +31,15 @@ impl ErrorResponse {
     /// Build a minimal ERROR response body. The NTSTATUS itself goes in the
     /// SMB2 header.
     ///
-    /// Per MS-SMB2 §2.2.2 a zero-`byte_count` ERROR response still emits a
-    /// single byte of `error_data` (the field is mandatory, length 1 when
-    /// there is no payload).
+    /// With `byte_count` 0 the body is 8 bytes, without an `error_data`
+    /// byte, though `structure_size` stays 9 (MS-SMB2 2.2.2).
     pub fn status(_ntstatus: u32) -> Self {
         Self {
             structure_size: 9,
             error_context_count: 0,
             reserved: 0,
             byte_count: 0,
-            error_data: vec![0],
+            error_data: Vec::new(),
         }
     }
 
@@ -79,7 +78,7 @@ mod tests {
         r.write_to(&mut buf).unwrap();
         let decoded = ErrorResponse::parse(&buf).unwrap();
         assert_eq!(decoded, r);
-        // structure_size, contexts, reserved, bytecount, 1 byte payload = 9 bytes
-        assert_eq!(buf.len(), 9);
+        // structure_size, contexts, reserved, bytecount, no payload
+        assert_eq!(buf, [9, 0, 0, 0, 0, 0, 0, 0]);
     }
 }

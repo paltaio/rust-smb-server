@@ -275,6 +275,6 @@ mod tests {
             [9, 0, 1, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
         );
         let response = info_length_mismatch(false);
-        assert_eq!(response.body, [9, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(response.body, [9, 0, 0, 0, 0, 0, 0, 0]);
     }
 }

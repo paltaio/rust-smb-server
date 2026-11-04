@@ -741,9 +741,9 @@ async fn stitch_responses(conn: &Connection, responses: Vec<Reply>) -> Vec<u8> {
     out
 }
 
-/// Bytes an error response takes in a compound response: the header, the
-/// 9-byte ERROR body and padding to 8 bytes.
-const ERROR_RESPONSE_ROOM: usize = align_8(SMB2_HEADER_LEN + 9);
+/// Bytes an error response takes in a compound response: the header and
+/// the 8-byte ERROR body.
+const ERROR_RESPONSE_ROOM: usize = SMB2_HEADER_LEN + 8;
 
 const fn align_8(n: usize) -> usize {
     (n + 7) & !7

@@ -223,7 +223,7 @@ async fn an_interim_response_grants_credits_and_is_never_signed() {
     assert_eq!(hdr.message_id, mid);
     assert_ne!(hdr.credit_request_response, 0);
     // An ERROR body with no data.
-    assert_eq!(interim.len(), SMB2_HEADER_LEN + 9);
+    assert_eq!(interim.len(), SMB2_HEADER_LEN + 8);
 }
 
 #[tokio::test]
