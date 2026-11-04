@@ -685,6 +685,7 @@ async fn rename_stream(
         _ => {}
     }
     let path = file.path();
+    let file_index = file.file_index();
     let backend = share.backend.as_ref();
     let status = |e: SmbError| stream_error(e).to_nt_status();
     let mut replaces = false;
@@ -717,7 +718,7 @@ async fn rename_stream(
     }
     if let (Some(old), Some(new)) = (&from, &to) {
         backend
-            .rename_stream(&path, Some(old), Some(new), replace)
+            .rename_stream(&path, file_index, Some(old), Some(new), replace)
             .await
             .map_err(status)?;
         file.rename_stream(Some(old), Some(new));
@@ -756,7 +757,7 @@ async fn rename_stream(
         None => {
             let reopened = reopen(backend, &path, None, access).await.map_err(status)?;
             if let Err(e) = backend
-                .rename_stream(&path, from.as_ref(), None, true)
+                .rename_stream(&path, file_index, from.as_ref(), None, true)
                 .await
             {
                 close(reopened, &path).await;
@@ -772,12 +773,15 @@ async fn rename_stream(
                 close(probe.map_err(status)?, &path).await;
             }
             backend
-                .rename_stream(&path, None, Some(to), replace)
+                .rename_stream(&path, file_index, None, Some(to), replace)
                 .await
                 .map_err(status)?;
             match reopen(backend, &path, Some(to), access).await {
                 Ok(reopened) => Some(reopened),
-                Err(e) => match backend.rename_stream(&path, Some(to), None, true).await {
+                Err(e) => match backend
+                    .rename_stream(&path, file_index, Some(to), None, true)
+                    .await
+                {
                     Ok(()) => {
                         if replaces {
                             make_empty(backend, &path, to).await;

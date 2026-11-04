@@ -25,7 +25,9 @@ use tempfile::tempdir;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
-/// `LocalFsBackend` that reports the given `case_sensitive` capability.
+/// `LocalFsBackend` that reports the given `case_sensitive` capability,
+/// and neither named streams nor extended attributes, which it does not
+/// pass on.
 struct CaseRule(LocalFsBackend, bool);
 
 #[async_trait::async_trait]
@@ -49,6 +51,7 @@ impl ShareBackend for CaseRule {
     fn capabilities(&self) -> BackendCapabilities {
         let mut capabilities = self.0.capabilities();
         capabilities.case_sensitive = self.1;
+        capabilities.named_streams = false;
         capabilities
     }
 }

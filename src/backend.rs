@@ -318,13 +318,25 @@ pub trait ShareBackend: Send + Sync + 'static {
 
     /// Remove the named stream of the file or directory at `path` that
     /// `stream` names, whatever the case of its spelling. Fail with
-    /// [`SmbError::NotFound`] when the file has no such stream. The default
-    /// returns [`SmbError::NotSupported`].
-    async fn remove_stream(&self, _path: &SmbPath, _stream: &StreamName) -> SmbResult<()> {
+    /// [`SmbError::NotFound`] when the file has no such stream.
+    ///
+    /// `file_index` is the [`FileInfo::file_index`] the backend reported
+    /// for the file the protocol layer means, `0` if it reported none. A
+    /// backend with file ids fails with [`SmbError::NotFound`] when the
+    /// file at `path` has another id, as when another file took its place
+    /// outside the server, and leaves that file alone. The default returns
+    /// [`SmbError::NotSupported`].
+    async fn remove_stream(
+        &self,
+        _path: &SmbPath,
+        _file_index: u64,
+        _stream: &StreamName,
+    ) -> SmbResult<()> {
         Err(SmbError::NotSupported)
     }
 
-    /// Rename a stream of the file or directory at `path`: the named
+    /// Rename a stream of the file or directory at `path`, which has the id
+    /// `file_index` as [`ShareBackend::remove_stream`] says: the named
     /// stream `from` names, or the default stream when `from` is `None`,
     /// to the named stream `to`, or to the default stream when `to` is
     /// `None`. Names compare without regard to case, and a renamed stream
@@ -357,6 +369,7 @@ pub trait ShareBackend: Send + Sync + 'static {
     async fn rename_stream(
         &self,
         _path: &SmbPath,
+        _file_index: u64,
         _from: Option<&StreamName>,
         _to: Option<&StreamName>,
         _replace_if_exists: bool,

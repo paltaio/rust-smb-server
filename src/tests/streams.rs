@@ -536,6 +536,33 @@ async fn a_stream_is_created_with_its_file_and_read_back_by_any_spelling() {
 }
 
 #[tokio::test]
+async fn a_stream_open_with_write_data_alone_grows_the_stream() {
+    const FILE_WRITE_DATA: u32 = 0x2;
+    const FILE_WRITE_ATTRIBUTES: u32 = 0x100;
+    let files = MemFsBackend::new();
+    let state = server(&files).await;
+    let mut c = Client::new(&state).await;
+
+    // How macOS sets an extended attribute.
+    let id = c
+        .open(
+            Create::new("f.txt:org.example.k")
+                .access(
+                    FILE_WRITE_DATA | FILE_WRITE_ATTRIBUTES,
+                    SHARE_READ | SHARE_DELETE,
+                )
+                .disposition(FILE_OVERWRITE_IF),
+        )
+        .await;
+    assert_eq!(c.write(id, 0, b"value").await, 0);
+    assert_eq!(c.write(id, 5, b"!").await, 0);
+    c.close(id).await;
+    let id = c.open(Create::new("f.txt:org.example.k")).await;
+    assert_eq!(c.read(id, 0, 16).await.unwrap(), b"value!");
+    c.close(id).await;
+}
+
+#[tokio::test]
 async fn dispositions_apply_to_the_stream() {
     let files = MemFsBackend::new();
     let state = server(&files).await;
@@ -1343,6 +1370,7 @@ impl ShareBackend for Picky {
     async fn rename_stream(
         &self,
         path: &SmbPath,
+        file_index: u64,
         from: Option<&StreamName>,
         to: Option<&StreamName>,
         replace: bool,
@@ -1351,7 +1379,9 @@ impl ShareBackend for Picky {
         if mode == REFUSE_OPENS_AND_MOVES_BACK && to.is_none() {
             return Err(crate::SmbError::AccessDenied);
         }
-        self.inner.rename_stream(path, from, to, replace).await?;
+        self.inner
+            .rename_stream(path, file_index, from, to, replace)
+            .await?;
         if mode == FAIL_A_STREAM_OPEN_AFTER_A_MOVE && from.is_none() {
             self.mode.store(
                 FAILING_NEXT_STREAM_OPEN,

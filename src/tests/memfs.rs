@@ -380,7 +380,12 @@ impl ShareBackend for MemFsBackend {
         Ok((Box::new(handle), action))
     }
 
-    async fn remove_stream(&self, path: &SmbPath, stream: &StreamName) -> SmbResult<()> {
+    async fn remove_stream(
+        &self,
+        path: &SmbPath,
+        _file_index: u64,
+        stream: &StreamName,
+    ) -> SmbResult<()> {
         let mut g = self.inner.lock().unwrap();
         let id = *g.ids.get(&key(path)).ok_or(SmbError::NotFound)?;
         let at = g.stream_at(id, stream.as_str()).ok_or(SmbError::NotFound)?;
@@ -391,6 +396,7 @@ impl ShareBackend for MemFsBackend {
     async fn rename_stream(
         &self,
         path: &SmbPath,
+        _file_index: u64,
         from: Option<&StreamName>,
         to: Option<&StreamName>,
         replace_if_exists: bool,

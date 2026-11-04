@@ -61,6 +61,14 @@ impl FileKey {
             Self::Path(path_key(path, case_sensitive))
         }
     }
+
+    /// The file id the key holds, `0` for a file known by its path.
+    fn file_index(&self) -> u64 {
+        match self {
+            Self::Index(index) => *index,
+            Self::Path(_) => 0,
+        }
+    }
 }
 
 fn path_key(path: &SmbPath, case_sensitive: bool) -> String {
@@ -1236,6 +1244,11 @@ impl FileRef {
         self.node.state().entry(self.id).and_then(|e| e.lease)
     }
 
+    /// The file id the backend reported for the file, `0` if none.
+    pub(crate) fn file_index(&self) -> u64 {
+        self.node.state().key.file_index()
+    }
+
     /// The open's current name.
     pub(crate) fn path(&self) -> SmbPath {
         self.node
@@ -1441,8 +1454,14 @@ impl FileRef {
         }
         let _renames = self.share.files.rename_lock().await;
         let path = self.path();
+        let file_index = self.file_index();
         for stream in &streams {
-            if let Err(e) = self.share.backend.remove_stream(&path, stream).await {
+            if let Err(e) = self
+                .share
+                .backend
+                .remove_stream(&path, file_index, stream)
+                .await
+            {
                 let e = stream_error(e);
                 debug!(error = %e, path = %path, stream = ?stream.as_str(), "stream removal failed");
             }
@@ -1690,8 +1709,15 @@ impl PendingDelete {
             // stream again in between, and no rename moves the file.
             let share = Arc::clone(&self.share);
             let _renames = share.files.rename_lock().await;
-            let path = self.node.state().name.clone();
-            if let Err(e) = share.backend.remove_stream(&path, &stream).await {
+            let (path, file_index) = {
+                let state = self.node.state();
+                (state.name.clone(), state.key.file_index())
+            };
+            if let Err(e) = share
+                .backend
+                .remove_stream(&path, file_index, &stream)
+                .await
+            {
                 let e = stream_error(e);
                 debug!(error = %e, path = %path, stream = ?stream.as_str(), "stream removal failed");
             }

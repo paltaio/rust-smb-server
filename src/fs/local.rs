@@ -38,6 +38,8 @@ use crate::backend::{
 };
 use crate::error::{SmbError, SmbResult};
 use crate::path::{SmbPath, same_path};
+#[cfg(target_os = "linux")]
+use crate::stream::StreamName;
 use crate::utils::{FILETIME_OFFSET, system_time_to_filetime};
 
 use super::volume;
@@ -55,6 +57,22 @@ use crate::wildcard::Pattern;
 /// set on Windows and macOS; other hosts have no call that sets it, so a
 /// requested creation time is ignored there and the other times still apply.
 /// The host keeps the change time.
+///
+/// On Linux, a file's or directory's named streams are its extended
+/// attributes named `user.DosStream.<name>:$DATA`, each holding the
+/// stream's data followed by one NUL byte. A share moves between this
+/// server and Samba 4.22's `vfs_streams_xattr` with its streams. Of
+/// attributes whose names differ only in case, the one that sorts first
+/// in byte order is the stream; removing or replacing the stream removes
+/// them all. A stream holds at most 65535 bytes, and less where the
+/// filesystem limits extended attributes, such as ext4, where all of a
+/// file's extended attributes share one block; a write past the limit
+/// fails with STATUS_DISK_FULL.
+///
+/// Whether the share has named streams is decided once, by probing the
+/// share root for user extended attributes. Below the root, a mount
+/// without them lists no streams, and a stream request there fails with
+/// STATUS_ACCESS_DENIED. Other hosts have no named streams.
 pub struct LocalFsBackend {
     root: Arc<Dir>,
     /// Device of the share root; see `file_index`.
@@ -65,6 +83,10 @@ pub struct LocalFsBackend {
     /// Watches directories for changes made outside the server.
     #[cfg(target_os = "linux")]
     hub: Option<Arc<super::inotify::Hub>>,
+    /// The named streams open through the backend; `None` when the share
+    /// has none.
+    #[cfg(target_os = "linux")]
+    streams: Option<Arc<super::streams::OpenStreams>>,
 }
 
 impl LocalFsBackend {
@@ -74,6 +96,8 @@ impl LocalFsBackend {
         let dir = Dir::open_ambient_dir(path, ambient_authority())?;
         let root_dev = file_key(&dir.dir_metadata()?).map(|(dev, _)| dev);
         let case_sensitive = volume::is_case_sensitive(&dir);
+        #[cfg(target_os = "linux")]
+        let streams = super::streams::supported(&dir).then(Arc::default);
         Ok(Self {
             root: Arc::new(dir),
             root_dev,
@@ -81,6 +105,8 @@ impl LocalFsBackend {
             case_sensitive,
             #[cfg(target_os = "linux")]
             hub: Some(Arc::default()),
+            #[cfg(target_os = "linux")]
+            streams,
         })
     }
 
@@ -129,7 +155,7 @@ impl LocalFsBackend {
 /// `SmbPath` is already validated (no `..`, no forbidden chars, no doubled
 /// separators), so this is purely a join. The empty `SmbPath` (root) yields
 /// `PathBuf::from(".")`, which cap-std accepts for `metadata` etc.
-fn to_rel_path(path: &SmbPath) -> PathBuf {
+pub(super) fn to_rel_path(path: &SmbPath) -> PathBuf {
     if path.is_root() {
         return PathBuf::from(".");
     }
@@ -144,7 +170,7 @@ fn to_rel_path(path: &SmbPath) -> PathBuf {
 // Error mapping
 // ---------------------------------------------------------------------------
 
-fn io_to_smb(err: io::Error) -> SmbError {
+pub(super) fn io_to_smb(err: io::Error) -> SmbError {
     use io::ErrorKind::*;
     #[cfg(windows)]
     {
@@ -170,7 +196,7 @@ fn io_to_smb(err: io::Error) -> SmbError {
 
 /// Convert a `spawn_blocking` join error (panic or cancellation) into
 /// `io::ErrorKind::Other`.
-fn join_to_io(_e: tokio::task::JoinError) -> io::Error {
+pub(super) fn join_to_io(_e: tokio::task::JoinError) -> io::Error {
     io::Error::other("blocking task panicked or was cancelled")
 }
 
@@ -204,7 +230,7 @@ fn write_at(file: &std::fs::File, data: &[u8], offset: u64) -> io::Result<usize>
 
 /// Host identity of a file: device and inode number on Unix, volume serial
 /// number and file index on Windows. `None` if `md` does not carry it.
-fn file_key(md: &Metadata) -> Option<(u64, u64)> {
+pub(super) fn file_key(md: &Metadata) -> Option<(u64, u64)> {
     #[cfg(unix)]
     {
         use cap_std::fs::MetadataExt as _;
@@ -224,7 +250,7 @@ fn file_key(md: &Metadata) -> Option<(u64, u64)> {
 /// device report the inode (file index on Windows). Files on other mounts
 /// below the root have their device mixed into the id, so equal inodes on
 /// different devices give different ids.
-fn file_index(root_dev: Option<u64>, key: Option<(u64, u64)>) -> u64 {
+pub(super) fn file_index(root_dev: Option<u64>, key: Option<(u64, u64)>) -> u64 {
     let Some((dev, ino)) = key else {
         return 0;
     };
@@ -239,7 +265,7 @@ fn file_index(root_dev: Option<u64>, key: Option<(u64, u64)>) -> u64 {
 }
 
 /// Number of hard links to a file. `None` if `md` does not carry it.
-fn link_count(md: &Metadata) -> Option<u64> {
+pub(super) fn link_count(md: &Metadata) -> Option<u64> {
     #[cfg(unix)]
     {
         use cap_std::fs::MetadataExt as _;
@@ -320,7 +346,7 @@ fn open_dir_handle(root: &Dir, rel: &Path, write_attributes: bool) -> io::Result
 /// A `File` on the same open directory, for setting its times. On Linux a
 /// `Dir` holds an `O_PATH` descriptor, which cannot change times, so the
 /// directory is opened again through it.
-fn dir_as_file(dir: &Dir) -> io::Result<std::fs::File> {
+pub(super) fn dir_as_file(dir: &Dir) -> io::Result<std::fs::File> {
     #[cfg(unix)]
     {
         Ok(dir.open(".")?.into_std())
@@ -335,7 +361,7 @@ fn dir_as_file(dir: &Dir) -> io::Result<std::fs::File> {
 /// Sets or clears the read-only state of an open file. On Unix a read-only
 /// file has no write permission bits, and clearing it gives the owner write
 /// permission back.
-fn set_read_only(file: &std::fs::File, read_only: bool) -> io::Result<()> {
+pub(super) fn set_read_only(file: &std::fs::File, read_only: bool) -> io::Result<()> {
     let mut perms = file.metadata()?.permissions();
     #[cfg(unix)]
     {
@@ -357,7 +383,7 @@ fn set_read_only(file: &std::fs::File, read_only: bool) -> io::Result<()> {
 /// Host times for `times`. The change time is left to the host. Hosts other
 /// than Windows and macOS have no call that sets the creation time, so it is
 /// ignored there.
-fn host_file_times(times: FileTimes) -> SmbResult<std::fs::FileTimes> {
+pub(super) fn host_file_times(times: FileTimes) -> SmbResult<std::fs::FileTimes> {
     let host_time = |ft| filetime_to_system_time(ft).ok_or(SmbError::NotSupported);
     let mut out = std::fs::FileTimes::new();
     if let Some(ft) = times.last_write_time {
@@ -403,7 +429,11 @@ fn filetime_to_system_time(ft: u64) -> Option<SystemTime> {
 // FileInfo construction
 // ---------------------------------------------------------------------------
 
-fn file_info_from_metadata(name: String, md: &Metadata, root_dev: Option<u64>) -> FileInfo {
+pub(super) fn file_info_from_metadata(
+    name: String,
+    md: &Metadata,
+    root_dev: Option<u64>,
+) -> FileInfo {
     let len = md.len();
     let modified = md.modified().ok().map(|t| t.into_std());
     let accessed = md.accessed().ok().map(|t| t.into_std());
@@ -521,16 +551,7 @@ impl LocalFsBackend {
         // 1. Read-only check: any open that requests creation, write access,
         //    truncation, or overwrite is rejected up front. Pure read opens
         //    pass through.
-        let writes = opts.write
-            || opts.write_attributes
-            || matches!(
-                opts.intent,
-                OpenIntent::Create
-                    | OpenIntent::OpenOrCreate
-                    | OpenIntent::OverwriteOrCreate
-                    | OpenIntent::Truncate
-            );
-        if self.read_only && writes {
+        if self.read_only && writes(&opts) {
             return Err(SmbError::AccessDenied);
         }
 
@@ -644,6 +665,12 @@ impl LocalFsBackend {
         });
         Ok((handle, action))
     }
+}
+
+/// True if an open with `opts` may change the file: it asks for write
+/// access, or its disposition may create or truncate.
+fn writes(opts: &OpenOptions) -> bool {
+    opts.write || opts.write_attributes || opts.intent != OpenIntent::Open
 }
 
 /// Opens the file `rel` below `root` for `opts.intent`. OPEN_IF opens an
@@ -821,6 +848,9 @@ impl ShareBackend for LocalFsBackend {
         BackendCapabilities {
             is_read_only: self.read_only,
             case_sensitive: self.case_sensitive,
+            #[cfg(target_os = "linux")]
+            named_streams: self.streams.is_some(),
+            #[cfg(not(target_os = "linux"))]
             named_streams: false,
         }
     }
@@ -833,6 +863,82 @@ impl ShareBackend for LocalFsBackend {
             .map_err(join_to_io)
             .map_err(io_to_smb)?
             .map_err(io_to_smb)
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn open_stream(
+        &self,
+        file: Box<dyn Handle>,
+        path: &SmbPath,
+        stream: &StreamName,
+        opts: OpenOptions,
+    ) -> SmbResult<(Box<dyn Handle>, OpenAction)> {
+        let id = file.stat().await.map(|info| info.file_index);
+        if let Err(e) = file.close().await {
+            debug!(error = %e, path = %path, "backend close failed");
+        }
+        if self.read_only && writes(&opts) {
+            return Err(SmbError::AccessDenied);
+        }
+        self.stream_place()?
+            .open_stream(
+                to_rel_path(path),
+                file_name_for(path),
+                id?,
+                stream.clone(),
+                opts.intent,
+            )
+            .await
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn remove_stream(
+        &self,
+        path: &SmbPath,
+        file_index: u64,
+        stream: &StreamName,
+    ) -> SmbResult<()> {
+        if self.read_only {
+            return Err(SmbError::AccessDenied);
+        }
+        self.stream_place()?
+            .remove_stream(to_rel_path(path), file_index, stream.clone())
+            .await
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn rename_stream(
+        &self,
+        path: &SmbPath,
+        file_index: u64,
+        from: Option<&StreamName>,
+        to: Option<&StreamName>,
+        replace_if_exists: bool,
+    ) -> SmbResult<()> {
+        if self.read_only {
+            return Err(SmbError::AccessDenied);
+        }
+        self.stream_place()?
+            .rename_stream(
+                to_rel_path(path),
+                file_index,
+                from.cloned(),
+                to.cloned(),
+                replace_if_exists,
+            )
+            .await
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl LocalFsBackend {
+    fn stream_place(&self) -> SmbResult<super::streams::Place> {
+        Ok(super::streams::Place {
+            root: Arc::clone(&self.root),
+            root_dev: self.root_dev,
+            read_only: self.read_only,
+            open: self.streams.clone().ok_or(SmbError::NotSupported)?,
+        })
     }
 }
 
@@ -859,7 +965,7 @@ enum LocalHandle {
     },
 }
 
-fn file_name_for(path: &SmbPath) -> String {
+pub(super) fn file_name_for(path: &SmbPath) -> String {
     path.file_name().unwrap_or("").to_string()
 }
 
@@ -1111,6 +1217,24 @@ impl Handle for LocalHandle {
                     .map_err(io_to_smb)
             }
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn streams(&self) -> SmbResult<Vec<crate::stream::StreamInfo>> {
+        let listed = match self {
+            LocalHandle::File { file, .. } => {
+                let file = Arc::clone(file);
+                spawn_blocking(move || super::streams::list_smb(&file)).await
+            }
+            LocalHandle::Dir { dir_handle, .. } => {
+                let dir_handle = Arc::clone(dir_handle);
+                spawn_blocking(move || {
+                    super::streams::list_smb(&dir_as_file(&dir_handle).map_err(io_to_smb)?)
+                })
+                .await
+            }
+        };
+        listed.map_err(join_to_io).map_err(io_to_smb)?
     }
 }
 

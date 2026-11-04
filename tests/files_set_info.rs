@@ -96,10 +96,13 @@ async fn disposition_counts_names_the_listing_hides() {
 }
 
 #[tokio::test]
-async fn rename_to_a_stream_name_is_refused() {
+async fn rename_to_a_stream_name_is_refused_on_a_share_without_streams() {
     let td = tempdir().unwrap();
     std::fs::write(td.path().join("f.txt"), b"data").unwrap();
-    let server = Server::public(local(td.path())).await;
+    let share = smb_server::Share::new("share", local(td.path()))
+        .public()
+        .named_streams(false);
+    let server = Server::start(smb_server::SmbServer::builder().share(share)).await;
     let mut c = server.client().await;
     let f = c.open("f.txt", RW | DELETE, SHARE_ALL).await.unwrap();
 

@@ -403,11 +403,14 @@ async fn default_stream_suffixes_follow_the_directory_rules() {
 }
 
 #[tokio::test]
-async fn named_streams_are_refused() {
+async fn named_streams_are_refused_on_a_share_without_them() {
     let td = tempdir().unwrap();
     std::fs::write(td.path().join("f.txt"), b"data").unwrap();
     std::fs::create_dir(td.path().join("d")).unwrap();
-    let server = Server::public(local(td.path())).await;
+    let share = smb_server::Share::new("share", local(td.path()))
+        .public()
+        .named_streams(false);
+    let server = Server::start(smb_server::SmbServer::builder().share(share)).await;
     let mut c = server.client().await;
 
     for name in [
