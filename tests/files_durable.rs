@@ -842,6 +842,21 @@ async fn only_the_owner_on_the_same_client_lease_name_and_share_gets_it_back() {
 }
 
 #[tokio::test]
+async fn a_reconnect_may_name_the_default_stream() {
+    let k = kept(RH, SHARE_ALL, false).await;
+    let mut a = user_client(k.server.addr, SignIn::default()).await;
+    let named = a
+        .create(reconnect("f.txt:s", k.file_id, lease_v1(KEY_A, RH)))
+        .await;
+    assert_eq!(named.err(), Some(ntstatus::STATUS_INVALID_PARAMETER));
+    let resp = a
+        .create(reconnect("f.txt::$DATA", k.file_id, lease_v1(KEY_A, RH)))
+        .await
+        .expect("reconnected");
+    assert_eq!(a.read(resp.file_id, 0, 10).await.unwrap(), b"0123456789");
+}
+
+#[tokio::test]
 async fn an_open_gone_from_its_kept_state_cannot_be_reconnected() {
     // A break that needed what the lease caches closed it.
     let k = kept(RWH, SHARE_ALL, false).await;

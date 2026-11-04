@@ -28,6 +28,7 @@ use crate::proto::messages::change_notify::{
     FILE_NOTIFY_CHANGE_LAST_WRITE,
 };
 use crate::server::{ServerState, ShareBindings};
+use crate::stream::{StreamPart, parse_create_name};
 use crate::utils::utf16le_to_units;
 use tokio::sync::RwLock;
 use tracing::warn;
@@ -199,9 +200,9 @@ async fn set(
                 Some(u) => u,
                 None => return Ok(HandlerResponse::err(ntstatus::STATUS_OBJECT_NAME_INVALID)),
             };
-            let new_path = match SmbPath::from_utf16(&units) {
-                Ok(p) => p,
-                Err(_) => return Ok(HandlerResponse::err(ntstatus::STATUS_OBJECT_NAME_INVALID)),
+            let new_path = match parse_create_name(&units) {
+                Ok((p, StreamPart::None)) => p,
+                _ => return Ok(HandlerResponse::err(ntstatus::STATUS_OBJECT_NAME_INVALID)),
             };
             let rename = Rename {
                 file_id: req.file_id,

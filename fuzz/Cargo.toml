@@ -60,6 +60,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "create_name"
+path = "fuzz_targets/create_name.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "lease_context"
 path = "fuzz_targets/lease_context.rs"
 test = false

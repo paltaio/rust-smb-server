@@ -43,9 +43,11 @@ pub struct OpenOptions {
     pub write_attributes: bool,
     /// CREATE disposition.
     pub intent: OpenIntent,
-    /// `FILE_DIRECTORY_FILE` was set on CREATE: open or create a directory.
+    /// `FILE_DIRECTORY_FILE` was set on CREATE, or the name ended in
+    /// `::$INDEX_ALLOCATION`: open or create a directory.
     pub directory: bool,
-    /// `FILE_NON_DIRECTORY_FILE` was set on CREATE: fail if the target is a directory.
+    /// `FILE_NON_DIRECTORY_FILE` was set on CREATE, or the name ended in
+    /// `::$DATA`: fail if the target is a directory.
     pub non_directory: bool,
     /// `FILE_DELETE_ON_CLOSE` was set on CREATE.
     pub delete_on_close: bool,

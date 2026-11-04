@@ -190,3 +190,250 @@ async fn file_ids_are_unique_within_a_session() {
     let b = c.open("f.txt", FILE_READ_DATA, SHARE_ALL).await.unwrap();
     assert_ne!(a, b);
 }
+
+const FILE_SEQUENTIAL_ONLY: u32 = 0x0000_0004;
+const FILE_NO_EA_KNOWLEDGE: u32 = 0x0000_0200;
+const FILE_RANDOM_ACCESS: u32 = 0x0000_0800;
+
+#[tokio::test]
+async fn default_stream_suffixes_open_the_file_or_directory() {
+    let td = tempdir().unwrap();
+    std::fs::write(td.path().join("f.txt"), b"data").unwrap();
+    std::fs::create_dir(td.path().join("d")).unwrap();
+    let server = Server::public(local(td.path())).await;
+    let mut c = server.client().await;
+
+    for name in ["f.txt::$DATA", "f.txt::$data"] {
+        let f = c.open(name, FILE_READ_DATA, SHARE_ALL).await.unwrap();
+        assert_eq!(c.read(f, 0, 16).await.unwrap(), b"data", "{name}");
+        c.close(f).await;
+    }
+    let created = c
+        .create(Create {
+            name: "new.txt::$DATA",
+            disposition: FILE_CREATE,
+            ..Create::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(created.create_action, 2, "FILE_CREATED");
+    c.close(created.file_id).await;
+    assert!(td.path().join("new.txt").is_file());
+
+    // A directory stream takes the options of a file open, and
+    // FILE_NON_DIRECTORY_FILE does not stop it.
+    let directories = [
+        ("d::$INDEX_ALLOCATION", 0, FILE_OPEN),
+        ("d:$I30:$INDEX_ALLOCATION", 0, FILE_OPEN),
+        ("d::$INDEX_ALLOCATION", FILE_SEQUENTIAL_ONLY, FILE_OPEN),
+        ("d::$INDEX_ALLOCATION", FILE_RANDOM_ACCESS, FILE_OPEN),
+        ("d::$INDEX_ALLOCATION", FILE_NO_EA_KNOWLEDGE, FILE_OPEN),
+        (
+            "d::$INDEX_ALLOCATION",
+            FILE_NON_DIRECTORY_FILE,
+            FILE_OPEN_IF,
+        ),
+        ("::$INDEX_ALLOCATION", 0, FILE_OPEN),
+    ];
+    for (name, options, disposition) in directories {
+        let dir = c
+            .create(Create {
+                name,
+                access: FILE_GENERIC_READ,
+                options,
+                disposition,
+                ..Create::default()
+            })
+            .await
+            .unwrap_or_else(|status| panic!("{name} {options:#x}: {status:#x}"));
+        assert_eq!(dir.create_action, 1, "FILE_OPENED");
+        assert_ne!(dir.file_attributes & FILE_ATTRIBUTE_DIRECTORY, 0, "{name}");
+        c.close(dir.file_id).await;
+    }
+    for (name, disposition) in [
+        ("new::$INDEX_ALLOCATION", FILE_CREATE),
+        ("new2::$INDEX_ALLOCATION", FILE_OVERWRITE_IF),
+    ] {
+        let dir = c
+            .create(Create {
+                name,
+                access: FILE_GENERIC_READ,
+                disposition,
+                ..Create::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(dir.create_action, 2, "FILE_CREATED");
+        c.close(dir.file_id).await;
+    }
+    assert!(td.path().join("new").is_dir());
+    assert!(td.path().join("new2").is_dir());
+}
+
+#[tokio::test]
+async fn default_stream_suffixes_follow_the_directory_rules() {
+    let td = tempdir().unwrap();
+    std::fs::write(td.path().join("f.txt"), b"data").unwrap();
+    std::fs::create_dir(td.path().join("d")).unwrap();
+    let server = Server::public(local(td.path())).await;
+    let mut c = server.client().await;
+
+    let both = FILE_DIRECTORY_FILE | FILE_NON_DIRECTORY_FILE;
+    let cases = [
+        (
+            "d::$DATA",
+            0,
+            FILE_OPEN,
+            ntstatus::STATUS_FILE_IS_A_DIRECTORY,
+        ),
+        (
+            "::$DATA",
+            0,
+            FILE_OPEN,
+            ntstatus::STATUS_FILE_IS_A_DIRECTORY,
+        ),
+        (
+            ".::$DATA",
+            0,
+            FILE_OPEN,
+            ntstatus::STATUS_FILE_IS_A_DIRECTORY,
+        ),
+        (
+            "d::$DATA",
+            FILE_DIRECTORY_FILE,
+            FILE_OPEN,
+            ntstatus::STATUS_NOT_A_DIRECTORY,
+        ),
+        (
+            "f.txt::$DATA",
+            FILE_DIRECTORY_FILE,
+            FILE_OPEN,
+            ntstatus::STATUS_NOT_A_DIRECTORY,
+        ),
+        (
+            "f.txt::$DATA",
+            both,
+            FILE_OPEN,
+            ntstatus::STATUS_INVALID_PARAMETER,
+        ),
+        (
+            "f.txt::$DATA",
+            FILE_DIRECTORY_FILE,
+            FILE_OVERWRITE_IF,
+            ntstatus::STATUS_INVALID_PARAMETER,
+        ),
+        (
+            "f.txt::$DATA",
+            FILE_DIRECTORY_FILE | FILE_SEQUENTIAL_ONLY,
+            FILE_OPEN,
+            ntstatus::STATUS_INVALID_PARAMETER,
+        ),
+        (
+            "f.txt::$INDEX_ALLOCATION",
+            0,
+            FILE_OPEN,
+            ntstatus::STATUS_NOT_A_DIRECTORY,
+        ),
+        (
+            "f.txt::$INDEX_ALLOCATION",
+            0,
+            FILE_CREATE,
+            ntstatus::STATUS_OBJECT_NAME_COLLISION,
+        ),
+        (
+            "f.txt::$INDEX_ALLOCATION",
+            0,
+            FILE_OVERWRITE_IF,
+            ntstatus::STATUS_NOT_A_DIRECTORY,
+        ),
+        (
+            "d::$INDEX_ALLOCATION",
+            0,
+            FILE_OVERWRITE_IF,
+            ntstatus::STATUS_OBJECT_NAME_COLLISION,
+        ),
+        (
+            "d::$INDEX_ALLOCATION",
+            0,
+            FILE_SUPERSEDE,
+            ntstatus::STATUS_OBJECT_NAME_COLLISION,
+        ),
+        (
+            "d::$INDEX_ALLOCATION",
+            0,
+            FILE_OVERWRITE,
+            ntstatus::STATUS_OBJECT_NAME_COLLISION,
+        ),
+        (
+            "::$INDEX_ALLOCATION",
+            0,
+            FILE_OVERWRITE_IF,
+            ntstatus::STATUS_ACCESS_DENIED,
+        ),
+        (
+            "d::$INDEX_ALLOCATION",
+            FILE_DIRECTORY_FILE,
+            FILE_OVERWRITE_IF,
+            ntstatus::STATUS_INVALID_PARAMETER,
+        ),
+        (
+            "missing::$INDEX_ALLOCATION",
+            0,
+            FILE_OVERWRITE,
+            ntstatus::STATUS_OBJECT_NAME_NOT_FOUND,
+        ),
+    ];
+    for (name, options, disposition, status) in cases {
+        let create = Create {
+            name,
+            access: FILE_GENERIC_READ,
+            options,
+            disposition,
+            ..Create::default()
+        };
+        assert_eq!(
+            c.create(create).await.unwrap_err(),
+            status,
+            "{name} {options:#x} {disposition}"
+        );
+    }
+    assert!(td.path().join("f.txt").is_file());
+    assert_eq!(std::fs::read(td.path().join("f.txt")).unwrap(), b"data");
+    assert!(!td.path().join("missing").exists());
+}
+
+#[tokio::test]
+async fn named_streams_are_refused() {
+    let td = tempdir().unwrap();
+    std::fs::write(td.path().join("f.txt"), b"data").unwrap();
+    std::fs::create_dir(td.path().join("d")).unwrap();
+    let server = Server::public(local(td.path())).await;
+    let mut c = server.client().await;
+
+    for name in [
+        "f.txt:s",
+        "f.txt:s:$DATA",
+        "f.txt:s:$INDEX_ALLOCATION",
+        "d:s",
+        ":s",
+        "new.txt:s",
+        "f.txt:",
+        "f.txt::",
+        "f.txt:s:$FOO",
+        "f.txt:a:b:c",
+        "d:s\\f.txt",
+    ] {
+        let create = Create {
+            name,
+            disposition: FILE_OPEN_IF,
+            ..Create::default()
+        };
+        assert_eq!(
+            c.create(create).await.unwrap_err(),
+            ntstatus::STATUS_OBJECT_NAME_INVALID,
+            "{name}"
+        );
+    }
+    assert!(!td.path().join("new.txt").exists());
+    assert_eq!(std::fs::read(td.path().join("f.txt")).unwrap(), b"data");
+}

@@ -1,0 +1,219 @@
+//! Stream suffixes in CREATE names: `file:name`, `file:name:$DATA`,
+//! `file::$DATA` (MS-FSCC 2.1.5).
+
+use std::str::FromStr;
+
+use crate::error::{SmbError, SmbResult};
+use crate::path::SmbPath;
+
+/// Name of a named data stream: the `name` in `file.txt:name:$DATA`.
+///
+/// 1 to 255 UTF-16 code units, none of them `\`, `/`, `:` or NUL
+/// (MS-FSCC 2.1.5.3). Control characters and `" * < > ? |` are allowed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamName(String);
+
+impl StreamName {
+    /// The name as the client sent it.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl FromStr for StreamName {
+    type Err = SmbError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let units = s.encode_utf16().count();
+        if !(1..=MAX_STREAM_NAME_UNITS).contains(&units) || s.contains(['\\', '/', ':', '\0']) {
+            return Err(SmbError::NameInvalid);
+        }
+        Ok(Self(s.to_string()))
+    }
+}
+
+/// Longest stream name, in UTF-16 code units (MS-FSCC 2.1.5.3).
+const MAX_STREAM_NAME_UNITS: usize = 255;
+
+/// The stream a CREATE name selects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StreamPart {
+    /// No suffix.
+    None,
+    /// `::$DATA`: the unnamed data stream, which a directory does not have.
+    Data,
+    /// `::$INDEX_ALLOCATION` or `:$I30:$INDEX_ALLOCATION`: the directory
+    /// itself.
+    Directory,
+    /// `:name` or `:name:$DATA`.
+    Named(StreamName),
+    /// `:name:$INDEX_ALLOCATION` with any other name.
+    NamedDirectory(StreamName),
+}
+
+/// Splits a CREATE name into the path of the file and the stream it
+/// selects (MS-FSA 2.1.5.1, phases 5 and 6). Only the last component may
+/// carry a suffix; a name that ends in `:` is invalid, and the stream type
+/// is `$DATA` or `$INDEX_ALLOCATION`, compared case-insensitively. The file
+/// part follows every [`SmbPath`] rule.
+pub(crate) fn parse_create_name(units: &[u16]) -> SmbResult<(SmbPath, StreamPart)> {
+    let name = String::from_utf16(units).map_err(|_| SmbError::NameInvalid)?;
+    let Some((file, suffix)) = name.split_once(':') else {
+        return Ok((name.parse()?, StreamPart::None));
+    };
+    if name.ends_with(':') {
+        return Err(SmbError::NameInvalid);
+    }
+    // A separator or a third `:` after the first `:` lands in the stream
+    // name or the type, and both refuse it.
+    let (stream, kind) = suffix.split_once(':').unwrap_or((suffix, "$DATA"));
+    let directory = if kind.eq_ignore_ascii_case("$DATA") {
+        false
+    } else if kind.eq_ignore_ascii_case("$INDEX_ALLOCATION") {
+        true
+    } else {
+        return Err(SmbError::NameInvalid);
+    };
+    let path = file.parse()?;
+    // `$I30` is the name of a directory's index (MS-FSA 2.1.5.1 phase 7).
+    let part = match (stream, directory) {
+        ("", false) => StreamPart::Data,
+        ("", true) => StreamPart::Directory,
+        (index, true) if index.eq_ignore_ascii_case("$I30") => StreamPart::Directory,
+        (stream, false) => StreamPart::Named(stream.parse()?),
+        (stream, true) => StreamPart::NamedDirectory(stream.parse()?),
+    };
+    Ok((path, part))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(s: &str) -> SmbResult<(SmbPath, StreamPart)> {
+        parse_create_name(&s.encode_utf16().collect::<Vec<_>>())
+    }
+
+    fn named(s: &str) -> StreamPart {
+        StreamPart::Named(s.parse().unwrap())
+    }
+
+    fn path(s: &str) -> SmbPath {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn names_without_a_suffix_are_paths() {
+        assert_eq!(
+            parse("dir\\f.txt").unwrap(),
+            (path("dir\\f.txt"), StreamPart::None)
+        );
+        assert_eq!(parse("").unwrap(), (SmbPath::root(), StreamPart::None));
+    }
+
+    #[test]
+    fn suffixes_select_a_stream() {
+        let cases = [
+            ("f:s", named("s")),
+            ("f:s:$DATA", named("s")),
+            ("f:s:$DaTa", named("s")),
+            ("f:$DATA", named("$DATA")),
+            ("f:$DATA:$DATA", named("$DATA")),
+            ("f::$DATA", StreamPart::Data),
+            ("f::$data", StreamPart::Data),
+            ("f::$INDEX_ALLOCATION", StreamPart::Directory),
+            ("f::$Index_Allocation", StreamPart::Directory),
+            ("f:$I30:$INDEX_ALLOCATION", StreamPart::Directory),
+            ("f:$i30:$index_allocation", StreamPart::Directory),
+            ("f:$I30", named("$I30")),
+            ("f:$I30:$DATA", named("$I30")),
+            (
+                "f:s:$INDEX_ALLOCATION",
+                StreamPart::NamedDirectory("s".parse().unwrap()),
+            ),
+        ];
+        for (name, part) in cases {
+            assert_eq!(parse(name).unwrap(), (path("f"), part), "{name}");
+        }
+        assert_eq!(
+            parse("\\dir\\f.txt:s").unwrap(),
+            (path("dir\\f.txt"), named("s"))
+        );
+        assert_eq!(parse(":s").unwrap(), (SmbPath::root(), named("s")));
+        for root in ["::$DATA", ".::$DATA", "\\::$DATA"] {
+            assert_eq!(
+                parse(root).unwrap(),
+                (SmbPath::root(), StreamPart::Data),
+                "{root}"
+            );
+        }
+        assert_eq!(
+            parse("::$INDEX_ALLOCATION").unwrap(),
+            (SmbPath::root(), StreamPart::Directory)
+        );
+    }
+
+    #[test]
+    fn stream_names_take_characters_file_names_refuse() {
+        for stream in ["\u{5}?*", "a\"b<c>|", " lead and trail. ", "\n"] {
+            assert_eq!(
+                parse(&format!("f:{stream}")).unwrap(),
+                (path("f"), named(stream)),
+                "{stream:?}"
+            );
+        }
+        let tags = "com.apple.metadata\u{F022}_kMDItemUserTags";
+        assert_eq!(parse(&format!("f:{tags}")).unwrap().1, named(tags));
+    }
+
+    #[test]
+    fn malformed_suffixes_are_refused() {
+        for name in [
+            "f:",
+            "f::",
+            "f:s:",
+            "f::$DATA:",
+            "f:a:b:c",
+            "f:s:$DATA:$DATA",
+            "f:s:$FOO",
+            "f::$BITMAP",
+            "f:s:DATA",
+            "a:s\\b",
+            "a:s/b",
+            "a::$DATA\\b",
+            "dir:s\\f.txt",
+            "dir\\:s",
+            "f:\0",
+            "*:s",
+            "a\\..\\b:s",
+        ] {
+            assert!(parse(name).is_err(), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn stream_names_count_utf16_units() {
+        let longest = "x".repeat(255);
+        assert_eq!(parse(&format!("f:{longest}")).unwrap().1, named(&longest));
+        assert!(parse(&format!("f:{longest}x")).is_err());
+        // U+1F600 takes two units.
+        let pairs = format!("{}x", "\u{1F600}".repeat(127));
+        assert_eq!(parse(&format!("f:{pairs}")).unwrap().1, named(&pairs));
+        assert!(parse(&format!("f:{}", "\u{1F600}".repeat(128))).is_err());
+    }
+
+    #[test]
+    fn unpaired_surrogates_are_refused() {
+        let mut units: Vec<u16> = "f:s".encode_utf16().collect();
+        units.push(0xD800);
+        assert!(parse_create_name(&units).is_err());
+    }
+
+    #[test]
+    fn stream_names_validate_on_their_own() {
+        assert_eq!("s".parse::<StreamName>().unwrap().as_str(), "s");
+        for bad in ["", "a:b", "a\\b", "a/b", "a\0b"] {
+            assert!(bad.parse::<StreamName>().is_err(), "{bad:?}");
+        }
+    }
+}

@@ -58,8 +58,10 @@ SmbServer::builder()
 //!
 //! - Paths arrive as [`SmbPath`], relative to the share root. `.` components
 //!   are dropped; `..`, empty components, `<>:"|?*`, control characters and
-//!   stream names are rejected before the backend sees them. The empty path
-//!   is the share root.
+//!   named streams are rejected before the backend sees them. A name ending
+//!   in `::$DATA` opens the file with [`OpenOptions::non_directory`] set,
+//!   and one ending in `::$INDEX_ALLOCATION` the directory with
+//!   [`OpenOptions::directory`] set. The empty path is the share root.
 //! - `open` fails with [`SmbError::PathNotFound`] when a directory on the
 //!   way to the path is missing, and with [`SmbError::NotFound`] when only
 //!   the last component is. Clients see STATUS_OBJECT_PATH_NOT_FOUND and
@@ -330,6 +332,7 @@ mod path;
 mod proto;
 mod rpc;
 mod server;
+mod stream;
 #[cfg(test)]
 mod tests {
     mod async_requests;
@@ -408,6 +411,62 @@ pub mod fuzzing {
     /// Parses `data` as the data of a lease create context.
     pub fn lease_context(data: &[u8]) {
         let _ = crate::proto::messages::LeaseContext::parse(data);
+    }
+
+    /// Parses `data` as a UTF-16LE CREATE name and checks the result. A
+    /// name without `:` parses as `SmbPath::from_utf16` does. In a name
+    /// with one, the text before the first `:` parses as the path, a suffix
+    /// that selects no named stream is `::$DATA`, `::$INDEX_ALLOCATION` or
+    /// `:$I30:$INDEX_ALLOCATION`, and the path and stream put back together
+    /// parse to the same result.
+    pub fn create_name(data: &[u8]) {
+        use crate::stream::{StreamPart, parse_create_name};
+        let units: Vec<u16> = data
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        let parsed = parse_create_name(&units);
+        let Ok(name) = String::from_utf16(&units) else {
+            assert!(parsed.is_err());
+            return;
+        };
+        let Some((file, suffix)) = name.split_once(':') else {
+            let path = parsed.ok().map(|(path, stream)| {
+                assert_eq!(stream, StreamPart::None);
+                path
+            });
+            assert_eq!(path, crate::SmbPath::from_utf16(&units).ok());
+            return;
+        };
+        let Ok((path, stream)) = parsed else {
+            return;
+        };
+        assert_eq!(file.parse::<crate::SmbPath>().ok(), Some(path.clone()));
+        let suffix = suffix.to_ascii_uppercase();
+        let rebuilt = match &stream {
+            StreamPart::None => panic!("a name with `:` parsed without a stream part"),
+            StreamPart::Data => {
+                assert_eq!(suffix, ":$DATA");
+                format!("{}::$DATA", path.display_backslash())
+            }
+            StreamPart::Directory => {
+                assert!(matches!(
+                    suffix.as_str(),
+                    ":$INDEX_ALLOCATION" | "$I30:$INDEX_ALLOCATION"
+                ));
+                format!("{}::$INDEX_ALLOCATION", path.display_backslash())
+            }
+            StreamPart::Named(stream) => {
+                format!("{}:{}", path.display_backslash(), stream.as_str())
+            }
+            StreamPart::NamedDirectory(stream) => format!(
+                "{}:{}:$INDEX_ALLOCATION",
+                path.display_backslash(),
+                stream.as_str()
+            ),
+        };
+        let units: Vec<u16> = rebuilt.encode_utf16().collect();
+        assert_eq!(parse_create_name(&units).ok(), Some((path, stream)));
     }
 
     /// Parses `data` as a lease break acknowledgment.

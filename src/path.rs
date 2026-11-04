@@ -1,8 +1,9 @@
 //! `SmbPath`: validated, normalized SMB path used between dispatcher and
 //! backend.
 //!
-//! Handlers decode wire names to `&[u16]` and build an `SmbPath` with
-//! `from_utf16`; backends can use it without further checks.
+//! CREATE, durable reconnect and rename decode wire names to `&[u16]` and
+//! split off any stream suffix with `parse_create_name`, which builds the
+//! `SmbPath`; backends can use it without further checks.
 
 use std::str::FromStr;
 

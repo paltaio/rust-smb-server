@@ -94,3 +94,33 @@ async fn disposition_counts_names_the_listing_hides() {
     c.close(dir).await;
     assert!(td.path().join("d").join("a:b").exists());
 }
+
+#[tokio::test]
+async fn rename_to_a_stream_name_is_refused() {
+    let td = tempdir().unwrap();
+    std::fs::write(td.path().join("f.txt"), b"data").unwrap();
+    let server = Server::public(local(td.path())).await;
+    let mut c = server.client().await;
+    let f = c.open("f.txt", RW | DELETE, SHARE_ALL).await.unwrap();
+
+    for to in [
+        ":s",
+        ":s:$DATA",
+        "g.txt:s",
+        "g.txt::$DATA",
+        "g.txt::$INDEX_ALLOCATION",
+        "g.txt:",
+    ] {
+        let name = common::utf16le(to);
+        let mut buf = vec![0u8; 16];
+        buf.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&name);
+        assert_eq!(
+            c.set_info(f, FILE_RENAME_INFORMATION, buf).await,
+            ntstatus::STATUS_OBJECT_NAME_INVALID,
+            "{to}"
+        );
+    }
+    assert!(td.path().join("f.txt").exists());
+    assert!(!td.path().join("g.txt").exists());
+}

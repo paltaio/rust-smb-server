@@ -606,6 +606,44 @@ async fn a_removal_reaches_only_watches_for_its_kind_of_entry() {
 }
 
 #[tokio::test]
+async fn creates_through_default_stream_suffixes_report_the_plain_name() {
+    let (srv, _td) = server().await;
+    let mut watcher = srv.client().await;
+    let mut maker = srv.client().await;
+    let dirs = watcher.open_dir("d").await;
+    let files = watcher.open_dir("d").await;
+
+    let mid = arm(&mut watcher, dirs, 4096, FILE_NOTIFY_CHANGE_DIR_NAME, false).await;
+    let created = maker
+        .create(Create {
+            name: "d\\sub::$INDEX_ALLOCATION",
+            access: FILE_GENERIC_READ,
+            disposition: FILE_CREATE,
+            ..Create::default()
+        })
+        .await
+        .expect("mkdir");
+    maker.close(created.file_id).await;
+    assert_eq!(
+        wait_notify(&mut watcher, mid, 4096).await,
+        (STATUS_SUCCESS, vec![added("sub")])
+    );
+    let mid = arm(
+        &mut watcher,
+        files,
+        4096,
+        FILE_NOTIFY_CHANGE_FILE_NAME,
+        false,
+    )
+    .await;
+    create_file(&mut maker, "d\\new.txt::$DATA").await;
+    assert_eq!(
+        wait_notify(&mut watcher, mid, 4096).await,
+        (STATUS_SUCCESS, vec![added("new.txt")])
+    );
+}
+
+#[tokio::test]
 async fn a_request_without_watch_tree_on_a_tree_watch_gets_no_nested_names() {
     let (srv, _td) = server().await;
     let mut watcher = srv.client().await;

@@ -42,6 +42,7 @@ use crate::ntstatus;
 use crate::path::SmbPath;
 use crate::proto::auth::ntlm::Identity;
 use crate::server::{ServerState, ShareBindings};
+use crate::stream::{StreamPart, parse_create_name};
 use crate::utils::utf16le_to_units;
 
 // CreateOptions
@@ -374,7 +375,12 @@ impl CreateArgs {
         };
         if let Some((file_id, create_guid)) = reconnect {
             let lease = lease_request(queries.lease.as_deref(), dialect, client, 0)?;
-            let name = utf16le_to_units(&req.name).and_then(|u| SmbPath::from_utf16(&u).ok());
+            let name = utf16le_to_units(&req.name)
+                .and_then(|u| parse_create_name(&u).ok())
+                .and_then(|(path, stream)| match stream {
+                    StreamPart::Named(_) | StreamPart::NamedDirectory(_) => None,
+                    _ => Some(path),
+                });
             return Ok(Request::Reconnect(Reconnect {
                 file_id,
                 create_guid,
@@ -388,10 +394,16 @@ impl CreateArgs {
 
         // Decode path.
         let units = utf16le_to_units(&req.name).ok_or(ntstatus::STATUS_INVALID_PARAMETER)?;
-        let path = SmbPath::from_utf16(&units).map_err(|_| ntstatus::STATUS_OBJECT_NAME_INVALID)?;
+        let (path, stream) =
+            parse_create_name(&units).map_err(|_| ntstatus::STATUS_OBJECT_NAME_INVALID)?;
+        // No share stores named streams.
+        if let StreamPart::Named(name) | StreamPart::NamedDirectory(name) = &stream {
+            debug!(path = %path, stream = ?name.as_str(), "named stream refused");
+            return Err(ntstatus::STATUS_OBJECT_NAME_INVALID);
+        }
 
         // Translate disposition.
-        let intent = match req.create_disposition {
+        let mut intent = match req.create_disposition {
             FILE_SUPERSEDE | FILE_OVERWRITE_IF => OpenIntent::OverwriteOrCreate,
             FILE_OPEN => OpenIntent::Open,
             FILE_CREATE => OpenIntent::Create,
@@ -404,8 +416,8 @@ impl CreateArgs {
         if options & (FILE_OPEN_BY_FILE_ID | FILE_RESERVE_OPFILTER) != 0 {
             return Err(ntstatus::STATUS_NOT_SUPPORTED);
         }
-        let directory = options & FILE_DIRECTORY_FILE != 0;
-        let non_directory = options & FILE_NON_DIRECTORY_FILE != 0;
+        let mut directory = options & FILE_DIRECTORY_FILE != 0;
+        let mut non_directory = options & FILE_NON_DIRECTORY_FILE != 0;
         if directory
             && (options & !DIRECTORY_OPTIONS != 0
                 || !matches!(
@@ -414,6 +426,19 @@ impl CreateArgs {
                 ))
         {
             return Err(ntstatus::STATUS_INVALID_PARAMETER);
+        }
+        // MS-FSA 2.1.5.1 phase 7, after the option checks of phase 1, which
+        // look at FILE_DIRECTORY_FILE only: `::$DATA` opens the data of a
+        // file and `::$INDEX_ALLOCATION` a directory. The backend never gets
+        // both `directory` and `non_directory`.
+        match &stream {
+            StreamPart::Data if directory => return Err(ntstatus::STATUS_NOT_A_DIRECTORY),
+            StreamPart::Data => non_directory = true,
+            StreamPart::Directory => {
+                directory = true;
+                non_directory = false;
+            }
+            _ => {}
         }
 
         if queries.timewarp {
@@ -476,6 +501,12 @@ impl CreateArgs {
             if intent != OpenIntent::Open && new_attributes & FILE_ATTRIBUTE_READONLY != 0 {
                 return Err(ntstatus::STATUS_CANNOT_DELETE);
             }
+        }
+
+        if stream == StreamPart::Directory
+            && matches!(intent, OpenIntent::OverwriteOrCreate | OpenIntent::Truncate)
+        {
+            intent = overwritten_directory(&share, &path, intent).await?;
         }
 
         let write = open_access & (FILE_WRITE_DATA | FILE_APPEND_DATA) != 0;
@@ -1137,6 +1168,36 @@ async fn reserve_existing(
     };
     let _ = handle.close().await;
     result
+}
+
+/// What an overwrite or supersede of `path` as a directory stream
+/// (`::$INDEX_ALLOCATION`) does: an existing directory cannot be
+/// overwritten, the share root with STATUS_ACCESS_DENIED and any other with
+/// STATUS_OBJECT_NAME_COLLISION (MS-FSA 2.1.5.1.2), a file is not a
+/// directory (MS-FSA 2.1.5.1 phase 7), and a missing directory is created
+/// unless `intent` is [`OpenIntent::Truncate`] (MS-FSA 2.1.5.1 phase 6).
+async fn overwritten_directory(
+    share: &ShareBindings,
+    path: &SmbPath,
+    intent: OpenIntent,
+) -> Result<OpenIntent, u32> {
+    if path.is_root() {
+        return Err(ntstatus::STATUS_ACCESS_DENIED);
+    }
+    let (handle, _) = match share.backend.open(path, OpenOptions::default()).await {
+        Ok(opened) => opened,
+        Err(SmbError::NotFound) if intent == OpenIntent::OverwriteOrCreate => {
+            return Ok(OpenIntent::Create);
+        }
+        Err(e) => return Err(e.to_nt_status()),
+    };
+    let info = handle.stat().await;
+    let _ = handle.close().await;
+    match info {
+        Ok(info) if info.is_directory => Err(ntstatus::STATUS_OBJECT_NAME_COLLISION),
+        Ok(_) => Err(ntstatus::STATUS_NOT_A_DIRECTORY),
+        Err(e) => Err(e.to_nt_status()),
+    }
 }
 
 /// Gives a file this CREATE made or overwrote the requested attributes. A
