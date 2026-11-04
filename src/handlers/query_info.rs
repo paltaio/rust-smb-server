@@ -12,7 +12,7 @@ use crate::handlers::shared::{lookup_open, lookup_session_tree};
 use crate::info_class as ic;
 use crate::ntstatus;
 use crate::server::{ServerState, ShareBindings};
-use crate::stream::{StreamInfo, stream_error, unsupported};
+use crate::stream::{StreamInfo, data_stream_info, stream_error, unsupported};
 
 const FILE_DEVICE_DISK: u32 = 0x0000_0007;
 const FILE_REMOTE_DEVICE: u32 = 0x0000_0010;
@@ -175,8 +175,15 @@ async fn query_file(open: &Open, share: &ShareBindings, class: u8, cap: usize) -
     }
     let handle = open.handle.as_ref().ok_or(ntstatus::STATUS_FILE_CLOSED)?;
     let info = handle.stat().await.map_err(|e| e.to_nt_status())?;
+    if class == ic::FILE_STREAM_INFORMATION {
+        return Ok((stream_information(open, share, info).await?, overflow));
+    }
+    let info = if open.on_stream {
+        data_stream_info(info)
+    } else {
+        info
+    };
     let buf = match class {
-        ic::FILE_STREAM_INFORMATION => stream_information(open, share, info).await?,
         ic::FILE_BASIC_INFORMATION => ic::encode_file_basic_information(&info),
         ic::FILE_STANDARD_INFORMATION | ic::FILE_ALL_INFORMATION => {
             let links = handle.link_count().await.map_err(|e| e.to_nt_status())?;

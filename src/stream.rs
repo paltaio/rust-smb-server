@@ -225,6 +225,17 @@ pub(crate) fn to_sfm(name: &str) -> String {
         .collect()
 }
 
+/// What an open of a named stream reports of its file, `info` as the
+/// backend gave it: a named stream is a data stream, also on a directory,
+/// so its attributes leave out FILE_ATTRIBUTE_DIRECTORY, and
+/// FileStandardInformation says it is no directory.
+pub(crate) fn data_stream_info(info: FileInfo) -> FileInfo {
+    FileInfo {
+        is_directory: false,
+        ..info
+    }
+}
+
 /// The error a stream request on a share that stores named streams answers
 /// for `e`. macOS keeps an extended attribute in a `._` file instead when a
 /// stream request fails with STATUS_NOT_SUPPORTED, and would then look for

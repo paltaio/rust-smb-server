@@ -20,6 +20,7 @@ use crate::ntstatus;
 use crate::proto::messages::change_notify::{
     FILE_ACTION_MODIFIED, FILE_ACTION_MODIFIED_STREAM, FILE_NOTIFY_CHANGE_LAST_WRITE,
 };
+use crate::stream::data_stream_info;
 
 pub(crate) use durable::{Claim, Durability, DurableReg, DurableTable, Unclaimed, v2_timeout};
 pub use durable::{DEFAULT_DURABLE_HANDLE_TIMEOUT, DEFAULT_MAX_DISCONNECTED_OPENS};
@@ -155,6 +156,10 @@ pub(crate) async fn close_open(open_arc: &Arc<RwLock<Open>>, want_attrs: bool) -
     let info = match &handle {
         Some(handle) if want_attrs => handle.stat().await.ok(),
         _ => None,
+    };
+    let info = match info {
+        Some(info) if open.on_stream => Some(data_stream_info(info)),
+        info => info,
     };
     open.slot.take();
     let delete_on_close = open.delete_on_close;

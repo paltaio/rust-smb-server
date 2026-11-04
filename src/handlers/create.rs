@@ -44,7 +44,8 @@ use crate::path::SmbPath;
 use crate::proto::auth::ntlm::Identity;
 use crate::server::{ServerState, ShareBindings};
 use crate::stream::{
-    StreamHandle, StreamName, StreamPart, parse_create_name, stream_error, unsupported,
+    StreamHandle, StreamName, StreamPart, data_stream_info, parse_create_name, stream_error,
+    unsupported,
 };
 use crate::utils::utf16le_to_units;
 
@@ -1066,7 +1067,11 @@ async fn attempt(
             },
         });
     }
-    let buf = encode_response(&info, file_id, granted.is_some(), create_action, &answers);
+    let shown = match stream {
+        Some(_) => data_stream_info(info),
+        None => info,
+    };
+    let buf = encode_response(&shown, file_id, granted.is_some(), create_action, &answers);
     let mut response = HandlerResponse::ok(buf);
     if let Some(guard) = after_send {
         response.after_send.push(Box::new(guard));

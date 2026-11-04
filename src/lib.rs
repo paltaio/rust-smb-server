@@ -69,8 +69,11 @@ SmbServer::builder()
 //!   [`ShareBackend::open_stream`], which gets the file's handle. An
 //!   overwrite of the file removes its named streams through
 //!   [`ShareBackend::remove_stream`], each once no open is on it. A rename
-//!   to `:name` or `::$DATA` goes to [`ShareBackend::rename_stream`].
-//!   Elsewhere named streams are rejected before the backend sees them.
+//!   to `:name` or `::$DATA` goes to [`ShareBackend::rename_stream`]. An
+//!   open of a named stream reports the file's times and attributes with
+//!   the stream's sizes, without FILE_ATTRIBUTE_DIRECTORY on a directory's
+//!   stream. Elsewhere named streams are rejected before the backend sees
+//!   them.
 //! - `open` fails with [`SmbError::PathNotFound`] when a directory on the
 //!   way to the path is missing, and with [`SmbError::NotFound`] when only
 //!   the last component is. Clients see STATUS_OBJECT_PATH_NOT_FOUND and

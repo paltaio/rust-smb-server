@@ -13,10 +13,10 @@ use crate::ntstatus;
 use crate::path::SmbPath;
 use crate::proto::header::{Command, SMB2_HEADER_LEN};
 use crate::proto::messages::{
-    ChangeNotifyRequest, ChangeNotifyResponse, CloseRequest, CreateContext, CreateRequest,
-    CreateResponse, FileId, IoctlRequest, LeaseBreakNotification, LeaseContext, LockElement,
-    LockRequest, QueryInfoRequest, QueryInfoResponse, ReadRequest, ReadResponse, SetInfoRequest,
-    WriteRequest,
+    ChangeNotifyRequest, ChangeNotifyResponse, CloseRequest, CloseResponse, CreateContext,
+    CreateRequest, CreateResponse, FileId, IoctlRequest, LeaseBreakNotification, LeaseContext,
+    LockElement, LockRequest, QueryInfoRequest, QueryInfoResponse, ReadRequest, ReadResponse,
+    SetInfoRequest, WriteRequest,
 };
 use crate::server::ServerState;
 use crate::stream::StreamName;
@@ -54,6 +54,8 @@ const OVERWRITTEN: u32 = 3;
 
 const BASIC: u8 = 0x04;
 const STANDARD: u8 = 0x05;
+const ALL: u8 = 0x12;
+const NETWORK_OPEN: u8 = 0x22;
 const RENAME: u8 = 0x0A;
 const LINK: u8 = 0x0B;
 const DISPOSITION: u8 = 0x0D;
@@ -198,6 +200,25 @@ impl Client {
             Ok(created) => created.file_id,
             Err(status) => panic!("open {name}: {status:#x}"),
         }
+    }
+
+    /// Closes `file_id`, asking for the attributes of the file, and
+    /// returns them.
+    async fn close_with_attributes(&mut self, file_id: FileId) -> u32 {
+        let mut body = Vec::new();
+        CloseRequest {
+            structure_size: 24,
+            flags: 1,
+            reserved: 0,
+            file_id,
+        }
+        .write_to(&mut body)
+        .expect("close");
+        let (status, body) = self.send(Command::Close, &body).await;
+        assert_eq!(status, 0);
+        CloseResponse::parse(&body)
+            .expect("close response")
+            .file_attributes
     }
 
     async fn close(&mut self, file_id: FileId) {
@@ -650,6 +671,49 @@ async fn dispositions_apply_to_the_stream() {
     assert_eq!(files.stream_names("f.txt"), ["s", "t", "u", "v"]);
     assert_eq!(files.stream_names("d"), ["ds"]);
     assert_eq!(files.stream_names(""), ["root"]);
+}
+
+#[tokio::test]
+async fn a_stream_of_a_directory_reports_no_directory_attribute() {
+    const DIRECTORY: u32 = 0x10;
+    const NORMAL: u32 = 0x80;
+    let state = server(&MemFsBackend::new()).await;
+    let mut c = Client::new(&state).await;
+    make(&mut c, "d:ds", b"dir").await;
+    make(&mut c, "f.txt:s", b"file").await;
+
+    let d = c
+        .open(
+            Create::new("d")
+                .access(READ, SHARE_ALL)
+                .options(FILE_DIRECTORY_FILE),
+        )
+        .await;
+    assert_eq!(u32_at(&c.file_info(d, BASIC).await, 32), DIRECTORY);
+    assert_eq!(c.file_info(d, STANDARD).await[21], 1);
+    c.close(d).await;
+
+    for (name, size) in [("d:ds", 3), ("f.txt:s", 4)] {
+        let created = c.create(Create::new(name)).await.unwrap();
+        assert_eq!(created.file_attributes, NORMAL, "{name}");
+        assert_eq!(created.end_of_file, size, "{name}");
+        let id = created.file_id;
+        assert_eq!(u32_at(&c.file_info(id, BASIC).await, 32), NORMAL, "{name}");
+        let standard = c.file_info(id, STANDARD).await;
+        assert_eq!(u64_at(&standard, 8), size, "{name}");
+        assert_eq!(standard[21], 0, "{name}");
+        let all = c.file_info(id, ALL).await;
+        assert_eq!(u32_at(&all, 32), NORMAL, "{name}");
+        assert_eq!(all[40 + 21], 0, "{name}");
+        let network_open = c.file_info(id, NETWORK_OPEN).await;
+        assert_eq!(u64_at(&network_open, 40), size, "{name}");
+        assert_eq!(u32_at(&network_open, 48), NORMAL, "{name}");
+        assert_eq!(c.write(id, size, b"!").await, 0, "{name}");
+        assert_eq!(c.close_with_attributes(id).await, NORMAL, "{name}");
+    }
+    let ds = c.open(Create::new("d:ds")).await;
+    assert_eq!(c.read(ds, 0, 16).await.unwrap(), b"dir!");
+    c.close(ds).await;
 }
 
 #[tokio::test]
