@@ -1179,7 +1179,7 @@ fn listed_ea_size(dir: &Dir, entry: &cap_std::fs::DirEntry, name: &str, md: &Met
         // The target, opened without reading it, inside the share.
         use cap_std::fs::OpenOptionsExt as _;
         let mut opts = CapOpenOptions::new();
-        opts.read(true).custom_flags(libc::O_PATH | libc::O_NOCTTY);
+        opts.read(true).custom_flags(libc::O_PATH);
         dir.open_with(name, &opts).and_then(|target| {
             let md = target.metadata()?;
             if md.is_file() || md.is_dir() {
@@ -2579,7 +2579,7 @@ impl Handle for LocalHandle {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::backend::{OpenIntent, OpenOptions};
     use crate::path::SmbPath;
@@ -3383,7 +3383,7 @@ mod tests {
 
     /// Makes a FIFO at `path`.
     #[cfg(unix)]
-    fn mkfifo(path: &Path) {
+    pub(in crate::fs) fn mkfifo(path: &Path) {
         let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
         // SAFETY: `path` is a NUL-terminated path.
         assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o644) }, 0);
@@ -3393,7 +3393,7 @@ mod tests {
     /// blocking, and writes to it, so a thread stuck opening, reading or
     /// writing it returns.
     #[cfg(unix)]
-    fn release(path: &Path) {
+    pub(in crate::fs) fn release(path: &Path) {
         use std::io::{Read as _, Write as _};
         use std::os::unix::fs::OpenOptionsExt as _;
         let reader = std::fs::OpenOptions::new()

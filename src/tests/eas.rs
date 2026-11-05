@@ -1424,3 +1424,45 @@ async fn a_cancelled_create_takes_back_the_file_it_made() {
     assert_eq!(files.contents("x.txt"), None);
     assert_eq!(files.ea_sets(), 0);
 }
+
+/// A symlink to a file lists with the extended attributes of its target,
+/// as an open of its name sees them.
+#[cfg(all(target_os = "linux", feature = "localfs"))]
+#[tokio::test]
+async fn a_symlink_lists_with_the_attributes_of_its_target() {
+    use crate::ShareBackend as _;
+
+    let exe = std::env::current_exe().unwrap();
+    let td = tempfile::tempdir_in(exe.parent().unwrap()).unwrap();
+    let backend = crate::fs::LocalFsBackend::new(td.path()).unwrap();
+    if !backend.capabilities().extended_attributes {
+        eprintln!(
+            "skipping: no extended attributes on {}",
+            td.path().display()
+        );
+        return;
+    }
+    std::fs::write(td.path().join("f.txt"), b"data").unwrap();
+    std::os::unix::fs::symlink("f.txt", td.path().join("link.txt")).unwrap();
+    let state = server_on(Share::new("home", backend).public());
+    let mut c = Client::new(&state).await;
+    let f = c.open(Create::new("f.txt")).await;
+    assert_eq!(c.set_eas(f, full_list(&[("test", b"hello")])).await, 0);
+    let size = c.info(f, 1, EA_INFORMATION).await;
+    c.close(f).await;
+    let link = c.open(Create::new("link.txt").access(READ)).await;
+    assert_eq!(c.info(link, 1, EA_INFORMATION).await, size);
+    c.close(link).await;
+
+    let size = u32_at(&size, 0);
+    assert_ne!(size, 0);
+    let root = c
+        .open(Create::new("").access(READ).options(FILE_DIRECTORY_FILE))
+        .await;
+    let listed = c.listed_ea_sizes(root, FULL_DIRECTORY).await;
+    assert!(listed.contains(&("f.txt".to_string(), size)), "{listed:?}");
+    assert!(
+        listed.contains(&("link.txt".to_string(), size)),
+        "{listed:?}"
+    );
+}

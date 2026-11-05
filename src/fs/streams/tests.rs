@@ -6,6 +6,7 @@ use tempfile::TempDir;
 use super::*;
 use crate::backend::{FILE_ATTRIBUTE_READONLY, OpenOptions, ShareBackend};
 use crate::fs::LocalFsBackend;
+use crate::fs::local::tests::{mkfifo, release};
 use crate::path::SmbPath;
 
 /// A backend on a new directory beside the test binary, on the build's
@@ -1932,10 +1933,8 @@ async fn a_peek_reads_files_and_directories_and_nothing_else() {
     assert!(spilled(&td, "spilled.txt", "AFP_Resource").exists());
     std::fs::create_dir(td.path().join("d")).unwrap();
     create(&backend, "d", "AFP_AfpInfo", &pattern(60)).await;
-    let fifo = std::ffi::CString::new(td.path().join("fifo").into_os_string().into_encoded_bytes())
-        .unwrap();
-    // SAFETY: `fifo` is a NUL-terminated path.
-    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
+    let fifo = td.path().join("fifo");
+    mkfifo(&fifo);
     std::os::unix::fs::symlink("f.txt", td.path().join("in.txt")).unwrap();
     std::os::unix::fs::symlink(outside.path().join("f.txt"), td.path().join("out.txt")).unwrap();
 
@@ -1949,9 +1948,11 @@ async fn a_peek_reads_files_and_directories_and_nothing_else() {
         "gone.txt",
     ];
     let streams = [("AFP_AfpInfo", 60), ("AFP_Resource", 0)];
-    let peeked = tokio::time::timeout(Duration::from_secs(10), peek(&backend, &entries, &streams))
-        .await
-        .expect("the peek returns");
+    let peeking = peek(&backend, &entries, &streams);
+    let Ok(peeked) = tokio::time::timeout(Duration::from_secs(10), peeking).await else {
+        release(&fifo);
+        panic!("the peek blocked");
+    };
     let info = Some((60, pattern(60)));
     assert_eq!(
         peeked,
