@@ -26,6 +26,49 @@ fn backend() -> Option<(TempDir, LocalFsBackend)> {
     Some((td, backend))
 }
 
+/// Set in the child process [`alone_in_child`] starts.
+const CHILD: &str = "SMB_SERVER_STREAMS_TEST_CHILD";
+
+/// Whether to run the test body here. In the test process, runs the test
+/// `name` of this module alone in a child process of the test binary,
+/// asserts that it passed there and returns false; in that child, returns
+/// true. A child can lower its descriptor limit without starving the tests
+/// that run beside it.
+fn alone_in_child(name: &str) -> bool {
+    if std::env::var_os(CHILD).is_some() {
+        return true;
+    }
+    let module = module_path!().split_once("::").unwrap().1;
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([&format!("{module}::{name}"), "--exact", "--test-threads=1"])
+        .env(CHILD, "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout.contains("1 passed"),
+        "{stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    false
+}
+
+/// Lowers the soft descriptor limit of this process to `headroom` above
+/// the descriptors it holds.
+fn limit_descriptors(headroom: libc::rlim_t) {
+    let open = std::fs::read_dir("/proc/self/fd").unwrap().count() as libc::rlim_t;
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limit` is a valid rlimit for both calls to read and write.
+    unsafe {
+        assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit), 0);
+        limit.rlim_cur = open + headroom;
+        assert_eq!(libc::setrlimit(libc::RLIMIT_NOFILE, &limit), 0);
+    }
+}
+
 /// Bytes that differ from one offset to the next.
 fn pattern(len: usize) -> Vec<u8> {
     (0..len).map(|i| (i * 7 % 251) as u8).collect()
@@ -996,6 +1039,9 @@ async fn sweeping_takes_two_passes_and_spares_what_is_used() {
 
 #[tokio::test]
 async fn a_sweep_walks_wide_trees() {
+    if !alone_in_child("a_sweep_walks_wide_trees") {
+        return;
+    }
     let Some((td, backend)) = backend() else {
         return;
     };
@@ -1005,14 +1051,11 @@ async fn a_sweep_walks_wide_trees() {
         std::fs::create_dir(&dir).unwrap();
         std::fs::write(dir.join("x"), b"x").unwrap();
     }
-    let fds = || std::fs::read_dir("/proc/self/fd").map(Iterator::count).ok();
-    let before = fds();
+    // A descriptor kept per directory would run out.
+    limit_descriptors(16);
     assert_eq!(backend.sweep_streams().await.unwrap(), 0);
     assert_eq!(backend.sweep_streams().await.unwrap(), 0);
     assert!(entry(&td, "f.txt").exists());
-    if let (Some(before), Some(after)) = (before, fds()) {
-        assert!(after <= before + 8, "{before} {after}");
-    }
 }
 
 #[tokio::test]
@@ -1592,6 +1635,9 @@ async fn an_overwrite_of_a_name_swapped_after_its_lookup_truncates_nothing() {
 
 #[tokio::test]
 async fn deep_paths_resolve_with_few_descriptors() {
+    if !alone_in_child("deep_paths_resolve_with_few_descriptors") {
+        return;
+    }
     let Some((td, backend)) = backend() else {
         return;
     };
@@ -1600,8 +1646,8 @@ async fn deep_paths_resolve_with_few_descriptors() {
     let rel: std::path::PathBuf = std::iter::repeat_n("a", depth).collect();
     std::fs::create_dir_all(td.path().join(&rel)).unwrap();
     std::fs::write(td.path().join(&rel).join("f"), b"deep").unwrap();
-    // Above the usual soft limit of 1024 descriptors, one per level would
-    // run out.
+    // A descriptor kept per level would run out.
+    limit_descriptors(16);
     let path = format!("{}\\f", vec!["a"; depth].join("\\"));
     let (h, _) = backend
         .open(&p(&path), opts(OpenIntent::Open, false))
@@ -1705,6 +1751,9 @@ async fn an_unreadable_store_id_leaves_streams_in_attributes() {
 async fn a_store_id_is_made_where_renames_cannot_refuse_to_replace() {
     use std::os::unix::fs::MetadataExt as _;
 
+    if !alone_in_child("a_store_id_is_made_where_renames_cannot_refuse_to_replace") {
+        return;
+    }
     let Some((td, backend)) = backend() else {
         return;
     };
@@ -1757,6 +1806,9 @@ async fn an_entry_a_crash_left_empty_does_not_block_store_id_recovery() {
 
 #[tokio::test]
 async fn a_directory_moved_while_its_path_is_looked_up_is_not_found() {
+    if !alone_in_child("a_directory_moved_while_its_path_is_looked_up_is_not_found") {
+        return;
+    }
     let Some((td, backend)) = backend() else {
         return;
     };
