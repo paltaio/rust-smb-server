@@ -156,7 +156,11 @@ SmbServer::builder()
 //!   hold the lease breaks it when it needs what the lease caches, whether
 //!   that open belongs to another client or to the same client under
 //!   another lease key or none; attribute-only opens and opens holding the
-//!   same lease break nothing. An open or rename that needs the client to
+//!   same lease break nothing. Each named stream of a file or directory has
+//!   leases of its own, which only opens of that stream grant and break,
+//!   except that an overwrite of the file breaks their handle caching; a
+//!   lease key held on one stream fails with STATUS_INVALID_PARAMETER on
+//!   another stream or file. An open or rename that needs the client to
 //!   write back or close first waits until the client acknowledges the
 //!   break or closes, or until the break times out 35 seconds after the
 //!   server sent it; meanwhile its backend handle stays open, except for
@@ -183,22 +187,25 @@ SmbServer::builder()
 //!   session instead. Meanwhile the same user, from the same client, takes
 //!   the file back with a durable handle reconnect (DHnC, or DH2C naming
 //!   the CreateGuid of a DH2Q open) on a tree of the same share that names
-//!   the file and its lease; the backend handle, share mode, byte-range
-//!   locks and lease carry on, and later lease breaks go to the new
-//!   connection. A reconnect fails with STATUS_ACCESS_DENIED from another
-//!   user, STATUS_INVALID_PARAMETER for a DHnC naming another file, and
-//!   STATUS_INSUFFICIENT_RESOURCES past the connection's open limit; from
-//!   another client, on another share, naming another lease, lease version
-//!   or CreateGuid, a DH2C naming another file, or for a file that is not
-//!   kept, with STATUS_OBJECT_NAME_NOT_FOUND. The file stays kept after a
-//!   failed reconnect. One that comes while the connection holding the file
-//!   is still closing waits up to 5 seconds for it. A file whose rights
-//!   exceed what the user's tree on the share grants now is closed instead
-//!   of reconnected. [`Handle::close`] runs when the time runs out; at once
+//!   the file, or its named stream, and its lease; the backend handle,
+//!   share mode, byte-range locks and lease carry on, and later lease
+//!   breaks go to the new connection. A reconnect fails with
+//!   STATUS_ACCESS_DENIED from another user, STATUS_INVALID_PARAMETER for a
+//!   DHnC naming another file, and STATUS_INSUFFICIENT_RESOURCES past the
+//!   connection's open limit; from another client, on another share, naming
+//!   another lease, lease version or CreateGuid, a DH2C naming another
+//!   file, or for a file that is not kept, with
+//!   STATUS_OBJECT_NAME_NOT_FOUND. The file stays kept after a failed
+//!   reconnect. One that comes while the connection holding the file is
+//!   still closing waits up to 5 seconds for it. A file whose rights exceed
+//!   what the user's tree on the share grants now is closed instead of
+//!   reconnected. [`Handle::close`] runs when the time runs out; at once
 //!   when an open, write, size change, byte-range lock, rename or delete
 //!   through an open that does not hold the lease needs what the lease
-//!   caches, or when the lease stops caching handles; on [`ConfigHandle`]
-//!   changes that end the user's sessions or the share's trees; and at
+//!   caches, or when the lease stops caching handles; for an open of a
+//!   named stream, also when its file is renamed, or deleted while no
+//!   connected open holds the same lease; on [`ConfigHandle`] changes that
+//!   end the user's sessions or the share's trees; and at
 //!   shutdown. At most [`SmbServerBuilder::max_disconnected_opens`] files
 //!   are kept at once, and a quarter of that, rounded up, for one user;
 //!   past that, files close with their session. Anonymous sessions and
@@ -371,6 +378,7 @@ mod tests {
     mod notify;
     pub(crate) mod peer;
     mod pipes;
+    mod stream_leases;
     mod streams;
 }
 mod utils;

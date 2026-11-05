@@ -127,6 +127,13 @@ impl Share {
     /// out 35 seconds after the server sent it; a byte-range lock is refused
     /// instead until the client has written back. On by default.
     ///
+    /// Each named stream of a file or directory has leases of its own:
+    /// opens, writes, locks and leases of the file's other streams break
+    /// none of them, and a lease key held on one stream fails with
+    /// STATUS_INVALID_PARAMETER on another, as on another file. A rename or
+    /// delete of the file leaves them alone; an overwrite of the file, which
+    /// deletes its streams, breaks their handle caching without waiting.
+    ///
     /// Changes made outside the server, or through another share over the
     /// same directory, break no lease: clients keep serving the old data.
     /// Turn leases off for such a share.
@@ -143,13 +150,15 @@ impl Share {
     /// stays open for [`SmbServerBuilder::durable_handle_timeout`], or the
     /// time a version 2 request was granted, or until an open, write, size change, byte-range lock, rename or
     /// delete through an open that does not hold the lease needs what the
-    /// lease caches, which closes the file at once. The same user, from the
+    /// lease caches, which closes the file at once. A kept open of a named
+    /// stream also closes when its file is renamed, or deleted while no
+    /// connected open holds the same lease. The same user, from the
     /// same client, on this share, takes a kept file back with a durable
-    /// handle reconnect that names the file and its lease, and for a version
-    /// 2 open its CreateGuid. Another user gets STATUS_ACCESS_DENIED;
-    /// another client, share, lease or CreateGuid gets
-    /// STATUS_OBJECT_NAME_NOT_FOUND. A kept file whose rights exceed what
-    /// the user's tree on the share grants at the reconnect is closed
+    /// handle reconnect that names the file, or its named stream, and its
+    /// lease, and for a version 2 open its CreateGuid. Another user gets
+    /// STATUS_ACCESS_DENIED; another client, share, lease or CreateGuid
+    /// gets STATUS_OBJECT_NAME_NOT_FOUND. A kept file whose rights exceed
+    /// what the user's tree on the share grants at the reconnect is closed
     /// instead. Version 1 and version 2 requests are both served; the
     /// PERSISTENT flag is ignored. On by default.
     pub fn durable_handles(mut self, enabled: bool) -> Self {

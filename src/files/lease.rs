@@ -8,6 +8,7 @@ use crate::access_mask::{FILE_READ_ATTRIBUTES, FILE_WRITE_ATTRIBUTES, READ_CONTR
 use crate::proto::messages::lease::{
     LEASE_HANDLE_CACHING, LEASE_READ_CACHING, LEASE_WRITE_CACHING,
 };
+use crate::stream::StreamName;
 
 /// A lease: the client that holds it and the key the client chose.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -83,11 +84,13 @@ pub(crate) struct LeaseRequest {
     pub parent: Option<[u8; 16]>,
 }
 
-/// One lease held on a file (MS-SMB2 3.3.1.12). It exists while at least
-/// one open of the file holds it.
+/// One lease held on a stream of a file (MS-SMB2 3.3.1.12). It exists
+/// while at least one open of the stream holds it.
 #[derive(Debug)]
 pub(crate) struct FileLease {
     pub id: LeaseId,
+    /// The named stream the lease caches; `None` for the default stream.
+    pub stream: Option<StreamName>,
     /// Tells this lease from an earlier one with the same id on the file.
     pub serial: u64,
     /// Lease.LeaseState.
@@ -131,10 +134,15 @@ impl Drop for Breaking {
 }
 
 impl FileLease {
-    /// A lease created by `req` with `state` granted. A version 2 lease
-    /// starts at the request's epoch, moved by one when something is
-    /// granted.
-    pub fn new(req: &LeaseRequest, state: LeaseState, serial: u64) -> Self {
+    /// A lease on `stream` created by `req` with `state` granted. A version
+    /// 2 lease starts at the request's epoch, moved by one when something
+    /// is granted.
+    pub fn new(
+        req: &LeaseRequest,
+        stream: Option<StreamName>,
+        state: LeaseState,
+        serial: u64,
+    ) -> Self {
         let epoch = match req.version {
             LeaseVersion::V1 => 0,
             LeaseVersion::V2 if state == LeaseState::NONE => req.epoch,
@@ -142,6 +150,7 @@ impl FileLease {
         };
         Self {
             id: req.id,
+            stream,
             serial,
             state,
             epoch,
@@ -188,20 +197,22 @@ pub(crate) fn stat_only(access: u32) -> bool {
     access & !(FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE) == 0
 }
 
-/// An open of the file, as the grant rules see it.
+/// An open of the stream, as the grant rules see it.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct OpenView {
     pub lease: Option<LeaseId>,
     pub stat_only: bool,
 }
 
-/// The file a lease is requested on.
+/// The stream of a file a lease is requested on.
 pub(crate) struct FileView<'a> {
-    /// Every open, the requester's own included.
+    /// Every open of the stream, the requester's own included.
     pub opens: &'a [OpenView],
-    /// Every lease on the file.
+    /// Every lease on the stream.
     pub leases: &'a [(LeaseId, LeaseState)],
+    /// Whether the stream has a byte-range lock.
     pub has_locks: bool,
+    /// Whether the file, or the named stream, is marked for deletion.
     pub delete_pending: bool,
 }
 
@@ -449,25 +460,25 @@ mod tests {
             parent: None,
         };
         assert_eq!(
-            FileLease::new(&req(LeaseVersion::V2), LeaseState::R, 0).epoch,
+            FileLease::new(&req(LeaseVersion::V2), None, LeaseState::R, 0).epoch,
             6
         );
         assert_eq!(
-            FileLease::new(&req(LeaseVersion::V2), LeaseState::NONE, 0).epoch,
+            FileLease::new(&req(LeaseVersion::V2), None, LeaseState::NONE, 0).epoch,
             5
         );
         assert_eq!(
-            FileLease::new(&req(LeaseVersion::V1), LeaseState::R, 0).epoch,
+            FileLease::new(&req(LeaseVersion::V1), None, LeaseState::R, 0).epoch,
             0
         );
 
-        let mut lease = FileLease::new(&req(LeaseVersion::V2), LeaseState::R, 0);
+        let mut lease = FileLease::new(&req(LeaseVersion::V2), None, LeaseState::R, 0);
         lease.set_state(LeaseState::R);
         assert_eq!(lease.epoch, 6);
         lease.set_state(LeaseState::NONE);
         assert_eq!((lease.state, lease.epoch), (LeaseState::NONE, 7));
 
-        let mut lease = FileLease::new(&req(LeaseVersion::V1), LeaseState::R, 0);
+        let mut lease = FileLease::new(&req(LeaseVersion::V1), None, LeaseState::R, 0);
         lease.set_state(LeaseState::NONE);
         assert_eq!(lease.epoch, 0);
     }

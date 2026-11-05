@@ -395,8 +395,9 @@ impl CreateArgs {
             let name = utf16le_to_units(&req.name)
                 .and_then(|u| parse_create_name(&u).ok())
                 .and_then(|(path, stream)| match stream {
-                    StreamPart::Named(_) | StreamPart::NamedDirectory(_) => None,
-                    _ => Some(path),
+                    StreamPart::Named(name) => Some((path, Some(name))),
+                    StreamPart::NamedDirectory(_) => None,
+                    _ => Some((path, None)),
                 });
             return Ok(Request::Reconnect(Reconnect {
                 file_id,
@@ -484,19 +485,16 @@ impl CreateArgs {
             }
             _ => None,
         };
-        // Directories get no lease, and neither do named streams nor shares
-        // that turn leases off.
-        let lease = if req.requested_oplock_level == OplockLevel::Lease as u8
-            && share.leases
-            && named.is_none()
-        {
+        // Shares that turn leases off grant none. A named stream, of a file
+        // or a directory, gets its own lease; a directory gets none, but
+        // its request still fails on a key held elsewhere.
+        let lease = if req.requested_oplock_level == OplockLevel::Lease as u8 && share.leases {
             lease_request(
                 queries.lease.as_deref(),
                 dialect,
                 client,
                 req.file_attributes,
             )?
-            .filter(|_| !directory)
         } else {
             None
         };
@@ -817,7 +815,7 @@ async fn attempt(
                 return fail(ntstatus::STATUS_INSUFFICIENT_RESOURCES);
             };
             let lease_ref = match &args.lease {
-                Some(l) => match server.leases.acquire(l.id, &share, path) {
+                Some(l) => match server.leases.acquire(l.id, &share, path, stream) {
                     Ok(lease_ref) => Some(lease_ref),
                     Err(status) => return fail(status),
                 },
@@ -929,7 +927,7 @@ async fn attempt(
     let mut granted = None;
     let mut after_send = None;
     if let (Some(lease), Some(lease_ref)) = (args.lease, lease_ref)
-        && !info.is_directory
+        && (stream.is_some() || !info.is_directory)
     {
         match server
             .leases

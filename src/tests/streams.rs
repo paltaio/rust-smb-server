@@ -2270,68 +2270,6 @@ async fn a_stream_open_reports_the_stream_s_size_and_the_file_s_times() {
 }
 
 #[tokio::test]
-async fn stream_opens_get_no_lease_and_break_none() {
-    let files = MemFsBackend::new();
-    let state = server(&files).await;
-    let mut holder = Client::from_client(&state, Uuid::from_u128(1)).await;
-    let mut other = Client::from_client(&state, Uuid::from_u128(2)).await;
-
-    let leased = holder
-        .create(Create {
-            lease: true,
-            ..Create::new("f.txt")
-        })
-        .await
-        .unwrap();
-    assert_eq!(leased.oplock_level, 0xFF);
-    let stream = other
-        .create(Create {
-            lease: true,
-            ..Create::new("f.txt:s")
-                .access(RW | DELETE, SHARE_ALL)
-                .disposition(FILE_OPEN_IF)
-        })
-        .await
-        .unwrap();
-    assert_eq!(stream.oplock_level, 0);
-    assert!(stream.create_contexts.is_empty());
-    assert_eq!(other.write(stream.file_id, 0, b"abc").await, 0);
-    assert_eq!(other.lock(stream.file_id, 0, 3).await, 0);
-    assert_eq!(
-        other
-            .set_info(stream.file_id, END_OF_FILE, vec![0; 8])
-            .await,
-        0
-    );
-    assert_eq!(
-        other.set_info(stream.file_id, DISPOSITION, vec![1]).await,
-        0
-    );
-    other.close(stream.file_id).await;
-    assert!(holder.peer.rx.try_recv().is_none(), "no lease break");
-    holder.close(leased.file_id).await;
-
-    // Opens and locks of named streams leave a lease on the file whole.
-    let stream = other
-        .open(Create::new("f.txt:s").disposition(FILE_OPEN_IF))
-        .await;
-    assert_eq!(other.lock(stream, 0, 1).await, 0);
-    let leased = holder
-        .create(Create {
-            lease: true,
-            ..Create::new("f.txt")
-        })
-        .await
-        .unwrap();
-    let contexts = CreateContext::parse_chain(&leased.create_contexts).unwrap();
-    let lease = contexts
-        .iter()
-        .find(|c| c.name == CreateContext::NAME_RQLS)
-        .expect("a lease");
-    assert_eq!(LeaseContext::parse(&lease.data).unwrap().state, 0x7, "RWH");
-}
-
-#[tokio::test]
 async fn extended_attributes_are_refused_on_a_stream() {
     let files = MemFsBackend::new();
     let state = server(&files).await;

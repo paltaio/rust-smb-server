@@ -3,8 +3,9 @@
 //! rather than per open: sharing modes (2.1.5.1.2.1, 2.1.5.1.2.2), the
 //! delete-pending flags (2.1.5.15.3), byte-range locks (2.1.5.8) and
 //! leases (MS-SMB2 3.3.1.4). An open on a named stream is on the file's
-//! node with the stream's name; leases are granted on the default stream
-//! only, and opens of named streams break none.
+//! node with the stream's name. A lease is on one stream, and its grant
+//! and breaks count the opens, locks and leases of that stream only
+//! (MS-FSA 2.1.1.5 Stream.Oplock).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -24,7 +25,7 @@ use crate::proto::messages::change_notify::{
     FILE_ACTION_REMOVED, FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME,
 };
 use crate::server::ShareBindings;
-use crate::stream::{StreamName, stream_error};
+use crate::stream::{StreamName, same_stream, stream_error};
 
 use super::durable::DurableTable;
 use super::lease::{
@@ -241,12 +242,23 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// True if `a` and `b` name the same stream of a file.
-fn same_stream(a: Option<&StreamName>, b: Option<&StreamName>) -> bool {
-    match (a, b) {
-        (None, None) => true,
-        (Some(a), Some(b)) => a.matches(b),
-        _ => false,
+/// The leases of a file an operation breaks.
+#[derive(Debug, Clone, Copy)]
+enum On<'a> {
+    /// The leases of one stream; `None` is the default stream or the
+    /// directory.
+    Stream(Option<&'a StreamName>),
+    /// Every lease of the file.
+    File,
+}
+
+impl On<'_> {
+    /// Whether the lease on `stream` is one of these.
+    fn reaches(self, stream: Option<&StreamName>) -> bool {
+        match self {
+            On::Stream(on) => same_stream(on, stream),
+            On::File => true,
+        }
     }
 }
 
@@ -284,16 +296,23 @@ impl FileNode {
         self.state().leases.iter().any(|l| l.id == id)
     }
 
-    /// The names of the opens holding the lease `id`, or `None` when the
-    /// lease is not held on this file.
-    pub(super) fn lease_paths(&self, id: LeaseId) -> Option<Vec<SmbPath>> {
+    /// Whether the lease `id` is held on this file, on a stream other than
+    /// `stream`.
+    pub(super) fn has_lease_off(&self, id: LeaseId, stream: Option<&StreamName>) -> bool {
+        self.state()
+            .leases
+            .iter()
+            .any(|l| l.id == id && !same_stream(l.stream.as_ref(), stream))
+    }
+
+    /// The names and streams of the opens holding the lease `id`, or
+    /// `None` when the lease is not held on this file.
+    pub(super) fn lease_names(&self, id: LeaseId) -> Option<Vec<(SmbPath, Option<StreamName>)>> {
         let state = self.state();
         state.leases.iter().any(|l| l.id == id).then(|| {
             state
-                .opens
-                .iter()
-                .filter(|e| e.lease == Some(id))
-                .map(|e| e.path.clone())
+                .holders(id)
+                .map(|e| (e.path.clone(), e.stream.clone()))
                 .collect()
         })
     }
@@ -469,11 +488,29 @@ impl FileState {
         self.opens.iter().find(|e| e.id == id)
     }
 
+    /// The stream the lease `id` is on, `None` when it is not held here.
+    fn lease_stream(&self, id: LeaseId) -> Option<Option<&StreamName>> {
+        self.leases
+            .iter()
+            .find(|l| l.id == id)
+            .map(|l| l.stream.as_ref())
+    }
+
+    /// The opens holding the lease `id`: those with its key on its stream.
+    /// A CREATE with the key on another stream of the file holds nothing,
+    /// and its grant fails.
+    fn holders(&self, id: LeaseId) -> impl Iterator<Item = &OpenEntry> {
+        let stream = self.lease_stream(id);
+        self.opens.iter().filter(move |e| {
+            e.lease == Some(id) && stream.is_some_and(|s| same_stream(e.stream.as_ref(), s))
+        })
+    }
+
     /// The connections of the opens holding the lease `id`, each once, in
     /// open order: where a break of the lease may go (MS-SMB2 3.3.4.7).
     fn owners(&self, id: LeaseId) -> Vec<Weak<Outbound>> {
         let mut owners: Vec<Weak<Outbound>> = Vec::new();
-        for entry in self.opens.iter().filter(|e| e.lease == Some(id)) {
+        for entry in self.holders(id) {
             if !owners.iter().any(|o| o.ptr_eq(&entry.owner)) {
                 owners.push(entry.owner.clone());
             }
@@ -481,18 +518,23 @@ impl FileState {
         owners
     }
 
-    /// Breaks every lease but `exempt` that `trigger` conflicts with
-    /// (MS-FSA 2.1.4.12, MS-SMB2 3.3.4.7). Returns the notifications to send
-    /// once the file is unlocked, and whether the operation has to wait for
-    /// a break to complete. A lease already breaking gets no second
-    /// notification: what the server needs is lowered instead, and the
-    /// acknowledgment breaks on to it.
-    fn break_for(&mut self, trigger: Trigger, exempt: Option<LeaseId>) -> (Notices, bool) {
+    /// Breaks every lease `on` reaches but `exempt` that `trigger`
+    /// conflicts with (MS-FSA 2.1.4.12, MS-SMB2 3.3.4.7). Returns the
+    /// notifications to send once the file is unlocked, and whether the
+    /// operation has to wait for a break to complete. A lease already
+    /// breaking gets no second notification: what the server needs is
+    /// lowered instead, and the acknowledgment breaks on to it.
+    fn break_for(
+        &mut self,
+        trigger: Trigger,
+        exempt: Option<LeaseId>,
+        on: On<'_>,
+    ) -> (Notices, bool) {
         let mut notices = Notices::default();
         let mut wait = false;
         for at in 0..self.leases.len() {
             let lease = &mut self.leases[at];
-            if Some(lease.id) == exempt {
+            if Some(lease.id) == exempt || !on.reaches(lease.stream.as_ref()) {
                 continue;
             }
             let Some(to) = break_to(trigger, lease.state) else {
@@ -557,7 +599,7 @@ impl FileState {
 
     /// Whether the lease `id` is held, and only by opens kept for reconnect.
     fn held_only_detached(&self, id: LeaseId) -> bool {
-        let mut holders = self.opens.iter().filter(|e| e.lease == Some(id)).peekable();
+        let mut holders = self.holders(id).peekable();
         holders.peek().is_some() && holders.all(|e| e.durable.as_ref().is_some_and(|d| d.detached))
     }
 
@@ -587,7 +629,12 @@ impl FileState {
     /// before.
     fn doom_detached(&mut self, id: LeaseId, pick: impl Fn(u64) -> bool) -> Vec<DurableMark> {
         let mut doomed = Vec::new();
-        for entry in self.opens.iter_mut().filter(|e| e.lease == Some(id)) {
+        let Some(stream) = self.lease_stream(id).map(|s| s.cloned()) else {
+            return doomed;
+        };
+        let holds =
+            |e: &OpenEntry| e.lease == Some(id) && same_stream(e.stream.as_ref(), stream.as_ref());
+        for entry in self.opens.iter_mut().filter(|e| holds(e)) {
             if !pick(entry.id) {
                 continue;
             }
@@ -599,19 +646,40 @@ impl FileState {
         doomed
     }
 
-    /// Whether a lease other than `exempt` still caches handles while a
-    /// break of it is in progress.
-    fn handle_break_pending(&self, exempt: Option<LeaseId>) -> bool {
+    /// Marks the opens kept for reconnect under the leases of the file's
+    /// named streams to be closed, with `alone` only those whose lease no
+    /// connected open holds, and returns the ones not marked before.
+    fn doom_kept_on_streams(&mut self, alone: bool) -> Vec<DurableMark> {
+        let ids: Vec<LeaseId> = self
+            .leases
+            .iter()
+            .filter(|l| l.stream.is_some() && (!alone || self.held_only_detached(l.id)))
+            .map(|l| l.id)
+            .collect();
+        ids.into_iter()
+            .flat_map(|id| self.doom_detached(id, |_| true))
+            .collect()
+    }
+
+    /// Whether a lease `on` reaches other than `exempt` still caches
+    /// handles while a break of it is in progress.
+    fn handle_break_pending(&self, exempt: Option<LeaseId>, on: On<'_>) -> bool {
         self.leases.iter().any(|l| {
-            Some(l.id) != exempt && l.breaking.is_some() && l.state.contains(LeaseState::H)
+            Some(l.id) != exempt
+                && on.reaches(l.stream.as_ref())
+                && l.breaking.is_some()
+                && l.state.contains(LeaseState::H)
         })
     }
 
-    /// Whether a lease other than `exempt` still caches writes while a
-    /// break of it is in progress.
-    fn write_break_pending(&self, exempt: Option<LeaseId>) -> bool {
+    /// Whether a lease `on` reaches other than `exempt` still caches
+    /// writes while a break of it is in progress.
+    fn write_break_pending(&self, exempt: Option<LeaseId>, on: On<'_>) -> bool {
         self.leases.iter().any(|l| {
-            Some(l.id) != exempt && l.breaking.is_some() && l.state.contains(LeaseState::W)
+            Some(l.id) != exempt
+                && on.reaches(l.stream.as_ref())
+                && l.breaking.is_some()
+                && l.state.contains(LeaseState::W)
         })
     }
 
@@ -786,11 +854,11 @@ impl FileTable {
                 continue;
             }
             let waits = if start {
-                let (notices, waits) = state.break_for(Trigger::Handle, exempt);
+                let (notices, waits) = state.break_for(Trigger::Handle, exempt, On::File);
                 all.push(notices);
                 waits
             } else {
-                state.handle_break_pending(exempt)
+                state.handle_break_pending(exempt, On::File)
             };
             if waits && wait.is_none() {
                 wait = Some(state.wait());
@@ -835,11 +903,11 @@ impl FileTable {
                 continue;
             }
             let waits = if start {
-                let (notices, waits) = state.break_for(Trigger::Handle, None);
+                let (notices, waits) = state.break_for(Trigger::Handle, None, On::File);
                 all.push(notices);
                 waits
             } else {
-                state.handle_break_pending(None)
+                state.handle_break_pending(None, On::File)
             };
             if waits && wait.is_none() {
                 wait = Some(state.wait());
@@ -960,13 +1028,14 @@ impl FileRef {
             let mut wait = None;
             let mut notices = Notices::default();
             // MS-FSA 2.1.5.1.2: a violation breaks the handle caching of
-            // the stream being opened, and no lease is on a named stream.
-            if status == ntstatus::STATUS_SHARING_VIOLATION && req.stream.is_none() {
+            // the stream being opened.
+            let on = On::Stream(req.stream.as_ref());
+            if status == ntstatus::STATUS_SHARING_VIOLATION {
                 if req.break_handles {
-                    let (sent, waits) = state.break_for(Trigger::SharingViolation, req.lease);
+                    let (sent, waits) = state.break_for(Trigger::SharingViolation, req.lease, on);
                     notices = sent;
                     wait = waits.then(|| state.wait());
-                } else if state.handle_break_pending(req.lease) {
+                } else if state.handle_break_pending(req.lease, on) {
                     wait = Some(state.wait());
                 }
             }
@@ -976,25 +1045,25 @@ impl FileRef {
             return Err(Refused { status, wait });
         }
         let id = table.next_open.fetch_add(1, Ordering::Relaxed);
-        let named = req.stream.is_some();
         state.opens.push(OpenEntry {
             id,
             sharing: req.sharing,
             path: path.clone(),
-            stream: req.stream,
+            stream: req.stream.clone(),
             supersedes: req.supersede,
             lease: req.lease,
             owner: req.owner,
             waiting: false,
             durable: None,
         });
-        let (notices, wait) = if stat_only(req.sharing.access) || named {
+        let (notices, wait) = if stat_only(req.sharing.access) {
             (Notices::default(), None)
         } else {
             let trigger = Trigger::Open {
                 overwrite: req.overwrite,
             };
-            let (notices, waits) = state.break_for(trigger, req.lease);
+            let on = On::Stream(req.stream.as_ref());
+            let (notices, waits) = state.break_for(trigger, req.lease, on);
             if waits && let Some(entry) = state.opens.last_mut() {
                 entry.waiting = true;
             }
@@ -1025,7 +1094,7 @@ impl FileRef {
         };
         let (lease, sharing, stream) = (entry.lease, entry.sharing, entry.stream.clone());
         let supersede = entry.supersedes;
-        if state.write_break_pending(lease) {
+        if state.write_break_pending(lease, On::Stream(stream.as_ref())) {
             return Ok(Some(state.wait()));
         }
         state.admit(sharing, stream.as_ref(), supersede, Some(self.id))?;
@@ -1059,28 +1128,39 @@ impl FileRef {
     ) -> (Granted, GrantGuard) {
         let mut state = self.node.state();
         let mut sender = Weak::new();
+        let mut stream = None;
         if let Some(entry) = state.opens.iter_mut().find(|e| e.id == self.id) {
             entry.lease = Some(req.id);
             sender = entry.owner.clone();
+            stream = entry.stream.clone();
         }
-        // Leases cache the default stream: opens and locks of named streams
-        // take no part.
+        // The lease caches the stream this open is on: opens, locks and
+        // leases of the file's other streams take no part.
+        let here = |s: &Option<StreamName>| same_stream(s.as_ref(), stream.as_ref());
         let opens: Vec<OpenView> = state
             .opens
             .iter()
-            .filter(|e| e.stream.is_none())
+            .filter(|e| here(&e.stream))
             .map(|e| OpenView {
                 lease: e.lease,
                 stat_only: stat_only(e.sharing.access),
             })
             .collect();
-        let leases: Vec<(LeaseId, LeaseState)> =
-            state.leases.iter().map(|l| (l.id, l.state)).collect();
+        let leases: Vec<(LeaseId, LeaseState)> = state
+            .leases
+            .iter()
+            .filter(|l| here(&l.stream))
+            .map(|l| (l.id, l.state))
+            .collect();
+        let deleted = match &stream {
+            Some(stream) => state.stream_deleted(stream),
+            None => false,
+        };
         let file = FileView {
             opens: &opens,
             leases: &leases,
-            has_locks: state.locks.iter().any(|l| l.stream.is_none()),
-            delete_pending: state.delete_pending.is_some(),
+            has_locks: state.locks.iter().any(|l| here(&l.stream)),
+            delete_pending: state.delete_pending.is_some() || deleted,
         };
         let existing = state.leases.iter().position(|l| l.id == req.id);
         let current = existing.map(|at| Current {
@@ -1096,7 +1176,9 @@ impl FileRef {
             }
             None => {
                 let serial = NEXT_LEASE_SERIAL.fetch_add(1, Ordering::Relaxed);
-                state.leases.push(FileLease::new(req, granted, serial));
+                state
+                    .leases
+                    .push(FileLease::new(req, stream, granted, serial));
                 state.leases.last_mut().expect("just pushed")
             }
         };
@@ -1222,20 +1304,31 @@ impl FileRef {
         Some((granted, guard))
     }
 
-    /// Breaks the leases on the file that `trigger` through this open
-    /// conflicts with: every lease but the one this open holds, whichever
-    /// client holds it. An open on a named stream breaks none.
+    /// Breaks the leases on the stream of this open that `trigger` through
+    /// it conflicts with: every lease of the stream but the one this open
+    /// holds, whichever client holds it.
     pub(crate) fn break_leases(&self, trigger: Trigger) {
         let notices = {
             let mut state = self.node.state();
             match state.entry(self.id) {
-                Some(entry) if entry.stream.is_none() => {
-                    let exempt = entry.lease;
-                    state.break_for(trigger, exempt).0
+                Some(entry) => {
+                    let (exempt, stream) = (entry.lease, entry.stream.clone());
+                    state
+                        .break_for(trigger, exempt, On::Stream(stream.as_ref()))
+                        .0
                 }
-                _ => Notices::default(),
+                None => Notices::default(),
             }
         };
+        drop(notices);
+    }
+
+    /// Closes the opens kept for reconnect on the file's named streams, as
+    /// a rename of the file does: their names moved, so no reconnect names
+    /// them. Connected opens of the streams keep their leases.
+    pub(crate) fn close_kept_stream_opens(&self) {
+        let mut notices = Notices::default();
+        notices.close(self.node.state().doom_kept_on_streams(false));
         drop(notices);
     }
 
@@ -1284,6 +1377,7 @@ impl FileRef {
     }
 
     /// Whether the file is delete-pending (MS-FSA Link.IsDeleted).
+    #[cfg(test)]
     pub(crate) fn delete_pending(&self) -> bool {
         self.node.state().delete_pending.is_some()
     }
@@ -1345,13 +1439,16 @@ impl FileRef {
     /// 2.1.5.15.12.1). A named stream renamed to the default stream leaves
     /// its mark behind: the file is not deleted for it.
     ///
-    /// An open moved off the default stream is no longer durable, and the
-    /// lease it holds, which caches the default stream, breaks to NONE:
-    /// the file it cached is empty now.
+    /// The leases of the moved opens move with them. An open moved off
+    /// the default stream is no longer durable, and its lease breaks to
+    /// NONE: the file it cached is empty now. A named stream renamed to
+    /// another name breaks the handle caching of the leases on it, all but
+    /// this open's (MS-FSA 2.1.5.15.12).
     pub(crate) fn rename_stream(&self, from: Option<&StreamName>, to: Option<&StreamName>) {
         let notices = {
             let mut state = self.node.state();
             let state = &mut *state;
+            let own = state.entry(self.id).and_then(|e| e.lease);
             let moved = |stream: &Option<StreamName>| same_stream(stream.as_ref(), from);
             let mut leases = Vec::new();
             for entry in state.opens.iter_mut().filter(|e| moved(&e.stream)) {
@@ -1363,6 +1460,9 @@ impl FileRef {
             }
             for lock in state.locks.iter_mut().filter(|l| moved(&l.stream)) {
                 lock.stream = to.cloned();
+            }
+            for lease in state.leases.iter_mut().filter(|l| leases.contains(&l.id)) {
+                lease.stream = to.cloned();
             }
             if let Some(from) = from {
                 let marked = state.stream_deleted(from);
@@ -1382,6 +1482,8 @@ impl FileRef {
                         None => state.start_break(at, LeaseState::NONE, &mut notices),
                     }
                 }
+            } else if to.is_some() {
+                notices = state.break_for(Trigger::Handle, own, On::Stream(to)).0;
             }
             notices
         };
@@ -1394,9 +1496,12 @@ impl FileRef {
     /// last open closes. A named stream is removed when the last open on it
     /// closes.
     ///
-    /// Marking the file breaks the handle caching of its leases, all but
-    /// this open's, under the same lock, so no lease caches handles to a
-    /// delete-pending file (MS-FSA 2.1.4.12, 2.1.5.18).
+    /// Marking the file or the stream breaks the handle caching of the
+    /// leases on the stream this open is on, all but this open's, under the
+    /// same lock, so no lease caches handles to it once it is marked
+    /// (MS-FSA 2.1.4.12, 2.1.5.18). The leases on the file's named streams
+    /// keep theirs when the file is marked; opens kept for reconnect under
+    /// one no connected open holds are closed, so they do not keep the file.
     pub(crate) fn set_delete_pending(&self, delete: bool) {
         let notices = {
             let mut state = self.node.state();
@@ -1408,13 +1513,20 @@ impl FileRef {
                 Some(stream) => {
                     state.deleted_streams.retain(|s| !s.matches(&stream));
                     if delete {
+                        let notices = state
+                            .break_for(Trigger::Handle, lease, On::Stream(Some(&stream)))
+                            .0;
                         state.deleted_streams.push(stream);
+                        notices
+                    } else {
+                        Notices::default()
                     }
-                    Notices::default()
                 }
                 None if delete => {
                     state.delete_pending = Some(path);
-                    state.break_for(Trigger::Handle, lease).0
+                    let mut notices = state.break_for(Trigger::Handle, lease, On::Stream(None)).0;
+                    notices.close(state.doom_kept_on_streams(true));
+                    notices
                 }
                 None => {
                     state.delete_pending = None;
@@ -1425,15 +1537,21 @@ impl FileRef {
         drop(notices);
     }
 
-    /// Marks the named streams `streams` of the file for deletion, as an
-    /// overwrite of the file through this open does on Windows: one an open
-    /// is on goes when the last open on it closes, and keeps serving the
-    /// opens already on it meanwhile. Returns the streams no open is on,
-    /// for [`FileRef::remove_streams`].
+    /// Marks the named streams `streams` of the file for deletion after an
+    /// overwrite of the file through this open: one an open is on goes when
+    /// the last open on it closes, and keeps serving the opens already on it
+    /// meanwhile, whose leases give up handle caching.
+    /// Returns the streams no open is on, for [`FileRef::remove_streams`].
     pub(crate) fn delete_streams(&self, streams: Vec<StreamName>) -> Vec<StreamName> {
         let mut state = self.node.state();
         let mut unopened = Vec::new();
+        let mut notices = Vec::new();
         for stream in streams {
+            notices.push(
+                state
+                    .break_for(Trigger::Handle, None, On::Stream(Some(&stream)))
+                    .0,
+            );
             if !state.stream_deleted(&stream) {
                 state.deleted_streams.push(stream.clone());
             }
@@ -1441,6 +1559,8 @@ impl FileRef {
                 unopened.push(stream);
             }
         }
+        drop(state);
+        drop(notices);
         unopened
     }
 
@@ -1495,34 +1615,22 @@ impl FileRef {
         if state.range_conflicts(self.id, stream.as_ref(), offset, length, exclusive, true) {
             return Err(ntstatus::STATUS_LOCK_NOT_GRANTED);
         }
-        // A lock on a named stream leaves the leases, which cache the
-        // default stream, alone.
-        if stream.is_some() {
-            state.locks.push(RangeLock {
-                owner: self.id,
-                stream,
-                offset,
-                length,
-                exclusive,
-            });
-            return Ok(());
-        }
-        // MS-FSA 2.1.5.8: a lock breaks the leases on the file, all but the
-        // one this open holds, wherever the range lies. Under the same lock
-        // no lease can be granted between the two. While another lease
+        // MS-FSA 2.1.5.8: a lock breaks the leases on the stream, all but
+        // the one this open holds, wherever the range lies. Under the same
+        // lock no lease can be granted between the two. While another lease
         // still caches writes, which only an attribute-only open allows,
         // the lock is refused: a lock taken now would keep that client from
         // writing back. Lock requests do not wait, so the client retries.
         let exempt = state.entry(self.id).and_then(|e| e.lease);
-        let caching_writes = state
-            .leases
-            .iter()
-            .any(|l| Some(l.id) != exempt && l.state.contains(LeaseState::W));
-        let notices = state.break_for(Trigger::Write, exempt).0;
+        let on = On::Stream(stream.as_ref());
+        let caching_writes = state.leases.iter().any(|l| {
+            Some(l.id) != exempt && on.reaches(l.stream.as_ref()) && l.state.contains(LeaseState::W)
+        });
+        let notices = state.break_for(Trigger::Write, exempt, on).0;
         if !caching_writes {
             state.locks.push(RangeLock {
                 owner: self.id,
-                stream: None,
+                stream,
                 offset,
                 length,
                 exclusive,
@@ -1593,6 +1701,19 @@ impl FileRef {
     }
 
     fn detach(&mut self, delete_on_close: bool) -> Option<PendingDelete> {
+        let mut doomed = Notices::default();
+        let pending = self.detach_entry(delete_on_close, &mut doomed);
+        drop(doomed);
+        pending
+    }
+
+    /// [`FileRef::detach`] under the table's locks; the kept opens it
+    /// dooms go to `doomed`, to close once the locks are released.
+    fn detach_entry(
+        &mut self,
+        delete_on_close: bool,
+        doomed: &mut Notices,
+    ) -> Option<PendingDelete> {
         if std::mem::replace(&mut self.released, true) {
             return None;
         }
@@ -1607,7 +1728,7 @@ impl FileRef {
         // MS-SMB2 3.3.4.17: a lease ends with its last open, without a
         // notification; a break in progress completes with it.
         if let Some(id) = entry.as_ref().and_then(|e| e.lease)
-            && !state.opens.iter().any(|e| e.lease == Some(id))
+            && state.holders(id).next().is_none()
         {
             state.leases.retain(|l| l.id != id);
         }
@@ -1621,7 +1742,10 @@ impl FileRef {
                     state.deleted_streams.push(stream.clone());
                 }
                 Some(_) => {}
-                None => state.delete_pending = Some(entry.path.clone()),
+                None => {
+                    state.delete_pending = Some(entry.path.clone());
+                    doomed.close(state.doom_kept_on_streams(true));
+                }
             }
         }
         let is_directory = state.is_directory;

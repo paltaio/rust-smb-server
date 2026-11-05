@@ -27,6 +27,7 @@ use crate::path::SmbPath;
 use crate::proto::header::Smb2Header;
 use crate::proto::messages::FileId;
 use crate::server::ServerState;
+use crate::stream::{StreamName, data_stream_info};
 
 /// How long a reconnect waits for the connection that still holds the
 /// open to finish closing.
@@ -38,9 +39,9 @@ pub(super) struct Reconnect {
     pub file_id: FileId,
     /// The CreateGuid of a DH2C; `None` for a DHnC.
     pub create_guid: Option<[u8; 16]>,
-    /// The name in the request; `None` when it is not a valid name, which
-    /// matches no open.
-    pub name: Option<SmbPath>,
+    /// The name in the request, and the named stream it ends in; `None`
+    /// when it is not a valid name, which matches no open.
+    pub name: Option<(SmbPath, Option<StreamName>)>,
     /// The configured name of the session's user; `None` for anonymous.
     pub owner: Option<String>,
     /// Connection.ClientGuid.
@@ -139,7 +140,8 @@ async fn attempt(
         client: r.client,
         lease: r.lease.map(|l| (l.id, l.version)),
         create_guid: r.create_guid,
-        name: r.name.as_ref(),
+        name: r.name.as_ref().map(|(path, _)| path),
+        stream: r.name.as_ref().and_then(|(_, stream)| stream.as_ref()),
     };
     let open = server.durable.claim(id, &claim)?;
     let tree = Tree {
@@ -208,6 +210,11 @@ async fn take_back(
         drop(open);
         server.durable.release_claim(id, open_arc).await;
         return Err(not_found);
+    };
+    let info = if open.on_stream {
+        data_stream_info(info)
+    } else {
+        info
     };
     let owner = Arc::downgrade(&conn.outbound);
     let Some((granted, guard)) = open.file.as_ref().and_then(|f| f.reattach(owner)) else {

@@ -22,6 +22,7 @@ use crate::conn::state::{Connection, Open};
 use crate::ntstatus;
 use crate::path::{SmbPath, same_path};
 use crate::server::ShareBindings;
+use crate::stream::{StreamName, same_stream};
 use crate::utils::fill_random;
 
 use super::close_open;
@@ -198,6 +199,8 @@ pub(crate) struct Claim<'a> {
     pub create_guid: Option<[u8; 16]>,
     /// The name in the request; `None` when it is not a valid name.
     pub name: Option<&'a SmbPath>,
+    /// The named stream the request's name ends in, if any.
+    pub stream: Option<&'a StreamName>,
 }
 
 /// Why [`DurableTable::claim`] gave no open.
@@ -580,10 +583,12 @@ impl DurableTable {
         Ok(open)
     }
 
-    /// Whether the kept open `open` has the name `claim` gives, which a
-    /// delete-on-close or delete-pending file always has (MS-SMB2
-    /// 3.3.5.9.7 "Open.Lease.FileDeleteOnClose"). An open that is still
-    /// being put in the table gives a wait, which ends once it is.
+    /// Whether the kept open `open` has the name and stream `claim` gives,
+    /// which an open that deletes its stream on close, or whose stream is
+    /// marked for deletion, always has (MS-SMB2 3.3.5.9.7
+    /// "Open.Lease.FileDeleteOnClose"); the stream of an open of the default
+    /// stream is the file. An open that is still being put in the table
+    /// gives a wait, which ends once it is.
     fn name_matches(&self, open: &Arc<RwLock<Open>>, claim: &Claim<'_>) -> Result<bool, Unclaimed> {
         let Ok(open) = open.try_read() else {
             return Err(Unclaimed::Wait(self.changed.subscribe()));
@@ -591,10 +596,11 @@ impl DurableTable {
         let case_sensitive = claim.share.backend.capabilities().case_sensitive;
         Ok(open.file.as_ref().is_some_and(|f| {
             open.delete_on_close
-                || f.delete_pending()
-                || claim
-                    .name
-                    .is_some_and(|name| same_path(&f.path(), name, case_sensitive))
+                || f.stream_delete_pending()
+                || claim.name.is_some_and(|name| {
+                    same_path(&f.path(), name, case_sensitive)
+                        && same_stream(f.stream().as_ref(), claim.stream)
+                })
         }))
     }
 
@@ -792,7 +798,10 @@ mod tests {
             let (handle, _) = self.share.backend.open(&path, opts).await.unwrap();
             let mut info = FileInfo::new("");
             info.file_index = u64::from(n);
-            let lease_ref = self.leases.acquire(lease(n), &self.share, &path).unwrap();
+            let lease_ref = self
+                .leases
+                .acquire(lease(n), &self.share, &path, None)
+                .unwrap();
             let req = OpenRequest {
                 sharing: Sharing {
                     access: FILE_READ_DATA | FILE_WRITE_DATA,
@@ -995,6 +1004,7 @@ mod tests {
             lease,
             create_guid: None,
             name: Some(&A),
+            stream: None,
         }
     }
 

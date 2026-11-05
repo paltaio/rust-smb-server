@@ -21,6 +21,7 @@ use crate::path::{SmbPath, same_path};
 use crate::proto::header::{Command, HeaderTail, SMB2_FLAGS_SERVER_TO_REDIR, Smb2Header};
 use crate::proto::messages::LeaseBreakNotification;
 use crate::server::ShareBindings;
+use crate::stream::{StreamName, same_stream};
 
 use super::lease::{FileLease, Granted, LeaseId, LeaseRequest, LeaseState, LeaseVersion};
 use super::table::{DurableMark, FileNode, FileRef};
@@ -66,14 +67,16 @@ impl LeaseTable {
         self.bindings.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Takes a use of the lease `id` for a CREATE of `path` on `share`.
-    /// Fails with STATUS_INVALID_PARAMETER when the lease is held on
-    /// another file, by name or by share (MS-SMB2 3.3.5.9.8, 3.3.5.9.11).
+    /// Takes a use of the lease `id` for a CREATE of `path`, or its named
+    /// stream `stream`, on `share`. Fails with STATUS_INVALID_PARAMETER
+    /// when the lease is held on another file or stream, by name or by
+    /// share (MS-SMB2 3.3.5.9.8, 3.3.5.9.11).
     pub(crate) fn acquire(
         self: &Arc<Self>,
         id: LeaseId,
         share: &Arc<ShareBindings>,
         path: &SmbPath,
+        stream: Option<&StreamName>,
     ) -> Result<LeaseRef, u32> {
         let mut bindings = self.bindings();
         let binding = bindings.entry(id).or_insert_with(|| Binding {
@@ -81,13 +84,16 @@ impl LeaseTable {
             node: None,
             refs: 0,
         });
-        if let Some(paths) = binding.node.as_ref().and_then(|n| n.lease_paths(id)) {
+        if let Some(names) = binding.node.as_ref().and_then(|n| n.lease_names(id)) {
             let case_sensitive = share.backend.capabilities().case_sensitive;
             let same_share = binding
                 .share
                 .upgrade()
                 .is_some_and(|s| Arc::ptr_eq(&s, share));
-            if !same_share || !paths.iter().any(|p| same_path(p, path, case_sensitive)) {
+            let same_name = |(p, s): &(SmbPath, Option<StreamName>)| {
+                same_path(p, path, case_sensitive) && same_stream(s.as_ref(), stream)
+            };
+            if !same_share || !names.iter().any(same_name) {
                 return Err(ntstatus::STATUS_INVALID_PARAMETER);
             }
         }
@@ -98,9 +104,10 @@ impl LeaseTable {
         })
     }
 
-    /// Binds `lease` to the file `file` opened and grants the state `req`
-    /// asks for, within `grantable`. The open keeps `lease`. Fails with
-    /// STATUS_INVALID_PARAMETER when the lease is held on another file.
+    /// Binds `lease` to the stream of the file `file` opened and grants the
+    /// state `req` asks for, within `grantable`. The open keeps `lease`.
+    /// Fails with STATUS_INVALID_PARAMETER when the lease is held on
+    /// another file or another stream of it.
     pub(crate) fn grant(
         &self,
         lease: LeaseRef,
@@ -113,10 +120,15 @@ impl LeaseTable {
             let binding = bindings
                 .get_mut(&req.id)
                 .expect("a LeaseRef keeps its binding");
-            match &binding.node {
-                Some(node) if !file.is_on(node) && node.has_lease(req.id) => {
-                    Err(ntstatus::STATUS_INVALID_PARAMETER)
+            let elsewhere = |node: &Arc<FileNode>| {
+                if file.is_on(node) {
+                    node.has_lease_off(req.id, file.stream().as_ref())
+                } else {
+                    node.has_lease(req.id)
                 }
+            };
+            match &binding.node {
+                Some(node) if elsewhere(node) => Err(ntstatus::STATUS_INVALID_PARAMETER),
                 _ => {
                     binding.node = Some(Arc::clone(file.node()));
                     binding.share = Arc::downgrade(file.share());
@@ -483,7 +495,7 @@ mod tests {
         owner: &Arc<Outbound>,
         n: u8,
     ) -> Result<(FileRef, Granted, GrantGuard), u32> {
-        let lease_ref = table.acquire(id(n), share, &p(name))?;
+        let lease_ref = table.acquire(id(n), share, &p(name), None)?;
         let mut file = open(share, index, name, owner, Some(id(n)));
         let (granted, guard) = table.grant(lease_ref, &mut file, &req(n), LeaseState::R)?;
         Ok((file, granted, guard))
@@ -497,7 +509,7 @@ mod tests {
         owner: &Arc<Outbound>,
         n: u8,
     ) -> FileRef {
-        let lease_ref = table.acquire(id(n), share, &p("f")).unwrap();
+        let lease_ref = table.acquire(id(n), share, &p("f"), None).unwrap();
         let mut info = FileInfo::new("");
         info.file_index = 7;
         let req = OpenRequest {
@@ -642,7 +654,7 @@ mod tests {
         let table = Arc::new(LeaseTable::default());
         let s = share();
         let (holder, mut rx) = connection();
-        let lease_ref = table.acquire(id(1), &s, &p("f")).unwrap();
+        let lease_ref = table.acquire(id(1), &s, &p("f"), None).unwrap();
         let mut held = open(&s, 7, "f", &holder, Some(id(1)));
         let (granted, _) = table
             .grant(lease_ref, &mut held, &req(1), LeaseState::RWH)
@@ -673,7 +685,7 @@ mod tests {
         assert_eq!(ack(&table, id(1), 3), Ok(LeaseState::RH));
         // The waiting open keeps the holder from taking write caching back
         // before it has run its own checks.
-        let lease_ref = table.acquire(id(1), &s, &p("f")).unwrap();
+        let lease_ref = table.acquire(id(1), &s, &p("f"), None).unwrap();
         let mut early = open(&s, 7, "f", &holder, Some(id(1)));
         let (granted, _) = table
             .grant(lease_ref, &mut early, &req(1), LeaseState::RWH)
@@ -681,7 +693,7 @@ mod tests {
         assert_eq!(granted.state, LeaseState::RH);
         assert!(matches!(other.end_wait(), Ok(None)));
         // The other open keeps the holder from taking write caching back.
-        let lease_ref = table.acquire(id(1), &s, &p("f")).unwrap();
+        let lease_ref = table.acquire(id(1), &s, &p("f"), None).unwrap();
         let mut again = open(&s, 7, "f", &holder, Some(id(1)));
         let (granted, _) = table
             .grant(lease_ref, &mut again, &req(1), LeaseState::RWH)
@@ -695,7 +707,7 @@ mod tests {
         let s = share();
         let (owner, _rx) = connection();
         // The file turns delete-pending between the open and its grant.
-        let lease_ref = table.acquire(id(1), &s, &p("f")).unwrap();
+        let lease_ref = table.acquire(id(1), &s, &p("f"), None).unwrap();
         let mut file = open(&s, 7, "f", &owner, Some(id(1)));
         open(&s, 7, "f", &owner, None).set_delete_pending(true);
         let (granted, _) = table
@@ -761,8 +773,8 @@ mod tests {
         let (owner, _rx) = connection();
         let (_a, _, _) = leased(&table, &s, 7, "f", &owner, 1).unwrap();
         let invalid = Some(ntstatus::STATUS_INVALID_PARAMETER);
-        assert_eq!(table.acquire(id(1), &s, &p("g")).err(), invalid);
-        assert_eq!(table.acquire(id(1), &share(), &p("f")).err(), invalid);
+        assert_eq!(table.acquire(id(1), &s, &p("g"), None).err(), invalid);
+        assert_eq!(table.acquire(id(1), &share(), &p("f"), None).err(), invalid);
         assert_eq!(table.bindings()[&id(1)].refs, 1);
     }
 
@@ -771,8 +783,8 @@ mod tests {
         let table = Arc::new(LeaseTable::default());
         let s = share();
         let (owner, _rx) = connection();
-        let first = table.acquire(id(1), &s, &p("f")).unwrap();
-        let second = table.acquire(id(1), &s, &p("g")).unwrap();
+        let first = table.acquire(id(1), &s, &p("f"), None).unwrap();
+        let second = table.acquire(id(1), &s, &p("g"), None).unwrap();
         let mut f = open(&s, 7, "f", &owner, Some(id(1)));
         let mut g = open(&s, 8, "g", &owner, Some(id(1)));
         let (_, guard) = table.grant(first, &mut f, &req(1), LeaseState::R).unwrap();
@@ -790,7 +802,7 @@ mod tests {
         let table = Arc::new(LeaseTable::default());
         let s = share();
         let (owner, _rx) = connection();
-        let held = table.acquire(id(1), &s, &p("f")).unwrap();
+        let held = table.acquire(id(1), &s, &p("f"), None).unwrap();
         let (f, _, _) = leased(&table, &s, 7, "f", &owner, 1).unwrap();
         drop(f);
         // `held` keeps the binding alive, but the lease has no open left.
@@ -886,7 +898,7 @@ mod tests {
         n: u8,
         bits: u32,
     ) -> FileRef {
-        let lease_ref = table.acquire(id(n), share, &p(name)).unwrap();
+        let lease_ref = table.acquire(id(n), share, &p(name), None).unwrap();
         let mut file = open(share, index, name, owner, Some(id(n)));
         let (granted, _) = table
             .grant(lease_ref, &mut file, &req_state(n, bits), LeaseState::RWH)

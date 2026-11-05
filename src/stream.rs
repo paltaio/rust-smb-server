@@ -32,6 +32,16 @@ impl StreamName {
     }
 }
 
+/// True if `a` and `b` name the same stream of a file, `None` being the
+/// default stream.
+pub(crate) fn same_stream(a: Option<&StreamName>, b: Option<&StreamName>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a.matches(b),
+        _ => false,
+    }
+}
+
 /// A named stream of a file, as [`Handle::streams`] lists it. Built with
 /// [`StreamInfo::new`]; every field is public.
 #[derive(Debug, Clone)]

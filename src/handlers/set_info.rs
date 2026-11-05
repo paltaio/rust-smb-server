@@ -408,7 +408,8 @@ fn set_info_ok() -> HandlerResponse {
 /// directory open below it is not renamed, and neither is an open target
 /// replaced; when they are open only because clients cache their handles,
 /// the first attempt breaks that caching and waits. The leases on the
-/// renamed file give up handle caching.
+/// renamed file give up handle caching; those on its named streams keep
+/// theirs, and opens of its streams kept for reconnect are closed.
 async fn rename_attempt(
     conn: &Arc<Connection>,
     hdr: &Smb2Header,
@@ -499,6 +500,9 @@ async fn rename_attempt(
     let result = match share.backend.rename(&from, to, rename.replace).await {
         Ok(()) => {
             share.files.rename_paths(&from, to, case_sensitive);
+            if let Some(file) = open_arc.read().await.file.as_ref() {
+                file.close_kept_stream_opens();
+            }
             if is_directory {
                 share.watches.rename(&from, to);
             }
