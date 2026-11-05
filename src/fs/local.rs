@@ -1991,18 +1991,6 @@ impl ShareBackend for LocalFsBackend {
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
-    async fn peek_stream(
-        &self,
-        path: &SmbPath,
-        stream: &StreamName,
-        max: u32,
-    ) -> SmbResult<Option<(u64, bytes::Bytes)>> {
-        self.stream_place()?
-            .peek_stream(to_rel_path(path), stream.clone(), max)
-            .await
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     async fn rename_stream(
         &self,
         path: &SmbPath,
@@ -2550,6 +2538,39 @@ impl Handle for LocalHandle {
         }
         .map_err(join_to_io)
         .map_err(io_to_smb)?
+    }
+
+    /// Each entry is opened from this directory, a symlink followed only
+    /// to a target below it, and its streams are read on that descriptor.
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    async fn peek_streams(
+        &self,
+        entries: &[(&str, &[(StreamName, u32)])],
+    ) -> SmbResult<Vec<Vec<Option<(u64, Bytes)>>>> {
+        let LocalHandle::Dir { dir_handle, .. } = self else {
+            return Err(SmbError::NotADirectory);
+        };
+        let dir = Arc::clone(dir_handle);
+        let entries: Vec<_> = entries
+            .iter()
+            .map(|&(name, streams)| (name.to_owned(), streams.to_vec()))
+            .collect();
+        #[cfg(target_os = "linux")]
+        let peek = {
+            let (open, store) = self
+                .open_streams()
+                .zip(self.store())
+                .ok_or(SmbError::NotSupported)?;
+            move || super::streams::peek_entries(&dir, &open, &store, &entries)
+        };
+        #[cfg(target_os = "macos")]
+        let peek = move || super::macos_streams::peek_entries(&dir, &entries);
+        #[cfg(windows)]
+        let peek = move || super::windows_streams::peek_entries(&dir, &entries);
+        spawn_blocking(peek)
+            .await
+            .map_err(join_to_io)
+            .map_err(io_to_smb)
     }
 }
 

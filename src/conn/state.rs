@@ -541,4 +541,7 @@ pub struct DirCursor {
     /// Pattern used for the current listing. RESTART_SCANS and REOPEN re-list
     /// with the request's pattern.
     pub pattern: Option<String>,
+    /// The entries' named streams are read for Finder data: the backend
+    /// has not refused to read them in this listing.
+    pub peek_streams: bool,
 }

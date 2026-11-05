@@ -58,6 +58,10 @@ struct MemInner {
     no_streams: bool,
     /// The backend reports no extended attributes.
     no_eas: bool,
+    /// Directory handles do not peek at the streams of their entries.
+    no_peeks: bool,
+    /// The entries of each call of `peek_streams`.
+    peeks: Vec<Vec<String>>,
     /// Most bytes the extended attributes of one entry take.
     ea_room: Option<u32>,
     /// Calls of `set_eas`.
@@ -195,15 +199,6 @@ impl MemFsBackend {
         self
     }
 
-    /// Marks the entry `path` read-only.
-    pub fn set_read_only(&self, path: &str) {
-        self.inner
-            .lock()
-            .unwrap()
-            .read_only
-            .insert(path.to_string());
-    }
-
     /// Gives the entry `path` the named stream `name` holding `data`.
     pub fn with_stream(self, path: &str, name: &str, data: &[u8]) -> Self {
         {
@@ -243,6 +238,13 @@ impl MemFsBackend {
         self
     }
 
+    /// A backend whose directory handles answer
+    /// [`Handle::peek_streams`] with [`SmbError::NotSupported`].
+    pub fn without_peeks(self) -> Self {
+        self.inner.lock().unwrap().no_peeks = true;
+        self
+    }
+
     /// A backend that reports no extended attributes.
     pub fn without_eas(self) -> Self {
         self.inner.lock().unwrap().no_eas = true;
@@ -277,6 +279,12 @@ impl MemFsBackend {
     pub fn failing_overwrites(self) -> Self {
         self.inner.lock().unwrap().fail_overwrites = true;
         self
+    }
+
+    /// The entries each call of [`Handle::peek_streams`] named, in order,
+    /// refused calls included.
+    pub fn peeks(&self) -> Vec<Vec<String>> {
+        self.inner.lock().unwrap().peeks.clone()
     }
 
     /// How many times `set_eas` was called.
@@ -526,23 +534,6 @@ impl ShareBackend for MemFsBackend {
             stream: Some((id, stream_id)),
         };
         Ok((Box::new(handle), action))
-    }
-
-    async fn peek_stream(
-        &self,
-        path: &SmbPath,
-        stream: &StreamName,
-        max: u32,
-    ) -> SmbResult<Option<(u64, Bytes)>> {
-        let g = self.inner.lock().unwrap();
-        let name = stream.as_str().to_lowercase();
-        Ok(g.streams_of(&key(path))
-            .iter()
-            .find(|s| s.name.to_lowercase() == name)
-            .map(|s| {
-                let head = &s.data[..s.data.len().min(max as usize)];
-                (s.data.len() as u64, Bytes::copy_from_slice(head))
-            }))
     }
 
     async fn remove_stream(
@@ -870,6 +861,49 @@ impl Handle for MemHandle {
         let id = g.id_of(&key);
         g.eas.insert(id, list);
         Ok(())
+    }
+
+    async fn peek_streams(
+        &self,
+        entries: &[(&str, &[(StreamName, u32)])],
+    ) -> SmbResult<Vec<Vec<Option<(u64, Bytes)>>>> {
+        let mut g = self.inner.lock().unwrap();
+        g.peeks.push(
+            entries
+                .iter()
+                .map(|(name, _)| (*name).to_string())
+                .collect(),
+        );
+        if g.no_peeks {
+            return Err(SmbError::NotSupported);
+        }
+        if !self.is_dir || self.stream.is_some() {
+            return Err(SmbError::NotADirectory);
+        }
+        Ok(entries
+            .iter()
+            .map(|(entry, streams)| {
+                let key = if self.key.is_empty() {
+                    (*entry).to_string()
+                } else {
+                    format!("{}\\{entry}", self.key)
+                };
+                let listed = g.streams_of(&key);
+                streams
+                    .iter()
+                    .map(|(stream, max)| {
+                        let name = stream.as_str().to_lowercase();
+                        listed
+                            .iter()
+                            .find(|s| s.name.to_lowercase() == name)
+                            .map(|s| {
+                                let head = &s.data[..s.data.len().min(*max as usize)];
+                                (s.data.len() as u64, Bytes::copy_from_slice(head))
+                            })
+                    })
+                    .collect()
+            })
+            .collect())
     }
 
     async fn streams(&self) -> SmbResult<Vec<StreamInfo>> {

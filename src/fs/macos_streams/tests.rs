@@ -1016,6 +1016,33 @@ async fn a_volume_with_attributes_only_in_dot_underscore_files_has_no_streams() 
     assert!(!backend.capabilities().named_streams);
 }
 
+/// What a peek from the share root of `backend` finds of each of
+/// `streams` of each of `entries`.
+async fn peek(
+    backend: &LocalFsBackend,
+    entries: &[&str],
+    streams: &[(&str, u32)],
+) -> Vec<Vec<Option<(u64, Vec<u8>)>>> {
+    let dir_opts = OpenOptions {
+        directory: true,
+        ..opts(OpenIntent::Open, false)
+    };
+    let (dir, _) = backend.open(&SmbPath::root(), dir_opts).await.unwrap();
+    let streams: Vec<_> = streams.iter().map(|&(s, max)| (name(s), max)).collect();
+    let asked: Vec<_> = entries.iter().map(|&e| (e, &streams[..])).collect();
+    let peeked = dir.peek_streams(&asked).await.unwrap();
+    dir.close().await.unwrap();
+    peeked
+        .into_iter()
+        .map(|found| {
+            found
+                .into_iter()
+                .map(|f| f.map(|(size, data)| (size, data.to_vec())))
+                .collect()
+        })
+        .collect()
+}
+
 #[tokio::test]
 async fn peeks_read_the_finder_info_and_fork_attributes_the_host_set() {
     let (td, backend) = backend();
@@ -1025,39 +1052,64 @@ async fn peeks_read_the_finder_info_and_fork_attributes_the_host_set() {
     set_xattr(&path, "com.apple.ResourceFork", &pattern(5000));
     set_xattr(&path, "com.apple.metadata:_kMDItemUserTags", b"tags");
     std::fs::write(td.path().join("plain.txt"), b"x").unwrap();
-    let peek = async |path: &str, stream: &str, max| {
-        backend
-            .peek_stream(&p(path), &name(stream), max)
-            .await
-            .unwrap()
-            .map(|(size, data)| (size, data.to_vec()))
-    };
+    let streams = [
+        ("AFP_AfpInfo", 60),
+        ("afp_resource", 0),
+        ("com.apple.metadata\u{F022}_kMDItemUserTags", 60),
+        ("other", 60),
+    ];
+    let peeked = peek(&backend, &["f.txt", "plain.txt"], &streams).await;
     assert_eq!(
-        peek("f.txt", "AFP_AfpInfo", 60).await,
-        Some((60, labeled_afp_info()))
+        peeked[0],
+        [
+            Some((60, labeled_afp_info())),
+            Some((5000, Vec::new())),
+            Some((4, b"tags".to_vec())),
+            None
+        ]
     );
-    assert_eq!(
-        peek("f.txt", "afp_resource", 0).await,
-        Some((5000, Vec::new()))
-    );
-    assert_eq!(
-        peek("f.txt", "com.apple.metadata\u{F022}_kMDItemUserTags", 60).await,
-        Some((4, b"tags".to_vec()))
-    );
-    for stream in ["AFP_AfpInfo", "AFP_Resource", "other"] {
-        assert_eq!(peek("plain.txt", stream, 60).await, None, "{stream}");
-    }
+    assert_eq!(peeked[1], vec![None; 4]);
 }
 
 #[tokio::test]
-async fn a_peek_of_a_fifo_returns_at_once() {
+async fn a_peek_reads_files_and_directories_and_nothing_else() {
     let (td, backend) = backend();
+    let outside = tempfile::tempdir_in(td.path().parent().unwrap()).unwrap();
+    let finder_info = &labeled_afp_info()[16..48];
+    for dir in [td.path(), outside.path()] {
+        std::fs::write(dir.join("f.txt"), b"x").unwrap();
+        set_xattr(&dir.join("f.txt"), "com.apple.FinderInfo", finder_info);
+    }
+    set_xattr(
+        &td.path().join("f.txt"),
+        "com.apple.ResourceFork",
+        &pattern(5000),
+    );
+    std::fs::create_dir(td.path().join("d")).unwrap();
+    set_xattr(&td.path().join("d"), "com.apple.FinderInfo", finder_info);
     let fifo = std::ffi::CString::new(td.path().join("fifo").into_os_string().into_encoded_bytes())
         .unwrap();
     // SAFETY: `fifo` is a NUL-terminated path.
     assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
-    let (path, stream) = (p("fifo"), name("AFP_AfpInfo"));
-    let peek = backend.peek_stream(&path, &stream, 60);
-    let peeked = tokio::time::timeout(Duration::from_secs(10), peek).await;
-    assert!(peeked.is_ok(), "the peek returns");
+    std::os::unix::fs::symlink("f.txt", td.path().join("in.txt")).unwrap();
+    std::os::unix::fs::symlink(outside.path().join("f.txt"), td.path().join("out.txt")).unwrap();
+
+    let entries = ["f.txt", "d", "fifo", "in.txt", "out.txt", "gone.txt"];
+    let streams = [("AFP_AfpInfo", 60), ("AFP_Resource", 0)];
+    let peeked = tokio::time::timeout(Duration::from_secs(10), peek(&backend, &entries, &streams))
+        .await
+        .expect("the peek returns");
+    let info = Some((60, labeled_afp_info()));
+    let fork = Some((5000, Vec::new()));
+    assert_eq!(
+        peeked,
+        [
+            vec![info.clone(), fork.clone()],
+            vec![info.clone(), None],
+            vec![None, None],
+            vec![info, fork],
+            vec![None, None],
+            vec![None, None],
+        ]
+    );
 }

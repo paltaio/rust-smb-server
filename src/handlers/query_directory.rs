@@ -118,28 +118,33 @@ pub async fn handle(
         }
     }
 
-    let dir = open.path();
-    let mut lister = aapl::FinderLister::new(backend.as_ref(), streams, dir.as_ref(), maximal);
+    let open = &mut *open;
+    let dir = open.handle.as_deref();
     let cursor = open.search_state.as_mut().expect("scan started");
+    let page = &cursor.entries[cursor.next..];
+    let page = &page[..page_len(page, name_offset, cap, single_entry)];
+    let finder_data = if finder {
+        // An entry alone past the buffer goes back as STATUS_BUFFER_OVERFLOW
+        // without its streams.
+        let dir = dir.filter(|_| !matches!(page, [entry] if entry_size(entry, name_offset) > cap));
+        let mut peek = streams && cursor.peek_streams;
+        let data = aapl::finder_data(dir, page, maximal, &mut peek).await;
+        cursor.peek_streams = peek;
+        data
+    } else {
+        Vec::new()
+    };
     let mut buf: Vec<u8> = Vec::new();
     let mut last_entry: Option<usize> = None;
     let mut status = ntstatus::STATUS_SUCCESS;
-    while cursor.next < cursor.entries.len() {
-        if single_entry && last_entry.is_some() {
-            break;
-        }
-        let entry = &cursor.entries[cursor.next];
+    for (i, entry) in page.iter().enumerate() {
         let start = align8(buf.len());
-        // The size of an entry is known before its Finder data is read.
-        let size = name_offset + 2 * entry.info.name.encode_utf16().count();
-        if last_entry.is_some() && start + size > cap {
-            break;
-        }
-        let mut bytes = if finder {
-            encode_finder_dir_entry(entry, &lister.data(&entry.info).await)
-        } else {
-            let size = if ea_size { entry.info.ea_size } else { 0 };
-            encode_dir_entry(class, entry, size)
+        let mut bytes = match finder_data.get(i) {
+            Some(data) => encode_finder_dir_entry(entry, data),
+            None => {
+                let size = if ea_size { entry.info.ea_size } else { 0 };
+                encode_dir_entry(class, entry, size)
+            }
         };
         if bytes.len() > cap {
             // Only the first entry gets here: return as much of its name as
@@ -158,7 +163,9 @@ pub async fn handle(
         if status != ntstatus::STATUS_SUCCESS {
             break;
         }
-        cursor.next += 1;
+    }
+    if status == ntstatus::STATUS_SUCCESS {
+        cursor.next += page.len();
     }
     if cursor.next >= cursor.entries.len() {
         // Exhausted: later queries return STATUS_NO_MORE_FILES.
@@ -234,8 +241,36 @@ async fn start_scan(
         entries,
         next: 0,
         pattern,
+        peek_streams: true,
     });
     Ok(())
+}
+
+/// How many of `entries` the next response carries: those that fit in
+/// `cap` bytes with entries of `name_offset` bytes before the name, at
+/// least one, which may not fit, and only one with `single_entry`.
+fn page_len(entries: &[DirEntry], name_offset: usize, cap: usize, single_entry: bool) -> usize {
+    let mut len = 0;
+    let mut count = 0;
+    for entry in entries {
+        let start = align8(len);
+        let size = entry_size(entry, name_offset);
+        if count > 0 && start + size > cap {
+            break;
+        }
+        count += 1;
+        len = start + size;
+        if single_entry || size > cap {
+            break;
+        }
+    }
+    count
+}
+
+/// The size of `entry` in a response whose entries have `name_offset`
+/// bytes before the name.
+fn entry_size(entry: &DirEntry, name_offset: usize) -> usize {
+    name_offset + 2 * entry.info.name.encode_utf16().count()
 }
 
 /// True if entries of the directory information class `class` carry EaSize.

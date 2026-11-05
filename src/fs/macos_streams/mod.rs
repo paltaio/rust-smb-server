@@ -29,7 +29,7 @@ use super::local::{
     file_index, file_info_from_metadata, host_file_times, io_to_smb, join_to_io, link_count,
     set_host_attributes,
 };
-use super::open_streams::{OpenStreams, StreamFile, lock, open_base, touch};
+use super::open_streams::{OpenStreams, StreamFile, lock, open_base, open_entry, touch};
 use crate::backend::{DirEntry, FileInfo, FileTimes, Handle, OpenAction, OpenIntent, OpenOptions};
 use crate::error::{SmbError, SmbResult};
 use crate::stream::{StreamInfo, StreamName, from_sfm, to_sfm};
@@ -692,6 +692,73 @@ impl Aside {
     }
 }
 
+/// The size and up to the given number of first bytes of each stream
+/// `entries` names of each entry of `dir` it names, `None` where the entry
+/// has no such stream or it cannot be read. Each entry is opened once,
+/// with [`open_entry`]. `AFP_AfpInfo` and `AFP_Resource` are read from
+/// their attributes without listing the others.
+pub(super) fn peek_entries(
+    dir: &Dir,
+    entries: &[(String, Vec<(StreamName, u32)>)],
+) -> Vec<Vec<Option<(u64, Bytes)>>> {
+    entries
+        .iter()
+        .map(|(name, streams)| match open_entry(dir, name) {
+            Ok((base, _)) => {
+                let mut view = None;
+                streams
+                    .iter()
+                    .map(|(stream, max)| {
+                        peek(&base, &mut view, stream, *max).unwrap_or_else(|e| {
+                            debug!(error = %e, name, stream = stream.as_str(), "stream of a listed entry not read");
+                            None
+                        })
+                    })
+                    .collect()
+            }
+            Err(e) => {
+                debug!(error = %e, name, "streams of a listed entry not read");
+                vec![None; streams.len()]
+            }
+        })
+        .collect()
+}
+
+/// The size of the stream `stream` of the file `fd` is open on and up to
+/// `max` bytes from its start. `view` holds the file's streams once a
+/// stream other than `AFP_AfpInfo` and `AFP_Resource` needed them.
+fn peek(
+    fd: &File,
+    view: &mut Option<View>,
+    stream: &StreamName,
+    max: u32,
+) -> io::Result<Option<(u64, Bytes)>> {
+    let attr = Attr::of(stream)?;
+    let attr = match attr.kind {
+        Kind::Plain => {
+            if view.is_none() {
+                *view = Some(View::load(fd)?);
+            }
+            match view.as_ref().and_then(|view| view.find(stream)) {
+                Some(found) => found.main.clone(),
+                None => return Ok(None),
+            }
+        }
+        Kind::FinderInfo | Kind::ResourceFork => attr,
+    };
+    match value_size(fd, &attr.xattr) {
+        Err(e) if is_missing(&e) => return Ok(None),
+        found => found?,
+    };
+    let size = size(fd, &attr)?;
+    let data = if max == 0 {
+        Bytes::new()
+    } else {
+        read(fd, &attr, 0, max)?
+    };
+    Ok(Some((size, data)))
+}
+
 // ---------------------------------------------------------------------------
 // Open streams
 // ---------------------------------------------------------------------------
@@ -776,44 +843,6 @@ impl Place {
                 read_only: self.read_only,
             });
             Ok((handle, action))
-        })
-        .await
-        .map_err(join_to_io)
-        .map_err(to_smb)?
-        .map_err(to_smb)
-    }
-
-    /// The size of the named stream `stream` of the file at `rel` and up
-    /// to `max` bytes from its start, `None` when it has no such stream.
-    /// `AFP_AfpInfo` and `AFP_Resource` are read from their attributes
-    /// without listing the others.
-    pub(super) async fn peek_stream(
-        self,
-        rel: PathBuf,
-        stream: StreamName,
-        max: u32,
-    ) -> SmbResult<Option<(u64, Bytes)>> {
-        spawn_blocking(move || -> io::Result<_> {
-            let (base, _, _) = open_base(&self.root, &rel, false)?;
-            let attr = Attr::of(&stream)?;
-            let attr = match attr.kind {
-                Kind::Plain => match View::load(&base)?.find(&stream) {
-                    Some(found) => found.main.clone(),
-                    None => return Ok(None),
-                },
-                Kind::FinderInfo | Kind::ResourceFork => attr,
-            };
-            match value_size(&base, &attr.xattr) {
-                Err(e) if is_missing(&e) => return Ok(None),
-                found => found?,
-            };
-            let size = size(&base, &attr)?;
-            let data = if max == 0 {
-                Bytes::new()
-            } else {
-                read(&base, &attr, 0, max)?
-            };
-            Ok(Some((size, data)))
         })
         .await
         .map_err(join_to_io)

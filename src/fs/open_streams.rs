@@ -13,6 +13,7 @@ use cap_std::fs::{Dir, Metadata, OpenOptions as CapOpenOptions};
 use tracing::debug;
 
 use super::local::{file_key, special_file};
+use crate::path::is_valid_component;
 use crate::stream::StreamName;
 
 pub(super) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -104,7 +105,68 @@ pub(super) fn open_base(
     opts.read(true)
         .write(write)
         .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY);
-    let file = root.open_with(rel, &opts)?.into_std();
+    checked(root.open_with(rel, &opts)?.into_std())
+}
+
+/// Opens the entry `name` of `dir` for reading, without following a
+/// symlink there, and returns it with its host identity; a symlink is
+/// followed only to a target below `dir`. Anything but a file or
+/// directory is refused, as [`open_base`] refuses it. The entry is
+/// opened as a path first and reopened for reading through
+/// `/proc/self/fd` only once it is known to be a file or directory, so
+/// nothing else is opened.
+#[cfg(target_os = "linux")]
+pub(super) fn open_entry(dir: &Dir, name: &str) -> io::Result<(File, (u64, u64))> {
+    use cap_std::fs::OpenOptionsExt as _;
+    use rustix::fs::{Mode, OFlags};
+    use std::os::fd::AsRawFd as _;
+    if !is_valid_component(name) {
+        return Err(io::ErrorKind::InvalidFilename.into());
+    }
+    let flags = OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let mut path = File::from(rustix::fs::openat(dir, name, flags, Mode::empty())?);
+    let mut md = Metadata::from_file(&path)?;
+    if md.file_type().is_symlink() {
+        let mut opts = CapOpenOptions::new();
+        opts.read(true).custom_flags(libc::O_PATH);
+        path = dir.open_with(name, &opts)?.into_std();
+        md = Metadata::from_file(&path)?;
+    }
+    if !md.is_file() && !md.is_dir() {
+        return Err(special_file());
+    }
+    let key = file_key(&md).ok_or(io::ErrorKind::Unsupported)?;
+    let file = rustix::fs::open(
+        format!("/proc/self/fd/{}", path.as_raw_fd()),
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    Ok((file.into(), key))
+}
+
+/// Opens the entry `name` of `dir` for reading, as [`open_base`] does,
+/// without following a symlink there, and returns it with its host
+/// identity; a symlink is opened through [`open_base`], which follows it
+/// only to a target below `dir`.
+#[cfg(target_os = "macos")]
+pub(super) fn open_entry(dir: &Dir, name: &str) -> io::Result<(File, (u64, u64))> {
+    use rustix::fs::{Mode, OFlags};
+    if !is_valid_component(name) {
+        return Err(io::ErrorKind::InvalidFilename.into());
+    }
+    let flags = OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::NOFOLLOW;
+    let opened = rustix::fs::openat(dir, name, flags | OFlags::CLOEXEC, Mode::empty());
+    let (file, _, key) = match opened {
+        Ok(fd) => checked(fd.into())?,
+        Err(rustix::io::Errno::LOOP) => open_base(dir, Path::new(name), false)?,
+        Err(e) => return Err(e.into()),
+    };
+    Ok((file, key))
+}
+
+/// `file` with its metadata and host identity, unless it is anything but a
+/// file or directory.
+fn checked(file: File) -> io::Result<(File, Metadata, (u64, u64))> {
     let md = Metadata::from_file(&file)?;
     if !md.is_file() && !md.is_dir() {
         return Err(special_file());

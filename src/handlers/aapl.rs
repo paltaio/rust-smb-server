@@ -8,11 +8,10 @@ use std::sync::atomic::Ordering;
 use tracing::debug;
 
 use crate::access_mask::{DELETE, FILE_APPEND_DATA, FILE_EXECUTE, FILE_WRITE_DATA, FILE_WRITE_EA};
-use crate::backend::{FileInfo, ShareBackend};
+use crate::backend::{DirEntry, FileInfo, Handle};
 use crate::conn::state::Connection;
 use crate::error::SmbError;
 use crate::info_class::FinderData;
-use crate::path::SmbPath;
 use crate::proto::messages::aapl::{
     AAPL_CASE_SENSITIVE, AAPL_SERVER_CAPS, AAPL_SUPPORTS_READ_DIR_ATTR, AAPL_UNIX_BASED,
 };
@@ -85,76 +84,78 @@ pub(super) fn reads_finder_data(conn: &Connection) -> bool {
     conn.aapl_read_dir_attr.load(Ordering::Acquire)
 }
 
-/// The Finder data of the entries of one listing of the directory `dir`
-/// on a share with `backend`, whose tree grants `maximal`. The Finder
-/// info and resource fork come from each entry's `AFP_AfpInfo` and
-/// `AFP_Resource` streams when `streams` is set and `dir` is known, for
-/// regular files and directories only; "." and ".." get none.
-pub(super) struct FinderLister<'a> {
-    backend: &'a dyn ShareBackend,
-    dir: Option<&'a SmbPath>,
+/// The Finder data of `entries`, the entries one response to a listing
+/// of the directory open as `dir` carries, on a share whose tree grants
+/// `maximal`. The Finder info and resource fork come from each entry's
+/// `AFP_AfpInfo` and `AFP_Resource` streams, read in one backend call when
+/// `peek` is set, for regular files and directories only; "." and ".."
+/// get none. A backend that does not read streams clears `peek`.
+pub(super) async fn finder_data(
+    dir: Option<&dyn Handle>,
+    entries: &[DirEntry],
     maximal: u32,
-    /// Streams are read: the share has them and the backend has not
-    /// refused to read one in this listing.
-    peeking: bool,
+    peek: &mut bool,
+) -> Vec<FinderData> {
+    let mut found = vec![Vec::new(); entries.len()];
+    if let Some(dir) = dir
+        && *peek
+    {
+        let streams = [
+            (stream(AFP_AFP_INFO), AFP_INFO_SIZE as u32),
+            (stream(AFP_RESOURCE), 0),
+        ];
+        let (at, asked): (Vec<usize>, Vec<_>) = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| has_streams(&entry.info))
+            .map(|(i, entry)| {
+                // A directory has no resource fork.
+                let wanted = if entry.info.is_directory {
+                    &streams[..1]
+                } else {
+                    &streams[..]
+                };
+                (i, (entry.info.name.as_str(), wanted))
+            })
+            .unzip();
+        if !asked.is_empty() {
+            match dir.peek_streams(&asked).await {
+                Ok(peeked) => {
+                    for (i, streams) in at.into_iter().zip(peeked) {
+                        found[i] = streams;
+                    }
+                }
+                Err(SmbError::NotSupported) => {
+                    debug!("backend reads no streams for listings");
+                    *peek = false;
+                }
+                Err(e) => debug!(error = %e, "streams not read for a listing"),
+            }
+        }
+    }
+    entries
+        .iter()
+        .zip(found)
+        .map(|(entry, streams)| {
+            let info = &entry.info;
+            let mut streams = streams.into_iter();
+            let afp_info = streams.next().flatten();
+            let fork = streams.next().flatten();
+            FinderData {
+                max_access: max_access(maximal, info),
+                resource_fork_size: fork.map_or(0, |(size, _)| size),
+                finder_info: compressed_finder_info(
+                    info,
+                    afp_info.as_ref().map(|(_, data)| &data[..]),
+                ),
+                unix_mode: info.unix_mode.map_or(0, |mode| (mode & 0xFFFF) as u16),
+            }
+        })
+        .collect()
 }
 
-impl<'a> FinderLister<'a> {
-    pub(super) fn new(
-        backend: &'a dyn ShareBackend,
-        streams: bool,
-        dir: Option<&'a SmbPath>,
-        maximal: u32,
-    ) -> Self {
-        Self {
-            backend,
-            dir,
-            maximal,
-            peeking: streams,
-        }
-    }
-
-    pub(super) async fn data(&mut self, info: &FileInfo) -> FinderData {
-        let path = match self.dir {
-            Some(dir) if self.peeking && has_streams(info) => dir.join(&info.name).ok(),
-            _ => None,
-        };
-        let (mut afp_info, mut fork) = (None, None);
-        if let Some(path) = &path {
-            if !info.is_directory {
-                fork = self.peek(path, AFP_RESOURCE, 0).await;
-            }
-            afp_info = self.peek(path, AFP_AFP_INFO, AFP_INFO_SIZE as u32).await;
-        }
-        FinderData {
-            max_access: max_access(self.maximal, info),
-            resource_fork_size: fork.map_or(0, |(size, _)| size),
-            finder_info: compressed_finder_info(info, afp_info.as_ref().map(|(_, data)| &data[..])),
-            unix_mode: info.unix_mode.map_or(0, |mode| (mode & 0xFFFF) as u16),
-        }
-    }
-
-    /// The size and first `max` bytes of the stream `name` of `path`,
-    /// `None` when it has none or the backend cannot say. A backend that
-    /// does not read streams is asked no more in this listing.
-    async fn peek(&mut self, path: &SmbPath, name: &str, max: u32) -> Option<(u64, bytes::Bytes)> {
-        if !self.peeking {
-            return None;
-        }
-        let stream: StreamName = name.parse().expect("a valid stream name");
-        match self.backend.peek_stream(path, &stream, max).await {
-            Ok(found) => found,
-            Err(SmbError::NotSupported) => {
-                debug!("backend reads no streams for listings");
-                self.peeking = false;
-                None
-            }
-            Err(e) => {
-                debug!(error = %e, path = %path, stream = name, "stream not read for a listing");
-                None
-            }
-        }
-    }
+fn stream(name: &str) -> StreamName {
+    name.parse().expect("a valid stream name")
 }
 
 /// True if the entry `info` is one whose streams a listing reads: not "."

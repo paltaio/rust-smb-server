@@ -101,8 +101,8 @@ SmbServer::builder()
 //!   name: the access the client may ask for, the low 16 bits of
 //!   [`FileInfo::unix_mode`], and, on shares with named streams, the
 //!   Finder info of each entry's `AFP_AfpInfo` stream and the size of its
-//!   `AFP_Resource` stream, both read through
-//!   [`ShareBackend::peek_stream`].
+//!   `AFP_Resource` stream, read through one [`Handle::peek_streams`] call
+//!   per response.
 //! - `open` fails with [`SmbError::PathNotFound`] when a directory on the
 //!   way to the path is missing, and with [`SmbError::NotFound`] when only
 //!   the last component is. Clients see STATUS_OBJECT_PATH_NOT_FOUND and

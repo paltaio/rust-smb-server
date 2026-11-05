@@ -31,9 +31,10 @@ use windows_sys::Win32::Foundation::{
     HANDLE, NTSTATUS, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, UNICODE_STRING,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    DELETE, FILE_ATTRIBUTE_NORMAL, FILE_DISPOSITION_INFO, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
-    FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, FILE_STANDARD_INFO, FILE_WRITE_ATTRIBUTES, FileDispositionInfo,
+    DELETE, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
+    FILE_DISPOSITION_INFO, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES,
+    FILE_READ_DATA, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    FILE_STANDARD_INFO, FILE_WRITE_ATTRIBUTES, FileAttributeTagInfo, FileDispositionInfo,
     FileRenameInfo, FileStandardInfo, GetFileInformationByHandleEx, GetVolumeInformationByHandleW,
     SYNCHRONIZE, SetFileInformationByHandle,
 };
@@ -45,6 +46,7 @@ use super::local::{
 };
 use crate::backend::{DirEntry, FileInfo, FileTimes, Handle, OpenAction, OpenIntent, OpenOptions};
 use crate::error::{SmbError, SmbResult};
+use crate::path::is_valid_component;
 use crate::stream::{StreamInfo, StreamName};
 
 /// The volume stores named streams (MS-FSCC 2.5.1).
@@ -188,7 +190,26 @@ fn open_relative(
     share: u32,
     disposition: u32,
 ) -> io::Result<(File, usize)> {
-    let mut name = object_name(stream);
+    nt_open(
+        base.as_raw_handle() as HANDLE,
+        object_name(stream),
+        access,
+        share,
+        disposition,
+        FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
+    )
+}
+
+/// Opens `name` relative to the open handle `root` with `access`, `share`,
+/// `disposition` and `options`. Returns the handle and what the open did.
+fn nt_open(
+    root: HANDLE,
+    mut name: Vec<u16>,
+    access: u32,
+    share: u32,
+    disposition: u32,
+    options: u32,
+) -> io::Result<(File, usize)> {
     let bytes = u16::try_from(name.len() * 2).map_err(|_| io::ErrorKind::InvalidFilename)?;
     let unicode = UNICODE_STRING {
         Length: bytes,
@@ -197,7 +218,7 @@ fn open_relative(
     };
     let attributes = OBJECT_ATTRIBUTES {
         Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
-        RootDirectory: base.as_raw_handle() as HANDLE,
+        RootDirectory: root,
         ObjectName: &unicode,
         Attributes: OBJ_CASE_INSENSITIVE,
         SecurityDescriptor: std::ptr::null(),
@@ -207,8 +228,8 @@ fn open_relative(
     let mut status_block = IO_STATUS_BLOCK::default();
     // SAFETY: every pointer refers to a live local that outlives the call:
     // `attributes` names `unicode`, whose buffer is `name`, and the root
-    // is the open handle `base` holds. The call writes only `handle` and
-    // `status_block`.
+    // is an open handle the caller holds. The call writes only `handle`
+    // and `status_block`.
     let status = unsafe {
         NtCreateFile(
             &mut handle,
@@ -219,7 +240,7 @@ fn open_relative(
             FILE_ATTRIBUTE_NORMAL,
             share,
             disposition,
-            FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
+            options,
             std::ptr::null(),
             0,
         )
@@ -420,6 +441,112 @@ pub(super) fn list_smb(file: &File) -> SmbResult<Vec<StreamInfo>> {
     list(file).map_err(to_smb)
 }
 
+/// The size and up to the given number of first bytes of each stream
+/// `entries` names of each entry of `dir` it names, `None` where the entry
+/// has no such stream or it cannot be read. Each entry is opened once,
+/// with [`open_entry`], and its streams relative to it.
+pub(super) fn peek_entries(
+    dir: &Dir,
+    entries: &[(String, Vec<(StreamName, u32)>)],
+) -> Vec<Vec<Option<(u64, Bytes)>>> {
+    entries
+        .iter()
+        .map(|(name, streams)| match open_entry(dir, name) {
+            Ok(base) => streams
+                .iter()
+                .map(|(stream, max)| {
+                    peek(&base, stream, *max).unwrap_or_else(|e| {
+                        debug!(error = %e, name, stream = stream.as_str(), "stream of a listed entry not read");
+                        None
+                    })
+                })
+                .collect(),
+            Err(e) => {
+                debug!(error = %e, name, "streams of a listed entry not read");
+                vec![None; streams.len()]
+            }
+        })
+        .collect()
+}
+
+/// Opens the entry `name` of `dir` for its attributes, to open its streams
+/// through, without following a reparse point there. A symlink or a
+/// junction is opened through cap-std instead, which follows it only to a
+/// target below `dir`; other reparse points, such as deduplicated,
+/// compressed or cloud files, keep the first handle.
+fn open_entry(dir: &Dir, name: &str) -> io::Result<File> {
+    use cap_primitives::fs::OpenOptionsExt as _;
+    use std::os::windows::io::AsHandle as _;
+    if !is_valid_component(name) {
+        return Err(io::ErrorKind::InvalidFilename.into());
+    }
+    let (file, _) = nt_open(
+        dir.as_handle().as_raw_handle() as HANDLE,
+        name.encode_utf16().collect(),
+        FILE_READ_ATTRIBUTES,
+        SHARE_ALL,
+        FILE_OPEN,
+        FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
+    )?;
+    if !is_link(&file)? {
+        return Ok(file);
+    }
+    let mut opts = CapOpenOptions::new();
+    opts.read(true)
+        .access_mode(FILE_READ_ATTRIBUTES | SYNCHRONIZE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+    Ok(dir.open_with(name, &opts)?.into_std())
+}
+
+/// True if `file` is open on a symlink or a junction itself.
+fn is_link(file: &File) -> io::Result<bool> {
+    const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
+    const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
+    let mut info = FILE_ATTRIBUTE_TAG_INFO::default();
+    // SAFETY: `info` is a live local of the size passed.
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle() as HANDLE,
+            FileAttributeTagInfo,
+            (&raw mut info).cast(),
+            std::mem::size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        && matches!(
+            info.ReparseTag,
+            IO_REPARSE_TAG_MOUNT_POINT | IO_REPARSE_TAG_SYMLINK
+        ))
+}
+
+/// The size of the stream `stream` of the file `base` is open on and up to
+/// `max` bytes from its start.
+fn peek(base: &File, stream: &StreamName, max: u32) -> io::Result<Option<(u64, Bytes)>> {
+    let access = if max == 0 {
+        FILE_READ_ATTRIBUTES
+    } else {
+        FILE_READ_DATA | FILE_READ_ATTRIBUTES
+    };
+    let file = match open_relative(base, Some(stream), access, SHARE_ALL, FILE_OPEN) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        file => file?.0,
+    };
+    let (size, _) = sizes(&file)?;
+    let mut data = vec![0; (max as u64).min(size) as usize];
+    let mut read = 0;
+    while read < data.len() {
+        match file.seek_read(&mut data[read..], read as u64)? {
+            0 => break,
+            n => read += n,
+        }
+    }
+    data.truncate(read);
+    Ok(Some((size, Bytes::from(data))))
+}
+
 // ---------------------------------------------------------------------------
 // Open streams
 // ---------------------------------------------------------------------------
@@ -501,43 +628,6 @@ impl Place {
                 read_only: self.read_only,
             });
             Ok((handle, action))
-        })
-        .await
-        .map_err(join_to_io)
-        .map_err(to_smb)?
-        .map_err(to_smb)
-    }
-
-    /// The size of the named stream `stream` of the file at `rel` and up
-    /// to `max` bytes from its start, `None` when it has no such stream.
-    pub(super) async fn peek_stream(
-        self,
-        rel: PathBuf,
-        stream: StreamName,
-        max: u32,
-    ) -> SmbResult<Option<(u64, Bytes)>> {
-        spawn_blocking(move || -> io::Result<_> {
-            let (base, _) = self.base(&rel, 0)?;
-            let access = if max == 0 {
-                FILE_READ_ATTRIBUTES
-            } else {
-                FILE_READ_DATA | FILE_READ_ATTRIBUTES
-            };
-            let file = match open_relative(&base, Some(&stream), access, SHARE_ALL, FILE_OPEN) {
-                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-                file => file?.0,
-            };
-            let (size, _) = sizes(&file)?;
-            let mut data = vec![0; (max as u64).min(size) as usize];
-            let mut read = 0;
-            while read < data.len() {
-                match file.seek_read(&mut data[read..], read as u64)? {
-                    0 => break,
-                    n => read += n,
-                }
-            }
-            data.truncate(read);
-            Ok(Some((size, Bytes::from(data))))
         })
         .await
         .map_err(join_to_io)

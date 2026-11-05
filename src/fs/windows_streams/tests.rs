@@ -692,6 +692,33 @@ fn pattern(len: usize) -> Vec<u8> {
     (0..len).map(|i| (i * 7 % 251) as u8).collect()
 }
 
+/// What a peek from the share root of `backend` finds of each of
+/// `streams` of each of `entries`.
+async fn peek(
+    backend: &LocalFsBackend,
+    entries: &[&str],
+    streams: &[(&str, u32)],
+) -> Vec<Vec<Option<(u64, Vec<u8>)>>> {
+    let dir_opts = crate::backend::OpenOptions {
+        directory: true,
+        ..opts(OpenIntent::Open, false)
+    };
+    let (dir, _) = backend.open(&SmbPath::root(), dir_opts).await.unwrap();
+    let streams: Vec<_> = streams.iter().map(|&(s, max)| (name(s), max)).collect();
+    let asked: Vec<_> = entries.iter().map(|&e| (e, &streams[..])).collect();
+    let peeked = dir.peek_streams(&asked).await.unwrap();
+    dir.close().await.unwrap();
+    peeked
+        .into_iter()
+        .map(|found| {
+            found
+                .into_iter()
+                .map(|f| f.map(|(size, data)| (size, data.to_vec())))
+                .collect()
+        })
+        .collect()
+}
+
 #[tokio::test]
 async fn peeks_give_the_size_and_start_of_ntfs_streams() {
     let (td, backend) = backend();
@@ -700,25 +727,109 @@ async fn peeks_give_the_size_and_start_of_ntfs_streams() {
     std::fs::create_dir(td.path().join("d")).unwrap();
     create(&backend, "d", "s", b"dir data").await;
     std::fs::write(td.path().join("plain.txt"), b"x").unwrap();
-    let peek = async |path: &str, stream: &str, max| {
-        backend
-            .peek_stream(&p(path), &name(stream), max)
-            .await
-            .unwrap()
-            .map(|(size, data)| (size, data.to_vec()))
-    };
+    let streams = [
+        ("afp_afpinfo", 60),
+        ("AFP_Resource", 0),
+        ("AFP_Resource", 100),
+        ("S", 100),
+    ];
+    let peeked = peek(&backend, &["f.txt", "d", "plain.txt"], &streams).await;
     assert_eq!(
-        peek("f.txt", "afp_afpinfo", 60).await,
-        Some((60, pattern(60)))
+        peeked[0],
+        [
+            Some((60, pattern(60))),
+            Some((70_000, Vec::new())),
+            Some((70_000, pattern(100))),
+            None
+        ]
     );
     assert_eq!(
-        peek("f.txt", "AFP_Resource", 0).await,
-        Some((70_000, Vec::new()))
+        peeked[1],
+        [None, None, None, Some((8, b"dir data".to_vec()))]
     );
-    assert_eq!(
-        peek("f.txt", "AFP_Resource", 100).await,
-        Some((70_000, pattern(100)))
-    );
-    assert_eq!(peek("d", "S", 100).await, Some((8, b"dir data".to_vec())));
-    assert_eq!(peek("plain.txt", "AFP_AfpInfo", 60).await, None);
+    assert_eq!(peeked[2], vec![None; 4]);
+}
+
+/// Symlinks are checked where the host lets the test make them.
+#[tokio::test]
+async fn a_peek_reads_files_and_directories_and_nothing_else() {
+    let (td, backend) = backend();
+    let outside = tempfile::tempdir_in(td.path().parent().unwrap()).unwrap();
+    let outside_backend = LocalFsBackend::new(outside.path()).unwrap();
+    create(&outside_backend, "f.txt", "AFP_AfpInfo", &pattern(60)).await;
+    create(&backend, "f.txt", "AFP_AfpInfo", &pattern(60)).await;
+    std::fs::create_dir(td.path().join("d")).unwrap();
+    create(&backend, "d", "AFP_AfpInfo", &pattern(60)).await;
+    let links = std::os::windows::fs::symlink_file("f.txt", td.path().join("in.txt")).is_ok()
+        && std::os::windows::fs::symlink_file(
+            outside.path().join("f.txt"),
+            td.path().join("out.txt"),
+        )
+        .is_ok();
+    let mut entries = vec!["f.txt", "d", "gone.txt"];
+    if links {
+        entries.extend(["in.txt", "out.txt"]);
+    } else {
+        eprintln!("no symlinks on {}", td.path().display());
+    }
+    let streams = [("AFP_AfpInfo", 60), ("AFP_Resource", 0)];
+    let peeked = peek(&backend, &entries, &streams).await;
+    let info = Some((60, pattern(60)));
+    let mut expected = vec![
+        vec![info.clone(), None],
+        vec![info.clone(), None],
+        vec![None, None],
+    ];
+    if links {
+        expected.extend([vec![info, None], vec![None, None]]);
+    }
+    assert_eq!(peeked, expected);
+}
+
+#[tokio::test]
+async fn a_junction_out_of_the_share_has_no_streams() {
+    let (td, backend) = backend();
+    let outside = tempfile::tempdir_in(td.path().parent().unwrap()).unwrap();
+    std::fs::create_dir(outside.path().join("d")).unwrap();
+    let outside_backend = LocalFsBackend::new(outside.path()).unwrap();
+    create(&outside_backend, "d", "AFP_AfpInfo", &pattern(60)).await;
+    let made = std::process::Command::new("cmd")
+        .arg("/C")
+        .arg("mklink")
+        .arg("/J")
+        .arg(td.path().join("j"))
+        .arg(outside.path().join("d"))
+        .output()
+        .unwrap();
+    assert!(made.status.success(), "{made:?}");
+    assert!(td.path().join("j").is_dir());
+    // The junction has a stream of its own, which only a peek that kept
+    // the junction itself would find.
+    let dir = Dir::open_ambient_dir(td.path(), cap_std::ambient_authority()).unwrap();
+    {
+        use std::os::windows::io::AsHandle as _;
+        let (junction, _) = nt_open(
+            dir.as_handle().as_raw_handle() as HANDLE,
+            "j".encode_utf16().collect(),
+            FILE_READ_ATTRIBUTES,
+            SHARE_ALL,
+            FILE_OPEN,
+            FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
+        )
+        .unwrap();
+        assert!(is_link(&junction).unwrap());
+        let (own, _) = open_relative(
+            &junction,
+            Some(&name("AFP_AfpInfo")),
+            FILE_GENERIC_WRITE,
+            SHARE_ALL,
+            FILE_CREATE,
+        )
+        .unwrap();
+        own.seek_write(&[7; 60], 0).unwrap();
+    }
+    let opened = open_entry(&dir, "j");
+    assert!(opened.is_err(), "{opened:?}");
+    let peeked = peek(&backend, &["j"], &[("AFP_AfpInfo", 60)]).await;
+    assert_eq!(peeked, [vec![None]]);
 }

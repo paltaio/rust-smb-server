@@ -1847,6 +1847,33 @@ async fn a_directory_moved_while_its_path_is_looked_up_is_not_found() {
     }
 }
 
+/// What a peek from the share root of `backend` finds of each of
+/// `streams` of each of `entries`.
+async fn peek(
+    backend: &LocalFsBackend,
+    entries: &[&str],
+    streams: &[(&str, u32)],
+) -> Vec<Vec<Option<(u64, Vec<u8>)>>> {
+    let dir_opts = OpenOptions {
+        directory: true,
+        ..opts(OpenIntent::Open, false)
+    };
+    let (dir, _) = backend.open(&SmbPath::root(), dir_opts).await.unwrap();
+    let streams: Vec<_> = streams.iter().map(|&(s, max)| (name(s), max)).collect();
+    let asked: Vec<_> = entries.iter().map(|&e| (e, &streams[..])).collect();
+    let peeked = dir.peek_streams(&asked).await.unwrap();
+    dir.close().await.unwrap();
+    peeked
+        .into_iter()
+        .map(|found| {
+            found
+                .into_iter()
+                .map(|f| f.map(|(size, data)| (size, data.to_vec())))
+                .collect()
+        })
+        .collect()
+}
+
 #[tokio::test]
 async fn peeks_give_the_size_and_start_of_kept_and_spilled_streams() {
     let Some((td, backend)) = backend() else {
@@ -1857,52 +1884,85 @@ async fn peeks_give_the_size_and_start_of_kept_and_spilled_streams() {
     assert!(spilled(&td, "f.txt", "AFP_Resource").exists());
     std::fs::create_dir(td.path().join("d")).unwrap();
     create(&backend, "d", "s", b"dir data").await;
-    let peek = async |path: &str, stream: &str, max| {
-        backend
-            .peek_stream(&p(path), &name(stream), max)
-            .await
-            .unwrap()
-            .map(|(size, data)| (size, data.to_vec()))
-    };
-    assert_eq!(
-        peek("f.txt", "afp_afpinfo", 60).await,
-        Some((60, pattern(60)))
-    );
-    assert_eq!(
-        peek("f.txt", "AFP_AfpInfo", 8).await,
-        Some((60, pattern(8)))
-    );
-    assert_eq!(
-        peek("f.txt", "AFP_Resource", 0).await,
-        Some((70_000, Vec::new()))
-    );
-    assert_eq!(
-        peek("f.txt", "AFP_Resource", 100).await,
-        Some((70_000, pattern(100)))
-    );
-    assert_eq!(peek("d", "S", 100).await, Some((8, b"dir data".to_vec())));
-    assert_eq!(peek("f.txt", "missing", 60).await, None);
     std::fs::write(td.path().join("plain.txt"), b"x").unwrap();
-    assert_eq!(peek("plain.txt", "AFP_AfpInfo", 60).await, None);
-    assert!(
-        backend
-            .peek_stream(&p("gone.txt"), &name("AFP_AfpInfo"), 60)
-            .await
-            .is_err()
+    let streams = [
+        ("afp_afpinfo", 60),
+        ("AFP_AfpInfo", 8),
+        ("AFP_Resource", 0),
+        ("AFP_Resource", 100),
+        ("S", 100),
+        ("missing", 60),
+    ];
+    let peeked = peek(&backend, &["f.txt", "d", "plain.txt"], &streams).await;
+    assert_eq!(
+        peeked[0],
+        [
+            Some((60, pattern(60))),
+            Some((60, pattern(8))),
+            Some((70_000, Vec::new())),
+            Some((70_000, pattern(100))),
+            None,
+            None
+        ]
     );
+    assert_eq!(
+        peeked[1],
+        [
+            None,
+            None,
+            None,
+            None,
+            Some((8, b"dir data".to_vec())),
+            None
+        ]
+    );
+    assert_eq!(peeked[2], vec![None; 6]);
 }
 
 #[tokio::test]
-async fn a_peek_of_a_fifo_returns_at_once() {
+async fn a_peek_reads_files_and_directories_and_nothing_else() {
     let Some((td, backend)) = backend() else {
         return;
     };
+    let outside = tempfile::tempdir_in(td.path().parent().unwrap()).unwrap();
+    let outside_backend = LocalFsBackend::new(outside.path()).unwrap();
+    create(&outside_backend, "f.txt", "AFP_AfpInfo", &pattern(60)).await;
+    create(&backend, "f.txt", "AFP_AfpInfo", &pattern(60)).await;
+    create(&backend, "spilled.txt", "AFP_Resource", &pattern(70_000)).await;
+    assert!(spilled(&td, "spilled.txt", "AFP_Resource").exists());
+    std::fs::create_dir(td.path().join("d")).unwrap();
+    create(&backend, "d", "AFP_AfpInfo", &pattern(60)).await;
     let fifo = std::ffi::CString::new(td.path().join("fifo").into_os_string().into_encoded_bytes())
         .unwrap();
     // SAFETY: `fifo` is a NUL-terminated path.
     assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
-    let (path, stream) = (p("fifo"), name("AFP_AfpInfo"));
-    let peek = backend.peek_stream(&path, &stream, 60);
-    let peeked = tokio::time::timeout(Duration::from_secs(10), peek).await;
-    assert!(peeked.is_ok(), "the peek returns");
+    std::os::unix::fs::symlink("f.txt", td.path().join("in.txt")).unwrap();
+    std::os::unix::fs::symlink(outside.path().join("f.txt"), td.path().join("out.txt")).unwrap();
+
+    let entries = [
+        "f.txt",
+        "spilled.txt",
+        "d",
+        "fifo",
+        "in.txt",
+        "out.txt",
+        "gone.txt",
+    ];
+    let streams = [("AFP_AfpInfo", 60), ("AFP_Resource", 0)];
+    let peeked = tokio::time::timeout(Duration::from_secs(10), peek(&backend, &entries, &streams))
+        .await
+        .expect("the peek returns");
+    let info = Some((60, pattern(60)));
+    assert_eq!(
+        peeked,
+        [
+            vec![info.clone(), None],
+            vec![None, Some((70_000, Vec::new()))],
+            vec![info.clone(), None],
+            vec![None, None],
+            vec![info, None],
+            vec![None, None],
+            vec![None, None],
+        ]
+    );
 }

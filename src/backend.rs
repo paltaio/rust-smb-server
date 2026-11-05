@@ -421,24 +421,6 @@ pub trait ShareBackend: Send + Sync + 'static {
     ) -> SmbResult<()> {
         Err(SmbError::NotSupported)
     }
-
-    /// The size of the named stream of the file or directory at `path`
-    /// that `stream` names, whatever the case of its spelling, and up to
-    /// `max` bytes from its start; `None` when it has no such stream.
-    /// Directory listings for macOS clients that negotiated Apple's
-    /// extensions call it for `AFP_AfpInfo` and `AFP_Resource` of each
-    /// entry, so it runs twice per listed file. Called only when
-    /// [`BackendCapabilities::named_streams`] is set. The default returns
-    /// [`SmbError::NotSupported`]; listings then carry no Finder info or
-    /// resource fork sizes.
-    async fn peek_stream(
-        &self,
-        _path: &SmbPath,
-        _stream: &StreamName,
-        _max: u32,
-    ) -> SmbResult<Option<(u64, bytes::Bytes)>> {
-        Err(SmbError::NotSupported)
-    }
 }
 
 /// A live open file or directory handle.
@@ -570,6 +552,31 @@ pub trait Handle: Send + Sync {
     /// default returns none.
     async fn streams(&self) -> SmbResult<Vec<StreamInfo>> {
         Ok(Vec::new())
+    }
+
+    /// The named streams of entries of this directory: for each entry of
+    /// `entries`, a name and the streams to read with the most bytes to
+    /// read of each, one result per stream, in order, with the stream's
+    /// size and up to that many bytes from its start. A result is `None`
+    /// when the entry has no such stream, or when it or the entry cannot
+    /// be read; stream names compare without regard to case. An entry
+    /// that is not a regular file or a directory has none: no FIFO,
+    /// socket or device is opened in a way that blocks, and no link is
+    /// followed out of the share.
+    ///
+    /// QUERY_DIRECTORY for a macOS client that negotiated Apple's
+    /// extensions calls it once per response, for `AFP_AfpInfo` of the
+    /// entries the response carries, other than "." and "..", and
+    /// `AFP_Resource` of the files among them. Called only on a directory
+    /// and only when [`BackendCapabilities::named_streams`] is set. A
+    /// handle that wraps another has to forward it, or listings carry no
+    /// Finder data. The default returns [`SmbError::NotSupported`];
+    /// listings then carry no Finder info or resource fork sizes.
+    async fn peek_streams(
+        &self,
+        _entries: &[(&str, &[(StreamName, u32)])],
+    ) -> SmbResult<Vec<Vec<Option<(u64, bytes::Bytes)>>>> {
+        Err(SmbError::NotSupported)
     }
 
     /// The extended attributes of the file or directory this handle is

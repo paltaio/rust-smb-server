@@ -33,7 +33,7 @@ use super::local::{
     file_index, file_info_from_metadata, host_file_times, io_to_smb, join_to_io, link_count,
     set_host_attributes,
 };
-use super::open_streams::{OpenStreams, StreamFile, lock, open_base, touch};
+use super::open_streams::{OpenStreams, StreamFile, lock, open_base, open_entry, touch};
 use crate::backend::{DirEntry, FileInfo, FileTimes, Handle, OpenAction, OpenIntent, OpenOptions};
 use crate::error::{SmbError, SmbResult};
 use crate::stream::{StreamInfo, StreamName};
@@ -323,6 +323,77 @@ pub(super) fn list(fd: &File, store: &Store) -> io::Result<Vec<StreamInfo>> {
 /// Like [`list`], with a backend error.
 pub(super) fn list_smb(fd: &File, store: &Store) -> SmbResult<Vec<StreamInfo>> {
     list(fd, store).map_err(to_smb)
+}
+
+/// The size and up to the given number of first bytes of each stream
+/// `entries` names of each entry of `dir` it names, `None` where the entry
+/// has no such stream or it cannot be read. Each entry is opened once,
+/// with [`open_entry`], and its streams are read with its entry among the
+/// open streams locked.
+pub(super) fn peek_entries(
+    dir: &Dir,
+    open: &Arc<OpenStreams>,
+    store: &Store,
+    entries: &[(String, Vec<(StreamName, u32)>)],
+) -> Vec<Vec<Option<(u64, Bytes)>>> {
+    entries
+        .iter()
+        .map(|(name, streams)| {
+            peek_entry(dir, open, store, name, streams).unwrap_or_else(|e| {
+                debug!(error = %e, name, "streams of a listed entry not read");
+                vec![None; streams.len()]
+            })
+        })
+        .collect()
+}
+
+/// [`peek_entries`] for the entry `name`.
+fn peek_entry(
+    dir: &Dir,
+    open: &Arc<OpenStreams>,
+    store: &Store,
+    name: &str,
+    streams: &[(StreamName, u32)],
+) -> io::Result<Vec<Option<(u64, Bytes)>>> {
+    let (base, key) = open_entry(dir, name)?;
+    let file = open.file(key);
+    let _open = lock(&file.open);
+    let access = Access::new(&base, store);
+    let view = access.view()?;
+    Ok(streams
+        .iter()
+        .map(|(stream, max)| {
+            peek(&base, &view, stream, *max).unwrap_or_else(|e| {
+                debug!(error = %e, name, stream = stream.as_str(), "stream of a listed entry not read");
+                None
+            })
+        })
+        .collect())
+}
+
+/// The size of the stream `stream` of the file `fd` is open on, whose
+/// streams `view` holds, and up to `max` bytes from its start.
+fn peek(fd: &File, view: &View, stream: &StreamName, max: u32) -> io::Result<Option<(u64, Bytes)>> {
+    let Some(found) = view.find(stream) else {
+        return Ok(None);
+    };
+    let main = &found.main;
+    let (size, data) = if main.spilled {
+        let spilled = view.spilled()?.open(&main.name, false)?;
+        let size = spilled.metadata()?.len();
+        let mut data = vec![0; (max as u64).min(size) as usize];
+        let read = spilled.read_at(&mut data, 0)?;
+        data.truncate(read);
+        (size, Bytes::from(data))
+    } else if max == 0 {
+        (view.size(fd, main)?.0, Bytes::new())
+    } else {
+        // The whole value is read; only its start is kept.
+        let data = get(fd, &attr_name(main.name.as_str())?)?;
+        let head = &data[..data.len().min(max as usize)];
+        (data.len() as u64, Bytes::copy_from_slice(head))
+    };
+    Ok(Some((size, data)))
 }
 
 /// Reads and changes the streams of one file, with its entry among the
@@ -665,45 +736,6 @@ impl Place {
                 read_only: self.read_only,
             });
             Ok((handle, action))
-        })
-        .await
-        .map_err(join_to_io)
-        .map_err(to_smb)?
-        .map_err(to_smb)
-    }
-
-    /// The size of the named stream `stream` of the file at `rel` and up
-    /// to `max` bytes from its start, `None` when it has no such stream.
-    pub(super) async fn peek_stream(
-        self,
-        rel: PathBuf,
-        stream: StreamName,
-        max: u32,
-    ) -> SmbResult<Option<(u64, Bytes)>> {
-        spawn_blocking(move || -> io::Result<_> {
-            let (base, _, file) = self.base(&rel, 0, false)?;
-            let _open = lock(&file.open);
-            let view = Access::new(&base, &self.store).view()?;
-            let Some(found) = view.find(&stream) else {
-                return Ok(None);
-            };
-            let main = &found.main;
-            let (size, data) = if main.spilled {
-                let spilled = view.spilled()?.open(&main.name, false)?;
-                let size = spilled.metadata()?.len();
-                let mut data = vec![0; (max as u64).min(size) as usize];
-                let read = spilled.read_at(&mut data, 0)?;
-                data.truncate(read);
-                (size, data)
-            } else if max == 0 {
-                (view.size(&base, main)?.0, Vec::new())
-            } else {
-                let mut data = get(&base, &attr_name(main.name.as_str())?)?;
-                let size = data.len() as u64;
-                data.truncate(max as usize);
-                (size, data)
-            };
-            Ok(Some((size, Bytes::from(data))))
         })
         .await
         .map_err(join_to_io)

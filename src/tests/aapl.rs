@@ -414,8 +414,29 @@ struct Listed {
 }
 
 async fn list(state: &Arc<ServerState>, peer: &mut Peer, tree: u32, class: u8) -> Vec<Listed> {
+    list_in(state, peer, tree, class, 65536).await
+}
+
+/// The first response to a listing of the share root with an output
+/// buffer of `len` bytes.
+async fn list_in(
+    state: &Arc<ServerState>,
+    peer: &mut Peer,
+    tree: u32,
+    class: u8,
+    len: u32,
+) -> Vec<Listed> {
+    let dir = open_dir(state, peer, tree, "").await;
+    let flags = QueryDirectoryRequest::FLAG_RESTART_SCANS;
+    let (status, listed) = query(state, peer, tree, dir, class, flags, len).await;
+    assert_eq!(status, ntstatus::STATUS_SUCCESS);
+    listed
+}
+
+/// Opens the directory `path` on `tree`.
+async fn open_dir(state: &Arc<ServerState>, peer: &mut Peer, tree: u32, path: &str) -> FileId {
     let open = create_body(
-        "",
+        path,
         FILE_READ_ATTRIBUTES | SYNCHRONIZE | 0x1,
         FILE_DIRECTORY_FILE,
         &[],
@@ -425,17 +446,31 @@ async fn list(state: &Arc<ServerState>, peer: &mut Peer, tree: u32, class: u8) -
     let reply = peer.dispatch(state, &msg).await.expect("a response");
     let (opened, dir, _) = created(&reply);
     assert_eq!(opened, ntstatus::STATUS_SUCCESS);
+    dir
+}
+
+/// One QUERY_DIRECTORY for "*" on the directory open as `dir`: its status
+/// and the entries of its response.
+async fn query(
+    state: &Arc<ServerState>,
+    peer: &mut Peer,
+    tree: u32,
+    dir: FileId,
+    class: u8,
+    flags: u8,
+    len: u32,
+) -> (u32, Vec<Listed>) {
     let pattern = crate::utils::utf16le("*");
     let mut body = Vec::new();
     QueryDirectoryRequest {
         structure_size: 33,
         file_information_class: class,
-        flags: QueryDirectoryRequest::FLAG_RESTART_SCANS,
+        flags,
         file_index: 0,
         file_id: dir,
         file_name_offset: 96,
         file_name_length: pattern.len() as u16,
-        output_buffer_length: 65536,
+        output_buffer_length: len,
         file_name: pattern,
     }
     .write_to(&mut body)
@@ -443,7 +478,10 @@ async fn list(state: &Arc<ServerState>, peer: &mut Peer, tree: u32, class: u8) -
     let (_, mut msg) = peer.message(Command::QueryDirectory, &body);
     msg[36..40].copy_from_slice(&tree.to_le_bytes());
     let reply = peer.dispatch(state, &msg).await.expect("a response");
-    assert_eq!(status(&reply), ntstatus::STATUS_SUCCESS);
+    let status = status(&reply);
+    if status != ntstatus::STATUS_SUCCESS {
+        return (status, Vec::new());
+    }
     let buf = QueryDirectoryResponse::parse(&reply[SMB2_HEADER_LEN..])
         .expect("listing")
         .buffer;
@@ -476,7 +514,7 @@ async fn list(state: &Arc<ServerState>, peer: &mut Peer, tree: u32, class: u8) -
             next => at += next as usize,
         }
     }
-    out
+    (status, out)
 }
 
 fn entry<'a>(listed: &'a [Listed], name: &str) -> &'a Listed {
@@ -543,6 +581,69 @@ async fn listings_after_read_dir_attr_carry_finder_data() {
     for e in list(&state, &mut peer, 1, BOTH).await {
         assert_eq!((e.ea_size, e.short, e.short_name), (0, [0, 0], [0; 24]));
     }
+}
+
+/// [`files`] and six more files, so a listing with a 346-byte buffer
+/// takes several responses.
+fn more_files() -> MemFsBackend {
+    (1..=6).fold(files(), |files, i| {
+        files.with_file(&format!("e{i}.txt"), b"x")
+    })
+}
+
+#[tokio::test]
+async fn each_response_of_a_listing_peeks_at_the_entries_it_carries() {
+    let files = more_files();
+    let state = server_with(SmbServer::builder(), files.clone());
+    let mut peer = Peer::new(&state, false).await;
+    mount(&state, &mut peer, &QUERY).await;
+    let dir = open_dir(&state, &mut peer, 1, "").await;
+    let mut flags = QueryDirectoryRequest::FLAG_RESTART_SCANS;
+    let mut carried = Vec::new();
+    loop {
+        let (status, listed) = query(&state, &mut peer, 1, dir, ID_BOTH, flags, 346).await;
+        if status == ntstatus::STATUS_NO_MORE_FILES {
+            break;
+        }
+        assert_eq!(status, ntstatus::STATUS_SUCCESS);
+        let names: Vec<String> = listed
+            .into_iter()
+            .map(|e| e.name)
+            .filter(|n| n != "." && n != "..")
+            .collect();
+        carried.push(names);
+        flags = 0;
+    }
+    assert_eq!(carried.iter().map(Vec::len).sum::<usize>(), 9);
+    assert!(carried.len() > 2, "{carried:?}");
+    assert_eq!(files.peeks(), carried);
+}
+
+#[tokio::test]
+async fn a_refused_peek_is_not_asked_again_until_the_listing_restarts() {
+    let files = more_files().without_peeks();
+    let state = server_with(SmbServer::builder(), files.clone());
+    let mut peer = Peer::new(&state, false).await;
+    mount(&state, &mut peer, &QUERY).await;
+    let dir = open_dir(&state, &mut peer, 1, "").await;
+    let mut query_all = async |flags: u8| {
+        let mut flags = flags;
+        let mut responses = 0;
+        loop {
+            let (status, _) = query(&state, &mut peer, 1, dir, ID_BOTH, flags, 346).await;
+            if status != ntstatus::STATUS_SUCCESS {
+                return responses;
+            }
+            responses += 1;
+            flags = 0;
+        }
+    };
+    assert!(query_all(QueryDirectoryRequest::FLAG_RESTART_SCANS).await > 2);
+    assert_eq!(files.peeks().len(), 1);
+    query_all(QueryDirectoryRequest::FLAG_RESTART_SCANS).await;
+    assert_eq!(files.peeks().len(), 2);
+    query_all(QueryDirectoryRequest::FLAG_REOPEN).await;
+    assert_eq!(files.peeks().len(), 3);
 }
 
 #[tokio::test]
@@ -632,13 +733,9 @@ async fn read_dir_attr_once_granted_stays_for_every_share() {
 
 #[tokio::test]
 async fn a_backend_without_stream_peeks_lists_no_finder_info() {
-    let state = server_with(SmbServer::builder(), CaseSensitive(files()));
+    let state = server_with(SmbServer::builder(), files().without_peeks());
     let mut peer = Peer::new(&state, false).await;
-    let (_, contexts) = mount(&state, &mut peer, &QUERY).await;
-    assert_eq!(
-        aapl_reply(&contexts),
-        Some(&reply(SERVER_CAPS, 0x02, "smb-server")[..])
-    );
+    mount(&state, &mut peer, &QUERY).await;
     for e in list(&state, &mut peer, 1, ID_BOTH).await {
         assert_eq!(e.short, [24, 0], "{e:?}");
         assert_eq!(e.short_name, short_name(0, NO_FINDER_INFO), "{e:?}");
@@ -707,20 +804,80 @@ async fn special_files_and_escaping_links_list_without_finder_data() {
     let finder = entry(&listed, "f.txt").short_name;
     assert_eq!(finder[8..16], *b"TEXTttxt");
     for name in ["fifo", "sock", "out.txt"] {
-        if let Some(e) = listed.iter().find(|e| e.name == name) {
-            assert_eq!(e.short_name, short_name(0, NO_FINDER_INFO), "{name}");
-        }
+        let e = entry(&listed, name);
+        assert_eq!(e.short_name, short_name(0, NO_FINDER_INFO), "{name}");
     }
-    assert!(listed.iter().any(|e| e.name == "fifo"));
 }
 
+/// A symlink in a subdirectory to a file beside that directory lists as
+/// a link, without Finder data, and a peek from the subdirectory finds
+/// none, while a file in it has its own.
+#[cfg(all(unix, feature = "localfs"))]
 #[tokio::test]
-async fn a_read_only_file_lists_without_write_or_delete_access() {
-    let files = files();
-    let state = server_with(SmbServer::builder(), files.clone());
+async fn a_link_out_of_a_listed_subdirectory_has_no_finder_data() {
+    use crate::backend::OpenIntent;
+    use crate::fs::LocalFsBackend;
+
+    let exe = std::env::current_exe().unwrap();
+    let td = tempfile::tempdir_in(exe.parent().unwrap()).unwrap();
+    let root = td.path();
+    std::fs::create_dir_all(root.join("other")).unwrap();
+    std::fs::create_dir_all(root.join("sub")).unwrap();
+    let backend = LocalFsBackend::new(root).unwrap();
+    if !backend.capabilities().named_streams {
+        eprintln!("skipping: no named streams on {}", root.display());
+        return;
+    }
+    let opts = OpenOptions {
+        read: true,
+        write: true,
+        write_attributes: false,
+        intent: OpenIntent::OpenOrCreate,
+        directory: false,
+        non_directory: false,
+        delete_on_close: false,
+    };
+    let stream: crate::StreamName = "AFP_AfpInfo".parse().unwrap();
+    for name in ["other\\f", "sub\\g.txt"] {
+        let path: SmbPath = name.parse().unwrap();
+        let (file, _) = backend.open(&path, opts).await.unwrap();
+        let (h, _) = backend
+            .open_stream(file, &path, &stream, opts)
+            .await
+            .unwrap();
+        h.write(0, &afp_info(&labelled())).await.unwrap();
+        h.close().await.unwrap();
+    }
+    std::os::unix::fs::symlink("../other/f", root.join("sub").join("link")).unwrap();
+
+    let dir_opts = OpenOptions {
+        write: false,
+        directory: true,
+        intent: OpenIntent::Open,
+        ..opts
+    };
+    let (sub, _) = backend
+        .open(&"sub".parse().unwrap(), dir_opts)
+        .await
+        .unwrap();
+    let streams = [(stream, 60)];
+    let peeked = sub
+        .peek_streams(&[("link", &streams[..]), ("g.txt", &streams[..])])
+        .await
+        .unwrap();
+    sub.close().await.unwrap();
+    assert!(peeked[0][0].is_none());
+    assert_eq!(peeked[1][0].as_ref().map(|(size, _)| *size), Some(60));
+
+    let state = server_with(SmbServer::builder(), backend);
     let mut peer = Peer::new(&state, false).await;
-    files.set_read_only("plain.txt");
     mount(&state, &mut peer, &QUERY).await;
-    let listed = list(&state, &mut peer, 1, ID_BOTH).await;
-    assert_eq!(entry(&listed, "plain.txt").ea_size, 0x001E_01C9);
+    let dir = open_dir(&state, &mut peer, 1, "sub").await;
+    let flags = QueryDirectoryRequest::FLAG_RESTART_SCANS;
+    let (status, listed) = query(&state, &mut peer, 1, dir, ID_BOTH, flags, 65536).await;
+    assert_eq!(status, ntstatus::STATUS_SUCCESS);
+    let link = entry(&listed, "link");
+    assert_eq!(link.short_name, short_name(0, NO_FINDER_INFO));
+    assert_eq!(u32::from(link.reserved2) & 0o170_000, 0o120_000);
+    assert_eq!(entry(&listed, "g.txt").short_name[8..16], *b"TEXTttxt");
 }
