@@ -8,6 +8,7 @@ use binrw::io::SeekFrom;
 
 use crate::proto::header::SMB2_HEADER_LEN;
 
+pub mod aapl;
 pub mod cancel;
 pub mod change_notify;
 pub mod close;
@@ -31,6 +32,7 @@ pub mod tree_connect;
 pub mod tree_disconnect;
 pub mod write;
 
+pub use aapl::{AaplQuery, AaplReply};
 pub use cancel::CancelRequest;
 pub use change_notify::{ChangeNotifyRequest, ChangeNotifyResponse};
 pub use close::{CloseRequest, CloseResponse};

@@ -67,6 +67,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "aapl_context"
+path = "fuzz_targets/aapl_context.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "lease_context"
 path = "fuzz_targets/lease_context.rs"
 test = false

@@ -361,6 +361,7 @@ mod server;
 mod stream;
 #[cfg(test)]
 mod tests {
+    mod aapl;
     mod async_requests;
     #[cfg(feature = "discovery")]
     mod discovery;
@@ -509,6 +510,55 @@ pub mod fuzzing {
         };
         let units: Vec<u16> = rebuilt.encode_utf16().collect();
         assert_eq!(parse_create_name(&units).ok(), Some((path, stream)));
+    }
+
+    /// Parses `data` as the data of an `AAPL` create context. It parses
+    /// exactly when it is 24 bytes with CommandCode 1, into the bitmap and
+    /// client caps at offsets 8 and 16. The reply to it holds the parts its
+    /// bitmap asks for, each at the offset the bits before it leave.
+    pub fn aapl_context(data: &[u8]) {
+        use crate::proto::messages::aapl::{AAPL_MODEL_INFO, AAPL_SERVER_CAPS, AAPL_VOLUME_CAPS};
+        use crate::proto::messages::{AaplQuery, AaplReply};
+        let parsed = AaplQuery::parse(data);
+        assert_eq!(
+            parsed.is_ok(),
+            data.len() == 24 && data[..4] == [1, 0, 0, 0]
+        );
+        let Ok(query) = parsed else {
+            return;
+        };
+        assert_eq!(query.bitmap.to_le_bytes(), data[8..16]);
+        assert_eq!(query.client_caps.to_le_bytes(), data[16..24]);
+        let (server_caps, volume_caps) = (query.client_caps, !query.client_caps);
+        let model = "smb-server";
+        let reply = AaplReply {
+            bitmap: query.bitmap,
+            server_caps,
+            volume_caps,
+            model,
+        }
+        .encode();
+        let bitmap = query.bitmap & (AAPL_SERVER_CAPS | AAPL_VOLUME_CAPS | AAPL_MODEL_INFO);
+        assert_eq!(reply[..8], [1, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(reply[8..16], bitmap.to_le_bytes());
+        let mut at = 16;
+        for (bit, caps) in [
+            (AAPL_SERVER_CAPS, server_caps),
+            (AAPL_VOLUME_CAPS, volume_caps),
+        ] {
+            if bitmap & bit != 0 {
+                assert_eq!(reply[at..at + 8], caps.to_le_bytes());
+                at += 8;
+            }
+        }
+        if bitmap & AAPL_MODEL_INFO != 0 {
+            let units = crate::utils::utf16le(model);
+            assert_eq!(reply[at..at + 4], [0, 0, 0, 0]);
+            assert_eq!(reply[at + 4..at + 8], (units.len() as u32).to_le_bytes());
+            assert_eq!(reply[at + 8..], units);
+            at += 8 + units.len();
+        }
+        assert_eq!(reply.len(), at);
     }
 
     /// Parses `data` as a lease break acknowledgment.

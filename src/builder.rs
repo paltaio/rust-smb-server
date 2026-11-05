@@ -259,6 +259,8 @@ pub enum BuildError {
         setting: &'static str,
         value: String,
     },
+    #[error("Apple model {0:?} must be 1 to 79 UTF-8 bytes without control characters")]
+    AppleModel(String),
     #[error("WS-Discovery needs the server on port 445, not {0}")]
     WsDiscoveryPort(u16),
     #[error(
@@ -306,6 +308,8 @@ pub struct SmbServerBuilder {
     max_opens_per_connection: usize,
     max_locks_per_open: usize,
     share_listing: bool,
+    apple_extensions: bool,
+    apple_model: String,
     #[cfg(feature = "discovery")]
     discovery: Option<crate::discovery::Discovery>,
 }
@@ -332,6 +336,8 @@ impl SmbServerBuilder {
             max_opens_per_connection: crate::files::DEFAULT_MAX_OPENS_PER_CONNECTION,
             max_locks_per_open: crate::files::DEFAULT_MAX_LOCKS_PER_OPEN,
             share_listing: true,
+            apple_extensions: true,
+            apple_model: DEFAULT_APPLE_MODEL.to_string(),
             #[cfg(feature = "discovery")]
             discovery: None,
         }
@@ -550,6 +556,28 @@ impl SmbServerBuilder {
         self
     }
 
+    /// Answer the `AAPL` create context that macOS clients send when they
+    /// mount a share. The reply carries the model string of
+    /// [`apple_model`](Self::apple_model), whether the server runs on a
+    /// Unix host and whether the share's names are case-sensitive, and the
+    /// client then treats the server as one with Apple's SMB2 extensions.
+    /// macOS keeps one case-sensitivity value per session: shares mounted
+    /// over one session all take that of the last one mounted. On by
+    /// default; turned off, the context is ignored.
+    pub fn apple_extensions(mut self, enabled: bool) -> Self {
+        self.apple_extensions = enabled;
+        self
+    }
+
+    /// The model string sent to macOS clients in the `AAPL` reply. Default
+    /// `smb-server`. While [`apple_extensions`](Self::apple_extensions) is
+    /// on, [`build`](Self::build) fails unless it is 1 to 79 bytes of UTF-8
+    /// without control characters.
+    pub fn apple_model(mut self, model: impl Into<String>) -> Self {
+        self.apple_model = model.into();
+        self
+    }
+
     pub fn build(self) -> Result<SmbServer, BuildError> {
         let limits = &self.limits;
         if limits.max_connections == 0 {
@@ -632,6 +660,13 @@ impl SmbServerBuilder {
             }
         }
 
+        if self.apple_extensions
+            && (!(1..=MAX_APPLE_MODEL).contains(&self.apple_model.len())
+                || self.apple_model.chars().any(char::is_control))
+        {
+            return Err(BuildError::AppleModel(self.apple_model));
+        }
+
         let listen = self.listen_addr.ok_or(BuildError::MissingListenAddr)?;
 
         let netbios = self.netbios_name.unwrap_or_else(default_netbios_name);
@@ -664,6 +699,7 @@ impl SmbServerBuilder {
             server_guid,
             limits: self.limits,
             share_listing: self.share_listing,
+            apple_model: self.apple_extensions.then_some(self.apple_model),
             #[cfg(feature = "discovery")]
             discovery,
         };
@@ -687,6 +723,12 @@ impl SmbServerBuilder {
 /// responses carry the timeout in whole milliseconds, in 32 bits.
 const MIN_DURABLE_HANDLE_TIMEOUT: Duration = Duration::from_millis(1);
 const MAX_DURABLE_HANDLE_TIMEOUT: Duration = Duration::from_secs(49 * 24 * 60 * 60);
+
+/// The model string of `AAPL` replies unless one is set.
+const DEFAULT_APPLE_MODEL: &str = "smb-server";
+/// Longest accepted model string, in UTF-8 bytes. macOS keeps the model
+/// in an 80-byte buffer with its terminator.
+const MAX_APPLE_MODEL: usize = 79;
 
 /// Smallest and largest accepted `max_read_size` and `max_write_size`.
 const MIN_IO_SIZE: u32 = 64 * 1024;
@@ -807,6 +849,53 @@ mod tests {
                 Err(BuildError::OutOfRange { setting: s, .. }) if s == setting
             ));
         }
+    }
+
+    #[test]
+    fn the_apple_model_holds_1_to_79_bytes_without_control_characters() {
+        let build = |builder: SmbServerBuilder, model: &str| {
+            builder
+                .listen("127.0.0.1:0".parse().unwrap())
+                .apple_model(model)
+                .build()
+        };
+        let longest = "\u{1F34E}".repeat(19) + "abc";
+        assert_eq!(longest.len(), 79);
+        for model in ["NAS 2", &"x".repeat(79), &longest] {
+            assert!(build(SmbServer::builder(), model).is_ok(), "{model:?}");
+        }
+        for model in [
+            "",
+            &"x".repeat(80),
+            &(longest.clone() + "a"),
+            "a\nb",
+            "a\u{85}",
+        ] {
+            assert!(
+                matches!(build(SmbServer::builder(), model), Err(BuildError::AppleModel(m)) if m == model),
+                "{model:?}"
+            );
+            let off = SmbServer::builder().apple_extensions(false);
+            assert!(
+                build(off, model).is_ok(),
+                "{model:?} with the extensions off"
+            );
+        }
+        let configured = |builder: SmbServerBuilder| {
+            let server = builder
+                .listen("127.0.0.1:0".parse().unwrap())
+                .build()
+                .expect("build");
+            server.state().config.apple_model.clone()
+        };
+        assert_eq!(
+            configured(SmbServer::builder()).as_deref(),
+            Some("smb-server")
+        );
+        assert_eq!(
+            configured(SmbServer::builder().apple_extensions(false)),
+            None
+        );
     }
 
     #[test]

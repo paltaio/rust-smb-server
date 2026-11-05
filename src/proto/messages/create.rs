@@ -185,6 +185,7 @@ impl CreateContext {
     pub const NAME_RQLS: &'static [u8; 4] = b"RqLs"; // REQUEST_LEASE
     pub const NAME_DH2Q: &'static [u8; 4] = b"DH2Q"; // DURABLE_HANDLE_REQUEST_V2
     pub const NAME_DH2C: &'static [u8; 4] = b"DH2C"; // DURABLE_HANDLE_RECONNECT_V2
+    pub const NAME_AAPL: &'static [u8; 4] = b"AAPL"; // Apple's SMB2 extensions
 
     /// Parse a chain of create-contexts from the raw chain bytes.
     ///

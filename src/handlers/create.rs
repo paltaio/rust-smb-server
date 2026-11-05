@@ -10,9 +10,9 @@ use crate::proto::messages::change_notify::{
     FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_STREAM_NAME,
 };
 use crate::proto::messages::{
-    CreateContext, CreateRequest, CreateResponse, Dialect, DurableReconnect, DurableReconnectV2,
-    DurableRequest, DurableRequestV2, DurableResponse, DurableResponseV2, FileId, LeaseContext,
-    OplockLevel,
+    AaplQuery, CreateContext, CreateRequest, CreateResponse, Dialect, DurableReconnect,
+    DurableReconnectV2, DurableRequest, DurableRequestV2, DurableResponse, DurableResponseV2,
+    FileId, LeaseContext, OplockLevel,
 };
 use tokio::time::Instant;
 use tracing::{debug, warn};
@@ -35,6 +35,7 @@ use crate::files::{
     LeaseRequest, LeaseState, LeaseVersion, MAX_BREAK_WAIT, OpenRequest, OpenSlot, Refused,
     STREAM_CHANGED, Sharing, Trigger, v2_timeout,
 };
+use crate::handlers::aapl;
 use crate::handlers::reconnect::{self, Reconnect};
 use crate::handlers::shared::{lookup_session, lookup_session_tree};
 use crate::handlers::{Outcome, Pending};
@@ -127,6 +128,8 @@ pub(super) struct ContextQueries {
     /// Data of a lease request.
     lease: Option<Vec<u8>>,
     durable: DurableAsk,
+    /// Data of Apple's `AAPL` context.
+    aapl: Option<Vec<u8>>,
 }
 
 /// The durable handle a CREATE asks for.
@@ -212,6 +215,7 @@ impl ContextQueries {
             timewarp: find(CreateContext::NAME_TWRP).is_some(),
             lease: find(CreateContext::NAME_RQLS).map(|c| c.data.clone()),
             durable: durable_ask(&contexts, dialect).ok()?,
+            aapl: find(CreateContext::NAME_AAPL).map(|c| c.data.clone()),
         })
     }
 
@@ -339,6 +343,8 @@ struct CreateArgs {
     sharing: Sharing,
     queries: ContextQueries,
     lease: Option<LeaseRequest>,
+    /// The `AAPL` server query to answer.
+    aapl: Option<AaplQuery>,
     /// The configured name of the session's user; `None` for anonymous.
     owner: Option<String>,
 }
@@ -351,7 +357,12 @@ enum Request {
 
 impl CreateArgs {
     /// Checks the request against the tree it targets (MS-SMB2 3.3.5.9).
-    async fn parse(conn: &Arc<Connection>, hdr: &Smb2Header, body: &[u8]) -> Result<Request, u32> {
+    async fn parse(
+        server: &ServerState,
+        conn: &Arc<Connection>,
+        hdr: &Smb2Header,
+        body: &[u8],
+    ) -> Result<Request, u32> {
         let req = CreateRequest::parse(body).map_err(|_| ntstatus::STATUS_INVALID_PARAMETER)?;
         let tree_arc = lookup_session_tree(conn, hdr).await?;
         let tree = tree_arc.read().await;
@@ -467,6 +478,12 @@ impl CreateArgs {
             }
             return Err(ntstatus::STATUS_EAS_NOT_SUPPORTED);
         }
+        let aapl = match (&queries.aapl, &server.config.apple_model) {
+            (Some(data), Some(_)) => {
+                Some(AaplQuery::parse(data).map_err(|_| ntstatus::STATUS_INVALID_PARAMETER)?)
+            }
+            _ => None,
+        };
         // Directories get no lease, and neither do named streams nor shares
         // that turn leases off.
         let lease = if req.requested_oplock_level == OplockLevel::Lease as u8
@@ -559,6 +576,7 @@ impl CreateArgs {
             },
             queries,
             lease,
+            aapl,
             owner,
         }))
     }
@@ -643,7 +661,7 @@ pub async fn handle(
     body: &[u8],
     retained: usize,
 ) -> Outcome {
-    let args = match CreateArgs::parse(conn, hdr, body).await {
+    let args = match CreateArgs::parse(server, conn, hdr, body).await {
         Ok(Request::Open(args)) => args,
         Ok(Request::Reconnect(r)) => {
             return reconnect::handle(server, conn, hdr, r, retained).await;
@@ -1042,6 +1060,9 @@ async fn attempt(
         OpenAction::Overwritten => FILE_OVERWRITTEN,
     };
     let mut answers = args.queries.answer(&info, args.maximal, volume_serial);
+    if let (Some(query), Some(model)) = (&args.aapl, &server.config.apple_model) {
+        answers.insert(0, aapl::reply(&share, query, model));
+    }
     if let Some(granted) = &granted {
         answers.push(lease_response(granted));
     }

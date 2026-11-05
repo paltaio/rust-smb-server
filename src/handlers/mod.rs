@@ -17,6 +17,7 @@ use crate::dispatch::HandlerResponse;
 use crate::ntstatus;
 use crate::server::ServerState;
 
+mod aapl;
 mod change_notify;
 mod close;
 pub(crate) mod create;

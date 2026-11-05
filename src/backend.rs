@@ -390,7 +390,8 @@ pub trait Handle: Send + Sync {
     /// Read up to `len` bytes at `offset`. May return fewer.
     async fn read(&self, offset: u64, len: u32) -> SmbResult<bytes::Bytes>;
 
-    /// Write `data` at `offset`. Returns bytes written.
+    /// Write `data` at `offset`. Returns bytes written. A write that starts
+    /// past the end of the file leaves a gap that reads as zeros.
     async fn write(&self, offset: u64, data: &[u8]) -> SmbResult<u32>;
 
     /// Write owned `data` at `offset`. Backends that need ownership across a
@@ -436,8 +437,9 @@ pub trait Handle: Send + Sync {
     /// other flag, and `READONLY` on a directory, returns `NotSupported`.
     async fn set_attributes(&self, attributes: u32) -> SmbResult<()>;
 
-    /// Truncate (or extend) to `len` bytes. For directories: the protocol
-    /// layer rejects this before reaching the backend.
+    /// Truncate (or extend) to `len` bytes; bytes added by extending read as
+    /// zeros. For directories: the protocol layer rejects this before
+    /// reaching the backend.
     async fn truncate(&self, len: u64) -> SmbResult<()>;
 
     /// List directory entries matching the optional pattern. The pattern
