@@ -14,6 +14,9 @@ pub const AAPL_VOLUME_CAPS: u64 = 0x02;
 /// RequestBitmap and ReplyBitmap: the reply carries the model string.
 pub const AAPL_MODEL_INFO: u64 = 0x04;
 
+/// Client and server caps: directory listings carry Finder data
+/// (READ_DIR_ATTR).
+pub const AAPL_SUPPORTS_READ_DIR_ATTR: u64 = 0x01;
 /// Server caps: the server runs on a Unix system.
 pub const AAPL_UNIX_BASED: u64 = 0x04;
 

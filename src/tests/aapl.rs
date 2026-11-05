@@ -16,9 +16,12 @@ use crate::error::SmbResult;
 use crate::ntstatus;
 use crate::path::SmbPath;
 use crate::proto::header::{Command, SMB2_HEADER_LEN};
-use crate::proto::messages::{CreateContext, CreateRequest, CreateResponse, FileId, LeaseContext};
+use crate::proto::messages::{
+    CreateContext, CreateRequest, CreateResponse, FileId, LeaseContext, QueryDirectoryRequest,
+    QueryDirectoryResponse,
+};
 use crate::server::ServerState;
-use crate::tests::memfs::MemFsBackend;
+use crate::tests::memfs::{DIR_MODE, FILE_MODE, MemFsBackend};
 use crate::tests::peer::{Peer, status};
 use crate::{Share, SmbServer, SmbServerBuilder};
 
@@ -36,8 +39,9 @@ const QUERY: [u8; 24] = [
     0x3F, 0, 0, 0, 0, 0, 0, 0,
 ];
 
-/// UNIX_BASED on Unix hosts.
-const SERVER_CAPS: u64 = if cfg!(unix) { 0x04 } else { 0 };
+/// READ_DIR_ATTR, which shares with named streams get, and UNIX_BASED on
+/// Unix hosts.
+const SERVER_CAPS: u64 = if cfg!(unix) { 0x05 } else { 0x01 };
 
 /// Memory backend whose names are case-sensitive.
 struct CaseSensitive(MemFsBackend);
@@ -359,4 +363,364 @@ async fn with_apple_extensions_off_the_context_is_ignored() {
         assert_eq!(status, ntstatus::STATUS_SUCCESS);
         assert_eq!(names(&contexts), [&CreateContext::NAME_MXAC[..]]);
     }
+}
+
+const ID_BOTH: u8 = 0x25;
+const BOTH: u8 = 0x03;
+const FILE_ALL_ACCESS: u32 = 0x001F_01FF;
+const FILE_EXECUTE: u32 = 0x20;
+
+/// An `AFP_AfpInfo` stream holding `finder`.
+fn afp_info(finder: &[u8; 32]) -> Vec<u8> {
+    let mut out = b"AFP\0\0\0\x01\0\0\0\0\0\x80\0\0\0".to_vec();
+    out.extend_from_slice(finder);
+    out.extend_from_slice(&[0; 12]);
+    out
+}
+
+/// Finder info with type TEXT, creator ttxt, the red label and extended
+/// flags 0x0001.
+fn labelled() -> [u8; 32] {
+    let mut finder = [0u8; 32];
+    finder[..8].copy_from_slice(b"TEXTttxt");
+    finder[8..10].copy_from_slice(&[0x00, 0x0C]);
+    finder[24..26].copy_from_slice(&[0x00, 0x01]);
+    finder
+}
+
+/// A share holding `f.txt` with Finder info and a 1000-byte resource fork,
+/// `plain.txt` with neither, and the directory `d` with Finder flags.
+fn files() -> MemFsBackend {
+    let mut folder = [0u8; 32];
+    folder[8..10].copy_from_slice(&[0x40, 0x00]);
+    MemFsBackend::new()
+        .with_file("f.txt", b"data")
+        .with_stream("f.txt", "AFP_AfpInfo", &afp_info(&labelled()))
+        .with_stream("f.txt", "AFP_Resource", &[7; 1000])
+        .with_file("plain.txt", b"x")
+        .with_dir("d")
+        .with_stream("d", "afp_afpinfo", &afp_info(&folder))
+}
+
+/// One entry of a directory listing: name, EaSize, the 2 bytes after it,
+/// the 24 bytes of ShortName, Reserved2 and FileId.
+#[derive(Debug)]
+struct Listed {
+    name: String,
+    ea_size: u32,
+    short: [u8; 2],
+    short_name: [u8; 24],
+    reserved2: u16,
+}
+
+async fn list(state: &Arc<ServerState>, peer: &mut Peer, tree: u32, class: u8) -> Vec<Listed> {
+    let open = create_body(
+        "",
+        FILE_READ_ATTRIBUTES | SYNCHRONIZE | 0x1,
+        FILE_DIRECTORY_FILE,
+        &[],
+    );
+    let (_, mut msg) = peer.message(Command::Create, &open);
+    msg[36..40].copy_from_slice(&tree.to_le_bytes());
+    let reply = peer.dispatch(state, &msg).await.expect("a response");
+    let (opened, dir, _) = created(&reply);
+    assert_eq!(opened, ntstatus::STATUS_SUCCESS);
+    let pattern = crate::utils::utf16le("*");
+    let mut body = Vec::new();
+    QueryDirectoryRequest {
+        structure_size: 33,
+        file_information_class: class,
+        flags: QueryDirectoryRequest::FLAG_RESTART_SCANS,
+        file_index: 0,
+        file_id: dir,
+        file_name_offset: 96,
+        file_name_length: pattern.len() as u16,
+        output_buffer_length: 65536,
+        file_name: pattern,
+    }
+    .write_to(&mut body)
+    .expect("query");
+    let (_, mut msg) = peer.message(Command::QueryDirectory, &body);
+    msg[36..40].copy_from_slice(&tree.to_le_bytes());
+    let reply = peer.dispatch(state, &msg).await.expect("a response");
+    assert_eq!(status(&reply), ntstatus::STATUS_SUCCESS);
+    let buf = QueryDirectoryResponse::parse(&reply[SMB2_HEADER_LEN..])
+        .expect("listing")
+        .buffer;
+    let u32_at = |at: usize| u32::from_le_bytes(buf[at..at + 4].try_into().unwrap());
+    let mut out = Vec::new();
+    let mut at = 0;
+    loop {
+        let (name_at, ea_at) = match class {
+            ID_BOTH => (104, 64),
+            _ => (94, 64),
+        };
+        let len = u32_at(at + 60) as usize;
+        let units: Vec<u16> = buf[at + name_at..at + name_at + len]
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        out.push(Listed {
+            name: String::from_utf16(&units).unwrap(),
+            ea_size: u32_at(at + ea_at),
+            short: [buf[at + 68], buf[at + 69]],
+            short_name: buf[at + 70..at + 94].try_into().unwrap(),
+            reserved2: if class == ID_BOTH {
+                u16::from_le_bytes([buf[at + 94], buf[at + 95]])
+            } else {
+                0
+            },
+        });
+        match u32_at(at) {
+            0 => break,
+            next => at += next as usize,
+        }
+    }
+    out
+}
+
+fn entry<'a>(listed: &'a [Listed], name: &str) -> &'a Listed {
+    listed.iter().find(|e| e.name == name).expect(name)
+}
+
+/// The 24 bytes of ShortName a listing with Finder data carries.
+fn short_name(fork: u64, finder: [u8; 16]) -> [u8; 24] {
+    let mut out = [0u8; 24];
+    out[..8].copy_from_slice(&fork.to_le_bytes());
+    out[8..].copy_from_slice(&finder);
+    out
+}
+
+/// The 16 bytes of Finder info without an `AFP_AfpInfo` stream.
+const NO_FINDER_INFO: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x80, 0, 0, 0];
+
+#[tokio::test]
+async fn listings_after_read_dir_attr_carry_finder_data() {
+    let state = server_with(SmbServer::builder(), files());
+    let mut peer = Peer::new(&state, false).await;
+    let (_, contexts) = mount(&state, &mut peer, &QUERY).await;
+    assert_eq!(
+        aapl_reply(&contexts),
+        Some(&reply(SERVER_CAPS, 0, "smb-server")[..])
+    );
+    let listed = list(&state, &mut peer, 1, ID_BOTH).await;
+    let mut names: Vec<&str> = listed.iter().map(|e| e.name.as_str()).collect();
+    names.sort_unstable();
+    assert_eq!(names, [".", "..", "d", "f.txt", "plain.txt"]);
+    for e in &listed {
+        assert_eq!(e.short, [24, 0], "{e:?}");
+    }
+
+    let f = entry(&listed, "f.txt");
+    assert_eq!(f.ea_size, FILE_ALL_ACCESS & !FILE_EXECUTE);
+    let mut finder = [0u8; 16];
+    finder[..8].copy_from_slice(b"TEXTttxt");
+    finder[8..12].copy_from_slice(&[0x00, 0x0C, 0x00, 0x01]);
+    // MemFsBackend files were created at 0x01D9_0000_0000_0000.
+    finder[12..].copy_from_slice(&0x2B12_1F7Eu32.to_be_bytes());
+    assert_eq!(f.short_name, short_name(1000, finder));
+    assert_eq!(u32::from(f.reserved2), FILE_MODE & 0xFFFF);
+
+    let plain = entry(&listed, "plain.txt");
+    assert_eq!(plain.short_name, short_name(0, NO_FINDER_INFO));
+
+    let d = entry(&listed, "d");
+    assert_eq!(d.ea_size, FILE_ALL_ACCESS);
+    let mut folder = [0u8; 16];
+    folder[8..10].copy_from_slice(&[0x40, 0x00]);
+    folder[12..].copy_from_slice(&0x2B12_1F7Eu32.to_be_bytes());
+    assert_eq!(d.short_name, short_name(0, folder));
+    assert_eq!(u32::from(d.reserved2), DIR_MODE & 0xFFFF);
+
+    for dot in [".", ".."] {
+        let e = entry(&listed, dot);
+        assert_eq!(e.ea_size, FILE_ALL_ACCESS);
+        assert_eq!(e.short_name, short_name(0, NO_FINDER_INFO));
+        assert_eq!(u32::from(e.reserved2), DIR_MODE & 0xFFFF);
+    }
+
+    // Other classes keep their layout.
+    for e in list(&state, &mut peer, 1, BOTH).await {
+        assert_eq!((e.ea_size, e.short, e.short_name), (0, [0, 0], [0; 24]));
+    }
+}
+
+#[tokio::test]
+async fn listings_without_read_dir_attr_are_plain() {
+    let state = server_with(SmbServer::builder(), files());
+    let mut peer = Peer::new(&state, false).await;
+    let plain = |listed: Vec<Listed>| {
+        listed
+            .iter()
+            .all(|e| (e.ea_size, e.short, e.short_name, e.reserved2) == (0, [0, 0], [0; 24], 0))
+    };
+    assert!(plain(list(&state, &mut peer, 1, ID_BOTH).await));
+    // A client without READ_DIR_ATTR gets none.
+    let mut query = QUERY;
+    query[16] = 0x3E;
+    let (_, contexts) = mount(&state, &mut peer, &query).await;
+    assert_eq!(
+        aapl_reply(&contexts),
+        Some(&reply(SERVER_CAPS & !1, 0, "smb-server")[..])
+    );
+    assert!(plain(list(&state, &mut peer, 1, ID_BOTH).await));
+    // Nor does one whose query asks for no server caps.
+    let mut query = QUERY;
+    query[8] = 0x06;
+    mount(&state, &mut peer, &query).await;
+    assert!(plain(list(&state, &mut peer, 1, ID_BOTH).await));
+}
+
+#[tokio::test]
+async fn read_dir_attr_once_granted_stays_for_every_share() {
+    let state = SmbServer::builder()
+        .listen("127.0.0.1:0".parse().unwrap())
+        .share(Share::new("home", files()).public())
+        .share(Share::new("bare", files().without_streams()).public())
+        .build()
+        .expect("build")
+        .state();
+    let mut peer = Peer::new(&state, false).await;
+    let bare = state.find_share("bare").await.expect("share");
+    let session = peer.conn.sessions.read().await[&1].clone();
+    session.read().await.trees.write().await.insert(
+        2,
+        Arc::new(RwLock::new(TreeConnect::new(2, bare, Access::Read))),
+    );
+    let mount_bare = async |peer: &mut Peer| {
+        let (_, mut msg) = peer.message(Command::Create, &mount_body(&QUERY));
+        msg[36..40].copy_from_slice(&2u32.to_le_bytes());
+        let response = peer.dispatch(&state, &msg).await.expect("a response");
+        let (_, _, contexts) = created(&response);
+        contexts
+    };
+    // Before a grant, the share without streams gets none.
+    let contexts = mount_bare(&mut peer).await;
+    assert_eq!(
+        aapl_reply(&contexts),
+        Some(&reply(SERVER_CAPS & !1, 0, "smb-server")[..])
+    );
+    assert_eq!(
+        entry(&list(&state, &mut peer, 2, ID_BOTH).await, "f.txt").short,
+        [0, 0]
+    );
+    mount(&state, &mut peer, &QUERY).await;
+    // After it, that share gets READ_DIR_ATTR too and lists Finder data
+    // without its streams, with the read-only tree's access.
+    let contexts = mount_bare(&mut peer).await;
+    assert_eq!(
+        aapl_reply(&contexts),
+        Some(&reply(SERVER_CAPS, 0, "smb-server")[..])
+    );
+    let listed = list(&state, &mut peer, 2, ID_BOTH).await;
+    let f = entry(&listed, "f.txt");
+    assert_eq!(f.short, [24, 0]);
+    assert_eq!(f.short_name, short_name(0, NO_FINDER_INFO));
+    assert_eq!(f.ea_size, 0x0012_0089);
+    let listed = list(&state, &mut peer, 1, ID_BOTH).await;
+    assert_eq!(
+        entry(&listed, "f.txt").short_name[..8],
+        1000u64.to_le_bytes()
+    );
+    // So does a query that asks for no server caps.
+    let mut query = QUERY;
+    query[8] = 0x06;
+    mount(&state, &mut peer, &query).await;
+    let listed = list(&state, &mut peer, 1, ID_BOTH).await;
+    assert_eq!(entry(&listed, "f.txt").short, [24, 0]);
+}
+
+#[tokio::test]
+async fn a_backend_without_stream_peeks_lists_no_finder_info() {
+    let state = server_with(SmbServer::builder(), CaseSensitive(files()));
+    let mut peer = Peer::new(&state, false).await;
+    let (_, contexts) = mount(&state, &mut peer, &QUERY).await;
+    assert_eq!(
+        aapl_reply(&contexts),
+        Some(&reply(SERVER_CAPS, 0x02, "smb-server")[..])
+    );
+    for e in list(&state, &mut peer, 1, ID_BOTH).await {
+        assert_eq!(e.short, [24, 0], "{e:?}");
+        assert_eq!(e.short_name, short_name(0, NO_FINDER_INFO), "{e:?}");
+        assert_ne!(e.ea_size, 0, "{e:?}");
+    }
+}
+
+/// Special files and a symlink out of the share in a listed directory on
+/// a host filesystem: the listing finishes, and those entries carry no
+/// Finder data while a regular file beside them does.
+#[cfg(all(unix, feature = "localfs"))]
+#[tokio::test]
+async fn special_files_and_escaping_links_list_without_finder_data() {
+    use crate::backend::OpenIntent;
+    use crate::fs::LocalFsBackend;
+
+    let exe = std::env::current_exe().unwrap();
+    let td = tempfile::tempdir_in(exe.parent().unwrap()).unwrap();
+    let (root, outside) = (td.path().join("share"), td.path().join("outside"));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    let with_info = async |dir: &std::path::Path, name: &str| {
+        let backend = LocalFsBackend::new(dir).unwrap();
+        let path: SmbPath = name.parse().unwrap();
+        let opts = OpenOptions {
+            read: true,
+            write: true,
+            write_attributes: false,
+            intent: OpenIntent::OpenOrCreate,
+            directory: false,
+            non_directory: false,
+            delete_on_close: false,
+        };
+        let (file, _) = backend.open(&path, opts).await.unwrap();
+        let stream = "AFP_AfpInfo".parse().unwrap();
+        let (h, _) = backend
+            .open_stream(file, &path, &stream, opts)
+            .await
+            .unwrap();
+        h.write(0, &afp_info(&labelled())).await.unwrap();
+        h.close().await.unwrap();
+    };
+    let backend = LocalFsBackend::new(&root).unwrap();
+    if !backend.capabilities().named_streams {
+        eprintln!("skipping: no named streams on {}", root.display());
+        return;
+    }
+    with_info(&root, "f.txt").await;
+    with_info(&outside, "f.txt").await;
+    let fifo =
+        std::ffi::CString::new(root.join("fifo").into_os_string().into_encoded_bytes()).unwrap();
+    // SAFETY: `fifo` is a NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
+    let _socket = std::os::unix::net::UnixListener::bind(root.join("sock")).unwrap();
+    std::os::unix::fs::symlink(outside.join("f.txt"), root.join("out.txt")).unwrap();
+
+    let state = server_with(SmbServer::builder(), backend);
+    let mut peer = Peer::new(&state, false).await;
+    mount(&state, &mut peer, &QUERY).await;
+    let listed = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        list(&state, &mut peer, 1, ID_BOTH),
+    )
+    .await
+    .expect("the listing finishes");
+    let finder = entry(&listed, "f.txt").short_name;
+    assert_eq!(finder[8..16], *b"TEXTttxt");
+    for name in ["fifo", "sock", "out.txt"] {
+        if let Some(e) = listed.iter().find(|e| e.name == name) {
+            assert_eq!(e.short_name, short_name(0, NO_FINDER_INFO), "{name}");
+        }
+    }
+    assert!(listed.iter().any(|e| e.name == "fifo"));
+}
+
+#[tokio::test]
+async fn a_read_only_file_lists_without_write_or_delete_access() {
+    let files = files();
+    let state = server_with(SmbServer::builder(), files.clone());
+    let mut peer = Peer::new(&state, false).await;
+    files.set_read_only("plain.txt");
+    mount(&state, &mut peer, &QUERY).await;
+    let listed = list(&state, &mut peer, 1, ID_BOTH).await;
+    assert_eq!(entry(&listed, "plain.txt").ea_size, 0x001E_01C9);
 }

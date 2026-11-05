@@ -416,6 +416,37 @@ pub fn encode_dir_entry(class: u8, entry: &DirEntry) -> Vec<u8> {
     }
 }
 
+/// What a FileIdBothDirectoryInformation entry for a macOS client sent
+/// READ_DIR_ATTR carries in EaSize, ShortName and Reserved2.
+pub struct FinderData {
+    /// The access the client may ask for.
+    pub max_access: u32,
+    pub resource_fork_size: u64,
+    /// Type, creator, Finder flags, extended Finder flags and date added.
+    pub finder_info: [u8; 16],
+    /// The low 16 bits of the POSIX mode, 0 when there is none.
+    pub unix_mode: u16,
+}
+
+/// Encode one FileIdBothDirectoryInformation entry with `finder` in place
+/// of the EaSize, ShortNameLength, ShortName and Reserved2 the class
+/// defines. ShortNameLength is 24 and Reserved1 0.
+pub fn encode_finder_dir_entry(entry: &DirEntry, finder: &FinderData) -> Vec<u8> {
+    let info = &entry.info;
+    let name_u16 = utf16le(&info.name);
+    let mut out = Vec::with_capacity(104 + name_u16.len());
+    write_dir_entry_prefix(&mut out, info, name_u16.len());
+    out.extend_from_slice(&finder.max_access.to_le_bytes());
+    out.push(24);
+    out.push(0);
+    out.extend_from_slice(&finder.resource_fork_size.to_le_bytes());
+    out.extend_from_slice(&finder.finder_info);
+    out.extend_from_slice(&finder.unix_mode.to_le_bytes());
+    out.extend_from_slice(&info.file_index.to_le_bytes());
+    out.extend_from_slice(&name_u16);
+    out
+}
+
 fn write_dir_entry_prefix(out: &mut Vec<u8>, info: &FileInfo, name_len: usize) {
     out.extend_from_slice(&0u32.to_le_bytes()); // NextEntryOffset (patched later)
     out.extend_from_slice(&(info.file_index as u32).to_le_bytes()); // FileIndex
@@ -464,6 +495,7 @@ mod tests {
             is_directory: false,
             read_only: false,
             file_index: 1,
+            unix_mode: None,
         }
     }
 

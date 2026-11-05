@@ -1847,3 +1847,63 @@ async fn a_directory_moved_while_its_path_is_looked_up_is_not_found() {
         std::fs::remove_dir_all(root.join("q")).unwrap();
     }
 }
+
+#[tokio::test]
+async fn peeks_give_the_size_and_start_of_kept_and_spilled_streams() {
+    let Some((td, backend)) = backend() else {
+        return;
+    };
+    create(&backend, "f.txt", "AFP_AfpInfo", &pattern(60)).await;
+    create(&backend, "f.txt", "AFP_Resource", &pattern(70_000)).await;
+    assert!(spilled(&td, "f.txt", "AFP_Resource").exists());
+    std::fs::create_dir(td.path().join("d")).unwrap();
+    create(&backend, "d", "s", b"dir data").await;
+    let peek = async |path: &str, stream: &str, max| {
+        backend
+            .peek_stream(&p(path), &name(stream), max)
+            .await
+            .unwrap()
+            .map(|(size, data)| (size, data.to_vec()))
+    };
+    assert_eq!(
+        peek("f.txt", "afp_afpinfo", 60).await,
+        Some((60, pattern(60)))
+    );
+    assert_eq!(
+        peek("f.txt", "AFP_AfpInfo", 8).await,
+        Some((60, pattern(8)))
+    );
+    assert_eq!(
+        peek("f.txt", "AFP_Resource", 0).await,
+        Some((70_000, Vec::new()))
+    );
+    assert_eq!(
+        peek("f.txt", "AFP_Resource", 100).await,
+        Some((70_000, pattern(100)))
+    );
+    assert_eq!(peek("d", "S", 100).await, Some((8, b"dir data".to_vec())));
+    assert_eq!(peek("f.txt", "missing", 60).await, None);
+    std::fs::write(td.path().join("plain.txt"), b"x").unwrap();
+    assert_eq!(peek("plain.txt", "AFP_AfpInfo", 60).await, None);
+    assert!(
+        backend
+            .peek_stream(&p("gone.txt"), &name("AFP_AfpInfo"), 60)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn a_peek_of_a_fifo_returns_at_once() {
+    let Some((td, backend)) = backend() else {
+        return;
+    };
+    let fifo = std::ffi::CString::new(td.path().join("fifo").into_os_string().into_encoded_bytes())
+        .unwrap();
+    // SAFETY: `fifo` is a NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
+    let (path, stream) = (p("fifo"), name("AFP_AfpInfo"));
+    let peek = backend.peek_stream(&path, &stream, 60);
+    let peeked = tokio::time::timeout(Duration::from_secs(10), peek).await;
+    assert!(peeked.is_ok(), "the peek returns");
+}

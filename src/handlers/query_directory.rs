@@ -5,12 +5,16 @@ use std::sync::Arc;
 use crate::proto::header::Smb2Header;
 use crate::proto::messages::{QueryDirectoryRequest, QueryDirectoryResponse};
 
-use crate::access_mask::FILE_LIST_DIRECTORY;
+use crate::access_mask::{FILE_LIST_DIRECTORY, maximal_access};
 use crate::backend::{DirEntry, FileInfo, OpenIntent, OpenOptions, ShareBackend};
 use crate::conn::state::{Connection, DirCursor, Open};
 use crate::dispatch::HandlerResponse;
+use crate::handlers::aapl;
 use crate::handlers::shared::{lookup_open, lookup_session_tree};
-use crate::info_class::{align8, dir_entry_name_offset, encode_dir_entry};
+use crate::info_class::{
+    FILE_ID_BOTH_DIRECTORY_INFORMATION, align8, dir_entry_name_offset, encode_dir_entry,
+    encode_finder_dir_entry,
+};
 use crate::ntstatus;
 use crate::path::is_valid_pattern;
 use crate::server::ServerState;
@@ -42,7 +46,14 @@ pub async fn handle(
         Some(o) => o,
         None => return HandlerResponse::err(ntstatus::STATUS_FILE_CLOSED),
     };
-    let backend = Arc::clone(&tree_arc.read().await.share.backend);
+    let (backend, streams, maximal) = {
+        let tree = tree_arc.read().await;
+        (
+            Arc::clone(&tree.share.backend),
+            tree.share.named_streams,
+            maximal_access(tree.granted_access),
+        )
+    };
 
     let mut open = open_arc.write().await;
     if !open.is_directory {
@@ -100,6 +111,11 @@ pub async fn handle(
         }
     }
 
+    // A macOS client sent READ_DIR_ATTR reads this class in its layout on
+    // every share.
+    let finder = class == FILE_ID_BOTH_DIRECTORY_INFORMATION && aapl::reads_finder_data(conn);
+    let dir = open.path();
+    let mut lister = aapl::FinderLister::new(backend.as_ref(), streams, dir.as_ref(), maximal);
     let cursor = open.search_state.as_mut().expect("scan started");
     let mut buf: Vec<u8> = Vec::new();
     let mut last_entry: Option<usize> = None;
@@ -108,11 +124,18 @@ pub async fn handle(
         if single_entry && last_entry.is_some() {
             break;
         }
-        let mut bytes = encode_dir_entry(class, &cursor.entries[cursor.next]);
+        let entry = &cursor.entries[cursor.next];
         let start = align8(buf.len());
-        if last_entry.is_some() && start + bytes.len() > cap {
+        // The size of an entry is known before its Finder data is read.
+        let size = name_offset + 2 * entry.info.name.encode_utf16().count();
+        if last_entry.is_some() && start + size > cap {
             break;
         }
+        let mut bytes = if finder {
+            encode_finder_dir_entry(entry, &lister.data(&entry.info).await)
+        } else {
+            encode_dir_entry(class, entry)
+        };
         if bytes.len() > cap {
             // Only the first entry gets here: return as much of its name as
             // fits. The entry is returned again by the next query.

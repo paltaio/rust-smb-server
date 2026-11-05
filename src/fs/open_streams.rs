@@ -92,14 +92,16 @@ impl OpenNames {
 }
 
 /// Opens the file or directory at `rel` below `root` for reading, or for
-/// writing too with `write`.
+/// writing too with `write`. The open does not block, so a FIFO there opens
+/// or fails at once.
 pub(super) fn open_base(
     root: &Dir,
     rel: &Path,
     write: bool,
 ) -> io::Result<(File, Metadata, (u64, u64))> {
+    use cap_std::fs::OpenOptionsExt as _;
     let mut opts = CapOpenOptions::new();
-    opts.read(true).write(write);
+    opts.read(true).write(write).custom_flags(libc::O_NONBLOCK);
     let file = root.open_with(rel, &opts)?.into_std();
     let md = Metadata::from_file(&file)?;
     let key = file_key(&md).ok_or(io::ErrorKind::Unsupported)?;

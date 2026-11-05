@@ -102,6 +102,11 @@ pub struct Connection {
     /// The change notification watches of this connection's opens and the
     /// bytes they buffer.
     pub(crate) notify_budget: Arc<NotifyBudget>,
+
+    /// Set once an `AAPL` reply on the connection granted READ_DIR_ATTR,
+    /// after which directory listings carry Finder data. It covers the
+    /// client's session because no other channel can be bound to it.
+    pub(crate) aapl_read_dir_attr: AtomicBool,
 }
 
 impl Connection {
@@ -130,6 +135,7 @@ impl Connection {
             pending: PendingOps::default(),
             pipe_budget: Arc::default(),
             notify_budget: Arc::default(),
+            aapl_read_dir_attr: AtomicBool::new(false),
         }
     }
 

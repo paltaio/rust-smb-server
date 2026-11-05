@@ -915,6 +915,21 @@ pub(super) fn file_info_from_metadata(
         is_directory: md.is_dir(),
         read_only: !md.is_dir() && md.permissions().readonly(),
         file_index: file_index(root_dev, file_key(md)),
+        unix_mode: unix_mode(md),
+    }
+}
+
+/// The POSIX mode of `md`, on hosts that have one.
+fn unix_mode(md: &Metadata) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        use cap_std::fs::MetadataExt as _;
+        Some(md.mode())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = md;
+        None
     }
 }
 
@@ -1521,6 +1536,18 @@ impl ShareBackend for LocalFsBackend {
         }
         self.stream_place()?
             .remove_stream(to_rel_path(path), file_index, stream.clone())
+            .await
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    async fn peek_stream(
+        &self,
+        path: &SmbPath,
+        stream: &StreamName,
+        max: u32,
+    ) -> SmbResult<Option<(u64, bytes::Bytes)>> {
+        self.stream_place()?
+            .peek_stream(to_rel_path(path), stream.clone(), max)
             .await
     }
 
@@ -2295,6 +2322,48 @@ mod tests {
         let h = backend.open(&p("f.txt"), opts_open_ro()).await.unwrap().0;
         let ino = std::fs::metadata(td.path().join("f.txt")).unwrap().ino();
         assert_eq!(h.stat().await.unwrap().file_index, ino);
+    }
+
+    #[tokio::test]
+    async fn stat_and_listings_report_the_host_mode() {
+        let td = tempdir().unwrap();
+        std::fs::write(td.path().join("f.txt"), b"x").unwrap();
+        std::fs::create_dir(td.path().join("d")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = |name: &str, mode| {
+                let perms = std::fs::Permissions::from_mode(mode);
+                std::fs::set_permissions(td.path().join(name), perms).unwrap();
+            };
+            mode("f.txt", 0o751);
+            mode("d", 0o710);
+        }
+        let backend = LocalFsBackend::new(td.path()).unwrap();
+        let root = backend
+            .open(&SmbPath::root(), opts_open_dir())
+            .await
+            .unwrap()
+            .0;
+        let listed = root.list_dir(None).await.unwrap();
+        let listed_mode = |name: &str| {
+            listed
+                .iter()
+                .find(|e| e.info.name == name)
+                .expect(name)
+                .info
+                .unix_mode
+        };
+        let h = backend.open(&p("f.txt"), opts_open_ro()).await.unwrap().0;
+        let stat = h.stat().await.unwrap().unix_mode;
+        let (file, dir) = if cfg!(unix) {
+            (Some(0o100_751), Some(0o040_710))
+        } else {
+            (None, None)
+        };
+        assert_eq!(stat, file);
+        assert_eq!(listed_mode("f.txt"), file);
+        assert_eq!(listed_mode("d"), dir);
     }
 
     /// Needs mounts below `/` whose roots share an inode number, as procfs,

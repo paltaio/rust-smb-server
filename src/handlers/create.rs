@@ -1061,7 +1061,7 @@ async fn attempt(
     };
     let mut answers = args.queries.answer(&info, args.maximal, volume_serial);
     if let (Some(query), Some(model)) = (&args.aapl, &server.config.apple_model) {
-        answers.insert(0, aapl::reply(&share, query, model));
+        answers.insert(0, aapl::reply(conn, &share, query, model));
     }
     if let Some(granted) = &granted {
         answers.push(lease_response(granted));

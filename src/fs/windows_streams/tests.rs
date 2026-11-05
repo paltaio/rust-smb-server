@@ -675,3 +675,39 @@ async fn a_stream_to_replace_goes_while_other_opens_do_not_use_its_data() {
     drop((file, attributes));
     assert_eq!(streams(&backend, "f.txt").await, [("B".to_string(), 4)]);
 }
+
+/// Bytes that differ from one offset to the next.
+fn pattern(len: usize) -> Vec<u8> {
+    (0..len).map(|i| (i * 7 % 251) as u8).collect()
+}
+
+#[tokio::test]
+async fn peeks_give_the_size_and_start_of_ntfs_streams() {
+    let (td, backend) = backend();
+    create(&backend, "f.txt", "AFP_AfpInfo", &pattern(60)).await;
+    create(&backend, "f.txt", "AFP_Resource", &pattern(70_000)).await;
+    std::fs::create_dir(td.path().join("d")).unwrap();
+    create(&backend, "d", "s", b"dir data").await;
+    std::fs::write(td.path().join("plain.txt"), b"x").unwrap();
+    let peek = async |path: &str, stream: &str, max| {
+        backend
+            .peek_stream(&p(path), &name(stream), max)
+            .await
+            .unwrap()
+            .map(|(size, data)| (size, data.to_vec()))
+    };
+    assert_eq!(
+        peek("f.txt", "afp_afpinfo", 60).await,
+        Some((60, pattern(60)))
+    );
+    assert_eq!(
+        peek("f.txt", "AFP_Resource", 0).await,
+        Some((70_000, Vec::new()))
+    );
+    assert_eq!(
+        peek("f.txt", "AFP_Resource", 100).await,
+        Some((70_000, pattern(100)))
+    );
+    assert_eq!(peek("d", "S", 100).await, Some((8, b"dir data".to_vec())));
+    assert_eq!(peek("plain.txt", "AFP_AfpInfo", 60).await, None);
+}

@@ -32,10 +32,10 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Storage::FileSystem::{
     DELETE, FILE_ATTRIBUTE_NORMAL, FILE_DISPOSITION_INFO, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
-    FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    FILE_STANDARD_INFO, FILE_WRITE_ATTRIBUTES, FileDispositionInfo, FileRenameInfo,
-    FileStandardInfo, GetFileInformationByHandleEx, GetVolumeInformationByHandleW, SYNCHRONIZE,
-    SetFileInformationByHandle,
+    FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, FILE_STANDARD_INFO, FILE_WRITE_ATTRIBUTES, FileDispositionInfo,
+    FileRenameInfo, FileStandardInfo, GetFileInformationByHandleEx, GetVolumeInformationByHandleW,
+    SYNCHRONIZE, SetFileInformationByHandle,
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
@@ -504,6 +504,43 @@ impl Place {
                 read_only: self.read_only,
             });
             Ok((handle, action))
+        })
+        .await
+        .map_err(join_to_io)
+        .map_err(to_smb)?
+        .map_err(to_smb)
+    }
+
+    /// The size of the named stream `stream` of the file at `rel` and up
+    /// to `max` bytes from its start, `None` when it has no such stream.
+    pub(super) async fn peek_stream(
+        self,
+        rel: PathBuf,
+        stream: StreamName,
+        max: u32,
+    ) -> SmbResult<Option<(u64, Bytes)>> {
+        spawn_blocking(move || -> io::Result<_> {
+            let (base, _) = self.base(&rel, 0)?;
+            let access = if max == 0 {
+                FILE_READ_ATTRIBUTES
+            } else {
+                FILE_READ_DATA | FILE_READ_ATTRIBUTES
+            };
+            let file = match open_relative(&base, Some(&stream), access, SHARE_ALL, FILE_OPEN) {
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+                file => file?.0,
+            };
+            let (size, _) = sizes(&file)?;
+            let mut data = vec![0; (max as u64).min(size) as usize];
+            let mut read = 0;
+            while read < data.len() {
+                match file.seek_read(&mut data[read..], read as u64)? {
+                    0 => break,
+                    n => read += n,
+                }
+            }
+            data.truncate(read);
+            Ok(Some((size, Bytes::from(data))))
         })
         .await
         .map_err(join_to_io)

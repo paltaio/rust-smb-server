@@ -1016,3 +1016,49 @@ async fn a_volume_with_attributes_only_in_dot_underscore_files_has_no_streams() 
     let backend = LocalFsBackend::new(fat.mount()).unwrap();
     assert!(!backend.capabilities().named_streams);
 }
+
+#[tokio::test]
+async fn peeks_read_the_finder_info_and_fork_attributes_the_host_set() {
+    let (td, backend) = backend();
+    let path = td.path().join("f.txt");
+    std::fs::write(&path, b"x").unwrap();
+    set_xattr(&path, "com.apple.FinderInfo", &labeled_afp_info()[16..48]);
+    set_xattr(&path, "com.apple.ResourceFork", &pattern(5000));
+    set_xattr(&path, "com.apple.metadata:_kMDItemUserTags", b"tags");
+    std::fs::write(td.path().join("plain.txt"), b"x").unwrap();
+    let peek = async |path: &str, stream: &str, max| {
+        backend
+            .peek_stream(&p(path), &name(stream), max)
+            .await
+            .unwrap()
+            .map(|(size, data)| (size, data.to_vec()))
+    };
+    assert_eq!(
+        peek("f.txt", "AFP_AfpInfo", 60).await,
+        Some((60, labeled_afp_info()))
+    );
+    assert_eq!(
+        peek("f.txt", "afp_resource", 0).await,
+        Some((5000, Vec::new()))
+    );
+    assert_eq!(
+        peek("f.txt", "com.apple.metadata\u{F022}_kMDItemUserTags", 60).await,
+        Some((4, b"tags".to_vec()))
+    );
+    for stream in ["AFP_AfpInfo", "AFP_Resource", "other"] {
+        assert_eq!(peek("plain.txt", stream, 60).await, None, "{stream}");
+    }
+}
+
+#[tokio::test]
+async fn a_peek_of_a_fifo_returns_at_once() {
+    let (td, backend) = backend();
+    let fifo = std::ffi::CString::new(td.path().join("fifo").into_os_string().into_encoded_bytes())
+        .unwrap();
+    // SAFETY: `fifo` is a NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
+    let (path, stream) = (p("fifo"), name("AFP_AfpInfo"));
+    let peek = backend.peek_stream(&path, &stream, 60);
+    let peeked = tokio::time::timeout(Duration::from_secs(10), peek).await;
+    assert!(peeked.is_ok(), "the peek returns");
+}

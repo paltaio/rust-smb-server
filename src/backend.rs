@@ -116,6 +116,10 @@ pub struct FileInfo {
     /// not see opens through the other, and clients on the two names can
     /// both cache writes to it.
     pub file_index: u64,
+    /// POSIX mode of the file, file type bits included, as `st_mode` has
+    /// it. Directory listings give macOS clients that negotiated Apple's
+    /// extensions its low 16 bits. `None` where the host has no modes.
+    pub unix_mode: Option<u32>,
 }
 
 // File attributes (MS-FSCC 2.6).
@@ -153,6 +157,7 @@ impl FileInfo {
             is_directory: false,
             read_only: false,
             file_index: 0,
+            unix_mode: None,
         }
     }
 
@@ -374,6 +379,24 @@ pub trait ShareBackend: Send + Sync + 'static {
         _to: Option<&StreamName>,
         _replace_if_exists: bool,
     ) -> SmbResult<()> {
+        Err(SmbError::NotSupported)
+    }
+
+    /// The size of the named stream of the file or directory at `path`
+    /// that `stream` names, whatever the case of its spelling, and up to
+    /// `max` bytes from its start; `None` when it has no such stream.
+    /// Directory listings for macOS clients that negotiated Apple's
+    /// extensions call it for `AFP_AfpInfo` and `AFP_Resource` of each
+    /// entry, so it runs twice per listed file. Called only when
+    /// [`BackendCapabilities::named_streams`] is set. The default returns
+    /// [`SmbError::NotSupported`]; listings then carry no Finder info or
+    /// resource fork sizes.
+    async fn peek_stream(
+        &self,
+        _path: &SmbPath,
+        _stream: &StreamName,
+        _max: u32,
+    ) -> SmbResult<Option<(u64, bytes::Bytes)>> {
         Err(SmbError::NotSupported)
     }
 }

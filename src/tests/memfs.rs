@@ -11,6 +11,11 @@ use crate::stream::{StreamInfo, StreamName};
 use async_trait::async_trait;
 use bytes::Bytes;
 
+/// The mode files report.
+pub const FILE_MODE: u32 = 0o100_644;
+/// The mode directories report.
+pub const DIR_MODE: u32 = 0o040_755;
+
 /// In-memory backend for unit tests. Files and directories are keyed by
 /// backslash-joined path. Clones share the same files. Files and
 /// directories have named streams, unless made with
@@ -149,6 +154,36 @@ impl MemFsBackend {
         {
             let mut g = self.inner.lock().unwrap();
             g.files.insert(path.to_string(), contents.to_vec());
+        }
+        self
+    }
+
+    pub fn with_dir(self, path: &str) -> Self {
+        self.inner.lock().unwrap().dirs.insert(path.to_string(), ());
+        self
+    }
+
+    /// Marks the entry `path` read-only.
+    pub fn set_read_only(&self, path: &str) {
+        self.inner
+            .lock()
+            .unwrap()
+            .read_only
+            .insert(path.to_string());
+    }
+
+    /// Gives the entry `path` the named stream `name` holding `data`.
+    pub fn with_stream(self, path: &str, name: &str, data: &[u8]) -> Self {
+        {
+            let mut g = self.inner.lock().unwrap();
+            let id = g.id_of(path);
+            g.next_id += 1;
+            let stream = MemStream {
+                id: g.next_id,
+                name: name.to_string(),
+                data: data.to_vec(),
+            };
+            g.streams.entry(id).or_default().push(stream);
         }
         self
     }
@@ -380,6 +415,23 @@ impl ShareBackend for MemFsBackend {
         Ok((Box::new(handle), action))
     }
 
+    async fn peek_stream(
+        &self,
+        path: &SmbPath,
+        stream: &StreamName,
+        max: u32,
+    ) -> SmbResult<Option<(u64, Bytes)>> {
+        let g = self.inner.lock().unwrap();
+        let name = stream.as_str().to_lowercase();
+        Ok(g.streams_of(&key(path))
+            .iter()
+            .find(|s| s.name.to_lowercase() == name)
+            .map(|s| {
+                let head = &s.data[..s.data.len().min(max as usize)];
+                (s.data.len() as u64, Bytes::copy_from_slice(head))
+            }))
+    }
+
     async fn remove_stream(
         &self,
         path: &SmbPath,
@@ -557,6 +609,7 @@ impl Handle for MemHandle {
             is_directory: self.is_dir,
             read_only: g.read_only.contains(&key),
             file_index: 0,
+            unix_mode: Some(if self.is_dir { DIR_MODE } else { FILE_MODE }),
         })
     }
 
@@ -627,8 +680,9 @@ impl Handle for MemHandle {
                         last_write_time: 0x01D9_0000_0000_0000,
                         change_time: 0x01D9_0000_0000_0000,
                         is_directory: false,
-                        read_only: false,
+                        read_only: g.read_only.contains(k),
                         file_index: 0,
+                        unix_mode: Some(FILE_MODE),
                     },
                 });
             }
@@ -650,6 +704,7 @@ impl Handle for MemHandle {
                         is_directory: true,
                         read_only: false,
                         file_index: 0,
+                        unix_mode: Some(DIR_MODE),
                     },
                 });
             }

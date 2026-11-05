@@ -786,6 +786,44 @@ impl Place {
         .map_err(to_smb)
     }
 
+    /// The size of the named stream `stream` of the file at `rel` and up
+    /// to `max` bytes from its start, `None` when it has no such stream.
+    /// `AFP_AfpInfo` and `AFP_Resource` are read from their attributes
+    /// without listing the others.
+    pub(super) async fn peek_stream(
+        self,
+        rel: PathBuf,
+        stream: StreamName,
+        max: u32,
+    ) -> SmbResult<Option<(u64, Bytes)>> {
+        spawn_blocking(move || -> io::Result<_> {
+            let (base, _, _) = open_base(&self.root, &rel, false)?;
+            let attr = Attr::of(&stream)?;
+            let attr = match attr.kind {
+                Kind::Plain => match View::load(&base)?.find(&stream) {
+                    Some(found) => found.main.clone(),
+                    None => return Ok(None),
+                },
+                Kind::FinderInfo | Kind::ResourceFork => attr,
+            };
+            match value_size(&base, &attr.xattr) {
+                Err(e) if is_missing(&e) => return Ok(None),
+                found => found?,
+            };
+            let size = size(&base, &attr)?;
+            let data = if max == 0 {
+                Bytes::new()
+            } else {
+                read(&base, &attr, 0, max)?
+            };
+            Ok(Some((size, data)))
+        })
+        .await
+        .map_err(join_to_io)
+        .map_err(to_smb)?
+        .map_err(to_smb)
+    }
+
     /// Removes the named stream `stream` of the file at `rel`, which has
     /// the id `id`.
     pub(super) async fn remove_stream(

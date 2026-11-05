@@ -675,6 +675,45 @@ impl Place {
         .map_err(to_smb)
     }
 
+    /// The size of the named stream `stream` of the file at `rel` and up
+    /// to `max` bytes from its start, `None` when it has no such stream.
+    pub(super) async fn peek_stream(
+        self,
+        rel: PathBuf,
+        stream: StreamName,
+        max: u32,
+    ) -> SmbResult<Option<(u64, Bytes)>> {
+        spawn_blocking(move || -> io::Result<_> {
+            let (base, _, file) = self.base(&rel, 0, false)?;
+            let _open = lock(&file.open);
+            let view = Access::new(&base, &self.store).view()?;
+            let Some(found) = view.find(&stream) else {
+                return Ok(None);
+            };
+            let main = &found.main;
+            let (size, data) = if main.spilled {
+                let spilled = view.spilled()?.open(&main.name, false)?;
+                let size = spilled.metadata()?.len();
+                let mut data = vec![0; (max as u64).min(size) as usize];
+                let read = spilled.read_at(&mut data, 0)?;
+                data.truncate(read);
+                (size, data)
+            } else if max == 0 {
+                (view.size(&base, main)?.0, Vec::new())
+            } else {
+                let mut data = get(&base, &attr_name(main.name.as_str())?)?;
+                let size = data.len() as u64;
+                data.truncate(max as usize);
+                (size, data)
+            };
+            Ok(Some((size, Bytes::from(data))))
+        })
+        .await
+        .map_err(join_to_io)
+        .map_err(to_smb)?
+        .map_err(to_smb)
+    }
+
     /// Removes the named stream `stream` of the file at `rel`, which has
     /// the id `id`.
     pub(super) async fn remove_stream(
