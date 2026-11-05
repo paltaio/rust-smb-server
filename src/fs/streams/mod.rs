@@ -1002,7 +1002,7 @@ impl Handle for StreamHandle {
         if self.read_only {
             return Err(SmbError::AccessDenied);
         }
-        let times = host_file_times(times)?;
+        let times = host_file_times(times);
         self.on_base(move |fd| fd.set_times(times)).await
     }
 

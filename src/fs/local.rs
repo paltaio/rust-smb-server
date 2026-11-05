@@ -973,21 +973,21 @@ pub(super) fn set_host_attributes(
 
 /// Host times for `times`. The change time is left to the host. Hosts other
 /// than Windows and macOS have no call that sets the creation time, so it is
-/// ignored there.
-pub(super) fn host_file_times(times: FileTimes) -> SmbResult<std::fs::FileTimes> {
-    let host_time = |ft| filetime_to_system_time(ft).ok_or(SmbError::NotSupported);
+/// ignored there, as is a time the host's clock cannot hold.
+pub(super) fn host_file_times(times: FileTimes) -> std::fs::FileTimes {
+    let host_time = |ft: Option<u64>| ft.and_then(filetime_to_system_time);
     let mut out = std::fs::FileTimes::new();
-    if let Some(ft) = times.last_write_time {
-        out = out.set_modified(host_time(ft)?);
+    if let Some(t) = host_time(times.last_write_time) {
+        out = out.set_modified(t);
     }
-    if let Some(ft) = times.last_access_time {
-        out = out.set_accessed(host_time(ft)?);
+    if let Some(t) = host_time(times.last_access_time) {
+        out = out.set_accessed(t);
     }
     #[cfg(any(windows, target_os = "macos"))]
-    if let Some(ft) = times.creation_time {
-        out = set_created(out, host_time(ft)?);
+    if let Some(t) = host_time(times.creation_time) {
+        out = set_created(out, t);
     }
-    Ok(out)
+    out
 }
 
 #[cfg(windows)]
@@ -1006,14 +1006,14 @@ fn set_created(times: std::fs::FileTimes, t: SystemTime) -> std::fs::FileTimes {
 // FILETIME conversion
 // ---------------------------------------------------------------------------
 
+/// The host time of the FILETIME `ft`, before 1970 too; `None` where the
+/// host's clock cannot hold it.
 fn filetime_to_system_time(ft: u64) -> Option<SystemTime> {
-    if ft < FILETIME_OFFSET {
-        return None;
+    let ticks = |n: u64| Duration::new(n / 10_000_000, (n % 10_000_000) as u32 * 100);
+    match ft.checked_sub(FILETIME_OFFSET) {
+        Some(after) => UNIX_EPOCH.checked_add(ticks(after)),
+        None => UNIX_EPOCH.checked_sub(ticks(FILETIME_OFFSET - ft)),
     }
-    let unix_100ns = ft - FILETIME_OFFSET;
-    let secs = unix_100ns / 10_000_000;
-    let nanos = ((unix_100ns % 10_000_000) * 100) as u32;
-    UNIX_EPOCH.checked_add(Duration::new(secs, nanos))
 }
 
 // ---------------------------------------------------------------------------
@@ -2293,7 +2293,7 @@ impl Handle for LocalHandle {
     }
 
     async fn set_times(&self, times: FileTimes) -> SmbResult<()> {
-        let host_times = host_file_times(times)?;
+        let host_times = host_file_times(times);
         match self {
             LocalHandle::File {
                 file, read_only, ..
@@ -3178,6 +3178,23 @@ mod tests {
             .unwrap();
         assert_eq!(changed(), before);
         h.close().await.unwrap();
+    }
+
+    #[test]
+    fn filetimes_before_1970_reach_the_host_clock() {
+        for ft in [
+            0,
+            95_616_288_000_000_000,
+            FILETIME_OFFSET - 1,
+            FILETIME_OFFSET,
+        ] {
+            let t = filetime_to_system_time(ft).unwrap();
+            assert_eq!(system_time_to_filetime(t), ft);
+        }
+        assert_eq!(
+            filetime_to_system_time(95_616_288_000_000_000),
+            UNIX_EPOCH.checked_sub(Duration::from_secs(2_082_844_800))
+        );
     }
 
     #[test]

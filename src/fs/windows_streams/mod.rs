@@ -738,7 +738,7 @@ impl Handle for StreamHandle {
         if self.read_only {
             return Err(SmbError::AccessDenied);
         }
-        let times = host_file_times(times)?;
+        let times = host_file_times(times);
         self.run(move |file| file.set_times(times)).await
     }
 

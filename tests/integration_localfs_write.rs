@@ -963,6 +963,67 @@ async fn write_time_applies_with_a_creation_time() {
     }
 }
 
+/// Times before 1970 are set and reported as they are, the creation time
+/// where the host keeps one. On Linux a creation time is ignored and the
+/// rest of the request applies.
+#[tokio::test]
+async fn times_before_1970_are_set_and_reported() {
+    const Y1904: i64 = 95_616_288_000_000_000;
+    const Y1950: i64 = 110_276_208_000_000_000;
+    let td = tempdir().expect("tempdir");
+    std::fs::write(td.path().join("f.txt"), b"x").expect("write file");
+    std::fs::create_dir(td.path().join("d")).expect("mkdir");
+    let backend = LocalFsBackend::new(td.path()).expect("open root");
+    let server = Server::public(backend).await;
+    let mut c = server.client().await;
+    let at = |basic: &[u8], offset: usize| {
+        i64::from_le_bytes(basic[offset..offset + 8].try_into().unwrap())
+    };
+
+    for (name, options) in [("f.txt", 0), ("d", FILE_DIRECTORY_FILE)] {
+        let file_id = c
+            .open_with_options(name, FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES, options)
+            .await
+            .unwrap();
+        let before = c
+            .query_file_info(file_id, FILE_BASIC_INFORMATION)
+            .await
+            .unwrap();
+        assert_eq!(
+            c.set_info(
+                file_id,
+                FILE_BASIC_INFORMATION,
+                basic_info([Y1904, Y1950, Y1950, 0], 0)
+            )
+            .await,
+            STATUS_SUCCESS,
+            "{name}"
+        );
+        let basic = c
+            .query_file_info(file_id, FILE_BASIC_INFORMATION)
+            .await
+            .unwrap();
+        c.close(file_id).await;
+        let created = if cfg!(any(windows, target_os = "macos")) {
+            Y1904
+        } else {
+            at(&before, 0)
+        };
+        assert_eq!(at(&basic, 0), created, "{name} creation");
+        assert_eq!(at(&basic, 8), Y1950, "{name} access");
+        assert_eq!(at(&basic, 16), Y1950, "{name} write");
+    }
+
+    // Listings report them too.
+    let root = c.open_dir("").await;
+    let (status, buf) = c
+        .query_directory(root, FILE_ID_BOTH_DIRECTORY_INFORMATION, 0, "f.txt", 4096)
+        .await;
+    assert_eq!(status, STATUS_SUCCESS);
+    assert_eq!(at(&buf, 24), Y1950, "listed write time");
+    c.close(root).await;
+}
+
 #[tokio::test]
 async fn alternate_name_query_reports_no_short_name() {
     let td = tempdir().expect("tempdir");
