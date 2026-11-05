@@ -1,7 +1,8 @@
 //! CHANGE_NOTIFY handler (MS-SMB2 3.3.5.19). The first request on a
 //! directory open arms a watch for it; every request is answered with the
 //! changes buffered since the previous answer, at once when there are some
-//! and asynchronously otherwise.
+//! and asynchronously otherwise. On a share with change notifications off,
+//! requests wait and nothing is watched.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -11,10 +12,11 @@ use tracing::warn;
 use crate::proto::header::Smb2Header;
 use crate::proto::messages::ChangeNotifyRequest;
 use crate::proto::messages::ChangeNotifyResponse;
+use crate::proto::messages::FileId;
 use crate::proto::messages::change_notify::FILE_NOTIFY_VALID_MASK;
 
 use crate::access_mask::FILE_LIST_DIRECTORY;
-use crate::conn::pending::{Stop, stopped};
+use crate::conn::pending::{AsyncOp, Stop, StopReceiver, stopped};
 use crate::conn::state::Connection;
 use crate::dispatch::HandlerResponse;
 use crate::files::{Answer, WatchReg};
@@ -52,9 +54,6 @@ pub async fn handle(
     if open.granted_access & FILE_LIST_DIRECTORY == 0 {
         return done(ntstatus::STATUS_ACCESS_DENIED);
     }
-    if !share.change_notify {
-        return done(ntstatus::STATUS_NOT_SUPPORTED);
-    }
     // MS-FSA 2.1.5.11: an open that marked its directory for deletion, or
     // opened it delete-on-close, gets STATUS_DELETE_PENDING. So does any
     // open of a directory that is delete-pending: Windows answers so the
@@ -62,6 +61,10 @@ pub async fn handle(
     if open.marked_deleted.load(Ordering::Acquire) || open.delete_on_close || open.delete_pending()
     {
         return done(ntstatus::STATUS_DELETE_PENDING);
+    }
+    if !share.change_notify {
+        drop(open);
+        return unanswered(conn, hdr, req.file_id, retained).await;
     }
     // Arming reads the open's name, so no rename may run until the watch
     // is in the table under it. The lock comes before the open's, as a
@@ -123,11 +126,11 @@ pub async fn handle(
     if let Some(answer) = watch.take(&ticket) {
         return Outcome::Done(respond(answer));
     }
-    // MS-SMB2 3.3.4.2: past its limits the connection gets no more
-    // asynchronous requests. The watch keeps buffering for the next one.
-    let Some((op, mut stop)) = conn.pending.reserve(hdr, Some(req.file_id), retained) else {
-        warn!("too many waiting requests on the connection");
-        return done(ntstatus::STATUS_INSUFFICIENT_RESOURCES);
+    // The watch keeps buffering for the next request when this one is
+    // refused.
+    let (op, mut stop) = match reserve(conn, hdr, req.file_id, retained) {
+        Ok(reserved) => reserved,
+        Err(refused) => return refused,
     };
     // A cancelled request leaves the queue and the changes stay buffered
     // for the next one. Its open, tree or session going away closes the
@@ -136,12 +139,7 @@ pub async fn handle(
         loop {
             tokio::select! {
                 biased;
-                why = stopped(&mut stop) => {
-                    return match why {
-                        Stop::Cancelled => HandlerResponse::err(ntstatus::STATUS_CANCELLED),
-                        Stop::Retry => respond(Answer::Ended(ntstatus::STATUS_NOTIFY_CLEANUP)),
-                    };
-                }
+                why = stopped(&mut stop) => return stopped_response(why),
                 _ = changed.changed() => {}
             }
             if let Some(answer) = watch.take(&ticket) {
@@ -153,6 +151,66 @@ pub async fn handle(
         op,
         work: Box::pin(work),
     })
+}
+
+/// A request on a share with change notifications off, which waits as on a
+/// share where nothing changes: until it is cancelled, or its open, tree,
+/// session or connection goes away. A macOS client that got the `AAPL`
+/// reply hangs on unmount if a CHANGE_NOTIFY fails with
+/// STATUS_NOT_SUPPORTED.
+async fn unanswered(
+    conn: &Arc<Connection>,
+    hdr: &Smb2Header,
+    file_id: FileId,
+    retained: usize,
+) -> Outcome {
+    let (op, mut stop) = match reserve(conn, hdr, file_id, retained) {
+        Ok(reserved) => reserved,
+        Err(refused) => return refused,
+    };
+    // An open closed, or a tree or session ended, before the request was
+    // reserved stopped no request for it; one that ends later stops it.
+    let reachable = match lookup_session_tree(conn, hdr).await {
+        Ok(tree) => lookup_open(&tree, file_id).await.is_some(),
+        Err(_) => false,
+    };
+    if !reachable {
+        conn.pending.finish(op.async_id);
+        return Outcome::Done(HandlerResponse::err(ntstatus::STATUS_FILE_CLOSED));
+    }
+    let work = async move { stopped_response(stopped(&mut stop).await) };
+    Outcome::Pending(Pending {
+        op,
+        work: Box::pin(work),
+    })
+}
+
+/// Registers the request `hdr` on `file_id` as asynchronous. MS-SMB2
+/// 3.3.4.2: past its limits the connection gets no more asynchronous
+/// requests, and the request fails with STATUS_INSUFFICIENT_RESOURCES.
+fn reserve(
+    conn: &Connection,
+    hdr: &Smb2Header,
+    file_id: FileId,
+    retained: usize,
+) -> Result<(Arc<AsyncOp>, StopReceiver), Outcome> {
+    conn.pending
+        .reserve(hdr, Some(file_id), retained)
+        .ok_or_else(|| {
+            warn!("too many waiting requests on the connection");
+            Outcome::Done(HandlerResponse::err(
+                ntstatus::STATUS_INSUFFICIENT_RESOURCES,
+            ))
+        })
+}
+
+/// The response of a waiting request told to stop: STATUS_CANCELLED for a
+/// CANCEL, STATUS_NOTIFY_CLEANUP when its open, tree or session went away.
+fn stopped_response(why: Stop) -> HandlerResponse {
+    match why {
+        Stop::Cancelled => HandlerResponse::err(ntstatus::STATUS_CANCELLED),
+        Stop::Retry => respond(Answer::Ended(ntstatus::STATUS_NOTIFY_CLEANUP)),
+    }
 }
 
 /// The response for `answer`. STATUS_NOTIFY_ENUM_DIR and

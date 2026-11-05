@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use smb_server::ntstatus::{
     STATUS_ACCESS_DENIED, STATUS_CANCELLED, STATUS_FILE_CLOSED, STATUS_INVALID_DEVICE_STATE,
-    STATUS_INVALID_PARAMETER, STATUS_NETWORK_NAME_DELETED, STATUS_NOT_SUPPORTED, STATUS_PENDING,
+    STATUS_INVALID_PARAMETER, STATUS_NETWORK_NAME_DELETED, STATUS_PENDING,
     STATUS_USER_SESSION_DELETED,
 };
 use smb_server::wire::header::{Command, HeaderTail, SMB2_FLAGS_ASYNC_COMMAND};
@@ -203,7 +203,7 @@ async fn change_notify_checks_come_before_waiting() {
 }
 
 #[tokio::test]
-async fn change_notify_off_answers_not_supported_after_the_checks() {
+async fn change_notify_off_waits_after_the_checks() {
     let mut c = connect_to(|share| share.change_notify(false)).await;
     let (sid, tid) = (c.sid, c.tid);
     let dir = c.open("d", FILE_READ_ATTRIBUTES, FILE_DIRECTORY_FILE).await;
@@ -216,6 +216,6 @@ async fn change_notify_off_answers_not_supported_after_the_checks() {
     assert_eq!(
         c.send(Command::ChangeNotify, sid, tid, &change_notify(dir))
             .await,
-        STATUS_NOT_SUPPORTED
+        STATUS_PENDING
     );
 }

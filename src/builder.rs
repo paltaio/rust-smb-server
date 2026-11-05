@@ -177,8 +177,9 @@ impl Share {
     /// Changes made outside the server, or through another
     /// share over the same directory, are reported only by a backend that
     /// watches for them: `LocalFsBackend` does on Linux, for the entries
-    /// directly in a watched folder. When off, such requests fail with
-    /// STATUS_NOT_SUPPORTED. On by default.
+    /// directly in a watched folder. When off, such a request reports
+    /// nothing and waits until it is cancelled or its handle closes. On by
+    /// default.
     pub fn change_notify(mut self, enabled: bool) -> Self {
         self.change_notify = enabled;
         self

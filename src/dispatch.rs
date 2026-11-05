@@ -461,8 +461,8 @@ async fn run_chain(
                         let async_id = pending.op.async_id;
                         // A CHANGE_NOTIFY can wait indefinitely, and the
                         // requests after it would wait with it: it fails
-                        // unless it is last (MS-SMB2 3.3.5.2.7). Its watch
-                        // stays armed.
+                        // unless it is last (MS-SMB2 3.3.5.2.7). A watch it
+                        // armed stays armed.
                         if req_hdr.command == Command::ChangeNotify && remaining > 0 {
                             conn.pending.finish(async_id);
                             drop(pending);

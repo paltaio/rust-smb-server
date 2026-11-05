@@ -518,6 +518,59 @@ async fn connection_teardown_cancels_waiting_requests_and_drops_the_watch() {
     assert_eq!(watcher.conn.notify_budget.watches(), 0);
 }
 
+/// A server like [`server`] whose share has change notifications off.
+fn server_without_notifications() -> (Arc<ServerState>, ConfigHandle) {
+    let server = SmbServer::builder()
+        .listen("127.0.0.1:0".parse().unwrap())
+        .share(
+            Share::new("home", MemFsBackend::new())
+                .public()
+                .change_notify(false),
+        )
+        .build()
+        .expect("build");
+    (server.state(), server.config_handle())
+}
+
+#[tokio::test]
+async fn with_notifications_off_a_request_waits_unanswered_until_cancelled() {
+    let (state, config) = server_without_notifications();
+    let mut maker = Peer::new(&state, false).await;
+    let mut watcher = Peer::new(&state, false).await;
+    let dir = open_dir(&mut watcher, &state, "d").await;
+    let (mid, async_id) = wait_notify(&mut watcher, &state, dir).await;
+    create_file(&mut maker, &state, "d\\a").await;
+    delete_file(&mut maker, &state, "d\\a").await;
+    settle().await;
+    assert!(watcher.rx.try_recv().is_none(), "no change is reported");
+    assert_eq!(home(&state).await.watches.len(), 0);
+    assert_eq!(watcher.conn.notify_budget.watches(), 0);
+    assert_eq!(watcher.conn.pending.len(), 1);
+
+    let cancel = watcher.message_with(Command::Cancel, mid, 1, &[4, 0, 0, 0]);
+    assert!(watcher.dispatch(&state, &cancel).await.is_none());
+    let last = final_of(&mut watcher, async_id).await;
+    assert_eq!(status(&last), ntstatus::STATUS_CANCELLED);
+    settle().await;
+    assert_eq!(watcher.conn.pending.len(), 0);
+
+    // Later requests on the handle wait the same way.
+    let (_, async_id) = wait_notify(&mut watcher, &state, dir).await;
+    close(&mut watcher, &state, dir).await;
+    let last = final_of(&mut watcher, async_id).await;
+    assert_cleanup(&state, &watcher, &last).await;
+    assert_eq!(watcher.conn.pending.len(), 0);
+
+    // Last: the share goes.
+    let (mut watcher, _, async_id) = waiting(&state, false).await;
+    state.active_connections.register(&watcher.conn).await;
+    config.remove_share("home").await.expect("removed");
+    let last = final_of(&mut watcher, async_id).await;
+    assert_eq!(status(&last), ntstatus::STATUS_NOTIFY_CLEANUP);
+    settle().await;
+    assert_eq!(watcher.conn.pending.len(), 0);
+}
+
 #[tokio::test]
 async fn handles_buffer_on_their_own_and_start_empty() {
     let (state, _) = server();
