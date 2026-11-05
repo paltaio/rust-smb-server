@@ -752,18 +752,29 @@ async fn rename_stream(
     }
     let access = open.granted_access;
     let reopened = match &to {
-        // The default stream exists, so its handle is opened before the
-        // data moves into it, and a failure leaves everything as it was.
+        // NTFS refuses to move data into the default stream while a
+        // handle is open on it, so the default stream is opened once the
+        // data is there, and the data moves back if that open fails.
         None => {
-            let reopened = reopen(backend, &path, None, access).await.map_err(status)?;
-            if let Err(e) = backend
+            backend
                 .rename_stream(&path, file_index, from.as_ref(), None, true)
                 .await
-            {
-                close(reopened, &path).await;
-                return Err(status(e));
+                .map_err(status)?;
+            match reopen(backend, &path, None, access).await {
+                Ok(reopened) => Some(reopened),
+                Err(e) => match backend
+                    .rename_stream(&path, file_index, None, from.as_ref(), false)
+                    .await
+                {
+                    Ok(()) => return Err(status(e)),
+                    // The data stays in the default stream, and so does the
+                    // open, which has no handle left to use.
+                    Err(back) => {
+                        warn!(error = %e, undo = %back, path = %path, "a moved stream has no handle");
+                        None
+                    }
+                },
             }
-            Some(reopened)
         }
         Some(to) => {
             // A stream the move replaces is gone once the data moves back,

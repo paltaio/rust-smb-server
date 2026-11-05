@@ -1528,6 +1528,42 @@ async fn a_moved_stream_gets_a_new_handle_or_moves_back() {
 }
 
 #[tokio::test]
+async fn a_stream_moved_onto_the_default_stream_moves_back_without_a_handle() {
+    let files = MemFsBackend::new().with_file("f.txt", b"");
+    let mode = Arc::new(std::sync::atomic::AtomicU8::new(ACCEPT));
+    let picky = Picky {
+        inner: files.clone(),
+        mode: Arc::clone(&mode),
+    };
+    let state = server_on(Share::new("home", picky).public());
+    let mut a = Client::new(&state).await;
+    let set = |m| mode.store(m, std::sync::atomic::Ordering::SeqCst);
+    make(&mut a, "f.txt:s", b"sdata").await;
+    let s = a
+        .open(Create::new("f.txt:s").access(RW | DELETE, SHARE_ALL))
+        .await;
+
+    // The default stream cannot be opened once the data is in it, so the
+    // data goes back to the stream, which the open stays on.
+    set(REFUSE_OPENS);
+    assert_eq!(
+        a.rename(s, "::$DATA", true).await,
+        ntstatus::STATUS_ACCESS_DENIED
+    );
+    assert_eq!(files.contents("f.txt"), Some(Vec::new()));
+    assert_eq!(files.stream_names("f.txt"), ["s"]);
+    assert_eq!(a.read(s, 0, 64).await.unwrap(), b"sdata");
+
+    set(ACCEPT);
+    assert_eq!(a.rename(s, "::$DATA", true).await, 0);
+    assert_eq!(files.contents("f.txt"), Some(b"sdata".to_vec()));
+    assert!(files.stream_names("f.txt").is_empty());
+    assert_eq!(a.read(s, 0, 64).await.unwrap(), b"sdata");
+    a.close(s).await;
+    assert_eq!(files.open_handles(), 0);
+}
+
+#[tokio::test]
 async fn a_stream_moved_onto_the_default_stream_shares_as_the_file_requires() {
     let files = MemFsBackend::new();
     let state = server(&files).await;
