@@ -46,6 +46,10 @@ pub enum SmbError {
     /// a stream with a fixed layout cannot hold.
     #[error("invalid parameter")]
     InvalidParameter,
+    /// The name is a FIFO, a socket or a device node, which the backend
+    /// does not open.
+    #[error("not a regular file or directory")]
+    SpecialFile,
 }
 
 impl SmbError {
@@ -67,6 +71,7 @@ impl SmbError {
             SmbError::DiskFull => ntstatus::STATUS_DISK_FULL,
             SmbError::QuotaExceeded => ntstatus::STATUS_DISK_QUOTA_EXCEEDED,
             SmbError::InvalidParameter => ntstatus::STATUS_INVALID_PARAMETER,
+            SmbError::SpecialFile => ntstatus::STATUS_IO_REPARSE_TAG_NOT_HANDLED,
         }
     }
 }
@@ -89,6 +94,7 @@ mod tests {
         assert_eq!(SmbError::NotSupported.to_nt_status(), 0xC000_00BB);
         assert_eq!(SmbError::NotSameDevice.to_nt_status(), 0xC000_00D4);
         assert_eq!(SmbError::InvalidParameter.to_nt_status(), 0xC000_000D);
+        assert_eq!(SmbError::SpecialFile.to_nt_status(), 0xC000_0279);
 
         let io_err = SmbError::Io(std::io::Error::other("boom"));
         assert_eq!(io_err.to_nt_status(), 0xC000_00E9);

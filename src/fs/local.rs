@@ -58,6 +58,12 @@ use crate::wildcard::Pattern;
 /// requested creation time is ignored there and the other times still apply.
 /// The host keeps the change time.
 ///
+/// On Unix, FIFOs, sockets and device nodes are listed, and an open of one,
+/// or of a symlink to one, fails with STATUS_IO_REPARSE_TAG_NOT_HANDLED.
+/// On Linux, an open that conflicts with a file lease (`F_SETLEASE`) fails
+/// with STATUS_SHARING_VIOLATION instead of waiting; the kernel starts
+/// breaking the lease, so a retry succeeds once the holder releases it.
+///
 /// On Linux, a file's or directory's named streams are its extended
 /// attributes named `user.DosStream.<name>:$DATA`, each holding the
 /// stream's data followed by one NUL byte. A share moves between this
@@ -427,8 +433,30 @@ fn in_store() -> io::Error {
     io::Error::new(io::ErrorKind::NotFound, InStore)
 }
 
+/// What [`special_file`] carries.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug)]
+struct Special;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl std::fmt::Display for Special {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("not a regular file or directory")
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl std::error::Error for Special {}
+
+/// The error for an open of a FIFO, a socket or a device node, which
+/// [`io_to_smb`] makes [`SmbError::SpecialFile`].
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(super) fn special_file() -> io::Error {
+    io::Error::other(Special)
+}
+
 /// The error for a name that changed between its lookup and its open.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn changed() -> io::Error {
     io::Error::new(
         io::ErrorKind::Interrupted,
@@ -628,6 +656,10 @@ pub(super) fn to_rel_path(path: &SmbPath) -> PathBuf {
 
 pub(super) fn io_to_smb(err: io::Error) -> SmbError {
     use io::ErrorKind::*;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if err.get_ref().is_some_and(|inner| inner.is::<Special>()) {
+        return SmbError::SpecialFile;
+    }
     #[cfg(windows)]
     {
         const ERROR_SHARING_VIOLATION: i32 = 32;
@@ -1039,6 +1071,25 @@ impl LocalFsBackend {
         let non_directory = opts.non_directory;
         let write_attributes = opts.write_attributes;
 
+        let existing = {
+            let root = Arc::clone(&root);
+            let rel = rel.clone();
+            spawn_blocking(move || -> io::Result<Option<cap_std::fs::FileType>> {
+                match root.metadata(&rel) {
+                    Ok(md) => Ok(Some(md.file_type())),
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+                    Err(e) => Err(e),
+                }
+            })
+            .await
+            .map_err(join_to_io)
+            .map_err(io_to_smb)?
+            .map_err(io_to_smb)?
+        };
+        if existing.is_some_and(|ty| is_special(&ty)) {
+            return Err(SmbError::SpecialFile);
+        }
+
         if directory {
             // Directory CREATE intents: Create / OpenOrCreate / OverwriteOrCreate
             // imply mkdir; Open / Truncate require existing.
@@ -1082,22 +1133,7 @@ impl LocalFsBackend {
             return Ok((handle, action));
         }
 
-        let existing_is_dir = {
-            let root = Arc::clone(&root);
-            let rel = rel.clone();
-            spawn_blocking(move || -> io::Result<bool> {
-                match root.metadata(&rel) {
-                    Ok(md) => Ok(md.is_dir()),
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
-                    Err(e) => Err(e),
-                }
-            })
-            .await
-            .map_err(join_to_io)
-            .map_err(io_to_smb)?
-            .map_err(io_to_smb)?
-        };
-        if existing_is_dir {
+        if existing.is_some_and(|ty| ty.is_dir()) {
             if non_directory {
                 return Err(SmbError::IsDirectory);
             }
@@ -1148,7 +1184,7 @@ impl LocalFsBackend {
         .await
         .map_err(join_to_io)
         .map_err(io_to_smb)?
-        .map_err(io_to_smb)?;
+        .map_err(open_to_smb)?;
 
         let handle: Box<dyn Handle> = Box::new(LocalHandle::File {
             name: file_name_for(path),
@@ -1160,6 +1196,82 @@ impl LocalFsBackend {
         });
         Ok((handle, action))
     }
+}
+
+/// True for a FIFO, a socket or a device node. Opening one can block or
+/// act on a device, so such entries are refused before any open.
+fn is_special(ty: &cap_std::fs::FileType) -> bool {
+    #[cfg(unix)]
+    {
+        use cap_std::fs::FileTypeExt as _;
+        ty.is_fifo() || ty.is_socket() || ty.is_char_device() || ty.is_block_device()
+    }
+    #[cfg(windows)]
+    {
+        let _ = ty;
+        false
+    }
+}
+
+/// Fails as changed unless `fd` is open on a regular file, as a name
+/// replaced since it was checked may not be, then clears the O_NONBLOCK
+/// the open used, so reads and writes of the file block as usual.
+#[cfg(unix)]
+fn check_regular_and_clear_nonblock(fd: &impl std::os::fd::AsFd) -> io::Result<()> {
+    use rustix::fs::{FileType, OFlags};
+    if FileType::from_raw_mode(rustix::fs::fstat(fd)?.st_mode) != FileType::RegularFile {
+        return Err(changed());
+    }
+    let flags = rustix::fs::fcntl_getfl(fd)?;
+    rustix::fs::fcntl_setfl(fd, flags.difference(OFlags::NONBLOCK))?;
+    Ok(())
+}
+
+/// The error of a file open. On Linux an open that a file lease of another
+/// process conflicts with fails with EWOULDBLOCK, as the open does not
+/// block, after the kernel has started breaking the lease; it becomes a
+/// sharing violation, which clients retry.
+fn open_to_smb(e: io::Error) -> SmbError {
+    #[cfg(target_os = "linux")]
+    if e.kind() == io::ErrorKind::WouldBlock {
+        return SmbError::Sharing;
+    }
+    io_to_smb(e)
+}
+
+/// Opens `rel` below `root` with `options`. On Unix an open that fails on a
+/// name a FIFO, a socket or a device node took since it was checked fails
+/// as changed, so the open is looked at again.
+#[cfg(unix)]
+fn open_with(root: &Dir, rel: &Path, options: &CapOpenOptions) -> io::Result<cap_std::fs::File> {
+    root.open_with(rel, options).map_err(|e| {
+        if root
+            .metadata(rel)
+            .is_ok_and(|md| is_special(&md.file_type()))
+        {
+            changed()
+        } else {
+            e
+        }
+    })
+}
+
+#[cfg(windows)]
+fn open_with(root: &Dir, rel: &Path, options: &CapOpenOptions) -> io::Result<cap_std::fs::File> {
+    root.open_with(rel, options)
+}
+
+/// True if `name` in `dir`, not following a final symlink, is a FIFO, a
+/// socket or a device node.
+#[cfg(target_os = "linux")]
+fn special_at(dir: &Dir, name: &Path) -> bool {
+    use rustix::fs::{AtFlags, FileType};
+    rustix::fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW).is_ok_and(|st| {
+        matches!(
+            FileType::from_raw_mode(st.st_mode),
+            FileType::Fifo | FileType::Socket | FileType::CharacterDevice | FileType::BlockDevice
+        )
+    })
 }
 
 /// True if an open with `opts` may change the file: it asks for write
@@ -1181,25 +1293,30 @@ fn open_file(
     created.read(opts.read).write(true).create_new(true);
     let mut truncated = CapOpenOptions::new();
     truncated.read(opts.read).write(true).truncate(true);
+    #[cfg(unix)]
+    for options in [&mut created, &mut truncated] {
+        use cap_std::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY);
+    }
     let not_found = |e: &io::Error| e.kind() == io::ErrorKind::NotFound;
     let exists = |e: &io::Error| e.kind() == io::ErrorKind::AlreadyExists;
-    match opts.intent {
-        OpenIntent::Open => Ok((root.open_with(rel, &existing)?, OpenAction::Opened)),
-        OpenIntent::Create => Ok((root.open_with(rel, &created)?, OpenAction::Created)),
-        OpenIntent::Truncate => Ok((root.open_with(rel, &truncated)?, OpenAction::Overwritten)),
+    let (file, action) = match opts.intent {
+        OpenIntent::Open => (open_with(root, rel, &existing)?, OpenAction::Opened),
+        OpenIntent::Create => (open_with(root, rel, &created)?, OpenAction::Created),
+        OpenIntent::Truncate => (open_with(root, rel, &truncated)?, OpenAction::Overwritten),
         // The file can appear or vanish between the two calls, so each pair
         // is tried a second time.
         OpenIntent::OpenOrCreate => {
             let mut attempt = 0;
             loop {
                 attempt += 1;
-                match root.open_with(rel, &existing) {
-                    Ok(f) => return Ok((f, OpenAction::Opened)),
+                match open_with(root, rel, &existing) {
+                    Ok(f) => break (f, OpenAction::Opened),
                     Err(e) if not_found(&e) => {}
                     Err(e) => return Err(e),
                 }
-                match root.open_with(rel, &created) {
-                    Ok(f) => return Ok((f, OpenAction::Created)),
+                match open_with(root, rel, &created) {
+                    Ok(f) => break (f, OpenAction::Created),
                     Err(e) if exists(&e) && attempt < 2 => {}
                     Err(e) => return Err(e),
                 }
@@ -1209,19 +1326,22 @@ fn open_file(
             let mut attempt = 0;
             loop {
                 attempt += 1;
-                match root.open_with(rel, &created) {
-                    Ok(f) => return Ok((f, OpenAction::Created)),
+                match open_with(root, rel, &created) {
+                    Ok(f) => break (f, OpenAction::Created),
                     Err(e) if exists(&e) => {}
                     Err(e) => return Err(e),
                 }
-                match root.open_with(rel, &truncated) {
-                    Ok(f) => return Ok((f, OpenAction::Overwritten)),
+                match open_with(root, rel, &truncated) {
+                    Ok(f) => break (f, OpenAction::Overwritten),
                     Err(e) if not_found(&e) && attempt < 2 => {}
                     Err(e) => return Err(e),
                 }
             }
         }
-    }
+    };
+    #[cfg(unix)]
+    check_regular_and_clear_nonblock(&file)?;
+    Ok((file, action))
 }
 
 /// Opens the file `name` in `dir` for `opts.intent`, as [`open_file`]
@@ -1235,7 +1355,7 @@ fn open_file_nofollow(
 ) -> io::Result<(std::fs::File, OpenAction)> {
     use rustix::fs::{Mode, OFlags};
 
-    let base = OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let base = OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK | OFlags::NOCTTY;
     let access = |write: bool| match (opts.read, write) {
         (true, true) => OFlags::RDWR,
         (false, true) => OFlags::WRONLY,
@@ -1253,15 +1373,16 @@ fn open_file_nofollow(
         match rustix::fs::openat(dir, name, flags, Mode::from_raw_mode(0o666)) {
             Ok(fd) => Ok(std::fs::File::from(fd)),
             Err(rustix::io::Errno::LOOP) => Err(changed()),
+            Err(_) if special_at(dir, name) => Err(changed()),
             Err(e) => Err(e.into()),
         }
     };
     let not_found = |e: &io::Error| e.kind() == io::ErrorKind::NotFound;
     let exists = |e: &io::Error| e.kind() == io::ErrorKind::AlreadyExists;
-    match opts.intent {
-        OpenIntent::Open => Ok((open(existing)?, OpenAction::Opened)),
-        OpenIntent::Create => Ok((open(created)?, OpenAction::Created)),
-        OpenIntent::Truncate => Ok((open(truncated)?, OpenAction::Overwritten)),
+    let (file, action) = match opts.intent {
+        OpenIntent::Open => (open(existing)?, OpenAction::Opened),
+        OpenIntent::Create => (open(created)?, OpenAction::Created),
+        OpenIntent::Truncate => (open(truncated)?, OpenAction::Overwritten),
         // The file can appear or vanish between the two calls, so each pair
         // is tried a second time.
         OpenIntent::OpenOrCreate => {
@@ -1269,12 +1390,12 @@ fn open_file_nofollow(
             loop {
                 attempt += 1;
                 match open(existing) {
-                    Ok(f) => return Ok((f, OpenAction::Opened)),
+                    Ok(f) => break (f, OpenAction::Opened),
                     Err(e) if not_found(&e) => {}
                     Err(e) => return Err(e),
                 }
                 match open(created) {
-                    Ok(f) => return Ok((f, OpenAction::Created)),
+                    Ok(f) => break (f, OpenAction::Created),
                     Err(e) if exists(&e) && attempt < 2 => {}
                     Err(e) => return Err(e),
                 }
@@ -1285,25 +1406,32 @@ fn open_file_nofollow(
             loop {
                 attempt += 1;
                 match open(created) {
-                    Ok(f) => return Ok((f, OpenAction::Created)),
+                    Ok(f) => break (f, OpenAction::Created),
                     Err(e) if exists(&e) => {}
                     Err(e) => return Err(e),
                 }
                 match open(truncated) {
-                    Ok(f) => return Ok((f, OpenAction::Overwritten)),
+                    Ok(f) => break (f, OpenAction::Overwritten),
                     Err(e) if not_found(&e) && attempt < 2 => {}
                     Err(e) => return Err(e),
                 }
             }
         }
-    }
+    };
+    check_regular_and_clear_nonblock(&file)?;
+    Ok((file, action))
 }
 
 /// cap-std options that open an existing file with the access `opts` asks
-/// for.
+/// for, and on Unix without blocking.
 fn existing_file_options(opts: &OpenOptions) -> CapOpenOptions {
     let mut cap_opts = CapOpenOptions::new();
     cap_opts.read(true).write(opts.write);
+    #[cfg(unix)]
+    {
+        use cap_std::fs::OpenOptionsExt as _;
+        cap_opts.custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY);
+    }
     // Unix sets times and permissions through a read-only descriptor.
     // Windows needs the access right, which a read-only file grants without
     // write access.
@@ -2741,5 +2869,164 @@ mod tests {
         assert!(!get("dangling").is_directory);
         opened.close().await.unwrap();
         root.close().await.unwrap();
+    }
+
+    /// Makes a FIFO at `path`.
+    #[cfg(unix)]
+    fn mkfifo(path: &Path) {
+        let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `path` is a NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o644) }, 0);
+    }
+
+    /// Opens the FIFO at `path` for reading and for writing without
+    /// blocking, and writes to it, so a thread stuck opening, reading or
+    /// writing it returns.
+    #[cfg(unix)]
+    fn release(path: &Path) {
+        use std::io::{Read as _, Write as _};
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let reader = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path);
+        if let Ok(mut fifo) = std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)
+        {
+            let _ = fifo.write_all(b"x");
+        }
+        if let Ok(mut reader) = reader {
+            let _ = reader.read(&mut [0; 64]);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_fifo_or_socket_in_place_of_a_checked_file_fails_as_changed_at_once() {
+        let td = tempdir().unwrap();
+        let fifo = td.path().join("fifo");
+        mkfifo(&fifo);
+        // A socket fails to open at all; a FIFO opens and is no file.
+        let _socket = std::os::unix::net::UnixListener::bind(td.path().join("sock")).unwrap();
+        let root = Arc::new(Dir::open_ambient_dir(td.path(), ambient_authority()).unwrap());
+        for (name, opts) in [
+            ("fifo", opts_open_ro()),
+            ("fifo", opts_open_rw()),
+            ("sock", opts_open_ro()),
+        ] {
+            let dir = Arc::clone(&root);
+            let opened = spawn_blocking(move || {
+                let name = Path::new(name);
+                #[cfg_attr(not(target_os = "linux"), expect(unused_mut))]
+                let mut results = vec![open_file(&dir, name, opts).map(|_| ())];
+                #[cfg(target_os = "linux")]
+                results.push(open_file_nofollow(&dir, name, opts).map(|_| ()));
+                results
+            });
+            let Ok(opened) = tokio::time::timeout(Duration::from_secs(10), opened).await else {
+                release(&fifo);
+                panic!("the open of a FIFO blocked");
+            };
+            for result in opened.unwrap() {
+                assert!(result.is_err_and(|e| is_changed(&e)), "{name}");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_opened_file_is_left_in_blocking_mode() {
+        let td = tempdir().unwrap();
+        std::fs::write(td.path().join("f"), b"x").unwrap();
+        let root = Dir::open_ambient_dir(td.path(), ambient_authority()).unwrap();
+        let (file, _) = open_file(&root, Path::new("f"), opts_open_rw()).unwrap();
+        let flags = rustix::fs::fcntl_getfl(&file).unwrap();
+        assert!(!flags.contains(rustix::fs::OFlags::NONBLOCK));
+        #[cfg(target_os = "linux")]
+        {
+            let (file, _) = open_file_nofollow(&root, Path::new("f"), opts_open_rw()).unwrap();
+            let flags = rustix::fs::fcntl_getfl(&file).unwrap();
+            assert!(!flags.contains(rustix::fs::OFlags::NONBLOCK));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fifos_and_sockets_are_refused_for_every_intent() {
+        let td = tempdir().unwrap();
+        let fifo = td.path().join("fifo");
+        mkfifo(&fifo);
+        let _socket = std::os::unix::net::UnixListener::bind(td.path().join("sock")).unwrap();
+        let backend = LocalFsBackend::new(td.path()).unwrap();
+        for name in ["fifo", "sock"] {
+            for intent in [
+                OpenIntent::Open,
+                OpenIntent::OpenOrCreate,
+                OpenIntent::Truncate,
+                OpenIntent::OverwriteOrCreate,
+            ] {
+                for opts in [opts_open_ro(), opts_open_rw()] {
+                    let (path, opts) = (p(name), OpenOptions { intent, ..opts });
+                    let open = backend.open(&path, opts);
+                    let Ok(opened) = tokio::time::timeout(Duration::from_secs(10), open).await
+                    else {
+                        release(&fifo);
+                        panic!("the open of {name} blocked");
+                    };
+                    assert!(
+                        matches!(opened, Err(SmbError::SpecialFile)),
+                        "{name} {intent:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_open_against_a_file_lease_fails_as_shared_and_breaks_the_lease() {
+        use libc::{F_GETLEASE, F_SETLEASE};
+        let td = tempdir().unwrap();
+        std::fs::write(td.path().join("f"), b"x").unwrap();
+        let backend = LocalFsBackend::new(td.path()).unwrap();
+        for (lease, opts, breaks_to) in [
+            (libc::F_WRLCK, opts_open_ro(), libc::F_RDLCK),
+            (libc::F_RDLCK, opts_open_rw(), libc::F_UNLCK),
+            (
+                libc::F_RDLCK,
+                OpenOptions {
+                    intent: OpenIntent::Truncate,
+                    ..opts_open_rw()
+                },
+                libc::F_UNLCK,
+            ),
+        ] {
+            let holder = std::fs::File::open(td.path().join("f")).unwrap();
+            let fd = std::os::fd::AsRawFd::as_raw_fd(&holder);
+            // SAFETY: `fd` is open for the whole block; F_SETOWN 0 sends the
+            // break signal to no process.
+            unsafe {
+                if libc::fcntl(fd, F_SETLEASE, lease) != 0 {
+                    eprintln!("skipping: no file lease: {}", io::Error::last_os_error());
+                    return;
+                }
+                assert_eq!(libc::fcntl(fd, libc::F_SETOWN, 0), 0);
+            }
+            let opened = backend.open(&p("f"), opts).await;
+            assert!(matches!(opened, Err(SmbError::Sharing)), "{lease}");
+            // SAFETY: as above.
+            assert_eq!(
+                unsafe { libc::fcntl(fd, F_GETLEASE) },
+                breaks_to,
+                "breaking"
+            );
+            // SAFETY: as above.
+            assert_eq!(unsafe { libc::fcntl(fd, F_SETLEASE, libc::F_UNLCK) }, 0);
+            let (file, _) = backend.open(&p("f"), opts).await.unwrap();
+            file.close().await.unwrap();
+            drop(holder);
+        }
     }
 }

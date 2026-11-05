@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use cap_std::fs::{Dir, Metadata, OpenOptions as CapOpenOptions};
 use tracing::debug;
 
-use super::local::file_key;
+use super::local::{file_key, special_file};
 use crate::stream::StreamName;
 
 pub(super) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -93,7 +93,7 @@ impl OpenNames {
 
 /// Opens the file or directory at `rel` below `root` for reading, or for
 /// writing too with `write`. The open does not block, so a FIFO there opens
-/// or fails at once.
+/// or fails at once, and anything but a file or directory is refused.
 pub(super) fn open_base(
     root: &Dir,
     rel: &Path,
@@ -101,9 +101,14 @@ pub(super) fn open_base(
 ) -> io::Result<(File, Metadata, (u64, u64))> {
     use cap_std::fs::OpenOptionsExt as _;
     let mut opts = CapOpenOptions::new();
-    opts.read(true).write(write).custom_flags(libc::O_NONBLOCK);
+    opts.read(true)
+        .write(write)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY);
     let file = root.open_with(rel, &opts)?.into_std();
     let md = Metadata::from_file(&file)?;
+    if !md.is_file() && !md.is_dir() {
+        return Err(special_file());
+    }
     let key = file_key(&md).ok_or(io::ErrorKind::Unsupported)?;
     Ok((file, md, key))
 }

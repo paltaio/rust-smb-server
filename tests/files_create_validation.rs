@@ -440,3 +440,96 @@ async fn named_streams_are_refused_on_a_share_without_them() {
     assert!(!td.path().join("new.txt").exists());
     assert_eq!(std::fs::read(td.path().join("f.txt")).unwrap(), b"data");
 }
+
+/// Opens the FIFO at `path` for reading and for writing without blocking,
+/// and writes to it, so a thread stuck opening, reading or writing it
+/// returns.
+#[cfg(unix)]
+fn release(path: &std::path::Path) {
+    use std::io::{Read as _, Write as _};
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let reader = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path);
+    if let Ok(mut fifo) = std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+    {
+        let _ = fifo.write_all(b"x");
+    }
+    if let Ok(mut reader) = reader {
+        let _ = reader.read(&mut [0; 64]);
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn fifos_sockets_and_links_to_them_are_refused_at_once() {
+    use smb_server::ShareBackend as _;
+    use std::os::unix::fs::FileTypeExt as _;
+
+    let td = tempdir().unwrap();
+    let fifo = td.path().join("fifo");
+    let path = std::ffi::CString::new(fifo.clone().into_os_string().into_encoded_bytes()).unwrap();
+    // SAFETY: `path` is a NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o644) }, 0);
+    let _socket = std::os::unix::net::UnixListener::bind(td.path().join("sock")).unwrap();
+    std::os::unix::fs::symlink("fifo", td.path().join("to-fifo")).unwrap();
+    let streams = local(td.path()).capabilities().named_streams;
+    let server = Server::public(local(td.path())).await;
+    let mut c = server.client().await;
+
+    const FILE_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    for name in ["fifo", "sock", "to-fifo", "fifo:s"] {
+        let expected = if name.contains(':') && !streams {
+            ntstatus::STATUS_OBJECT_NAME_INVALID
+        } else {
+            ntstatus::STATUS_IO_REPARSE_TAG_NOT_HANDLED
+        };
+        for (access, disposition, options) in [
+            (FILE_READ_DATA, FILE_OPEN, 0),
+            (FILE_READ_ATTRIBUTES, FILE_OPEN, 0),
+            (FILE_READ_ATTRIBUTES, FILE_OPEN, FILE_OPEN_REPARSE_POINT),
+            (RW, FILE_OPEN, 0),
+            (RW, FILE_CREATE, 0),
+            (RW, FILE_OPEN_IF, 0),
+            (RW, FILE_OVERWRITE, 0),
+            (RW, FILE_OVERWRITE_IF, 0),
+            (RW, FILE_SUPERSEDE, 0),
+            (FILE_READ_DATA, FILE_OPEN, FILE_DIRECTORY_FILE),
+            (FILE_READ_DATA, FILE_OPEN_IF, FILE_DIRECTORY_FILE),
+            (RW, FILE_CREATE, FILE_DIRECTORY_FILE),
+        ] {
+            // A named stream is no directory, which the name already says.
+            if name.contains(':') && options == FILE_DIRECTORY_FILE {
+                continue;
+            }
+            let create = c.create(Create {
+                name,
+                access,
+                disposition,
+                options,
+                ..Create::default()
+            });
+            let Ok(created) =
+                tokio::time::timeout(std::time::Duration::from_secs(10), create).await
+            else {
+                release(&fifo);
+                panic!("CREATE {name} {access:#x} {disposition} {options:#x} blocked");
+            };
+            assert_eq!(
+                created.map(|r| r.file_id).err(),
+                Some(expected),
+                "{name} {access:#x} {disposition} {options:#x}"
+            );
+        }
+    }
+    assert!(
+        std::fs::symlink_metadata(&fifo)
+            .unwrap()
+            .file_type()
+            .is_fifo()
+    );
+}
