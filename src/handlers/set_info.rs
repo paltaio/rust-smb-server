@@ -18,7 +18,10 @@ use crate::conn::state::{Connection, Open};
 use crate::dispatch::HandlerResponse;
 use crate::ea;
 use crate::error::{SmbError, SmbResult};
-use crate::files::{BreakWait, CONTENT_CHANGED, Change, MAX_BREAK_WAIT, STREAM_CHANGED, Trigger};
+use crate::files::{
+    BreakWait, CONTENT_CHANGED, Change, MAX_BREAK_WAIT, STREAM_BASE_CHANGED, STREAM_CHANGED,
+    Trigger,
+};
 use crate::handlers::shared::{lookup_open, lookup_session_tree, restore_fixed_times};
 use crate::handlers::{Outcome, Pending};
 use crate::info_class as ic;
@@ -276,14 +279,13 @@ async fn report_modified(share: &ShareBindings, open_arc: &RwLock<Open>, filter:
 
 /// Reports a size change through `open_arc` when `resized`, once; Windows
 /// reports a truncation twice. A named stream resized reports a change of
-/// the stream, and of the file's last write time, and again as the open
-/// closes.
+/// the stream, and of the file's times, and again as the open closes.
 async fn report_resized(share: &ShareBindings, open_arc: &RwLock<Open>, resized: bool) {
     if !resized {
         return;
     }
     if open_arc.read().await.on_stream {
-        report_stream(share, open_arc, Some(FILE_NOTIFY_CHANGE_LAST_WRITE)).await;
+        report_stream(share, open_arc, Some(STREAM_BASE_CHANGED)).await;
     } else {
         report_modified(share, open_arc, CONTENT_CHANGED).await;
     }
@@ -731,7 +733,7 @@ async fn rename_stream(
             .map_err(status)?;
         file.rename_stream(Some(old), Some(new));
         // A stream rename is reported as changes of both names and of the
-        // file's last write time.
+        // file's times.
         let of_stream = |stream| Change {
             path: &path,
             stream: Some(stream),
@@ -745,7 +747,7 @@ async fn rename_stream(
                 path: &path,
                 stream: None,
                 action: FILE_ACTION_MODIFIED,
-                filter: FILE_NOTIFY_CHANGE_LAST_WRITE,
+                filter: STREAM_BASE_CHANGED,
                 seen: true,
             },
             of_stream(new),

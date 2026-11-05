@@ -17,9 +17,7 @@ use crate::backend::{FileInfo, Handle};
 use crate::conn::state::Open;
 use crate::handlers::shared::restore_fixed_times;
 use crate::ntstatus;
-use crate::proto::messages::change_notify::{
-    FILE_ACTION_MODIFIED, FILE_ACTION_MODIFIED_STREAM, FILE_NOTIFY_CHANGE_LAST_WRITE,
-};
+use crate::proto::messages::change_notify::{FILE_ACTION_MODIFIED, FILE_ACTION_MODIFIED_STREAM};
 use crate::stream::data_stream_info;
 
 pub(crate) use durable::{Claim, Durability, DurableReg, DurableTable, Unclaimed, v2_timeout};
@@ -32,7 +30,8 @@ pub(crate) use table::{FileRef, FileTable, OpenRequest, Refused, Sharing};
 #[cfg(test)]
 pub(crate) use watch::MAX_WATCHES_PER_CONNECTION;
 pub(crate) use watch::{
-    Answer, CONTENT_CHANGED, Change, EA_CHANGED, NotifyBudget, STREAM_CHANGED, WatchReg, WatchTable,
+    Answer, CONTENT_CHANGED, Change, EA_CHANGED, NotifyBudget, STREAM_BASE_CHANGED, STREAM_CHANGED,
+    WatchReg, WatchTable,
 };
 
 /// Default for
@@ -197,13 +196,12 @@ pub(crate) async fn finish_close(
     closing: Closing,
     eas_changed: bool,
 ) {
-    // A close reports new contents of the file and new extended
-    // attributes, and a change of the named stream the open is on, as
-    // which a deletion on close of a stream not yet marked for deletion is
-    // reported too.
+    // A close reports new contents of the file, new extended attributes
+    // and a change of the named stream the open is on. Deleting on close a
+    // stream not yet marked for deletion counts as a change of the stream.
     let contents = match closing {
         Closing::Wrote | Closing::StreamWrote { moved: true } => CONTENT_CHANGED,
-        Closing::StreamWrote { moved: false } => FILE_NOTIFY_CHANGE_LAST_WRITE,
+        Closing::StreamWrote { moved: false } => STREAM_BASE_CHANGED,
         _ => 0,
     };
     let filter = contents | if eas_changed { EA_CHANGED } else { 0 };

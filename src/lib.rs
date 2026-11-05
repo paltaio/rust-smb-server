@@ -272,9 +272,9 @@ SmbServer::builder()
 //!     STREAM_* bits: a new stream as an added stream; a write, a size
 //!     change, an overwrite, a rename (under both names) and a deletion as
 //!     a modified stream, after a modification of the file under
-//!     LAST_WRITE for all but the deletion; and the named streams an
-//!     overwrite of the file removes as removed streams. A write is
-//!     reported when the open that wrote closes; an overwrite or a size
+//!     LAST_WRITE and LAST_ACCESS for all but the deletion; and the named
+//!     streams an overwrite of the file removes as removed streams. A write
+//!     is reported when the open that wrote closes; an overwrite or a size
 //!     change of a stream at once, and the stream again when that open
 //!     closes. A deletion of the file reports the file alone. Changes of a
 //!     stream whose name has a `"` are not reported: clients refuse a

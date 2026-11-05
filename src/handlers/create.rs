@@ -8,8 +8,7 @@ use crate::proto::header::{SMB2_FLAGS_REPLAY_OPERATION, Smb2Header};
 use crate::proto::messages::change_notify::{
     FILE_ACTION_ADDED, FILE_ACTION_ADDED_STREAM, FILE_ACTION_MODIFIED, FILE_ACTION_MODIFIED_STREAM,
     FILE_ACTION_REMOVED_STREAM, FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_DIR_NAME,
-    FILE_NOTIFY_CHANGE_EA, FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE,
-    FILE_NOTIFY_CHANGE_STREAM_NAME,
+    FILE_NOTIFY_CHANGE_EA, FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_STREAM_NAME,
 };
 use crate::proto::messages::{
     AaplQuery, CreateContext, CreateRequest, CreateResponse, Dialect, DurableReconnect,
@@ -36,7 +35,7 @@ use crate::error::SmbError;
 use crate::files::{
     BreakWait, CONTENT_CHANGED, Change, Closing, Durability, FileRef, Granted, LeaseId, LeaseRef,
     LeaseRequest, LeaseState, LeaseVersion, MAX_BREAK_WAIT, OpenRequest, OpenSlot, Refused,
-    STREAM_CHANGED, Sharing, Trigger, finish_close, v2_timeout,
+    STREAM_BASE_CHANGED, STREAM_CHANGED, Sharing, Trigger, finish_close, v2_timeout,
 };
 use crate::handlers::aapl;
 use crate::handlers::reconnect::{self, Reconnect};
@@ -1340,7 +1339,7 @@ async fn open_reported(
             changes.push(modified(CONTENT_CHANGED | eas));
         }
         (Some(OpenAction::Overwritten), Some(_)) => {
-            changes.push(modified(FILE_NOTIFY_CHANGE_LAST_WRITE));
+            changes.push(modified(STREAM_BASE_CHANGED));
             changes.push(of_stream(FILE_ACTION_MODIFIED_STREAM, STREAM_CHANGED));
         }
         (Some(OpenAction::Created), Some(_)) => {

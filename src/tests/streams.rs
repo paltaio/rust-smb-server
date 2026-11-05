@@ -2049,6 +2049,80 @@ async fn stream_changes_match_the_stream_filters() {
 }
 
 #[tokio::test]
+async fn stream_changes_report_their_file_or_directory_under_both_times() {
+    const LAST_WRITE: u32 = 0x10;
+    const LAST_ACCESS: u32 = 0x20;
+    let files = MemFsBackend::new();
+    let state = server(&files).await;
+    let mut a = Client::new(&state).await;
+    make(&mut a, "d\\f.txt", b"").await;
+    let sub = a
+        .open(
+            Create::new("d\\sub")
+                .access(READ, SHARE_ALL)
+                .disposition(FILE_CREATE)
+                .options(FILE_DIRECTORY_FILE),
+        )
+        .await;
+    a.close(sub).await;
+    for base in ["f.txt", "sub"] {
+        let stream = format!("d\\{base}:s");
+        let modified = heard(&[(MODIFIED, base)]);
+        for filter in [LAST_WRITE, LAST_ACCESS] {
+            make(&mut a, &stream, b"x").await;
+            let mut watcher = Client::new(&state).await;
+            let d = watched(&mut watcher, "d").await;
+
+            // stream_changes_match_the_stream_filters covers a write to a
+            // file's stream under LAST_WRITE.
+            if base != "f.txt" || filter != LAST_WRITE {
+                let w = watcher.watch(d, filter).await;
+                let s = a.open(Create::new(&stream)).await;
+                assert_eq!(a.write(s, 0, b"data").await, 0);
+                a.close(s).await;
+                let heard = watcher.events(w).await;
+                assert_eq!(heard, modified, "write {base} {filter:#x}");
+            }
+
+            if filter == LAST_ACCESS {
+                let w = watcher.watch(d, filter).await;
+                let s = a.open(Create::new(&stream)).await;
+                let size = 2u64.to_le_bytes().to_vec();
+                assert_eq!(a.set_info(s, END_OF_FILE, size).await, 0);
+                let heard = watcher.events(w).await;
+                assert_eq!(heard, modified, "resize {base} {filter:#x}");
+                a.close(s).await;
+            }
+
+            let w = watcher.watch(d, filter).await;
+            let s = a
+                .open(Create::new(&stream).disposition(FILE_OVERWRITE_IF))
+                .await;
+            let heard = watcher.events(w).await;
+            assert_eq!(heard, modified, "overwrite {base} {filter:#x}");
+            a.close(s).await;
+
+            let w = watcher.watch(d, filter).await;
+            let s = a
+                .open(Create::new(&stream).access(RW | DELETE, SHARE_ALL))
+                .await;
+            assert_eq!(a.rename(s, ":t", true).await, 0);
+            let heard = watcher.events(w).await;
+            assert_eq!(heard, modified, "rename {base} {filter:#x}");
+            a.close(s).await;
+            let t = a
+                .open(
+                    Create::new(&format!("d\\{base}:t"))
+                        .access(DELETE, SHARE_ALL)
+                        .options(FILE_DELETE_ON_CLOSE),
+                )
+                .await;
+            a.close(t).await;
+        }
+    }
+}
+
+#[tokio::test]
 async fn changes_to_streams_named_with_a_quote_go_unreported() {
     let files = MemFsBackend::new();
     let state = server(&files).await;

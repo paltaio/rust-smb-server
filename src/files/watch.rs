@@ -19,9 +19,9 @@ use crate::path::{SmbPath, is_valid_component, rebase};
 use crate::proto::messages::change_notify::{
     FILE_ACTION_ADDED, FILE_ACTION_MODIFIED, FILE_ACTION_REMOVED, FILE_ACTION_RENAMED_NEW_NAME,
     FILE_ACTION_RENAMED_OLD_NAME, FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_DIR_NAME,
-    FILE_NOTIFY_CHANGE_EA, FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE,
-    FILE_NOTIFY_CHANGE_SIZE, FILE_NOTIFY_CHANGE_STREAM_SIZE, FILE_NOTIFY_CHANGE_STREAM_WRITE,
-    entries_len, push_entry,
+    FILE_NOTIFY_CHANGE_EA, FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_ACCESS,
+    FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE, FILE_NOTIFY_CHANGE_STREAM_SIZE,
+    FILE_NOTIFY_CHANGE_STREAM_WRITE, entries_len, push_entry,
 };
 use crate::server::ShareBindings;
 use crate::stream::StreamName;
@@ -54,6 +54,12 @@ pub(crate) const EA_CHANGED: u32 = FILE_NOTIFY_CHANGE_EA | FILE_NOTIFY_CHANGE_AT
 /// MODIFIED_STREAM.
 pub(crate) const STREAM_CHANGED: u32 =
     FILE_NOTIFY_CHANGE_STREAM_SIZE | FILE_NOTIFY_CHANGE_STREAM_WRITE;
+
+/// Filter of the change of a file or directory that a write, a size
+/// change, an overwrite or a rename of one of its named streams makes,
+/// reported as MODIFIED before the stream's own change.
+pub(crate) const STREAM_BASE_CHANGED: u32 =
+    FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_LAST_ACCESS;
 
 /// One change to report: `action` (FILE_ACTION_*) happened at `path`, or
 /// at its named stream `stream`, and it matches the FILE_NOTIFY_CHANGE_*
