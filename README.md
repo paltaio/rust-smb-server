@@ -234,7 +234,7 @@ Not supported:
 - DFS
 - multichannel and compression
 - transports other than direct TCP: NetBIOS sessions, QUIC and RDMA
-- extended attributes with `LocalFsBackend` on macOS
+- SMB extended attributes with `LocalFsBackend` on macOS; the xattrs macOS clients set travel as named streams and work there
 - security descriptors and quotas
 - server-side copy and reparse points
 - snapshots for Previous Versions
