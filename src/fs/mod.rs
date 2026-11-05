@@ -9,6 +9,8 @@ mod macos_streams;
 mod open_streams;
 #[cfg(target_os = "linux")]
 mod streams;
+#[cfg(windows)]
+mod windows_streams;
 
 pub use local::LocalFsBackend;
 

@@ -32,7 +32,7 @@ use super::local::{
 use super::open_streams::{OpenStreams, StreamFile, lock, open_base, touch};
 use crate::backend::{
     DirEntry, FILE_ATTRIBUTE_ARCHIVE, FILE_ATTRIBUTE_READONLY, FileInfo, FileTimes, Handle,
-    OpenAction, OpenIntent,
+    OpenAction, OpenIntent, OpenOptions,
 };
 use crate::error::{SmbError, SmbResult};
 use crate::stream::{StreamInfo, StreamName, from_sfm, to_sfm};
@@ -726,15 +726,16 @@ impl Place {
     }
 
     /// Opens the named stream `stream` of the file at `rel`, which has the
-    /// id `id`, for `intent`.
+    /// id `id`, for `opts.intent`.
     pub(super) async fn open_stream(
         self,
         rel: PathBuf,
         name: String,
         id: u64,
         stream: StreamName,
-        intent: OpenIntent,
+        opts: OpenOptions,
     ) -> SmbResult<(Box<dyn Handle>, OpenAction)> {
+        let intent = opts.intent;
         spawn_blocking(move || -> io::Result<_> {
             let (base, md, file) = self.base(&rel, id, false)?;
             let mut open = lock(&file.open);

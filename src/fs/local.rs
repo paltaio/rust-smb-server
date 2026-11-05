@@ -38,7 +38,7 @@ use crate::backend::{
 };
 use crate::error::{SmbError, SmbResult};
 use crate::path::{SmbPath, same_path};
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 use crate::stream::StreamName;
 use crate::utils::{FILETIME_OFFSET, system_time_to_filetime};
 
@@ -125,13 +125,25 @@ use crate::wildcard::Pattern;
 /// STATUS_DISK_FULL, as does a rename that moves more than the target
 /// holds, and a read of a stream other than those two that the host made
 /// larger than 1 MiB fails with STATUS_ACCESS_DENIED. Reads of a resource
-/// fork stop at 4 GiB. An
-/// overwrite or supersede of a file removes every attribute it lists as a
-/// stream, `com.apple.quarantine` and others the host set included. A
-/// share on a volume that keeps extended attributes only in `._` files,
-/// such as FAT or exFAT, has no named streams.
+/// fork stop at 4 GiB. An overwrite or supersede of a file removes every
+/// attribute it lists as a stream, `com.apple.quarantine` and others the
+/// host set included. A share on a volume that keeps extended attributes
+/// only in `._` files, such as FAT or exFAT, has no named streams.
 ///
-/// Windows has no named streams.
+/// On Windows, a file's or directory's named streams are its NTFS
+/// alternate data streams, under the names clients send, each opened
+/// relative to a handle of its file inside the share without following
+/// reparse points. NTFS compares stream names by the uppercase form of
+/// each character and keeps the spelling a stream was made with; names
+/// that differ only in a character without a one-character uppercase form,
+/// such as U+00DF and U+1E9E, are two streams to NTFS and one to the
+/// server's share modes and locks, while U+03C2 and U+03C3 are one stream
+/// to NTFS and two to the server. A file lists at most 4096 named streams, and a new stream
+/// past that fails with STATUS_DISK_FULL. Whether the share has named
+/// streams is decided once, from the volume of the share root: FAT and
+/// exFAT volumes have none. ReFS cannot rename streams: a stream rename
+/// there fails with STATUS_INVALID_PARAMETER, and a stream larger than the
+/// volume holds fails with STATUS_DISK_FULL.
 pub struct LocalFsBackend {
     root: Arc<Dir>,
     /// Device of the share root; see `file_index`.
@@ -146,6 +158,10 @@ pub struct LocalFsBackend {
     /// has none.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     streams: Option<Arc<super::open_streams::OpenStreams>>,
+    /// The named streams of the share root's volume; `None` when it has
+    /// none.
+    #[cfg(windows)]
+    volume: Option<super::windows_streams::Volume>,
     /// Where streams too large for an extended attribute go; `None` when
     /// the share has no named streams.
     #[cfg(target_os = "linux")]
@@ -167,6 +183,8 @@ impl LocalFsBackend {
         let streams = super::streams::supported(&root).then(Arc::default);
         #[cfg(target_os = "macos")]
         let streams = super::macos_streams::supported(&root).then(Arc::default);
+        #[cfg(windows)]
+        let volume = super::windows_streams::volume(&root);
         #[cfg(target_os = "linux")]
         let store = streams
             .is_some()
@@ -180,6 +198,8 @@ impl LocalFsBackend {
             hub: Some(Arc::default()),
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             streams,
+            #[cfg(windows)]
+            volume,
             #[cfg(target_os = "linux")]
             store,
             #[cfg(test)]
@@ -1446,7 +1466,9 @@ impl ShareBackend for LocalFsBackend {
             case_sensitive: self.case_sensitive,
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             named_streams: self.streams.is_some(),
-            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            #[cfg(windows)]
+            named_streams: self.volume.is_some(),
+            #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
             named_streams: false,
         }
     }
@@ -1461,7 +1483,7 @@ impl ShareBackend for LocalFsBackend {
             .map_err(io_to_smb)
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     async fn open_stream(
         &self,
         file: Box<dyn Handle>,
@@ -1482,12 +1504,12 @@ impl ShareBackend for LocalFsBackend {
                 file_name_for(path),
                 id?,
                 stream.clone(),
-                opts.intent,
+                opts,
             )
             .await
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     async fn remove_stream(
         &self,
         path: &SmbPath,
@@ -1502,7 +1524,7 @@ impl ShareBackend for LocalFsBackend {
             .await
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     async fn rename_stream(
         &self,
         path: &SmbPath,
@@ -1526,7 +1548,7 @@ impl ShareBackend for LocalFsBackend {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 impl LocalFsBackend {
     #[cfg(target_os = "linux")]
     fn stream_place(&self) -> SmbResult<super::streams::Place> {
@@ -1546,6 +1568,16 @@ impl LocalFsBackend {
             root_dev: self.root_dev,
             read_only: self.read_only,
             open: self.streams.clone().ok_or(SmbError::NotSupported)?,
+        })
+    }
+
+    #[cfg(windows)]
+    fn stream_place(&self) -> SmbResult<super::windows_streams::Place> {
+        Ok(super::windows_streams::Place {
+            root: Arc::clone(&self.root),
+            root_dev: self.root_dev,
+            read_only: self.read_only,
+            volume: self.volume.ok_or(SmbError::NotSupported)?,
         })
     }
 }
@@ -1929,18 +1961,22 @@ impl Handle for LocalHandle {
         listed.map_err(join_to_io).map_err(io_to_smb)?
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     async fn streams(&self) -> SmbResult<Vec<crate::stream::StreamInfo>> {
+        #[cfg(target_os = "macos")]
+        use super::macos_streams::list_smb;
+        #[cfg(windows)]
+        use super::windows_streams::list_smb;
         match self {
             LocalHandle::File { file, .. } => {
                 let file = Arc::clone(file);
-                spawn_blocking(move || super::macos_streams::list_smb(&file)).await
+                spawn_blocking(move || list_smb(&file)).await
             }
             LocalHandle::Dir { dir_handle, .. } => {
                 let dir_handle = Arc::clone(dir_handle);
                 spawn_blocking(move || {
                     let fd = dir_as_file(&dir_handle).map_err(io_to_smb)?;
-                    super::macos_streams::list_smb(&fd)
+                    list_smb(&fd)
                 })
                 .await
             }
