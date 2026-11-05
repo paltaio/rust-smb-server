@@ -511,4 +511,143 @@ mod tests {
         let response = info_length_mismatch(false);
         assert_eq!(response.body, [9, 0, 0, 0, 0, 0, 0, 0]);
     }
+
+    #[tokio::test]
+    async fn directories_are_reported_with_a_size_of_zero_whatever_the_backend_says() {
+        use crate::proto::header::{Command, SMB2_HEADER_LEN};
+        use crate::proto::messages::{
+            CloseRequest, CloseResponse, CreateRequest, CreateResponse, FileId,
+            QueryDirectoryRequest, QueryDirectoryResponse,
+        };
+        use crate::tests::memfs::MemFsBackend;
+        use crate::tests::peer::{Peer, status};
+        use crate::{Share, SmbServer};
+
+        let backend = MemFsBackend::new()
+            .with_dir("d")
+            .with_dir("d\\sub")
+            .with_file("d\\a.txt", b"hello\n")
+            .with_dir_size(4096);
+        let state = SmbServer::builder()
+            .listen("127.0.0.1:0".parse().unwrap())
+            .share(Share::new("home", backend).public())
+            .build()
+            .expect("build")
+            .state();
+        let mut peer = Peer::new(&state, false).await;
+        let u64_at =
+            |buf: &[u8], at: usize| u64::from_le_bytes(buf[at..at + 8].try_into().unwrap());
+
+        let name = crate::utils::utf16le("d");
+        let mut body = Vec::new();
+        CreateRequest {
+            structure_size: 57,
+            security_flags: 0,
+            requested_oplock_level: 0,
+            impersonation_level: 2,
+            smb_create_flags: 0,
+            reserved: 0,
+            desired_access: 0x0012_0089,
+            file_attributes: 0,
+            share_access: 0x7,
+            create_disposition: 1,
+            create_options: 0x1,
+            name_offset: 0x78,
+            name_length: name.len() as u16,
+            create_contexts_offset: 0,
+            create_contexts_length: 0,
+            name: name.clone(),
+            create_contexts: vec![],
+        }
+        .write_to(&mut body)
+        .unwrap();
+        let (_, reply) = peer.request(&state, Command::Create, &body).await;
+        assert_eq!(status(&reply), 0);
+        let created = CreateResponse::parse(&reply[SMB2_HEADER_LEN..]).unwrap();
+        assert_eq!((created.allocation_size, created.end_of_file), (0, 0));
+        let dir: FileId = created.file_id;
+
+        // FileStandardInformation, FileAllInformation and
+        // FileNetworkOpenInformation, with where their sizes are.
+        for (class, at) in [(5, 0), (18, 40), (34, 32)] {
+            let mut body = Vec::new();
+            QueryInfoRequest {
+                structure_size: 41,
+                info_type: 1,
+                file_information_class: class,
+                output_buffer_length: 4096,
+                input_buffer_offset: 0,
+                reserved: 0,
+                input_buffer_length: 0,
+                additional_information: 0,
+                flags: 0,
+                file_id: dir,
+                input_buffer: vec![],
+            }
+            .write_to(&mut body)
+            .unwrap();
+            let (_, reply) = peer.request(&state, Command::QueryInfo, &body).await;
+            assert_eq!(status(&reply), 0, "class {class}");
+            let buf = QueryInfoResponse::parse(&reply[SMB2_HEADER_LEN..])
+                .unwrap()
+                .buffer;
+            assert_eq!(u64_at(&buf, at), 0, "AllocationSize in class {class}");
+            assert_eq!(u64_at(&buf, at + 8), 0, "EndOfFile in class {class}");
+        }
+
+        let pattern = crate::utils::utf16le("*");
+        let mut body = Vec::new();
+        QueryDirectoryRequest {
+            structure_size: 33,
+            file_information_class: 37,
+            flags: QueryDirectoryRequest::FLAG_RESTART_SCANS,
+            file_index: 0,
+            file_id: dir,
+            file_name_offset: 96,
+            file_name_length: pattern.len() as u16,
+            output_buffer_length: 65536,
+            file_name: pattern,
+        }
+        .write_to(&mut body)
+        .unwrap();
+        let (_, reply) = peer.request(&state, Command::QueryDirectory, &body).await;
+        assert_eq!(status(&reply), 0);
+        let buf = QueryDirectoryResponse::parse(&reply[SMB2_HEADER_LEN..])
+            .unwrap()
+            .buffer;
+        let mut listed = Vec::new();
+        let mut at = 0;
+        loop {
+            let entry = &buf[at..];
+            let len = u32::from_le_bytes(entry[60..64].try_into().unwrap()) as usize;
+            let units: Vec<u16> = entry[104..104 + len]
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            let name = String::from_utf16(&units).unwrap();
+            listed.push((name, u64_at(entry, 40), u64_at(entry, 48)));
+            match u32::from_le_bytes(entry[0..4].try_into().unwrap()) as usize {
+                0 => break,
+                next => at += next,
+            }
+        }
+        listed.sort();
+        let expected = [(".", 0), ("..", 0), ("a.txt", 6), ("sub", 0)]
+            .map(|(name, size)| (name.to_string(), size, size));
+        assert_eq!(listed, expected);
+
+        let mut body = Vec::new();
+        CloseRequest {
+            structure_size: 24,
+            flags: 1,
+            reserved: 0,
+            file_id: dir,
+        }
+        .write_to(&mut body)
+        .unwrap();
+        let (_, reply) = peer.request(&state, Command::Close, &body).await;
+        assert_eq!(status(&reply), 0);
+        let closed = CloseResponse::parse(&reply[SMB2_HEADER_LEN..]).unwrap();
+        assert_eq!((closed.allocation_size, closed.end_of_file), (0, 0));
+    }
 }

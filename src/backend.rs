@@ -93,10 +93,12 @@ pub struct FileInfo {
     /// Display name (last component). For QUERY_INFO at the share root this
     /// is the share name.
     pub name: String,
-    /// File size in bytes.
+    /// File size in bytes. The server reports a directory with a size of
+    /// 0 whatever this says.
     pub end_of_file: u64,
     /// Allocation size, usually `end_of_file` rounded up to a cluster.
-    /// Backends may return `end_of_file`.
+    /// Backends may return `end_of_file`. The server reports 0 for a
+    /// directory.
     pub allocation_size: u64,
     /// FILETIME (100ns ticks since 1601).
     pub creation_time: u64,
@@ -186,6 +188,16 @@ impl FileInfo {
             FILE_ATTRIBUTE_NORMAL
         } else {
             attributes
+        }
+    }
+
+    /// EndOfFile and AllocationSize as the server reports them: 0 for a
+    /// directory, which has no data of its own.
+    pub(crate) fn sizes(&self) -> (u64, u64) {
+        if self.is_directory {
+            (0, 0)
+        } else {
+            (self.end_of_file, self.allocation_size)
         }
     }
 }

@@ -955,7 +955,8 @@ pub(super) fn file_info_from_metadata(
     md: &Metadata,
     root_dev: Option<u64>,
 ) -> FileInfo {
-    let len = md.len();
+    // Unix hosts report the size of a directory's index; clients expect 0.
+    let len = if md.is_dir() { 0 } else { md.len() };
     let modified = md.modified().ok().map(|t| t.into_std());
     let accessed = md.accessed().ok().map(|t| t.into_std());
     let created = md.created().ok().map(|t| t.into_std());

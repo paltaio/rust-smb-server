@@ -66,6 +66,8 @@ struct MemInner {
     fail_overwrites: bool,
     /// Handles opened and not yet closed.
     open_handles: usize,
+    /// Size reported for directories, as a host reports that of its index.
+    dir_size: u64,
 }
 
 impl MemInner {
@@ -213,6 +215,12 @@ impl MemFsBackend {
             };
             g.streams.entry(id).or_default().push(stream);
         }
+        self
+    }
+
+    /// A backend that reports `size` as the size of every directory.
+    pub fn with_dir_size(self, size: u64) -> Self {
+        self.inner.lock().unwrap().dir_size = size;
         self
     }
 
@@ -671,7 +679,7 @@ impl Handle for MemHandle {
     async fn stat(&self) -> SmbResult<FileInfo> {
         let mut g = self.inner.lock().unwrap();
         let size = if self.is_dir && self.stream.is_none() {
-            0
+            g.dir_size
         } else {
             self.data(&mut g)?.len() as u64
         };
@@ -789,8 +797,8 @@ impl Handle for MemHandle {
                 entries.push(DirEntry {
                     info: FileInfo {
                         name: rest.to_string(),
-                        end_of_file: 0,
-                        allocation_size: 0,
+                        end_of_file: g.dir_size,
+                        allocation_size: g.dir_size,
                         creation_time: 0x01D9_0000_0000_0000,
                         last_access_time: 0x01D9_0000_0000_0000,
                         last_write_time: 0x01D9_0000_0000_0000,

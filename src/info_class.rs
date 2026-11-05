@@ -63,9 +63,10 @@ pub fn encode_file_standard_information(
     links: u32,
     delete_pending: bool,
 ) -> Vec<u8> {
+    let (end_of_file, allocation_size) = info.sizes();
     let mut out = Vec::with_capacity(24);
-    out.extend_from_slice(&info.allocation_size.to_le_bytes());
-    out.extend_from_slice(&info.end_of_file.to_le_bytes());
+    out.extend_from_slice(&allocation_size.to_le_bytes());
+    out.extend_from_slice(&end_of_file.to_le_bytes());
     out.extend_from_slice(&links.to_le_bytes());
     out.push(u8::from(delete_pending || links == 0));
     out.push(if info.is_directory { 1 } else { 0 }); // Directory
@@ -168,8 +169,9 @@ pub fn encode_file_network_open_information(info: &FileInfo) -> Vec<u8> {
     out.extend_from_slice(&info.last_access_time.to_le_bytes());
     out.extend_from_slice(&info.last_write_time.to_le_bytes());
     out.extend_from_slice(&info.change_time.to_le_bytes());
-    out.extend_from_slice(&info.allocation_size.to_le_bytes());
-    out.extend_from_slice(&info.end_of_file.to_le_bytes());
+    let (end_of_file, allocation_size) = info.sizes();
+    out.extend_from_slice(&allocation_size.to_le_bytes());
+    out.extend_from_slice(&end_of_file.to_le_bytes());
     out.extend_from_slice(&info.attributes().to_le_bytes());
     out.extend_from_slice(&0u32.to_le_bytes()); // Reserved
     out
@@ -459,8 +461,9 @@ fn write_dir_entry_prefix(out: &mut Vec<u8>, info: &FileInfo, name_len: usize) {
     out.extend_from_slice(&info.last_access_time.to_le_bytes());
     out.extend_from_slice(&info.last_write_time.to_le_bytes());
     out.extend_from_slice(&info.change_time.to_le_bytes());
-    out.extend_from_slice(&info.end_of_file.to_le_bytes());
-    out.extend_from_slice(&info.allocation_size.to_le_bytes());
+    let (end_of_file, allocation_size) = info.sizes();
+    out.extend_from_slice(&end_of_file.to_le_bytes());
+    out.extend_from_slice(&allocation_size.to_le_bytes());
     out.extend_from_slice(&info.attributes().to_le_bytes());
     out.extend_from_slice(&(name_len as u32).to_le_bytes());
 }
