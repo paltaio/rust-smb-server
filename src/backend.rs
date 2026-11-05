@@ -130,6 +130,12 @@ pub struct FileInfo {
     /// FileEaInformation, FileAllInformation and directory listings report
     /// it as EaSize; on an open of a named stream, the file's.
     pub ea_size: u32,
+    /// The file's other attributes (MS-FSCC 2.6) as the backend stores
+    /// them: any of `FILE_ATTRIBUTE_HIDDEN`, `SYSTEM`, `ARCHIVE`,
+    /// `TEMPORARY`, `OFFLINE` and `NOT_CONTENT_INDEXED`. Other flags here
+    /// are ignored: `read_only` and `is_directory` give READONLY and
+    /// DIRECTORY. `0` for a backend that stores none of them.
+    pub file_attributes: u32,
 }
 
 // File attributes (MS-FSCC 2.6).
@@ -143,14 +149,16 @@ pub(crate) const FILE_ATTRIBUTE_TEMPORARY: u32 = 0x0000_0100;
 pub(crate) const FILE_ATTRIBUTE_OFFLINE: u32 = 0x0000_1000;
 pub(crate) const FILE_ATTRIBUTE_NOT_CONTENT_INDEXED: u32 = 0x0000_2000;
 
-/// Attributes FileBasicInformation can set (MS-FSA 2.1.5.15.2).
-pub(crate) const VALID_SET_ATTRIBUTES: u32 = FILE_ATTRIBUTE_READONLY
-    | FILE_ATTRIBUTE_HIDDEN
+/// Attributes [`FileInfo::file_attributes`] carries.
+const OTHER_ATTRIBUTES: u32 = FILE_ATTRIBUTE_HIDDEN
     | FILE_ATTRIBUTE_SYSTEM
     | FILE_ATTRIBUTE_ARCHIVE
     | FILE_ATTRIBUTE_TEMPORARY
     | FILE_ATTRIBUTE_OFFLINE
     | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED;
+
+/// Attributes FileBasicInformation can set (MS-FSA 2.1.5.15.2).
+pub(crate) const VALID_SET_ATTRIBUTES: u32 = FILE_ATTRIBUTE_READONLY | OTHER_ATTRIBUTES;
 
 impl FileInfo {
     /// A zero-length, writable file named `name` with no times and no file
@@ -169,15 +177,17 @@ impl FileInfo {
             file_index: 0,
             unix_mode: None,
             ea_size: 0,
+            file_attributes: 0,
         }
     }
 
     /// SMB2 file attributes (MS-FSCC 2.6) for this file:
-    /// `FILE_ATTRIBUTE_DIRECTORY` for directories and
-    /// `FILE_ATTRIBUTE_READONLY` for read-only files.
-    /// `FILE_ATTRIBUTE_NORMAL` stands alone when neither applies.
+    /// `FILE_ATTRIBUTE_DIRECTORY` for directories,
+    /// `FILE_ATTRIBUTE_READONLY` for read-only files, and the flags of
+    /// [`FileInfo::file_attributes`]. `FILE_ATTRIBUTE_NORMAL` stands alone
+    /// when none applies.
     pub fn attributes(&self) -> u32 {
-        let mut attributes = 0;
+        let mut attributes = self.file_attributes & OTHER_ATTRIBUTES;
         if self.is_directory {
             attributes |= FILE_ATTRIBUTE_DIRECTORY;
         }
@@ -482,12 +492,15 @@ pub trait Handle: Send + Sync {
     /// Flags left out are cleared. The protocol layer calls this only when
     /// the request differs from the attributes [`Handle::stat`] reports.
     ///
-    /// Return [`SmbError::NotSupported`] if a flag cannot be stored.
+    /// Return [`SmbError::NotSupported`] if a flag cannot be stored, or
+    /// store what the backend can and ignore the rest, as long as
+    /// [`Handle::stat`] then reports what is stored.
     ///
-    /// `LocalFsBackend` stores `READONLY` on files: on Unix as the absence
-    /// of write permission bits, on Windows as the host attribute. It
-    /// accepts `ARCHIVE` without storing it and never reports it. Every
-    /// other flag, and `READONLY` on a directory, returns `NotSupported`.
+    /// `LocalFsBackend` on Windows stores every flag as the host's
+    /// attributes. On Unix hosts it stores `READONLY` on files as the
+    /// absence of write permission bits and ignores the other flags, and
+    /// `READONLY` on a directory: [`FileInfo::file_attributes`] stays 0
+    /// there.
     async fn set_attributes(&self, attributes: u32) -> SmbResult<()>;
 
     /// Truncate (or extend) to `len` bytes; bytes added by extending read as

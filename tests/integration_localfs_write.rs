@@ -833,7 +833,7 @@ async fn deleting_a_non_empty_directory_fails() {
 }
 
 #[tokio::test]
-async fn read_only_attribute_is_applied_and_others_are_rejected() {
+async fn read_only_is_applied_and_other_attributes_where_the_host_keeps_them() {
     let td = tempdir().expect("tempdir");
     let path = td.path().join("f.txt");
     std::fs::write(&path, b"x").expect("write file");
@@ -876,17 +876,14 @@ async fn read_only_attribute_is_applied_and_others_are_rejected() {
     );
     assert!(path.exists());
 
+    // Windows hosts store the other attributes; Linux and macOS hosts
+    // accept them and keep none.
     let file_id = c.open("f.txt", attrs_access, SHARE_ALL).await.unwrap();
-    assert_eq!(
-        c.set_info(
-            file_id,
-            FILE_BASIC_INFORMATION,
-            basic_info([0; 4], FILE_ATTRIBUTE_HIDDEN)
-        )
-        .await,
-        ntstatus::STATUS_NOT_SUPPORTED
-    );
-    for attributes in [FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_ARCHIVE] {
+    for attributes in [
+        FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_NORMAL,
+        FILE_ATTRIBUTE_ARCHIVE,
+        FILE_ATTRIBUTE_NORMAL,
+    ] {
         assert_eq!(
             c.set_info(
                 file_id,
@@ -897,12 +894,26 @@ async fn read_only_attribute_is_applied_and_others_are_rejected() {
             STATUS_SUCCESS,
             "attributes {attributes:#x}"
         );
+        let basic = c
+            .query_file_info(file_id, FILE_BASIC_INFORMATION)
+            .await
+            .unwrap();
+        let stored = if cfg!(windows) {
+            attributes & !FILE_ATTRIBUTE_NORMAL
+        } else {
+            0
+        };
+        let expected = if stored == 0 {
+            FILE_ATTRIBUTE_NORMAL
+        } else {
+            stored
+        };
+        assert_eq!(
+            attributes_of(&basic),
+            expected,
+            "attributes {attributes:#x}"
+        );
     }
-    let basic = c
-        .query_file_info(file_id, FILE_BASIC_INFORMATION)
-        .await
-        .unwrap();
-    assert_eq!(attributes_of(&basic), FILE_ATTRIBUTE_NORMAL);
     assert_eq!(
         c.set_info(
             file_id,
@@ -1185,4 +1196,71 @@ async fn create_ignores_other_contexts_and_rejects_malformed_ones() {
         assert_eq!(status, ntstatus::STATUS_INVALID_PARAMETER, "{case}");
         assert!(!td.path().join("b.txt").exists(), "{case}");
     }
+}
+
+/// A CREATE gives a new file the attributes it asks for and ARCHIVE. An
+/// overwrite adds them to the file's own, and has to ask for HIDDEN and
+/// SYSTEM again where the file has them; a supersede replaces them. Unix
+/// hosts keep none of these attributes.
+#[tokio::test]
+async fn created_overwritten_and_superseded_files_take_the_attributes_asked_for() {
+    const TEMPORARY: u32 = 0x100;
+    let td = tempdir().expect("tempdir");
+    let backend = LocalFsBackend::new(td.path()).expect("open root");
+    let server = Server::public(backend).await;
+    let mut c = server.client().await;
+    let mut step = async |name: &str, disposition: u32, attributes: u32| {
+        let created = c
+            .create(Create {
+                name,
+                access: RW,
+                disposition,
+                attributes,
+                ..Create::default()
+            })
+            .await?;
+        let basic = c
+            .query_file_info(created.file_id, FILE_BASIC_INFORMATION)
+            .await
+            .unwrap();
+        c.close(created.file_id).await;
+        Ok::<u32, u32>(attributes_of(&basic))
+    };
+    let on_host = |windows: u32| {
+        if cfg!(windows) {
+            windows
+        } else {
+            FILE_ATTRIBUTE_NORMAL
+        }
+    };
+
+    let hidden = FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_ARCHIVE;
+    assert_eq!(
+        step("h.txt", FILE_CREATE, FILE_ATTRIBUTE_HIDDEN).await,
+        Ok(on_host(hidden))
+    );
+    let denied = if cfg!(windows) {
+        Err(ntstatus::STATUS_ACCESS_DENIED)
+    } else {
+        Ok(FILE_ATTRIBUTE_NORMAL)
+    };
+    assert_eq!(step("h.txt", FILE_OVERWRITE_IF, 0).await, denied);
+    assert_eq!(
+        step("h.txt", FILE_OVERWRITE_IF, FILE_ATTRIBUTE_HIDDEN).await,
+        Ok(on_host(hidden))
+    );
+
+    let temporary = TEMPORARY | FILE_ATTRIBUTE_ARCHIVE;
+    assert_eq!(
+        step("t.txt", FILE_CREATE, TEMPORARY).await,
+        Ok(on_host(temporary))
+    );
+    assert_eq!(
+        step("t.txt", FILE_OVERWRITE_IF, 0).await,
+        Ok(on_host(temporary))
+    );
+    assert_eq!(
+        step("t.txt", FILE_SUPERSEDE, 0).await,
+        Ok(on_host(FILE_ATTRIBUTE_ARCHIVE))
+    );
 }

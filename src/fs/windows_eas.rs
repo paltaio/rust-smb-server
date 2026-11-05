@@ -117,7 +117,7 @@ fn to_smb(e: io::Error) -> SmbError {
 
 /// A second handle of the file or directory `file` is open on, with
 /// `access`.
-fn reopen(file: &File, access: u32) -> io::Result<File> {
+pub(super) fn reopen(file: &File, access: u32) -> io::Result<File> {
     let empty = UNICODE_STRING {
         Length: 0,
         MaximumLength: 0,

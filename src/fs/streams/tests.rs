@@ -4,7 +4,7 @@ use std::time::{Duration, SystemTime};
 use tempfile::TempDir;
 
 use super::*;
-use crate::backend::{OpenOptions, ShareBackend};
+use crate::backend::{FILE_ATTRIBUTE_READONLY, OpenOptions, ShareBackend};
 use crate::fs::LocalFsBackend;
 use crate::path::SmbPath;
 
@@ -589,10 +589,9 @@ async fn directories_and_the_share_root_have_streams() {
     let info = h.stat().await.unwrap();
     assert!(info.is_directory);
     assert_eq!(info.end_of_file, 3);
-    assert!(matches!(
-        h.set_attributes(FILE_ATTRIBUTE_READONLY).await,
-        Err(SmbError::NotSupported)
-    ));
+    // On Unix a directory reports no READONLY.
+    h.set_attributes(FILE_ATTRIBUTE_READONLY).await.unwrap();
+    assert!(!h.stat().await.unwrap().read_only);
     h.close().await.unwrap();
     let (root, _) = backend
         .open(

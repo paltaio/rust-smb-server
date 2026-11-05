@@ -3,7 +3,7 @@ use std::time::{Duration, SystemTime};
 use tempfile::TempDir;
 
 use super::*;
-use crate::backend::ShareBackend;
+use crate::backend::{FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_READONLY, ShareBackend};
 use crate::fs::LocalFsBackend;
 use crate::path::SmbPath;
 
@@ -395,11 +395,22 @@ async fn directories_and_the_share_root_have_streams() {
     let info = h.stat().await.unwrap();
     assert!(info.is_directory);
     assert_eq!(info.end_of_file, 3);
-    assert!(matches!(
-        h.set_attributes(FILE_ATTRIBUTE_READONLY).await,
-        Err(SmbError::NotSupported)
-    ));
+    // Through a stream, the directory takes the attribute.
+    h.set_attributes(FILE_ATTRIBUTE_READONLY).await.unwrap();
+    assert!(h.stat().await.unwrap().read_only);
+    h.set_attributes(0).await.unwrap();
+    assert!(!h.stat().await.unwrap().read_only);
     h.close().await.unwrap();
+    // So does a file.
+    create(&backend, "f.txt", "s", b"x").await;
+    let (h, _) = open(&backend, "f.txt", "s", OpenIntent::Open)
+        .await
+        .unwrap();
+    h.set_attributes(FILE_ATTRIBUTE_HIDDEN).await.unwrap();
+    h.close().await.unwrap();
+    let md = std::fs::metadata(td.path().join("f.txt")).unwrap();
+    let attributes = std::os::windows::fs::MetadataExt::file_attributes(&md);
+    assert_ne!(attributes & FILE_ATTRIBUTE_HIDDEN, 0);
     assert_eq!(streams(&backend, "dir").await, [("ds".to_string(), 3)]);
     let (root, _) = backend
         .open(

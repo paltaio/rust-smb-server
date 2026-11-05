@@ -33,8 +33,8 @@ use tokio::task::spawn_blocking;
 use tracing::debug;
 
 use crate::backend::{
-    BackendCapabilities, DirEntry as SmbDirEntry, FILE_ATTRIBUTE_ARCHIVE, FILE_ATTRIBUTE_READONLY,
-    FileInfo, FileTimes, Handle, OpenAction, OpenIntent, OpenOptions, ShareBackend,
+    BackendCapabilities, DirEntry as SmbDirEntry, FileInfo, FileTimes, Handle, OpenAction,
+    OpenIntent, OpenOptions, ShareBackend,
 };
 use crate::error::{SmbError, SmbResult};
 use crate::path::{SmbPath, same_path};
@@ -879,26 +879,96 @@ pub(super) fn dir_as_file(dir: &Dir) -> io::Result<std::fs::File> {
     }
 }
 
-/// Sets or clears the read-only state of an open file. On Unix a read-only
-/// file has no write permission bits, and clearing it gives the owner write
-/// permission back.
-pub(super) fn set_read_only(file: &std::fs::File, read_only: bool) -> io::Result<()> {
+/// Sets or clears the read-only state of an open file: a read-only file has
+/// no write permission bits, and clearing it gives the owner write
+/// permission back. A file already in that state is left alone, so a file
+/// the server can write but does not own takes the other attributes.
+#[cfg(unix)]
+fn set_read_only(file: &std::fs::File, read_only: bool) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
     let mut perms = file.metadata()?.permissions();
+    let mode = perms.mode();
+    let wanted = if read_only {
+        mode & !0o222
+    } else {
+        mode | 0o200
+    };
+    if wanted == mode {
+        return Ok(());
+    }
+    perms.set_mode(wanted);
+    file.set_permissions(perms)
+}
+
+/// Gives the file or directory `file` is open on the attributes
+/// `attributes` (MS-FSCC 2.6). Windows stores them as the host's
+/// attributes; a handle opened without FILE_WRITE_ATTRIBUTES sets them
+/// through a second handle that has only that access. Other hosts store
+/// READONLY on a file and ignore the rest.
+#[cfg_attr(
+    windows,
+    expect(unused_variables, reason = "is_dir is used on Unix only")
+)]
+pub(super) fn set_host_attributes(
+    file: &std::fs::File,
+    attributes: u32,
+    is_dir: bool,
+) -> io::Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt as _;
-        let mode = perms.mode();
-        perms.set_mode(if read_only {
-            mode & !0o222
-        } else {
-            mode | 0o200
-        });
+        if is_dir {
+            return Ok(());
+        }
+        set_read_only(
+            file,
+            attributes & crate::backend::FILE_ATTRIBUTE_READONLY != 0,
+        )
     }
     #[cfg(windows)]
     {
-        perms.set_readonly(read_only);
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::Foundation::HANDLE;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ATTRIBUTE_NORMAL, FILE_BASIC_INFO, FILE_WRITE_ATTRIBUTES, FileBasicInfo,
+            SetFileInformationByHandle,
+        };
+        // 0 leaves a time unchanged, and attributes of 0 would too, so no
+        // attributes are sent as FILE_ATTRIBUTE_NORMAL.
+        let info = FILE_BASIC_INFO {
+            CreationTime: 0,
+            LastAccessTime: 0,
+            LastWriteTime: 0,
+            ChangeTime: 0,
+            FileAttributes: if attributes == 0 {
+                FILE_ATTRIBUTE_NORMAL
+            } else {
+                attributes
+            },
+        };
+        let set = |file: &std::fs::File| {
+            // SAFETY: `info` is a live local of the size passed, and the
+            // handle stays open for the call.
+            let ok = unsafe {
+                SetFileInformationByHandle(
+                    file.as_raw_handle() as HANDLE,
+                    FileBasicInfo,
+                    (&raw const info).cast(),
+                    std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+                )
+            };
+            if ok == 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        };
+        match set(file) {
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                set(&super::windows_eas::reopen(file, FILE_WRITE_ATTRIBUTES)?)
+            }
+            result => result,
+        }
     }
-    file.set_permissions(perms)
 }
 
 /// Host times for `times`. The change time is left to the host. Hosts other
@@ -979,10 +1049,26 @@ pub(super) fn file_info_from_metadata(
         last_write_time: system_time_to_filetime(modified),
         change_time: system_time_to_filetime(modified),
         is_directory: md.is_dir(),
-        read_only: !md.is_dir() && md.permissions().readonly(),
+        // On Unix a directory reports no READONLY.
+        read_only: (cfg!(windows) || !md.is_dir()) && md.permissions().readonly(),
         file_index: file_index(root_dev, file_key(md)),
         unix_mode: unix_mode(md),
         ea_size: 0,
+        file_attributes: host_attributes(md),
+    }
+}
+
+/// The attributes the host stores for the file of `md`: those of Windows,
+/// none elsewhere.
+fn host_attributes(md: &Metadata) -> u32 {
+    #[cfg(unix)]
+    {
+        let _ = md;
+        0
+    }
+    #[cfg(windows)]
+    {
+        cap_std::fs::MetadataExt::file_attributes(md)
     }
 }
 
@@ -1520,7 +1606,11 @@ fn open_file(
     let mut created = CapOpenOptions::new();
     created.read(opts.read).write(true).create_new(true);
     let mut truncated = CapOpenOptions::new();
-    truncated.read(opts.read).write(true).truncate(true);
+    truncated.read(opts.read).write(true);
+    // Windows refuses to truncate a HIDDEN or SYSTEM file as it opens it;
+    // the file is emptied once open instead.
+    #[cfg(unix)]
+    truncated.truncate(true);
     #[cfg(unix)]
     for options in [&mut created, &mut truncated] {
         use cap_std::fs::OpenOptionsExt as _;
@@ -1569,6 +1659,10 @@ fn open_file(
     };
     #[cfg(unix)]
     check_regular_and_clear_nonblock(&file)?;
+    #[cfg(windows)]
+    if action == OpenAction::Overwritten {
+        file.set_len(0)?;
+    }
     Ok((file, action))
 }
 
@@ -2226,29 +2320,37 @@ impl Handle for LocalHandle {
     }
 
     async fn set_attributes(&self, attributes: u32) -> SmbResult<()> {
-        if attributes & !(FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_ARCHIVE) != 0 {
-            return Err(SmbError::NotSupported);
-        }
-        let read_only = attributes & FILE_ATTRIBUTE_READONLY != 0;
-        match self {
+        let set = match self {
             LocalHandle::File {
-                file,
-                read_only: backend_read_only,
-                ..
+                file, read_only, ..
             } => {
-                if *backend_read_only {
+                if *read_only {
                     return Err(SmbError::AccessDenied);
                 }
                 let file = Arc::clone(file);
-                spawn_blocking(move || set_read_only(&file, read_only))
-                    .await
-                    .map_err(join_to_io)
-                    .map_err(io_to_smb)?
-                    .map_err(io_to_smb)
+                spawn_blocking(move || set_host_attributes(&file, attributes, false))
             }
-            LocalHandle::Dir { .. } if read_only => Err(SmbError::NotSupported),
-            LocalHandle::Dir { .. } => Ok(()),
-        }
+            LocalHandle::Dir {
+                dir_handle,
+                read_only,
+                ..
+            } => {
+                if *read_only {
+                    return Err(SmbError::AccessDenied);
+                }
+                if cfg!(unix) {
+                    return Ok(());
+                }
+                let dir_handle = Arc::clone(dir_handle);
+                spawn_blocking(move || {
+                    set_host_attributes(&dir_as_file(&dir_handle)?, attributes, true)
+                })
+            }
+        };
+        set.await
+            .map_err(join_to_io)
+            .map_err(io_to_smb)?
+            .map_err(io_to_smb)
     }
 
     async fn truncate(&self, len: u64) -> SmbResult<()> {
@@ -2998,24 +3100,84 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unsupported_attributes_are_rejected() {
+    async fn attributes_are_stored_where_the_host_keeps_them() {
+        use crate::backend::{
+            FILE_ATTRIBUTE_ARCHIVE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN,
+            FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_SYSTEM,
+        };
         let td = tempdir().unwrap();
         std::fs::create_dir(td.path().join("d")).unwrap();
+        std::fs::write(td.path().join("f.txt"), b"x").unwrap();
         let backend = LocalFsBackend::new(td.path()).unwrap();
-        let h = backend.open(&p("f.txt"), opts_create()).await.unwrap().0;
-        assert!(matches!(
-            h.set_attributes(0x2).await,
-            Err(SmbError::NotSupported)
-        ));
+        async fn listed(backend: &LocalFsBackend, name: &str) -> u32 {
+            let root = backend
+                .open(&SmbPath::root(), opts_open_dir())
+                .await
+                .unwrap()
+                .0;
+            let entries = root.list_dir(None).await.unwrap();
+            root.close().await.unwrap();
+            let entry = entries.into_iter().find(|e| e.info.name == name).unwrap();
+            entry.info.attributes()
+        }
+
+        // A handle opened without attribute access sets them too.
+        let others = FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_ARCHIVE;
+        let h = backend.open(&p("f.txt"), opts_open_ro()).await.unwrap().0;
+        for (set, windows, unix) in [
+            (others, others, FILE_ATTRIBUTE_NORMAL),
+            (
+                FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_HIDDEN,
+                FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_HIDDEN,
+                FILE_ATTRIBUTE_READONLY,
+            ),
+            (0, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_NORMAL),
+        ] {
+            h.set_attributes(set).await.unwrap();
+            let expected = if cfg!(windows) { windows } else { unix };
+            assert_eq!(h.stat().await.unwrap().attributes(), expected, "{set:#x}");
+            assert_eq!(listed(&backend, "f.txt").await, expected, "{set:#x} listed");
+        }
         h.close().await.unwrap();
 
         let dir = backend.open(&p("d"), opts_open_dir()).await.unwrap().0;
-        assert!(matches!(
-            dir.set_attributes(FILE_ATTRIBUTE_READONLY).await,
-            Err(SmbError::NotSupported)
-        ));
+        let set = FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_HIDDEN;
+        dir.set_attributes(set).await.unwrap();
+        let expected = if cfg!(windows) {
+            FILE_ATTRIBUTE_DIRECTORY | set
+        } else {
+            FILE_ATTRIBUTE_DIRECTORY
+        };
+        assert_eq!(dir.stat().await.unwrap().attributes(), expected);
+        assert_eq!(listed(&backend, "d").await, expected);
         dir.set_attributes(0).await.unwrap();
+        assert_eq!(
+            dir.stat().await.unwrap().attributes(),
+            FILE_ATTRIBUTE_DIRECTORY
+        );
         dir.close().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_set_that_keeps_the_read_only_state_leaves_the_mode_alone() {
+        use std::os::unix::fs::MetadataExt as _;
+        let td = tempdir().unwrap();
+        let path = td.path().join("f.txt");
+        std::fs::write(&path, b"x").unwrap();
+        let backend = LocalFsBackend::new(td.path()).unwrap();
+        let h = backend.open(&p("f.txt"), opts_open_ro()).await.unwrap().0;
+        let changed = || {
+            let md = std::fs::metadata(&path).unwrap();
+            (md.ctime(), md.ctime_nsec())
+        };
+        let before = changed();
+        std::thread::sleep(Duration::from_millis(20));
+        h.set_attributes(crate::backend::FILE_ATTRIBUTE_HIDDEN)
+            .await
+            .unwrap();
+        assert_eq!(changed(), before);
+        h.close().await.unwrap();
     }
 
     #[test]

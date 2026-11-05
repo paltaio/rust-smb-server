@@ -446,6 +446,31 @@ async fn attributes_set_through_basic_info_are_reported_under_attributes() {
 }
 
 #[tokio::test]
+async fn hidden_set_through_basic_info_is_reported_where_the_host_keeps_it() {
+    let (srv, _td) = server().await;
+    let mut watcher = srv.client().await;
+    let mut maker = srv.client().await;
+    create_file(&mut maker, "d\\f").await;
+    let dir = watcher.open_dir("d").await;
+    arm_idle(&mut watcher, dir, ATTRIBUTES, false).await;
+    let file = maker
+        .open(
+            "d\\f",
+            FILE_WRITE_ATTRIBUTES | FILE_READ_ATTRIBUTES,
+            SHARE_ALL,
+        )
+        .await
+        .unwrap();
+    let mut basic = vec![0u8; 40];
+    basic[32..36].copy_from_slice(&FILE_ATTRIBUTE_HIDDEN.to_le_bytes());
+    assert_eq!(maker.set_info(file, FILE_BASIC_INFORMATION, basic).await, 0);
+    maker.close(file).await;
+    // Unix hosts keep no HIDDEN, so nothing changed there.
+    let expected = cfg!(windows).then(|| vec![modified("f")]);
+    assert_eq!(now(&mut watcher, dir, false).await, expected);
+}
+
+#[tokio::test]
 async fn a_rename_into_a_subdirectory_modifies_it_for_write_time_watchers() {
     let (srv, _td) = server().await;
     let mut watcher = srv.client().await;

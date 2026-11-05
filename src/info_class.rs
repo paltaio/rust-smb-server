@@ -505,6 +505,7 @@ mod tests {
             file_index: 1,
             unix_mode: None,
             ea_size: 0,
+            file_attributes: 0,
         }
     }
 

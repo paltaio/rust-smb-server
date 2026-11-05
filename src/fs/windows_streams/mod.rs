@@ -41,12 +41,9 @@ use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
 use super::local::{
     file_index, file_info_from_metadata, file_key, host_file_times, io_to_smb, join_to_io,
-    link_count, set_read_only,
+    link_count, set_host_attributes,
 };
-use crate::backend::{
-    DirEntry, FILE_ATTRIBUTE_ARCHIVE, FILE_ATTRIBUTE_READONLY, FileInfo, FileTimes, Handle,
-    OpenAction, OpenIntent, OpenOptions,
-};
+use crate::backend::{DirEntry, FileInfo, FileTimes, Handle, OpenAction, OpenIntent, OpenOptions};
 use crate::error::{SmbError, SmbResult};
 use crate::stream::{StreamInfo, StreamName};
 
@@ -728,7 +725,6 @@ impl Handle for StreamHandle {
             let md = Metadata::from_file(file)?;
             let mut info = file_info_from_metadata(name, &md, root_dev);
             info.is_directory = is_dir;
-            info.read_only = !is_dir && md.permissions().readonly();
             (info.end_of_file, info.allocation_size) = sizes(file)?;
             // A volume with streams and without extended attributes, such
             // as ReFS, may refuse the query; the file then has none.
@@ -747,18 +743,12 @@ impl Handle for StreamHandle {
     }
 
     async fn set_attributes(&self, attributes: u32) -> SmbResult<()> {
-        if attributes & !(FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_ARCHIVE) != 0 {
-            return Err(SmbError::NotSupported);
-        }
         if self.read_only {
             return Err(SmbError::AccessDenied);
         }
-        let read_only = attributes & FILE_ATTRIBUTE_READONLY != 0;
-        match self.is_dir {
-            true if read_only => Err(SmbError::NotSupported),
-            true => Ok(()),
-            false => self.run(move |file| set_read_only(file, read_only)).await,
-        }
+        let is_dir = self.is_dir;
+        self.run(move |file| set_host_attributes(file, attributes, is_dir))
+            .await
     }
 
     async fn truncate(&self, len: u64) -> SmbResult<()> {

@@ -68,6 +68,8 @@ struct MemInner {
     open_handles: usize,
     /// Size reported for directories, as a host reports that of its index.
     dir_size: u64,
+    /// Attributes other than READONLY and DIRECTORY entries report.
+    attributes: HashMap<String, u32>,
 }
 
 impl MemInner {
@@ -215,6 +217,17 @@ impl MemFsBackend {
             };
             g.streams.entry(id).or_default().push(stream);
         }
+        self
+    }
+
+    /// A backend whose entry `path` reports `attributes` as its
+    /// [`FileInfo::file_attributes`].
+    pub fn with_attributes(self, path: &str, attributes: u32) -> Self {
+        self.inner
+            .lock()
+            .unwrap()
+            .attributes
+            .insert(path.to_string(), attributes);
         self
     }
 
@@ -711,6 +724,7 @@ impl Handle for MemHandle {
             file_index: 0,
             unix_mode: Some(if self.is_dir { DIR_MODE } else { FILE_MODE }),
             ea_size: g.ea_size(&key),
+            file_attributes: g.attributes.get(&key).copied().unwrap_or(0),
         })
     }
 
@@ -785,6 +799,7 @@ impl Handle for MemHandle {
                         file_index: 0,
                         unix_mode: Some(FILE_MODE),
                         ea_size: g.ea_size(k),
+                        file_attributes: 0,
                     },
                 });
             }
@@ -808,6 +823,7 @@ impl Handle for MemHandle {
                         file_index: 0,
                         unix_mode: Some(DIR_MODE),
                         ea_size: g.ea_size(k),
+                        file_attributes: 0,
                     },
                 });
             }

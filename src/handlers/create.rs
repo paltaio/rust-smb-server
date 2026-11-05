@@ -24,8 +24,9 @@ use crate::access_mask::{
     granted_access, maximal_access,
 };
 use crate::backend::{
-    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_READONLY, FileInfo, FileTimes, Handle, OpenAction,
-    OpenIntent, OpenOptions, VALID_SET_ATTRIBUTES,
+    FILE_ATTRIBUTE_ARCHIVE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN,
+    FILE_ATTRIBUTE_NOT_CONTENT_INDEXED, FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_SYSTEM, FileInfo,
+    FileTimes, Handle, OpenAction, OpenIntent, OpenOptions, VALID_SET_ATTRIBUTES,
 };
 use crate::conn::pending::{Stop, stopped};
 use crate::conn::state::{Connection, Open};
@@ -896,6 +897,7 @@ async fn attempt(
                 let checks = Checks {
                     delete_on_close: args.opts.delete_on_close,
                     no_ea_knowledge: args.no_ea_knowledge,
+                    attributes: stream.is_none().then_some(args.new_attributes),
                 };
                 match reserve_existing(&share, path, stream, args.opts, checks, request).await {
                     Ok(Probe::Reserved(file, Some(wait))) => {
@@ -1127,12 +1129,11 @@ async fn attempt(
     }
 
     // A stream created on a file leaves the file's attributes alone.
-    if action != OpenAction::Opened
-        && stream.is_none()
-        && args.new_attributes != 0
-        && args.new_attributes != info.attributes() & VALID_SET_ATTRIBUTES
+    if stream.is_none()
+        && let Some(wanted) = new_attributes(args, action, &info)
+        && wanted != info.attributes() & VALID_SET_ATTRIBUTES
     {
-        apply_attributes(handle.as_ref(), args.new_attributes, path).await;
+        apply_attributes(handle.as_ref(), wanted, path).await;
         if let Ok(updated) = handle.stat().await {
             info = updated;
         }
@@ -1622,7 +1623,13 @@ async fn reserve_existing(
         Err(e) if e.is_missing() => return Ok(Probe::Missing(e)),
         Err(e) => return Err(e.status().into()),
     };
+    let dropped = |info: &FileInfo, asked: u32| {
+        info.attributes() & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM) & !asked != 0
+    };
     let result = match handle.stat().await {
+        Ok(info) if checks.attributes.is_some_and(|asked| dropped(&info, asked)) => {
+            Err(ntstatus::STATUS_ACCESS_DENIED.into())
+        }
         Ok(info) if checks.delete_on_close && info.read_only => {
             Err(ntstatus::STATUS_CANNOT_DELETE.into())
         }
@@ -1651,6 +1658,10 @@ struct Checks {
     delete_on_close: bool,
     /// The open asks for FILE_NO_EA_KNOWLEDGE.
     no_ea_knowledge: bool,
+    /// The attributes of an open that overwrites or supersedes the file
+    /// itself, which has to ask for HIDDEN and SYSTEM again where the file
+    /// has them (MS-FSA 2.1.5.1.2).
+    attributes: Option<u32>,
 }
 
 /// STATUS_ACCESS_DENIED for a file that has an extended attribute with
@@ -1880,6 +1891,29 @@ async fn overwritten_directory(
     }
 }
 
+/// The attributes the file or directory `info` describes takes from a
+/// CREATE that made or overwrote it with `action`: a new file or
+/// directory, or a superseded file, has those the CREATE asks
+/// for, and an overwritten file adds them to its own. A file also gets
+/// ARCHIVE, and NOT_CONTENT_INDEXED in the request is ignored. `None` when
+/// nothing is to be set: an open, and a new entry the CREATE asks no
+/// attributes for.
+fn new_attributes(args: &CreateArgs, action: OpenAction, info: &FileInfo) -> Option<u32> {
+    let asked = if info.is_directory {
+        args.new_attributes
+    } else {
+        (args.new_attributes & !FILE_ATTRIBUTE_NOT_CONTENT_INDEXED) | FILE_ATTRIBUTE_ARCHIVE
+    };
+    match action {
+        OpenAction::Opened => None,
+        OpenAction::Created if args.new_attributes == 0 => None,
+        OpenAction::Overwritten if args.create_disposition != FILE_SUPERSEDE => {
+            Some((info.attributes() & VALID_SET_ATTRIBUTES) | asked)
+        }
+        _ => Some(asked),
+    }
+}
+
 /// Gives a file this CREATE made or overwrote the requested attributes. A
 /// backend that cannot store all of them gets READONLY alone, when asked
 /// for; the CREATE succeeds either way.
@@ -1971,6 +2005,56 @@ mod tests {
         req.write_to(&mut body)
             .expect("encoding into a Vec cannot fail");
         body
+    }
+
+    #[tokio::test]
+    async fn an_overwrite_of_a_hidden_or_system_file_has_to_ask_for_those_attributes() {
+        use crate::tests::peer::{Peer, status};
+        let cases = [
+            (FILE_ATTRIBUTE_HIDDEN, 0, ntstatus::STATUS_ACCESS_DENIED),
+            (
+                FILE_ATTRIBUTE_HIDDEN,
+                FILE_ATTRIBUTE_HIDDEN,
+                ntstatus::STATUS_SUCCESS,
+            ),
+            (
+                FILE_ATTRIBUTE_SYSTEM,
+                FILE_ATTRIBUTE_HIDDEN,
+                ntstatus::STATUS_ACCESS_DENIED,
+            ),
+            (
+                FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM,
+                FILE_ATTRIBUTE_SYSTEM,
+                ntstatus::STATUS_ACCESS_DENIED,
+            ),
+            (
+                FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM,
+                FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM,
+                ntstatus::STATUS_SUCCESS,
+            ),
+        ];
+        for (has, asked, expected) in cases {
+            for disposition in [FILE_OVERWRITE, FILE_OVERWRITE_IF, FILE_SUPERSEDE] {
+                let files = MemFsBackend::new()
+                    .with_file("f.txt", b"precious")
+                    .with_attributes("f.txt", has);
+                let state = SmbServer::builder()
+                    .listen("127.0.0.1:0".parse().unwrap())
+                    .share(Share::new("home", files.clone()).public())
+                    .build()
+                    .unwrap()
+                    .state();
+                let mut peer = Peer::new(&state, false).await;
+                let mut body = create_body("f.txt", disposition);
+                body[28..32].copy_from_slice(&asked.to_le_bytes());
+                let (_, reply) = peer.request(&state, Command::Create, &body).await;
+                let case = format!("{has:#x} asked {asked:#x} disposition {disposition}");
+                assert_eq!(status(&reply), expected, "{case}");
+                let left = files.contents("f.txt").unwrap();
+                let kept = expected != ntstatus::STATUS_SUCCESS;
+                assert_eq!(left == b"precious", kept, "{case}");
+            }
+        }
     }
 
     #[test]

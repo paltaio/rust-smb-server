@@ -168,12 +168,16 @@ fn has_streams(info: &FileInfo) -> bool {
 }
 
 /// The access a client may ask for on `info` on a tree whose maximal
-/// access is `maximal`: no writing or deleting a read-only file, and no
-/// running a file whose mode has no execute bit.
+/// access is `maximal`: no deleting a read-only file or directory, no
+/// writing a read-only file, and no running a file whose mode has no
+/// execute bit. A read-only directory still takes new entries.
 fn max_access(maximal: u32, info: &FileInfo) -> u32 {
     let mut access = maximal;
     if info.read_only {
-        access &= !(FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_EA | DELETE);
+        access &= !DELETE;
+        if !info.is_directory {
+            access &= !(FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_EA);
+        }
     }
     if !info.is_directory && info.unix_mode.is_some_and(|mode| mode & 0o111 == 0) {
         access &= !FILE_EXECUTE;
@@ -339,7 +343,7 @@ mod tests {
     }
 
     #[test]
-    fn read_only_files_and_files_without_execute_bits_lose_those_rights() {
+    fn read_only_entries_and_files_without_execute_bits_lose_those_rights() {
         let all = FILE_ALL_ACCESS;
         let mut info = file(0);
         assert_eq!(max_access(all, &info), all & !FILE_EXECUTE);
@@ -353,5 +357,7 @@ mod tests {
         dir.is_directory = true;
         dir.unix_mode = Some(0o040_700);
         assert_eq!(max_access(all, &dir), all);
+        dir.read_only = true;
+        assert_eq!(max_access(all, &dir), all & !DELETE);
     }
 }

@@ -27,13 +27,10 @@ use tracing::debug;
 
 use super::local::{
     file_index, file_info_from_metadata, host_file_times, io_to_smb, join_to_io, link_count,
-    set_read_only,
+    set_host_attributes,
 };
 use super::open_streams::{OpenStreams, StreamFile, lock, open_base, touch};
-use crate::backend::{
-    DirEntry, FILE_ATTRIBUTE_ARCHIVE, FILE_ATTRIBUTE_READONLY, FileInfo, FileTimes, Handle,
-    OpenAction, OpenIntent, OpenOptions,
-};
+use crate::backend::{DirEntry, FileInfo, FileTimes, Handle, OpenAction, OpenIntent, OpenOptions};
 use crate::error::{SmbError, SmbResult};
 use crate::stream::{StreamInfo, StreamName, from_sfm, to_sfm};
 
@@ -1053,18 +1050,12 @@ impl Handle for StreamHandle {
     }
 
     async fn set_attributes(&self, attributes: u32) -> SmbResult<()> {
-        if attributes & !(FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_ARCHIVE) != 0 {
-            return Err(SmbError::NotSupported);
-        }
         if self.read_only {
             return Err(SmbError::AccessDenied);
         }
-        let read_only = attributes & FILE_ATTRIBUTE_READONLY != 0;
-        match self.is_dir {
-            true if read_only => Err(SmbError::NotSupported),
-            true => Ok(()),
-            false => self.on_base(move |fd| set_read_only(fd, read_only)).await,
-        }
+        let is_dir = self.is_dir;
+        self.on_base(move |fd| set_host_attributes(fd, attributes, is_dir))
+            .await
     }
 
     async fn truncate(&self, len: u64) -> SmbResult<()> {
