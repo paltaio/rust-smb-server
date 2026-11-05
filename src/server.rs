@@ -100,6 +100,9 @@ pub struct ShareBindings {
     /// Named streams are served: the share allows them and the backend
     /// stores them.
     pub(crate) named_streams: bool,
+    /// Extended attributes are served: the share allows them and the
+    /// backend stores them.
+    pub(crate) extended_attributes: bool,
     /// The directories clients watch for changes, on any connection.
     pub(crate) watches: crate::files::WatchTable,
 }
@@ -114,8 +117,8 @@ impl ShareBindings {
         leases: bool,
         durable_handles: bool,
     ) -> Arc<Self> {
-        let watches = crate::files::WatchTable::new(backend.capabilities().case_sensitive);
-        let backend_streams = backend.capabilities().named_streams;
+        let capabilities = backend.capabilities();
+        let watches = crate::files::WatchTable::new(capabilities.case_sensitive);
         Arc::new(Self {
             name,
             backend,
@@ -128,7 +131,8 @@ impl ShareBindings {
             remark: String::new(),
             files: crate::files::FileTable::default(),
             change_notify: !is_ipc,
-            named_streams: !is_ipc && backend_streams,
+            named_streams: !is_ipc && capabilities.named_streams,
+            extended_attributes: !is_ipc && capabilities.extended_attributes,
             watches,
         })
     }
@@ -152,6 +156,7 @@ impl ShareBindings {
             files: crate::files::FileTable::default(),
             change_notify: share.change_notify,
             named_streams: share.named_streams && capabilities.named_streams,
+            extended_attributes: share.extended_attributes && capabilities.extended_attributes,
             watches,
         })
     }

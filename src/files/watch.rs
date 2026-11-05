@@ -19,8 +19,9 @@ use crate::path::{SmbPath, is_valid_component, rebase};
 use crate::proto::messages::change_notify::{
     FILE_ACTION_ADDED, FILE_ACTION_MODIFIED, FILE_ACTION_REMOVED, FILE_ACTION_RENAMED_NEW_NAME,
     FILE_ACTION_RENAMED_OLD_NAME, FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_DIR_NAME,
-    FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE,
-    FILE_NOTIFY_CHANGE_STREAM_SIZE, FILE_NOTIFY_CHANGE_STREAM_WRITE, entries_len, push_entry,
+    FILE_NOTIFY_CHANGE_EA, FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE,
+    FILE_NOTIFY_CHANGE_SIZE, FILE_NOTIFY_CHANGE_STREAM_SIZE, FILE_NOTIFY_CHANGE_STREAM_WRITE,
+    entries_len, push_entry,
 };
 use crate::server::ShareBindings;
 use crate::stream::StreamName;
@@ -43,6 +44,10 @@ pub(crate) const MAX_WATCHES_PER_CONNECTION: usize = 4096;
 /// but not for times, as macOS clients do, hear about new contents too.
 pub(crate) const CONTENT_CHANGED: u32 =
     FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_ATTRIBUTES;
+
+/// Filter of a change to a file's extended attributes, reported when the
+/// open that set them closes.
+pub(crate) const EA_CHANGED: u32 = FILE_NOTIFY_CHANGE_EA | FILE_NOTIFY_CHANGE_ATTRIBUTES;
 
 /// Filter of a change to a named stream: a write, a size change, an
 /// overwrite, a rename or a deletion of the stream, each reported as

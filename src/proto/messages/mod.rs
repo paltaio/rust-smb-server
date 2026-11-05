@@ -97,3 +97,26 @@ fn read_buf_at(offset: u64, len: usize, min_offset: u64) -> binrw::BinResult<Vec
     reader.seek(SeekFrom::Start(offset - SMB2_HEADER_LEN as u64))?;
     read_buf(reader, binrw::Endian::Little, (len,))
 }
+
+/// Writes `buf` at `offset`, counted from the start of the SMB2 header as
+/// [`read_buf_at`] reads it, with zeros before it from where the writer
+/// stands. A buffer whose offset lies before that is written where the
+/// writer stands; an empty one writes nothing.
+#[binrw::writer(writer)]
+#[expect(clippy::ptr_arg, reason = "binrw passes the field as it is declared")]
+fn write_buf_at(buf: &Vec<u8>, offset: u64) -> binrw::BinResult<()> {
+    if buf.is_empty() {
+        return Ok(());
+    }
+    let pos = writer.stream_position()?;
+    let at = offset.saturating_sub(SMB2_HEADER_LEN as u64);
+    if at > pos {
+        let gap = usize::try_from(at - pos).map_err(|_| binrw::Error::AssertFail {
+            pos,
+            message: format!("buffer offset {offset:#x} is out of reach"),
+        })?;
+        writer.write_all(&vec![0; gap])?;
+    }
+    writer.write_all(buf)?;
+    Ok(())
+}

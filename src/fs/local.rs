@@ -144,12 +144,36 @@ use crate::wildcard::Pattern;
 /// that differ only in a character without a one-character uppercase form,
 /// such as U+00DF and U+1E9E, are two streams to NTFS and one to the
 /// server's share modes and locks, while U+03C2 and U+03C3 are one stream
-/// to NTFS and two to the server. A file lists at most 4096 named streams, and a new stream
-/// past that fails with STATUS_DISK_FULL. Whether the share has named
-/// streams is decided once, from the volume of the share root: FAT and
-/// exFAT volumes have none. ReFS cannot rename streams: a stream rename
-/// there fails with STATUS_INVALID_PARAMETER, and a stream larger than the
-/// volume holds fails with STATUS_DISK_FULL.
+/// to NTFS and two to the server. A file lists at most 4096 named streams,
+/// and a new stream past that fails with STATUS_DISK_FULL. Whether the
+/// share has named streams is decided once, from the volume of the share
+/// root: FAT and exFAT volumes have none. ReFS cannot rename streams: a
+/// stream rename there fails with STATUS_INVALID_PARAMETER, and a stream
+/// larger than the volume holds fails with STATUS_DISK_FULL.
+///
+/// On Linux, a file's or directory's extended attributes are its extended
+/// attributes named `user.<name>`, the layout Samba uses, when the
+/// filesystem of the share root stores user extended attributes. Names
+/// compare without regard to ASCII case: a set or a removal acts on the
+/// attribute as the host spells it, and a new one keeps the client's
+/// spelling. Of attributes whose names differ only in case, the one that
+/// sorts first in byte order is listed, and a set or removal of the name
+/// replaces or removes them all. Names longer than 250 bytes fail with
+/// STATUS_INVALID_EA_NAME. These host attributes are hidden, and a set of
+/// one of their names fails with STATUS_ACCESS_DENIED, in any case: names
+/// clients cannot send, `user.DosStream.*`, `user.smb-server.*`, and
+/// Samba's `user.DOSATTRIB`, `user.SAMBA_PAI`, `user.SAMBA_STREAMS`,
+/// `user.SmbReparse` and `user.org.netatalk.Metadata`. FILE_NEED_EA is not
+/// kept. A set that does not fit, past the room the filesystem gives a
+/// file's extended attributes (one block for all of them on ext4), fails
+/// with STATUS_EA_TOO_LARGE and changes nothing. A set on a read-only file
+/// fails with STATUS_ACCESS_DENIED unless the server may write the file
+/// whatever its mode.
+///
+/// On Windows, extended attributes are the NTFS ones, on volumes that
+/// store them; NTFS keeps the letters a-z of their names in uppercase.
+/// macOS hosts have none: every extended attribute there is a named
+/// stream.
 pub struct LocalFsBackend {
     root: Arc<Dir>,
     /// Device of the share root; see `file_index`.
@@ -157,6 +181,8 @@ pub struct LocalFsBackend {
     read_only: bool,
     /// Case rule of name lookups in the share root.
     case_sensitive: bool,
+    /// The share root's filesystem stores extended attributes.
+    eas: bool,
     /// Watches directories for changes made outside the server.
     #[cfg(target_os = "linux")]
     hub: Option<Arc<super::inotify::Hub>>,
@@ -192,6 +218,12 @@ impl LocalFsBackend {
         #[cfg(windows)]
         let volume = super::windows_streams::volume(&root);
         #[cfg(target_os = "linux")]
+        let eas = streams.is_some();
+        #[cfg(windows)]
+        let eas = super::windows_eas::supported(&root);
+        #[cfg(not(any(target_os = "linux", windows)))]
+        let eas = false;
+        #[cfg(target_os = "linux")]
         let store = streams
             .is_some()
             .then(|| Arc::new(super::streams::Store::in_share(Arc::clone(&root))));
@@ -200,6 +232,7 @@ impl LocalFsBackend {
             root_dev,
             read_only: false,
             case_sensitive,
+            eas,
             #[cfg(target_os = "linux")]
             hub: Some(Arc::default()),
             #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -948,6 +981,7 @@ pub(super) fn file_info_from_metadata(
         read_only: !md.is_dir() && md.permissions().readonly(),
         file_index: file_index(root_dev, file_key(md)),
         unix_mode: unix_mode(md),
+        ea_size: 0,
     }
 }
 
@@ -971,16 +1005,33 @@ fn unix_mode(md: &Metadata) -> Option<u32> {
 
 /// Entries of `dir` whose names match `pattern`, every entry for `None`.
 /// Names a client could not open again are left out, and entries that
-/// resolve to the object with the host identity `hidden`.
+/// resolve to the object with the host identity `hidden`. With `eas`, each
+/// entry carries the size of its extended attributes.
+#[cfg_attr(
+    not(any(target_os = "linux", windows)),
+    expect(
+        unused_variables,
+        reason = "only Linux and Windows list extended attributes"
+    )
+)]
 fn list_entries(
     dir: &Dir,
     pattern: Option<&str>,
     root_dev: Option<u64>,
     hidden: Option<(u64, u64)>,
+    eas: bool,
 ) -> io::Result<Vec<SmbDirEntry>> {
-    let pattern = pattern
-        .filter(|p| !matches!(*p, "" | "*" | "*.*"))
-        .map(|p| Pattern::new(p, !volume::is_case_sensitive(dir)));
+    let pattern = pattern.filter(|p| !matches!(*p, "" | "*" | "*.*"));
+    #[cfg(windows)]
+    let ea_sizes = if eas {
+        super::windows_eas::listing_sizes(dir, pattern).unwrap_or_else(|e| {
+            debug!(error = %e, "extended attribute sizes not listed");
+            Default::default()
+        })
+    } else {
+        Default::default()
+    };
+    let pattern = pattern.map(|p| Pattern::new(p, !volume::is_case_sensitive(dir)));
     let mut out = Vec::new();
     for entry in dir.entries()? {
         let entry = entry?;
@@ -1004,10 +1055,59 @@ fn list_entries(
         if hidden.is_some() && file_key(&md) == hidden {
             continue;
         }
-        let info = file_info_from_metadata(name.to_owned(), &md, root_dev);
+        #[cfg_attr(
+            not(any(target_os = "linux", windows)),
+            expect(unused_mut, reason = "only Linux and Windows list extended attributes")
+        )]
+        let mut info = file_info_from_metadata(name.to_owned(), &md, root_dev);
+        #[cfg(target_os = "linux")]
+        if eas {
+            info.ea_size = listed_ea_size(dir, &entry, name, &md);
+        }
+        #[cfg(windows)]
+        if eas {
+            info.ea_size = match ea_sizes.get(name) {
+                Some(Some(size)) => *size,
+                Some(None) => super::windows_eas::entry_size(dir, name).unwrap_or_else(|e| {
+                    debug!(error = %e, name, "extended attribute size not read");
+                    0
+                }),
+                None => 0,
+            };
+        }
         out.push(SmbDirEntry { info });
     }
     Ok(out)
+}
+
+/// [`FileInfo::ea_size`] of a listed entry with metadata `md`, as an open
+/// of its name sees it; 0 when it cannot be read.
+#[cfg(target_os = "linux")]
+fn listed_ea_size(dir: &Dir, entry: &cap_std::fs::DirEntry, name: &str, md: &Metadata) -> u32 {
+    use super::eas::{Source, size};
+    if !md.is_file() && !md.is_dir() {
+        return 0;
+    }
+    let sized = if entry.file_type().is_ok_and(|ty| ty.is_symlink()) {
+        // The target, opened without reading it, inside the share.
+        use cap_std::fs::OpenOptionsExt as _;
+        let mut opts = CapOpenOptions::new();
+        opts.read(true).custom_flags(libc::O_PATH | libc::O_NOCTTY);
+        dir.open_with(name, &opts).and_then(|target| {
+            let md = target.metadata()?;
+            if md.is_file() || md.is_dir() {
+                size(&Source::fd(&target))
+            } else {
+                Ok(0)
+            }
+        })
+    } else {
+        size(&Source::entry(dir, name))
+    };
+    sized.unwrap_or_else(|e| {
+        debug!(error = %e, name, "extended attribute size not read");
+        0
+    })
 }
 
 /// Metadata of a listed entry as an open of its name sees it: a symlink
@@ -1020,6 +1120,122 @@ fn listed_metadata(dir: &Dir, entry: &cap_std::fs::DirEntry) -> io::Result<Metad
         return Ok(md);
     }
     entry_metadata(dir, entry)
+}
+
+/// [`FileInfo::ea_size`] of the file `file` is open on, 0 when it cannot
+/// be read: a stat does not fail on it.
+fn host_ea_size(file: &std::fs::File) -> u32 {
+    #[cfg(target_os = "linux")]
+    let size = super::eas::size(&super::eas::Source::File(file));
+    #[cfg(windows)]
+    let size = super::windows_eas::size(file);
+    #[cfg(not(any(target_os = "linux", windows)))]
+    let size: io::Result<u32> = {
+        let _ = file;
+        Ok(0)
+    };
+    best_effort(size)
+}
+
+/// [`FileInfo::ea_size`] of the directory `dir` is open on, 0 when it
+/// cannot be read. On Linux it is read through the descriptor's path, so a
+/// directory the server may only traverse costs no open.
+fn dir_ea_size(dir: &Dir) -> u32 {
+    #[cfg(target_os = "linux")]
+    let size = super::eas::size(&super::eas::Source::fd(dir));
+    #[cfg(windows)]
+    let size = dir_as_file(dir).and_then(|file| super::windows_eas::size(&file));
+    #[cfg(not(any(target_os = "linux", windows)))]
+    let size: io::Result<u32> = {
+        let _ = dir;
+        Ok(0)
+    };
+    best_effort(size)
+}
+
+fn best_effort(size: io::Result<u32>) -> u32 {
+    size.unwrap_or_else(|e| {
+        debug!(error = %e, "extended attribute size not read");
+        0
+    })
+}
+
+/// The extended attributes of the file or directory `file` is open on.
+fn host_eas(file: &std::fs::File) -> io::Result<Vec<crate::Ea>> {
+    #[cfg(target_os = "linux")]
+    {
+        super::eas::list(file)
+    }
+    #[cfg(windows)]
+    {
+        super::windows_eas::list(file)
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        let _ = file;
+        Ok(Vec::new())
+    }
+}
+
+/// Changes the extended attributes of the file or directory `file` is open
+/// on, as [`Handle::set_eas`] does. On Linux, the lock of the file among
+/// `open` is held throughout, as for every change of its named streams.
+#[cfg_attr(
+    not(target_os = "linux"),
+    expect(unused_variables, reason = "only Linux shares a lock with the streams")
+)]
+fn host_set_eas(
+    file: &std::fs::File,
+    eas: &[crate::Ea],
+    open: Option<&Arc<OpenStreamsOf>>,
+) -> SmbResult<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let entry = match open {
+            Some(open) => {
+                let md = Metadata::from_file(file).map_err(io_to_smb)?;
+                let key = file_key(&md).ok_or(SmbError::NotSupported)?;
+                Some(open.file(key))
+            }
+            None => None,
+        };
+        let _locked = entry
+            .as_ref()
+            .map(|entry| super::open_streams::lock(&entry.open));
+        super::eas::set(file, eas)
+    }
+    #[cfg(windows)]
+    {
+        super::windows_eas::set(file, eas)
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        let _ = (file, eas);
+        Err(SmbError::NotSupported)
+    }
+}
+
+/// The named streams open through a backend, whose per-file lock changes of
+/// extended attributes take on Linux.
+#[cfg(target_os = "linux")]
+type OpenStreamsOf = super::open_streams::OpenStreams;
+#[cfg(not(target_os = "linux"))]
+type OpenStreamsOf = ();
+
+/// What the extended attribute calls of a handle work on.
+enum EaTarget {
+    File(Arc<std::fs::File>),
+    Dir(Arc<Dir>),
+}
+
+impl EaTarget {
+    /// A file handle on it; a directory is opened again for one.
+    fn file(&self) -> io::Result<Arc<std::fs::File>> {
+        match self {
+            EaTarget::File(file) => Ok(Arc::clone(file)),
+            EaTarget::Dir(dir) => dir_as_file(dir).map(Arc::new),
+        }
+    }
 }
 
 /// True if `dir` has no entries besides `.` and `..`.
@@ -1125,6 +1341,10 @@ impl LocalFsBackend {
                 name: file_name_for(path),
                 root_dev: self.root_dev,
                 dir_handle: Arc::new(dir_handle),
+                read_only,
+                eas: self.eas,
+                #[cfg(target_os = "linux")]
+                open: self.streams.clone(),
                 #[cfg(target_os = "linux")]
                 hub: self.hub.clone(),
                 #[cfg(target_os = "linux")]
@@ -1155,6 +1375,10 @@ impl LocalFsBackend {
                         name: file_name_for(path),
                         root_dev: self.root_dev,
                         dir_handle: Arc::new(dir_handle),
+                        read_only,
+                        eas: self.eas,
+                        #[cfg(target_os = "linux")]
+                        open: self.streams.clone(),
                         #[cfg(target_os = "linux")]
                         hub: self.hub.clone(),
                         #[cfg(target_os = "linux")]
@@ -1191,6 +1415,9 @@ impl LocalFsBackend {
             root_dev: self.root_dev,
             file: Arc::new(std_file),
             read_only,
+            eas: self.eas,
+            #[cfg(target_os = "linux")]
+            open: self.streams.clone(),
             #[cfg(target_os = "linux")]
             store: self.store.clone(),
         });
@@ -1613,6 +1840,7 @@ impl ShareBackend for LocalFsBackend {
             named_streams: self.volume.is_some(),
             #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
             named_streams: false,
+            extended_attributes: self.eas,
         }
     }
 
@@ -1750,6 +1978,11 @@ enum LocalHandle {
         root_dev: Option<u64>,
         file: Arc<std::fs::File>,
         read_only: bool,
+        /// The share stores extended attributes.
+        eas: bool,
+        /// The named streams open through the backend.
+        #[cfg(target_os = "linux")]
+        open: Option<Arc<super::open_streams::OpenStreams>>,
         #[cfg(target_os = "linux")]
         store: Option<Arc<super::streams::Store>>,
     },
@@ -1757,6 +1990,12 @@ enum LocalHandle {
         name: String,
         root_dev: Option<u64>,
         dir_handle: Arc<Dir>,
+        read_only: bool,
+        /// The share stores extended attributes.
+        eas: bool,
+        /// The named streams open through the backend.
+        #[cfg(target_os = "linux")]
+        open: Option<Arc<super::open_streams::OpenStreams>>,
         #[cfg(target_os = "linux")]
         hub: Option<Arc<super::inotify::Hub>>,
         #[cfg(target_os = "linux")]
@@ -1765,6 +2004,31 @@ enum LocalHandle {
 }
 
 impl LocalHandle {
+    /// What the extended attribute calls work on; `NotSupported` when the
+    /// share stores none.
+    fn ea_target(&self) -> SmbResult<EaTarget> {
+        match self {
+            LocalHandle::File { eas: false, .. } | LocalHandle::Dir { eas: false, .. } => {
+                Err(SmbError::NotSupported)
+            }
+            LocalHandle::File { file, .. } => Ok(EaTarget::File(Arc::clone(file))),
+            LocalHandle::Dir { dir_handle, .. } => Ok(EaTarget::Dir(Arc::clone(dir_handle))),
+        }
+    }
+
+    /// The named streams open through the backend, on Linux.
+    fn open_streams(&self) -> Option<Arc<OpenStreamsOf>> {
+        #[cfg(target_os = "linux")]
+        {
+            let (LocalHandle::File { open, .. } | LocalHandle::Dir { open, .. }) = self;
+            open.clone()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
+    }
+
     /// The stream store of the share, which listings leave out.
     #[cfg(target_os = "linux")]
     fn store(&self) -> Option<Arc<super::streams::Store>> {
@@ -1888,14 +2152,19 @@ impl Handle for LocalHandle {
                 file,
                 name,
                 root_dev,
+                eas,
                 ..
             } => {
                 let file = Arc::clone(file);
                 let name = name.clone();
-                let root_dev = *root_dev;
+                let (root_dev, eas) = (*root_dev, *eas);
                 spawn_blocking(move || -> io::Result<FileInfo> {
                     let md = Metadata::from_file(&file)?;
-                    Ok(file_info_from_metadata(name, &md, root_dev))
+                    let mut info = file_info_from_metadata(name, &md, root_dev);
+                    if eas {
+                        info.ea_size = host_ea_size(&file);
+                    }
+                    Ok(info)
                 })
                 .await
                 .map_err(join_to_io)
@@ -1906,14 +2175,19 @@ impl Handle for LocalHandle {
                 dir_handle,
                 name,
                 root_dev,
+                eas,
                 ..
             } => {
                 let dir_handle = Arc::clone(dir_handle);
                 let name = name.clone();
-                let root_dev = *root_dev;
+                let (root_dev, eas) = (*root_dev, *eas);
                 spawn_blocking(move || -> io::Result<FileInfo> {
                     let md = dir_handle.dir_metadata()?;
-                    Ok(file_info_from_metadata(name, &md, root_dev))
+                    let mut info = file_info_from_metadata(name, &md, root_dev);
+                    if eas {
+                        info.ea_size = dir_ea_size(&dir_handle);
+                    }
+                    Ok(info)
                 })
                 .await
                 .map_err(join_to_io)
@@ -1998,15 +2272,24 @@ impl Handle for LocalHandle {
     }
 
     async fn list_dir(&self, pattern: Option<&str>) -> SmbResult<Vec<SmbDirEntry>> {
+        self.list_dir_sized(pattern, true).await
+    }
+
+    async fn list_dir_sized(
+        &self,
+        pattern: Option<&str>,
+        ea_size: bool,
+    ) -> SmbResult<Vec<SmbDirEntry>> {
         match self {
             LocalHandle::File { .. } => Err(SmbError::NotADirectory),
             LocalHandle::Dir {
                 dir_handle,
                 root_dev,
+                eas,
                 ..
             } => {
                 let dir_handle = Arc::clone(dir_handle);
-                let root_dev = *root_dev;
+                let (root_dev, eas) = (*root_dev, *eas && ea_size);
                 let pat = pattern.map(|s| s.to_owned());
                 #[cfg(target_os = "linux")]
                 let store = self.store();
@@ -2015,7 +2298,7 @@ impl Handle for LocalHandle {
                     let hidden = store.and_then(|store| store.key());
                     #[cfg(not(target_os = "linux"))]
                     let hidden = None;
-                    list_entries(&dir_handle, pat.as_deref(), root_dev, hidden)
+                    list_entries(&dir_handle, pat.as_deref(), root_dev, hidden, eas)
                 })
                 .await
                 .map_err(join_to_io)
@@ -2086,6 +2369,32 @@ impl Handle for LocalHandle {
                     .map_err(io_to_smb)
             }
         }
+    }
+
+    async fn eas(&self) -> SmbResult<Vec<crate::Ea>> {
+        let target = self.ea_target()?;
+        spawn_blocking(move || host_eas(&*target.file()?))
+            .await
+            .map_err(join_to_io)
+            .map_err(io_to_smb)?
+            .map_err(io_to_smb)
+    }
+
+    async fn set_eas(&self, eas: &[crate::Ea]) -> SmbResult<()> {
+        let (LocalHandle::File { read_only, .. } | LocalHandle::Dir { read_only, .. }) = self;
+        if *read_only {
+            return Err(SmbError::AccessDenied);
+        }
+        let target = self.ea_target()?;
+        let open = self.open_streams();
+        let eas = eas.to_vec();
+        spawn_blocking(move || {
+            let file = target.file().map_err(io_to_smb)?;
+            host_set_eas(&file, &eas, open.as_ref())
+        })
+        .await
+        .map_err(join_to_io)
+        .map_err(io_to_smb)?
     }
 
     #[cfg(target_os = "linux")]

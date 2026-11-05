@@ -85,8 +85,10 @@ pub fn encode_file_internal_information(file_index: u64) -> Vec<u8> {
 // FileEaInformation (MS-FSCC §2.4.12) - 4 bytes
 // ---------------------------------------------------------------------------
 
-pub fn encode_file_ea_information() -> Vec<u8> {
-    0u32.to_le_bytes().to_vec()
+/// EaSize `ea_size`, as [`FileInfo::ea_size`] counts it: the size
+/// directory listings carry, without the 4 bytes MS-FSA 2.1.5.12.10 adds.
+pub fn encode_file_ea_information(ea_size: u32) -> Vec<u8> {
+    ea_size.to_le_bytes().to_vec()
 }
 
 // ---------------------------------------------------------------------------
@@ -127,12 +129,14 @@ pub fn encode_file_alignment_information() -> Vec<u8> {
 // internal, EA, access, position, mode, alignment, name.
 // ---------------------------------------------------------------------------
 
-/// The name part is empty, as MS-SMB2 3.3.5.20.1 asks of servers.
+/// The name part is empty, as MS-SMB2 3.3.5.20.1 asks of servers. The EA
+/// part is FileEaInformation for `ea_size`.
 pub fn encode_file_all_information(
     info: &FileInfo,
     access_mask: u32,
     links: u32,
     delete_pending: bool,
+    ea_size: u32,
 ) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&encode_file_basic_information(info));
@@ -142,7 +146,7 @@ pub fn encode_file_all_information(
         delete_pending,
     ));
     out.extend_from_slice(&encode_file_internal_information(info.file_index));
-    out.extend_from_slice(&encode_file_ea_information());
+    out.extend_from_slice(&encode_file_ea_information(ea_size));
     out.extend_from_slice(&encode_file_access_information(access_mask));
     out.extend_from_slice(&encode_file_position_information());
     out.extend_from_slice(&encode_file_mode_information(0));
@@ -352,9 +356,10 @@ pub fn encode_fs_sector_size_information(bytes_per_sector: u32) -> Vec<u8> {
 // Directory information classes (MS-FSCC §2.4.{8,14,17,30,31})
 // ---------------------------------------------------------------------------
 
-/// Encode one directory entry in info class `class`; empty for unsupported
-/// classes. The caller patches `NextEntryOffset` for chained entries.
-pub fn encode_dir_entry(class: u8, entry: &DirEntry) -> Vec<u8> {
+/// Encode one directory entry in info class `class`, with EaSize `ea_size`
+/// in the classes that have it; empty for unsupported classes. The caller
+/// patches `NextEntryOffset` for chained entries.
+pub fn encode_dir_entry(class: u8, entry: &DirEntry, ea_size: u32) -> Vec<u8> {
     let info = &entry.info;
     let name_u16 = utf16le(&info.name);
     match class {
@@ -368,14 +373,14 @@ pub fn encode_dir_entry(class: u8, entry: &DirEntry) -> Vec<u8> {
         FILE_FULL_DIRECTORY_INFORMATION => {
             let mut out = Vec::new();
             write_dir_entry_prefix(&mut out, info, name_u16.len());
-            out.extend_from_slice(&0u32.to_le_bytes()); // EaSize
+            out.extend_from_slice(&ea_size.to_le_bytes());
             out.extend_from_slice(&name_u16);
             out
         }
         FILE_BOTH_DIRECTORY_INFORMATION => {
             let mut out = Vec::new();
             write_dir_entry_prefix(&mut out, info, name_u16.len());
-            out.extend_from_slice(&0u32.to_le_bytes()); // EaSize
+            out.extend_from_slice(&ea_size.to_le_bytes());
             out.push(0); // ShortNameLength
             out.push(0); // Reserved1
             // ShortName: 24 bytes (12 UTF-16 chars).
@@ -386,7 +391,7 @@ pub fn encode_dir_entry(class: u8, entry: &DirEntry) -> Vec<u8> {
         FILE_ID_BOTH_DIRECTORY_INFORMATION => {
             let mut out = Vec::new();
             write_dir_entry_prefix(&mut out, info, name_u16.len());
-            out.extend_from_slice(&0u32.to_le_bytes()); // EaSize
+            out.extend_from_slice(&ea_size.to_le_bytes());
             out.push(0); // ShortNameLength
             out.push(0); // Reserved1
             out.extend_from_slice(&[0u8; 24]); // ShortName
@@ -398,7 +403,7 @@ pub fn encode_dir_entry(class: u8, entry: &DirEntry) -> Vec<u8> {
         FILE_ID_FULL_DIRECTORY_INFORMATION => {
             let mut out = Vec::new();
             write_dir_entry_prefix(&mut out, info, name_u16.len());
-            out.extend_from_slice(&0u32.to_le_bytes()); // EaSize
+            out.extend_from_slice(&ea_size.to_le_bytes());
             out.extend_from_slice(&0u32.to_le_bytes()); // Reserved
             out.extend_from_slice(&info.file_index.to_le_bytes()); // FileId
             out.extend_from_slice(&name_u16);
@@ -496,6 +501,7 @@ mod tests {
             read_only: false,
             file_index: 1,
             unix_mode: None,
+            ea_size: 0,
         }
     }
 
@@ -535,7 +541,7 @@ mod tests {
 
     #[test]
     fn file_all_information_empty_name_keeps_linux_minimum_size() {
-        let bytes = encode_file_all_information(&fake_info(), 0x001F_01FF, 1, false);
+        let bytes = encode_file_all_information(&fake_info(), 0x001F_01FF, 1, false, 0);
         assert_eq!(bytes.len(), 101);
         // FileNameLength
         assert_eq!(bytes[96..100], [0; 4]);
@@ -554,7 +560,7 @@ mod tests {
             FILE_ID_FULL_DIRECTORY_INFORMATION,
         ] {
             let offset = dir_entry_name_offset(class).unwrap();
-            assert_eq!(encode_dir_entry(class, &entry).len(), offset + name_len);
+            assert_eq!(encode_dir_entry(class, &entry, 0).len(), offset + name_len);
         }
         assert_eq!(dir_entry_name_offset(0x3C), None);
     }

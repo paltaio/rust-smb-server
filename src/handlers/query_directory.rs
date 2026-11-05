@@ -12,8 +12,8 @@ use crate::dispatch::HandlerResponse;
 use crate::handlers::aapl;
 use crate::handlers::shared::{lookup_open, lookup_session_tree};
 use crate::info_class::{
-    FILE_ID_BOTH_DIRECTORY_INFORMATION, align8, dir_entry_name_offset, encode_dir_entry,
-    encode_finder_dir_entry,
+    FILE_DIRECTORY_INFORMATION, FILE_ID_BOTH_DIRECTORY_INFORMATION, FILE_NAMES_INFORMATION, align8,
+    dir_entry_name_offset, encode_dir_entry, encode_finder_dir_entry,
 };
 use crate::ntstatus;
 use crate::path::is_valid_pattern;
@@ -46,11 +46,12 @@ pub async fn handle(
         Some(o) => o,
         None => return HandlerResponse::err(ntstatus::STATUS_FILE_CLOSED),
     };
-    let (backend, streams, maximal) = {
+    let (backend, streams, eas, maximal) = {
         let tree = tree_arc.read().await;
         (
             Arc::clone(&tree.share.backend),
             tree.share.named_streams,
+            tree.share.extended_attributes,
             maximal_access(tree.granted_access),
         )
     };
@@ -87,6 +88,12 @@ pub async fn handle(
         return HandlerResponse::err(ntstatus::STATUS_OBJECT_NAME_INVALID);
     };
 
+    // A macOS client sent READ_DIR_ATTR reads this class in its layout on
+    // every share.
+    let finder = class == FILE_ID_BOTH_DIRECTORY_INFORMATION && aapl::reads_finder_data(conn);
+    // Classes that carry EaSize, unless Finder data takes its place.
+    let ea_size = eas && !finder && carries_ea_size(class);
+
     let reopen = req.flags & QueryDirectoryRequest::FLAG_REOPEN != 0;
     let restart = reopen || req.flags & QueryDirectoryRequest::FLAG_RESTART_SCANS != 0;
     let single_entry = req.flags & QueryDirectoryRequest::FLAG_RETURN_SINGLE_ENTRY != 0;
@@ -101,19 +108,16 @@ pub async fn handle(
             return HandlerResponse::err(ntstatus::STATUS_OBJECT_NAME_INVALID);
         }
         let pattern = (!requested.is_empty() && requested != "*").then_some(requested);
-        if let Err(status) = start_scan(&mut open, backend.as_ref(), pattern).await {
+        if let Err(status) = start_scan(&mut open, backend.as_ref(), pattern, ea_size).await {
             return HandlerResponse::err(status);
         }
     } else if restart {
         let pattern = open.search_state.as_mut().and_then(|c| c.pattern.take());
-        if let Err(status) = start_scan(&mut open, backend.as_ref(), pattern).await {
+        if let Err(status) = start_scan(&mut open, backend.as_ref(), pattern, ea_size).await {
             return HandlerResponse::err(status);
         }
     }
 
-    // A macOS client sent READ_DIR_ATTR reads this class in its layout on
-    // every share.
-    let finder = class == FILE_ID_BOTH_DIRECTORY_INFORMATION && aapl::reads_finder_data(conn);
     let dir = open.path();
     let mut lister = aapl::FinderLister::new(backend.as_ref(), streams, dir.as_ref(), maximal);
     let cursor = open.search_state.as_mut().expect("scan started");
@@ -134,7 +138,8 @@ pub async fn handle(
         let mut bytes = if finder {
             encode_finder_dir_entry(entry, &lister.data(&entry.info).await)
         } else {
-            encode_dir_entry(class, entry)
+            let size = if ea_size { entry.info.ea_size } else { 0 };
+            encode_dir_entry(class, entry, size)
         };
         if bytes.len() > cap {
             // Only the first entry gets here: return as much of its name as
@@ -185,15 +190,18 @@ pub async fn handle(
 /// matches every name) and stores the listing as its search state. On the
 /// first query and every restart the listing starts with "." and "..",
 /// when the pattern matches them. At the share root, ".." describes the
-/// share root itself, with file id 0.
+/// share root itself, with file id 0. The backend fills the entries' EA
+/// sizes when `ea_size` asks for them, and later queries that carry on the
+/// listing report them as listed here.
 async fn start_scan(
     open: &mut Open,
     backend: &dyn ShareBackend,
     pattern: Option<String>,
+    ea_size: bool,
 ) -> Result<(), u32> {
     let handle = open.handle.as_ref().ok_or(ntstatus::STATUS_FILE_CLOSED)?;
     let listed = handle
-        .list_dir(pattern.as_deref())
+        .list_dir_sized(pattern.as_deref(), ea_size)
         .await
         .map_err(|e| e.to_nt_status())?;
 
@@ -228,6 +236,11 @@ async fn start_scan(
         pattern,
     });
     Ok(())
+}
+
+/// True if entries of the directory information class `class` carry EaSize.
+fn carries_ea_size(class: u8) -> bool {
+    !matches!(class, FILE_DIRECTORY_INFORMATION | FILE_NAMES_INFORMATION)
 }
 
 /// File info of the parent directory of `open`, or `None` at the share root

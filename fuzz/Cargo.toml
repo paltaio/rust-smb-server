@@ -74,6 +74,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "ea_list"
+path = "fuzz_targets/ea_list.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "lease_context"
 path = "fuzz_targets/lease_context.rs"
 test = false

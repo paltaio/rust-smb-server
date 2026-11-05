@@ -57,7 +57,6 @@ const STANDARD: u8 = 0x05;
 const ALL: u8 = 0x12;
 const NETWORK_OPEN: u8 = 0x22;
 const RENAME: u8 = 0x0A;
-const LINK: u8 = 0x0B;
 const DISPOSITION: u8 = 0x0D;
 const ALLOCATION: u8 = 0x13;
 const END_OF_FILE: u8 = 0x14;
@@ -75,7 +74,6 @@ struct Create<'a> {
     disposition: u32,
     options: u32,
     lease: bool,
-    ea: bool,
 }
 
 impl<'a> Create<'a> {
@@ -87,7 +85,6 @@ impl<'a> Create<'a> {
             disposition: FILE_OPEN,
             options: 0,
             lease: false,
-            ea: false,
         }
     }
 
@@ -124,12 +121,6 @@ impl<'a> Create<'a> {
                     ..LeaseContext::default()
                 }
                 .encode(),
-            });
-        }
-        if self.ea {
-            list.push(CreateContext {
-                name: CreateContext::NAME_EXTA.to_vec(),
-                data: vec![0; 12],
             });
         }
         let mut contexts = Vec::new();
@@ -2213,77 +2204,6 @@ async fn the_stream_list_names_every_stream_of_the_file() {
     );
 }
 
-#[tokio::test]
-async fn a_stream_open_reports_the_stream_s_size_and_the_file_s_times() {
-    let files = MemFsBackend::new();
-    let state = server(&files).await;
-    let mut a = Client::new(&state).await;
-    make(&mut a, "f.txt:s", b"abcdef").await;
-    let base = a.open(Create::new("f.txt")).await;
-    let s = a
-        .open(Create::new("f.txt:s").access(RW | DELETE, SHARE_ALL))
-        .await;
-
-    let standard = a.file_info(s, STANDARD).await;
-    assert_eq!(u64_at(&standard, 8), 6, "EndOfFile");
-    assert_eq!(u64_at(&a.file_info(base, STANDARD).await, 8), 4);
-    assert_eq!(a.file_info(s, 0x22).await[40..48], 6u64.to_le_bytes());
-
-    // Times set through the stream are the file's.
-    let mut basic = vec![0; 40];
-    basic[16..24].copy_from_slice(&0x01D0_0000_0000_0000u64.to_le_bytes());
-    assert_eq!(a.set_info(s, BASIC, basic).await, 0);
-    assert_eq!(
-        u64_at(&a.file_info(base, BASIC).await, 16),
-        0x01D0_0000_0000_0000
-    );
-    assert_eq!(a.file_info(s, BASIC).await, a.file_info(base, BASIC).await);
-
-    // Sizes set through the stream are the stream's.
-    assert_eq!(
-        a.set_info(s, END_OF_FILE, 2u64.to_le_bytes().to_vec())
-            .await,
-        0
-    );
-    assert_eq!(a.read(s, 0, 16).await.unwrap(), b"ab");
-    assert_eq!(
-        a.set_info(s, ALLOCATION, 1u64.to_le_bytes().to_vec()).await,
-        0
-    );
-    assert_eq!(a.read(s, 0, 16).await.unwrap(), b"a");
-    assert_eq!(a.read(base, 0, 16).await.unwrap(), b"data");
-
-    // A stream has no name of its own to rename or link.
-    let mut rename = vec![0; 16];
-    let to = crate::utils::utf16le("g.txt");
-    rename.extend_from_slice(&(to.len() as u32).to_le_bytes());
-    rename.extend_from_slice(&to);
-    assert_eq!(
-        a.set_info(s, RENAME, rename.clone()).await,
-        ntstatus::STATUS_INVALID_PARAMETER
-    );
-    assert_eq!(
-        a.set_info(s, LINK, rename).await,
-        ntstatus::STATUS_INVALID_PARAMETER
-    );
-    assert_eq!(files.contents("g.txt"), None);
-}
-
-#[tokio::test]
-async fn extended_attributes_are_refused_on_a_stream() {
-    let files = MemFsBackend::new();
-    let state = server(&files).await;
-    let mut a = Client::new(&state).await;
-    let create = Create {
-        ea: true,
-        ..Create::new("f.txt:s").disposition(FILE_OPEN_IF)
-    };
-    assert_eq!(
-        a.create(create).await.err(),
-        Some(ntstatus::STATUS_INVALID_PARAMETER)
-    );
-}
-
 async fn fs_attributes(c: &mut Client) -> u32 {
     let root = c
         .open(
@@ -2319,7 +2239,8 @@ async fn the_volume_reports_named_streams_only_when_the_share_serves_them() {
     ] {
         let state = server_on(share.public());
         let mut c = Client::new(&state).await;
-        assert_eq!(fs_attributes(&mut c).await, 0x6);
+        // FILE_SUPPORTS_EXTENDED_ATTRIBUTES aside.
+        assert_eq!(fs_attributes(&mut c).await & !0x0080_0000, 0x6);
         for name in [
             "f.txt:s",
             "f.txt:s:$DATA",

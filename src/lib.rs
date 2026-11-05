@@ -74,6 +74,20 @@ SmbServer::builder()
 //!   the stream's sizes, without FILE_ATTRIBUTE_DIRECTORY on a directory's
 //!   stream. Elsewhere named streams are rejected before the backend sees
 //!   them.
+//! - Extended attributes, on shares whose backend reports
+//!   [`BackendCapabilities::extended_attributes`] unless
+//!   [`Share::extended_attributes`] turns them off: FileFullEaInformation
+//!   queries call [`Handle::eas`], sets [`Handle::set_eas`], and an `ExtA`
+//!   create context gives a new file its attributes. The protocol layer
+//!   checks the names and the 65531-byte limit before the backend is
+//!   called, matches names without regard to ASCII case, keeps each open's
+//!   position in the attribute list across queries, replaces a file's
+//!   attributes with those of a CREATE that overwrites or supersedes it,
+//!   and refuses an open with FILE_NO_EA_KNOWLEDGE of a file that has one
+//!   flagged FILE_NEED_EA. EaSize in FileEaInformation, FileAllInformation
+//!   and directory listings is [`FileInfo::ea_size`]. A set breaks no
+//!   lease and is reported, under EA and ATTRIBUTES, when the open that
+//!   made it closes. A named stream has none of its own.
 //! - `open` fails with [`SmbError::PathNotFound`] when a directory on the
 //!   way to the path is missing, and with [`SmbError::NotFound`] when only
 //!   the last component is. Clients see STATUS_OBJECT_PATH_NOT_FOUND and
@@ -354,6 +368,7 @@ pub(crate) mod conn;
 #[cfg(feature = "discovery")]
 mod discovery;
 mod dispatch;
+mod ea;
 mod error;
 mod files;
 #[cfg(feature = "localfs")]
@@ -374,6 +389,7 @@ mod tests {
     mod discovery;
     mod durable;
     mod dynamic_config;
+    mod eas;
     pub(crate) mod memfs;
     mod notify;
     pub(crate) mod peer;
@@ -392,6 +408,7 @@ pub use builder::{Access, BuildError, Share, SmbServerBuilder};
 pub use bytes::Bytes;
 #[cfg(feature = "discovery")]
 pub use discovery::Discovery;
+pub use ea::Ea;
 pub use error::{SmbError, SmbResult};
 pub use files::{
     DEFAULT_DURABLE_HANDLE_TIMEOUT, DEFAULT_MAX_DISCONNECTED_OPENS, DEFAULT_MAX_LOCKS_PER_OPEN,
@@ -567,6 +584,29 @@ pub mod fuzzing {
             at += 8 + units.len();
         }
         assert_eq!(reply.len(), at);
+    }
+
+    /// Parses `data` as a FILE_FULL_EA_INFORMATION list and as a
+    /// FILE_GET_EA_INFORMATION list. Every attribute read has a valid name
+    /// and reads back the same from the list it encodes to; every name read
+    /// is valid and listed once.
+    pub fn ea_list(data: &[u8]) {
+        use crate::ea::{encode_full_list, parse_full_list, parse_get_list, valid_name};
+        if let Ok(eas) = parse_full_list(data) {
+            assert!(!eas.is_empty());
+            assert!(eas.iter().all(|ea| valid_name(ea.name.as_bytes())));
+            assert_eq!(parse_full_list(&encode_full_list(&eas)), Ok(eas));
+        }
+        if let Ok(names) = parse_get_list(data) {
+            for (at, name) in names.iter().enumerate() {
+                assert!(valid_name(name.as_bytes()));
+                assert!(
+                    !names[..at]
+                        .iter()
+                        .any(|before| before.eq_ignore_ascii_case(name))
+                );
+            }
+        }
     }
 
     /// Parses `data` as a lease break acknowledgment.

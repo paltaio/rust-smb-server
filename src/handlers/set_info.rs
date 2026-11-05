@@ -7,7 +7,7 @@ use crate::proto::header::Smb2Header;
 use crate::proto::messages::{InfoType, SetInfoRequest, SetInfoResponse};
 
 use crate::access_mask::{
-    DELETE, FILE_APPEND_DATA, FILE_READ_DATA, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA,
+    DELETE, FILE_APPEND_DATA, FILE_READ_DATA, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FILE_WRITE_EA,
 };
 use crate::backend::{
     FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_TEMPORARY, FileInfo, FileTimes, Handle, OpenIntent,
@@ -16,6 +16,7 @@ use crate::backend::{
 use crate::conn::pending::{Stop, stopped};
 use crate::conn::state::{Connection, Open};
 use crate::dispatch::HandlerResponse;
+use crate::ea;
 use crate::error::{SmbError, SmbResult};
 use crate::files::{BreakWait, CONTENT_CHANGED, Change, MAX_BREAK_WAIT, STREAM_CHANGED, Trigger};
 use crate::handlers::shared::{lookup_open, lookup_session_tree, restore_fixed_times};
@@ -51,6 +52,7 @@ enum Class {
     Disposition,
     Rename,
     Allocation,
+    FullEa,
 }
 
 pub async fn handle(
@@ -109,6 +111,7 @@ async fn set(
         ic::FILE_RENAME_INFORMATION => (Class::Rename, DELETE),
         ic::FILE_END_OF_FILE_INFORMATION => (Class::EndOfFile, FILE_WRITE_DATA),
         ic::FILE_ALLOCATION_INFORMATION => (Class::Allocation, FILE_WRITE_DATA),
+        ic::FILE_FULL_EA_INFORMATION => (Class::FullEa, FILE_WRITE_EA),
         class if SETTABLE_CLASSES.contains(&class) => {
             return Ok(HandlerResponse::err(unsupported));
         }
@@ -165,6 +168,7 @@ async fn set(
                 Err(status) => Err(status),
             }
         }
+        Class::FullEa => set_eas(&share, &*open_arc.read().await, &buffer).await,
         Class::Disposition => {
             if buffer.is_empty() {
                 return Ok(HandlerResponse::err(ntstatus::STATUS_INFO_LENGTH_MISMATCH));
@@ -1019,6 +1023,41 @@ fn changed_fields(before: &FileInfo, after: &FileInfo) -> u32 {
     .fold(0, |bits, (_, bit)| bits | bit)
 }
 
+/// FileFullEaInformation (MS-FSA 2.1.5.15.6): sets, replaces or, with an
+/// empty value, removes each attribute `buffer` lists, all or none. On a
+/// share without extended attributes a well-formed list fails with
+/// STATUS_INVALID_DEVICE_REQUEST. A name listed twice takes the last value.
+/// The attributes the file ends up with may take at most 65531 bytes as
+/// [`ea::stored_length`] counts them; sets through different opens of the
+/// file run one at a time, so together they stay within that. Extended
+/// attributes belong to the file, so an open of a named stream sets none.
+/// Leases stay as they are, and the close of the open reports the change.
+async fn set_eas(share: &ShareBindings, open: &Open, buffer: &[u8]) -> Result<(), u32> {
+    if open.on_stream {
+        return Err(ntstatus::STATUS_INVALID_PARAMETER);
+    }
+    ea::check_full_list(buffer)?;
+    if !share.extended_attributes {
+        return Err(ntstatus::STATUS_INVALID_DEVICE_REQUEST);
+    }
+    let mut changes = ea::parse_full_list(buffer)?;
+    ea::dedup(&mut changes);
+    let handle = open.handle.as_ref().ok_or(ntstatus::STATUS_FILE_CLOSED)?;
+    let file = open.file.as_ref().ok_or(ntstatus::STATUS_FILE_CLOSED)?;
+    let _setting = file.lock_eas().await;
+    let current = handle.eas().await.map_err(|e| e.to_nt_status())?;
+    if ea::stored_length_after(&current, &changes) > ea::MAX_STORED_LENGTH {
+        return Err(ntstatus::STATUS_EA_TOO_LARGE);
+    }
+    handle
+        .set_eas(&changes)
+        .await
+        .map_err(|e| e.to_nt_status())?;
+    file.count_ea_change();
+    open.eas_changed.store(true, Ordering::Release);
+    Ok(())
+}
+
 /// FileEndOfFileInformation, or FileAllocationInformation when
 /// `allocation` is set (MS-FSA 2.1.5.15.1, 2.1.5.15.4). An allocation size
 /// below the end of file truncates the file to it; a larger one leaves the
@@ -1242,6 +1281,8 @@ mod tests {
                 wrote: Default::default(),
                 created: false,
                 marked_deleted: Default::default(),
+                ea_cursor: Default::default(),
+                eas_changed: Default::default(),
                 resized: Default::default(),
                 moved_data: false,
             };

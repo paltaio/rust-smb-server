@@ -7,6 +7,7 @@
 use async_trait::async_trait;
 use std::time::SystemTime;
 
+use crate::ea::Ea;
 use crate::error::{SmbError, SmbResult};
 use crate::path::SmbPath;
 use crate::stream::{StreamInfo, StreamName};
@@ -120,6 +121,13 @@ pub struct FileInfo {
     /// it. Directory listings give macOS clients that negotiated Apple's
     /// extensions its low 16 bits. `None` where the host has no modes.
     pub unix_mode: Option<u32>,
+    /// Bytes the file's extended attributes take as FILE_FULL_EA_INFORMATION
+    /// entries of what [`Handle::eas`] returns, each 8 bytes, the name, a
+    /// NUL and the value, padded to 4 bytes. `0` when it has none or the
+    /// backend does not report [`BackendCapabilities::extended_attributes`].
+    /// FileEaInformation, FileAllInformation and directory listings report
+    /// it as EaSize; on an open of a named stream, the file's.
+    pub ea_size: u32,
 }
 
 // File attributes (MS-FSCC 2.6).
@@ -158,6 +166,7 @@ impl FileInfo {
             read_only: false,
             file_index: 0,
             unix_mode: None,
+            ea_size: 0,
         }
     }
 
@@ -231,6 +240,15 @@ pub struct BackendCapabilities {
     /// it, a CREATE that names a stream fails with
     /// STATUS_OBJECT_NAME_INVALID before the backend is called.
     pub named_streams: bool,
+    /// The backend stores extended attributes of files and directories,
+    /// served by [`Handle::eas`] and [`Handle::set_eas`]. On a share that
+    /// leaves
+    /// [`Share::extended_attributes`](crate::Share::extended_attributes)
+    /// on, FileFsAttributeInformation then reports
+    /// FILE_SUPPORTS_EXTENDED_ATTRIBUTES. Without it, the share answers as
+    /// [`Share::extended_attributes`](crate::Share::extended_attributes)
+    /// describes for a share that turns them off.
+    pub extended_attributes: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -473,6 +491,25 @@ pub trait Handle: Send + Sync {
     /// them.
     async fn list_dir(&self, pattern: Option<&str>) -> SmbResult<Vec<DirEntry>>;
 
+    /// [`Handle::list_dir`] for a caller that reads the
+    /// [`FileInfo::ea_size`] of the entries only when `ea_size` is set;
+    /// without it a backend may leave that 0 and skip reading it.
+    /// QUERY_DIRECTORY calls this when a listing starts or restarts, with
+    /// `ea_size` set when the share serves extended attributes and the
+    /// information class carries EaSize; the layout with Finder data for
+    /// macOS clients carries none. Queries that carry on a listing reuse
+    /// its entries, so one carried on under a class with EaSize after it
+    /// started under one without reports 0 until it restarts. The default
+    /// calls `list_dir`.
+    async fn list_dir_sized(
+        &self,
+        pattern: Option<&str>,
+        ea_size: bool,
+    ) -> SmbResult<Vec<DirEntry>> {
+        let _ = ea_size;
+        self.list_dir(pattern).await
+    }
+
     /// Close the handle. Boxed self lets implementors consume internal state.
     async fn close(self: Box<Self>) -> SmbResult<()>;
 
@@ -508,6 +545,36 @@ pub trait Handle: Send + Sync {
     /// default returns none.
     async fn streams(&self) -> SmbResult<Vec<StreamInfo>> {
         Ok(Vec::new())
+    }
+
+    /// The extended attributes of the file or directory this handle is
+    /// on, in the order FileFullEaInformation lists them. The protocol
+    /// layer leaves out those with names a client cannot send, empty
+    /// values or values over 65535 bytes. Called only when
+    /// [`BackendCapabilities::extended_attributes`] is set, and never on a
+    /// handle of a named stream. The default returns none.
+    async fn eas(&self) -> SmbResult<Vec<Ea>> {
+        Ok(Vec::new())
+    }
+
+    /// Changes the extended attributes of the file or directory this
+    /// handle is on: each of `eas` replaces the attribute of its name, or
+    /// adds it, and one with an empty value removes it, if there is one.
+    /// Names compare without regard to ASCII case; a replaced attribute
+    /// may keep the spelling it had. A name appears once in `eas`. All
+    /// of them apply or none does.
+    ///
+    /// The protocol layer has checked the names, and that the attributes
+    /// the file ends up with take at most 65531 bytes, counting 5 bytes,
+    /// the name and the value of each. Fail with
+    /// [`SmbError::EaTooLarge`] when they need more room than the backend
+    /// has, and with [`SmbError::EaNameInvalid`] for a name it cannot
+    /// store. Called only when
+    /// [`BackendCapabilities::extended_attributes`] is set, and never on a
+    /// handle of a named stream. The default returns
+    /// [`SmbError::NotSupported`].
+    async fn set_eas(&self, _eas: &[Ea]) -> SmbResult<()> {
+        Err(SmbError::NotSupported)
     }
 }
 
@@ -599,6 +666,7 @@ impl ShareBackend for NotSupportedBackend {
             is_read_only: true,
             case_sensitive: false,
             named_streams: false,
+            extended_attributes: false,
         }
     }
 }

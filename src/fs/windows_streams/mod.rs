@@ -730,6 +730,9 @@ impl Handle for StreamHandle {
             info.is_directory = is_dir;
             info.read_only = !is_dir && md.permissions().readonly();
             (info.end_of_file, info.allocation_size) = sizes(file)?;
+            // A volume with streams and without extended attributes, such
+            // as ReFS, may refuse the query; the file then has none.
+            info.ea_size = super::windows_eas::size(file).unwrap_or(0);
             Ok(info)
         })
         .await

@@ -46,11 +46,22 @@ pub struct QueryInfoRequest {
     pub additional_information: u32,
     pub flags: u32,
     pub file_id: FileId,
-    /// Optional input buffer (used by FILE/FS info classes that need it, e.g.
-    /// `FileFullEaInformation` extended-attribute name lists).
-    #[br(parse_with = super::read_buf, args(input_buffer_length as usize))]
+    /// `input_buffer_length` bytes at `input_buffer_offset`, counted from
+    /// the start of the SMB2 header and not before the end of the fixed
+    /// fields: the extended attribute names of a `FileFullEaInformation`
+    /// query.
+    #[br(parse_with = super::read_buf_at, args(
+        input_buffer_offset.into(),
+        input_buffer_length as usize,
+        QUERY_INFO_BUFFER_OFFSET,
+    ))]
+    #[bw(write_with = super::write_buf_at, args(u64::from(*input_buffer_offset)))]
     pub input_buffer: Vec<u8>,
 }
+
+/// Offset of the first byte after the fixed QUERY_INFO request fields,
+/// counted from the start of the SMB2 header: 64 + 40.
+const QUERY_INFO_BUFFER_OFFSET: u64 = 0x68;
 
 impl QueryInfoRequest {
     /// Flag: SL_RESTART_SCAN.
@@ -123,6 +134,31 @@ mod tests {
         let decoded = QueryInfoRequest::parse(&buf).unwrap();
         assert_eq!(decoded, r);
         assert_eq!(decoded.info_type_enum(), Some(InfoType::File));
+    }
+
+    #[test]
+    fn the_input_buffer_is_written_and_read_at_its_offset() {
+        let request = QueryInfoRequest {
+            structure_size: 41,
+            info_type: InfoType::File as u8,
+            file_information_class: 0x0F,
+            output_buffer_length: 0x1000,
+            input_buffer_offset: 0x70,
+            reserved: 0,
+            input_buffer_length: 4,
+            additional_information: 0,
+            flags: 0,
+            file_id: FileId::new(1, 2),
+            input_buffer: vec![1, 2, 3, 4],
+        };
+        let mut body = Vec::new();
+        request.write_to(&mut body).unwrap();
+        // 0x70 is 8 bytes past the end of the fixed fields.
+        assert_eq!(body[40..], [0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4]);
+        assert_eq!(QueryInfoRequest::parse(&body).unwrap(), request);
+        // Inside the fixed fields.
+        body[8..10].copy_from_slice(&0x60u16.to_le_bytes());
+        assert!(QueryInfoRequest::parse(&body).is_err());
     }
 
     #[test]

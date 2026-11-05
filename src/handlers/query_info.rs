@@ -6,8 +6,9 @@ use crate::proto::header::Smb2Header;
 use crate::proto::messages::{Dialect, InfoType, QueryInfoRequest, QueryInfoResponse};
 
 use crate::backend::{FileInfo, Handle, OpenOptions};
-use crate::conn::state::{Connection, Open};
+use crate::conn::state::{Connection, EaCursor, Open};
 use crate::dispatch::HandlerResponse;
+use crate::ea::{self, Ea};
 use crate::handlers::shared::{lookup_open, lookup_session_tree};
 use crate::info_class as ic;
 use crate::ntstatus;
@@ -22,6 +23,7 @@ const FILE_CASE_SENSITIVE_SEARCH: u32 = 0x0000_0001;
 const FILE_CASE_PRESERVED_NAMES: u32 = 0x0000_0002;
 const FILE_UNICODE_ON_DISK: u32 = 0x0000_0004;
 const FILE_NAMED_STREAMS: u32 = 0x0004_0000;
+const FILE_SUPPORTS_EXTENDED_ATTRIBUTES: u32 = 0x0080_0000;
 
 // Access mask bits (MS-SMB2 2.2.13.1.1)
 const FILE_READ_EA: u32 = 0x0000_0008;
@@ -81,6 +83,21 @@ pub async fn handle(
     };
     let open = open_arc.read().await;
     let on_stream = open.on_stream;
+    if matches!(info_type, InfoType::File)
+        && req.file_information_class == ic::FILE_FULL_EA_INFORMATION
+    {
+        let result = query_eas(&open, &share, &req, cap).await;
+        drop(open);
+        return match result {
+            Ok((buf, status)) => {
+                let mut response = info_response(buf);
+                response.status = status;
+                response
+            }
+            Err(ntstatus::STATUS_BUFFER_TOO_SMALL) => buffer_too_small(smb311),
+            Err(status) => HandlerResponse::err(status),
+        };
+    }
     let result = match info_type {
         InfoType::File => query_file(&open, &share, req.file_information_class, cap).await,
         InfoType::FileSystem => {
@@ -107,7 +124,13 @@ pub async fn handle(
         }
         status = ntstatus::STATUS_BUFFER_OVERFLOW;
     }
+    let mut response = info_response(buf);
+    response.status = status;
+    response
+}
 
+/// A QUERY_INFO response carrying `buf`.
+fn info_response(buf: Vec<u8>) -> HandlerResponse {
     let resp = QueryInfoResponse {
         structure_size: 9,
         output_buffer_offset: 64 + 8,
@@ -117,9 +140,7 @@ pub async fn handle(
     let mut out = Vec::new();
     resp.write_to(&mut out)
         .expect("QUERY_INFO response encodes");
-    let mut response = HandlerResponse::ok(out);
-    response.status = status;
-    response
+    HandlerResponse::ok(out)
 }
 
 /// STATUS_INFO_LENGTH_MISMATCH with the error data of MS-SMB2 3.3.5.20.1:
@@ -160,7 +181,6 @@ async fn query_file(open: &Open, share: &ShareBindings, class: u8, cap: usize) -
         ic::FILE_ALL_INFORMATION => (104, Overflow::Truncate, FILE_READ_ATTRIBUTES),
         ic::FILE_NETWORK_OPEN_INFORMATION => (56, Overflow::Never, FILE_READ_ATTRIBUTES),
         ic::FILE_STREAM_INFORMATION => (24, Overflow::WholeEntries, 0),
-        ic::FILE_FULL_EA_INFORMATION => (0, Overflow::Never, FILE_READ_EA),
         ic::FILE_ALTERNATE_NAME_INFORMATION => (8, Overflow::Never, 0),
         // MS-FSA 2.1.5.12.19: not available to remote clients.
         ic::FILE_NAME_INFORMATION => return Err(ntstatus::STATUS_NOT_SUPPORTED),
@@ -183,6 +203,11 @@ async fn query_file(open: &Open, share: &ShareBindings, class: u8, cap: usize) -
     } else {
         info
     };
+    let ea_size = if share.extended_attributes {
+        info.ea_size
+    } else {
+        0
+    };
     let buf = match class {
         ic::FILE_BASIC_INFORMATION => ic::encode_file_basic_information(&info),
         ic::FILE_STANDARD_INFORMATION | ic::FILE_ALL_INFORMATION => {
@@ -195,17 +220,17 @@ async fn query_file(open: &Open, share: &ShareBindings, class: u8, cap: usize) -
                     open.granted_access,
                     links,
                     open.delete_pending(),
+                    ea_size,
                 )
             }
         }
         ic::FILE_INTERNAL_INFORMATION => ic::encode_file_internal_information(info.file_index),
-        ic::FILE_EA_INFORMATION => ic::encode_file_ea_information(),
+        ic::FILE_EA_INFORMATION => ic::encode_file_ea_information(ea_size),
         ic::FILE_ACCESS_INFORMATION => ic::encode_file_access_information(open.granted_access),
         ic::FILE_POSITION_INFORMATION => ic::encode_file_position_information(),
         ic::FILE_MODE_INFORMATION => ic::encode_file_mode_information(0),
         ic::FILE_ALIGNMENT_INFORMATION => ic::encode_file_alignment_information(),
         ic::FILE_NETWORK_OPEN_INFORMATION => ic::encode_file_network_open_information(&info),
-        ic::FILE_FULL_EA_INFORMATION => return Err(ntstatus::STATUS_NO_EAS_ON_FILE),
         // MS-FSA 2.1.5.12.4. Files here have no 8.3 short name.
         ic::FILE_ALTERNATE_NAME_INFORMATION => return Err(ntstatus::STATUS_OBJECT_NAME_NOT_FOUND),
         _ => unreachable!("class checked above"),
@@ -307,8 +332,17 @@ async fn query_filesystem(open: &Open, share: &ShareBindings, class: u8, cap: us
             } else {
                 0
             };
+            let eas = if share.extended_attributes {
+                FILE_SUPPORTS_EXTENDED_ATTRIBUTES
+            } else {
+                0
+            };
             ic::encode_fs_attribute_information(
-                case_sensitive | named_streams | FILE_CASE_PRESERVED_NAMES | FILE_UNICODE_ON_DISK,
+                case_sensitive
+                    | named_streams
+                    | eas
+                    | FILE_CASE_PRESERVED_NAMES
+                    | FILE_UNICODE_ON_DISK,
                 volume.max_name_length,
                 "NTFS",
             )
@@ -326,6 +360,135 @@ async fn query_filesystem(open: &Open, share: &ShareBindings, class: u8, cap: us
         _ => unreachable!("class checked above"),
     };
     Ok((buf, overflow))
+}
+
+/// FileFullEaInformation (MS-SMB2 3.3.5.20.1, MS-FSA 2.1.5.12.12) for an
+/// OutputBufferLength of `cap`: the reply and its status. A share without
+/// extended attributes answers STATUS_INVALID_DEVICE_REQUEST.
+///
+/// A list of names gets one entry per name, with an empty value for a
+/// name the file does not have, or STATUS_BUFFER_OVERFLOW and nothing when
+/// they do not all fit. Otherwise the entries start at EaIndex with
+/// SL_INDEX_SPECIFIED, at the first with SL_RESTART_SCAN, and else where
+/// the open's last such query stopped; as many whole entries as fit are
+/// returned, one with SL_RETURN_SINGLE_ENTRY, with STATUS_BUFFER_OVERFLOW
+/// when more follow, and the open's place moves past them. A query that
+/// carries on from there after the file's attributes were set fails with
+/// STATUS_EA_CORRUPT_ERROR until one restarts.
+async fn query_eas(
+    open: &Open,
+    share: &ShareBindings,
+    req: &QueryInfoRequest,
+    cap: usize,
+) -> Result<(Vec<u8>, u32), u32> {
+    if open.granted_access & FILE_READ_EA == 0 {
+        return Err(ntstatus::STATUS_ACCESS_DENIED);
+    }
+    if open.on_stream {
+        return Err(ntstatus::STATUS_INVALID_PARAMETER);
+    }
+    if !share.extended_attributes {
+        return Err(ntstatus::STATUS_INVALID_DEVICE_REQUEST);
+    }
+    let names = if req.input_buffer.is_empty() {
+        None
+    } else {
+        Some(ea::parse_get_list(&req.input_buffer)?)
+    };
+    let handle = open.handle.as_ref().ok_or(ntstatus::STATUS_FILE_CLOSED)?;
+    let file = open.file.as_ref().ok_or(ntstatus::STATUS_FILE_CLOSED)?;
+    let changes = file.ea_changes();
+    let mut eas = handle.eas().await.map_err(|e| e.to_nt_status())?;
+    eas.retain(ea::listable);
+    let single = req.flags & QueryInfoRequest::FLAG_RETURN_SINGLE_ENTRY != 0;
+
+    if let Some(names) = names {
+        let names = if single { &names[..1] } else { &names[..] };
+        let asked = ea::select(&eas, names);
+        return Ok(match fitting(&asked, cap) {
+            n if n == asked.len() => (ea::encode_full_list(&asked), ntstatus::STATUS_SUCCESS),
+            _ => (Vec::new(), ntstatus::STATUS_BUFFER_OVERFLOW),
+        });
+    }
+
+    let mut cursor = open.ea_cursor.lock().unwrap_or_else(|e| e.into_inner());
+    let start = if req.flags & QueryInfoRequest::FLAG_INDEX_SPECIFIED != 0 {
+        let index = req.additional_information as usize;
+        if index == 0 || index > eas.len() + 1 || eas.is_empty() {
+            return Err(ntstatus::STATUS_NONEXISTENT_EA_ENTRY);
+        }
+        index - 1
+    } else if eas.is_empty() {
+        return Err(ntstatus::STATUS_NO_EAS_ON_FILE);
+    } else if req.flags & QueryInfoRequest::FLAG_RESTART_SCAN != 0 {
+        0
+    } else if cursor.changes.is_some_and(|seen| seen != changes) {
+        return Err(ntstatus::STATUS_EA_CORRUPT_ERROR);
+    } else {
+        cursor.next
+    };
+    if start >= eas.len() {
+        *cursor = EaCursor {
+            next: start,
+            changes: Some(changes),
+        };
+        return Err(ntstatus::STATUS_NO_MORE_EAS);
+    }
+    let rest = &eas[start..];
+    let count = match fitting(rest, cap) {
+        0 => return Err(ntstatus::STATUS_BUFFER_TOO_SMALL),
+        n if single => 1.min(n),
+        n => n,
+    };
+    *cursor = EaCursor {
+        next: start + count,
+        changes: Some(changes),
+    };
+    let status = if count < rest.len() && !single {
+        ntstatus::STATUS_BUFFER_OVERFLOW
+    } else {
+        ntstatus::STATUS_SUCCESS
+    };
+    Ok((ea::encode_full_list(&rest[..count]), status))
+}
+
+/// How many of the first entries of `eas` fit in `cap` bytes as one
+/// FILE_FULL_EA_INFORMATION list, the last of them unpadded.
+fn fitting(eas: &[Ea], cap: usize) -> usize {
+    let mut used = 0usize;
+    let mut count = 0;
+    for ea in eas {
+        let end = used.next_multiple_of(4) + ea::entry_len(ea);
+        if end > cap {
+            break;
+        }
+        used = end;
+        count += 1;
+    }
+    count
+}
+
+/// STATUS_BUFFER_TOO_SMALL with the error data of MS-SMB2 3.3.5.20.3 and
+/// a required length of 0: on SMB 3.1.1 in one error context.
+fn buffer_too_small(smb311: bool) -> HandlerResponse {
+    let mut response = HandlerResponse::err(ntstatus::STATUS_BUFFER_TOO_SMALL);
+    let mut body = Vec::with_capacity(20);
+    body.extend_from_slice(&9u16.to_le_bytes());
+    if smb311 {
+        // ErrorContextCount, Reserved, ByteCount, then an ERROR Context
+        // with ErrorDataLength 4, ErrorId 0 and the length.
+        body.push(1);
+        body.push(0);
+        body.extend_from_slice(&12u32.to_le_bytes());
+        body.extend_from_slice(&4u32.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+    } else {
+        body.extend_from_slice(&[0, 0]);
+        body.extend_from_slice(&4u32.to_le_bytes());
+    }
+    body.extend_from_slice(&0u32.to_le_bytes());
+    response.body = body;
+    response
 }
 
 /// True if MS-FSCC 2.4 documents `class` as a file information class.

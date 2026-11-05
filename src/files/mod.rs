@@ -32,7 +32,7 @@ pub(crate) use table::{FileRef, FileTable, OpenRequest, Refused, Sharing};
 #[cfg(test)]
 pub(crate) use watch::MAX_WATCHES_PER_CONNECTION;
 pub(crate) use watch::{
-    Answer, CONTENT_CHANGED, Change, NotifyBudget, STREAM_CHANGED, WatchReg, WatchTable,
+    Answer, CONTENT_CHANGED, Change, EA_CHANGED, NotifyBudget, STREAM_CHANGED, WatchReg, WatchTable,
 };
 
 /// Default for
@@ -100,6 +100,7 @@ impl Closing {
         if let Some(file) = &open.file {
             let watches = &file.share().watches;
             match closing {
+                _ if open.eas_changed.load(Ordering::Acquire) => watches.touch(&file.path()),
                 Self::ReadOnly => {}
                 Self::Unwritten => watches.closed(&file.path()),
                 Self::RestoresTimes
@@ -147,6 +148,7 @@ pub(crate) async fn close_open(open_arc: &Arc<RwLock<Open>>, want_attrs: bool) -
     // out first and ends it once its response is queued.
     drop(open.watch.take());
     let closing = Closing::announce(&open, true);
+    let eas_changed = open.eas_changed.load(Ordering::Acquire);
     restore_fixed_times(&open).await;
     let handle = open.handle.take();
     let file = open.file.take();
@@ -165,7 +167,15 @@ pub(crate) async fn close_open(open_arc: &Arc<RwLock<Open>>, want_attrs: bool) -
     let delete_on_close = open.delete_on_close;
     let is_directory = open.is_directory;
     drop(open);
-    finish_close(handle, file, delete_on_close, is_directory, closing).await;
+    finish_close(
+        handle,
+        file,
+        delete_on_close,
+        is_directory,
+        closing,
+        eas_changed,
+    )
+    .await;
     info
 }
 
@@ -174,7 +184,8 @@ pub(crate) async fn close_open(open_arc: &Arc<RwLock<Open>>, want_attrs: bool) -
 /// delete-pending, unless it is a directory with entries (MS-FSA 2.1.5.5
 /// phase 1), and is removed when this was its last open. An open that
 /// wrote and leaves the file in place reports the new contents to the
-/// share's watchers, once, and one that changed or deleted the named
+/// share's watchers, once, one that set extended attributes
+/// (`eas_changed`) reports that, and one that changed or deleted the named
 /// stream it is on reports that. A directory this leaves delete-pending, open
 /// elsewhere, ends its watches with STATUS_DELETE_PENDING. Every path that
 /// ends an open goes through here.
@@ -184,15 +195,19 @@ pub(crate) async fn finish_close(
     delete_on_close: bool,
     is_directory: bool,
     closing: Closing,
+    eas_changed: bool,
 ) {
-    // A close reports new contents of the file, and a change of the named
-    // stream the open is on, as which a deletion on close of a stream not
-    // yet marked for deletion is reported too.
-    let file_filter = match closing {
-        Closing::Wrote | Closing::StreamWrote { moved: true } => Some(CONTENT_CHANGED),
-        Closing::StreamWrote { moved: false } => Some(FILE_NOTIFY_CHANGE_LAST_WRITE),
-        _ => None,
+    // A close reports new contents of the file and new extended
+    // attributes, and a change of the named stream the open is on, as
+    // which a deletion on close of a stream not yet marked for deletion is
+    // reported too.
+    let contents = match closing {
+        Closing::Wrote | Closing::StreamWrote { moved: true } => CONTENT_CHANGED,
+        Closing::StreamWrote { moved: false } => FILE_NOTIFY_CHANGE_LAST_WRITE,
+        _ => 0,
     };
+    let filter = contents | if eas_changed { EA_CHANGED } else { 0 };
+    let file_filter = (filter != 0).then_some(filter);
     let on_stream = file.as_ref().is_some_and(|f| f.stream().is_some());
     let deletes = delete_on_close && !file.as_ref().is_some_and(FileRef::stream_delete_pending);
     let stream_changed = on_stream
@@ -390,6 +405,8 @@ mod tests {
             wrote: Default::default(),
             created: false,
             marked_deleted: Default::default(),
+            ea_cursor: Default::default(),
+            eas_changed: Default::default(),
             resized: Default::default(),
             moved_data: false,
         });

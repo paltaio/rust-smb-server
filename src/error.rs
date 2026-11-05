@@ -50,6 +50,13 @@ pub enum SmbError {
     /// does not open.
     #[error("not a regular file or directory")]
     SpecialFile,
+    /// The extended attributes of a file would take more room than the
+    /// backend gives them.
+    #[error("extended attributes too large")]
+    EaTooLarge,
+    /// The backend cannot store an extended attribute under this name.
+    #[error("invalid extended attribute name")]
+    EaNameInvalid,
 }
 
 impl SmbError {
@@ -72,6 +79,8 @@ impl SmbError {
             SmbError::QuotaExceeded => ntstatus::STATUS_DISK_QUOTA_EXCEEDED,
             SmbError::InvalidParameter => ntstatus::STATUS_INVALID_PARAMETER,
             SmbError::SpecialFile => ntstatus::STATUS_IO_REPARSE_TAG_NOT_HANDLED,
+            SmbError::EaTooLarge => ntstatus::STATUS_EA_TOO_LARGE,
+            SmbError::EaNameInvalid => ntstatus::STATUS_INVALID_EA_NAME,
         }
     }
 }
@@ -95,6 +104,8 @@ mod tests {
         assert_eq!(SmbError::NotSameDevice.to_nt_status(), 0xC000_00D4);
         assert_eq!(SmbError::InvalidParameter.to_nt_status(), 0xC000_000D);
         assert_eq!(SmbError::SpecialFile.to_nt_status(), 0xC000_0279);
+        assert_eq!(SmbError::EaTooLarge.to_nt_status(), 0xC000_0050);
+        assert_eq!(SmbError::EaNameInvalid.to_nt_status(), 0x8000_0013);
 
         let io_err = SmbError::Io(std::io::Error::other("boom"));
         assert_eq!(io_err.to_nt_status(), 0xC000_00E9);

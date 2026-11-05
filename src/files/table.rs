@@ -15,6 +15,7 @@ use tracing::{debug, warn};
 
 use crate::access_mask::{
     DELETE, FILE_APPEND_DATA, FILE_EXECUTE, FILE_READ_DATA, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA,
+    FILE_WRITE_EA,
 };
 use crate::backend::FileInfo;
 use crate::conn::outbound::Outbound;
@@ -120,6 +121,9 @@ pub(crate) struct FileTable {
 
 pub(super) struct FileNode {
     state: Mutex<FileState>,
+    /// Held across a read, check and set of the file's extended
+    /// attributes, so sets through different opens run one at a time.
+    eas: tokio::sync::Mutex<()>,
 }
 
 struct FileState {
@@ -142,6 +146,8 @@ struct FileState {
     /// Counts changes that can unblock an operation waiting on the file: a
     /// lease break that completed, a lease that ended, an open that left.
     changed: tokio::sync::watch::Sender<u64>,
+    /// Counts sets of the file's extended attributes while it is open.
+    ea_changes: u64,
 }
 
 struct OpenEntry {
@@ -769,8 +775,8 @@ impl FileTable {
     }
 
     /// For each of `paths`, whether an open on the share that may write
-    /// the file's data or attributes currently has it as its name. The
-    /// opens are looked at once for all of them.
+    /// the file's data, attributes or extended attributes currently has it
+    /// as its name. The opens are looked at once for all of them.
     pub(crate) fn open_to_change(&self, paths: &[SmbPath], case_sensitive: bool) -> Vec<bool> {
         if paths.is_empty() {
             return Vec::new();
@@ -778,7 +784,9 @@ impl FileTable {
         let mut open = HashSet::new();
         for node in self.files().values() {
             for entry in &node.state().opens {
-                if entry.sharing.access & (WRITE_ACCESS | FILE_WRITE_ATTRIBUTES) != 0 {
+                if entry.sharing.access & (WRITE_ACCESS | FILE_WRITE_ATTRIBUTES | FILE_WRITE_EA)
+                    != 0
+                {
                     open.insert(path_key(&entry.path, case_sensitive));
                 }
             }
@@ -1019,7 +1027,9 @@ impl FileRef {
                         locks: Vec::new(),
                         leases: Vec::new(),
                         changed: tokio::sync::watch::Sender::new(0),
+                        ea_changes: 0,
                     }),
+                    eas: tokio::sync::Mutex::new(()),
                 })
             })
             .clone();
@@ -1380,6 +1390,27 @@ impl FileRef {
     #[cfg(test)]
     pub(crate) fn delete_pending(&self) -> bool {
         self.node.state().delete_pending.is_some()
+    }
+
+    pub(crate) fn is_directory(&self) -> bool {
+        self.node.state().is_directory
+    }
+
+    /// How many times the file's extended attributes were set while it
+    /// has been open.
+    pub(crate) fn ea_changes(&self) -> u64 {
+        self.node.state().ea_changes
+    }
+
+    /// Counts a set of the file's extended attributes.
+    pub(crate) fn count_ea_change(&self) {
+        self.node.state().ea_changes += 1;
+    }
+
+    /// Waits for the sets of the file's extended attributes in progress
+    /// through other opens, and keeps others out until dropped.
+    pub(crate) async fn lock_eas(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.node.eas.lock().await
     }
 
     /// Whether the stream this open is on is marked for deletion: the

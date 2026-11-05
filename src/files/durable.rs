@@ -848,6 +848,8 @@ mod tests {
                 wrote: Default::default(),
                 created: false,
                 marked_deleted: Default::default(),
+                ea_cursor: Default::default(),
+                eas_changed: Default::default(),
                 resized: Default::default(),
                 moved_data: false,
             }))

@@ -53,6 +53,7 @@ pub struct Share {
     pub(crate) durable_handles: bool,
     pub(crate) change_notify: bool,
     pub(crate) named_streams: bool,
+    pub(crate) extended_attributes: bool,
     pub(crate) listed: bool,
     pub(crate) remark: String,
 }
@@ -70,6 +71,7 @@ impl Share {
             durable_handles: true,
             change_notify: true,
             named_streams: true,
+            extended_attributes: true,
             listed: true,
             remark: String::new(),
         }
@@ -169,9 +171,10 @@ impl Share {
     /// Answer change notification requests: a client watching a folder, as
     /// Explorer and Finder do for an open window, hears when a file or
     /// folder in it is created, deleted, renamed, written, truncated or
-    /// overwritten, or has its attributes or times set, through any
-    /// connection to this share. A write is reported when the open that
-    /// wrote it closes. Changes made outside the server, or through another
+    /// overwritten, or has its attributes, times or extended attributes
+    /// set, through any connection to this share. A write, and a set of
+    /// extended attributes, is reported when the open that made it closes.
+    /// Changes made outside the server, or through another
     /// share over the same directory, are reported only by a backend that
     /// watches for them: `LocalFsBackend` does on Linux, for the entries
     /// directly in a watched folder. When off, such requests fail with
@@ -191,6 +194,22 @@ impl Share {
     /// [`BackendCapabilities::named_streams`]: crate::BackendCapabilities::named_streams
     pub fn named_streams(mut self, enabled: bool) -> Self {
         self.named_streams = enabled;
+        self
+    }
+
+    /// Serve the extended attributes of files and directories on the share
+    /// when its backend stores them
+    /// ([`BackendCapabilities::extended_attributes`]), as Linux clients
+    /// use for `user.*` attributes on a cifs mount. The share then reports
+    /// FILE_SUPPORTS_EXTENDED_ATTRIBUTES. When off, the share answers as a
+    /// volume that keeps none: FileFullEaInformation queries and sets fail
+    /// with STATUS_INVALID_DEVICE_REQUEST, FileEaInformation reports 0, and
+    /// a CREATE that carries some fails with STATUS_EAS_NOT_SUPPORTED.
+    /// Named streams do not depend on it. On by default.
+    ///
+    /// [`BackendCapabilities::extended_attributes`]: crate::BackendCapabilities::extended_attributes
+    pub fn extended_attributes(mut self, enabled: bool) -> Self {
+        self.extended_attributes = enabled;
         self
     }
 

@@ -52,6 +52,7 @@ impl ShareBackend for CaseRule {
         let mut capabilities = self.0.capabilities();
         capabilities.case_sensitive = self.1;
         capabilities.named_streams = false;
+        capabilities.extended_attributes = false;
         capabilities
     }
 }
@@ -200,7 +201,7 @@ async fn end_to_end_anon_read_localfs() {
         "root is a directory"
     );
 
-    // ---- QUERY_INFO FileFullEaInformation -> STATUS_NO_EAS_ON_FILE ------
+    // ---- QUERY_INFO FileFullEaInformation on a share without EAs --------
     let ea_req = QueryInfoRequest {
         structure_size: 41,
         info_type: InfoType::File as u8,
@@ -221,7 +222,7 @@ async fn end_to_end_anon_read_localfs() {
     let resp = read_frame(&mut s).await;
     let (rh, _rb) = parse_response_header(&resp);
     assert_eq!(rh.command, Command::QueryInfo);
-    assert_eq!(rh.channel_sequence_status, 0xC000_0052);
+    assert_eq!(rh.channel_sequence_status, 0xC000_0010);
 
     // ---- QUERY_INFO FileFsAttributeInformation ---------------------------
     let fs_req = QueryInfoRequest {

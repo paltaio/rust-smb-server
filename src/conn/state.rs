@@ -473,6 +473,22 @@ pub struct Open {
     /// for deletion (MS-FSA Open.ChangeNotifyDirectoryMarkedDeleted). It
     /// stays set when the mark is cleared.
     pub(crate) marked_deleted: AtomicBool,
+    /// Where the next FileFullEaInformation query that names neither
+    /// attributes nor an index starts (MS-SMB2 Open.CurrentEaIndex).
+    pub(crate) ea_cursor: std::sync::Mutex<EaCursor>,
+    /// A set of extended attributes through the open; its close reports
+    /// that.
+    pub(crate) eas_changed: AtomicBool,
+}
+
+/// The place of an open in its file's extended attributes.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct EaCursor {
+    /// The entry the next query returns first, from 0.
+    pub next: usize,
+    /// [`FileRef::ea_changes`] when a query last placed the cursor; `None`
+    /// before the first query.
+    pub changes: Option<u64>,
 }
 
 impl Open {
@@ -511,6 +527,7 @@ impl Drop for Open {
             self.delete_on_close,
             self.is_directory,
             closing,
+            self.eas_changed.load(Ordering::Acquire),
         ));
     }
 }

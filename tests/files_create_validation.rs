@@ -3,6 +3,7 @@
 mod common;
 
 use common::client::*;
+use smb_server::ShareBackend as _;
 use smb_server::ntstatus;
 use smb_server::wire::header::Command;
 use smb_server::wire::messages::{CreateContext, CreateRequest};
@@ -25,6 +26,7 @@ fn context(name: &[u8; 4], data: &[u8]) -> Vec<u8> {
 async fn malformed_creates_are_refused() {
     let td = tempdir().unwrap();
     std::fs::write(td.path().join("f.txt"), b"data").unwrap();
+    let eas = local(td.path()).capabilities().extended_attributes;
     let server = Server::public(local(td.path())).await;
     let mut c = server.client().await;
 
@@ -107,7 +109,12 @@ async fn malformed_creates_are_refused() {
                 contexts: context(CreateContext::NAME_EXTA, &[0; 12]),
                 ..Create::default()
             },
-            ntstatus::STATUS_EAS_NOT_SUPPORTED,
+            // One entry with an empty name.
+            if eas {
+                ntstatus::STATUS_INVALID_EA_NAME
+            } else {
+                ntstatus::STATUS_EAS_NOT_SUPPORTED
+            },
         ),
         (
             Create {

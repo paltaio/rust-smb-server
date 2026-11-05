@@ -90,7 +90,7 @@ fn is_full(e: &io::Error) -> bool {
 
 /// A value read with `read` into a buffer of the size `query` reports,
 /// again if it grew in between.
-fn read_sized(
+pub(super) fn read_sized(
     query: impl Fn() -> rustix::io::Result<usize>,
     read: impl Fn(&mut [u8]) -> rustix::io::Result<usize>,
 ) -> io::Result<Vec<u8>> {
@@ -991,6 +991,11 @@ impl Handle for StreamHandle {
             let view = access.view()?;
             let main = &view.find(stream).ok_or(io::ErrorKind::NotFound)?.main;
             (info.end_of_file, info.allocation_size) = view.size(access.fd, main)?;
+            info.ea_size =
+                super::eas::size(&super::eas::Source::File(access.fd)).unwrap_or_else(|e| {
+                    debug!(error = %e, "extended attribute size not read");
+                    0
+                });
             Ok(info)
         })
         .await

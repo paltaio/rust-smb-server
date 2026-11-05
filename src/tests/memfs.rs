@@ -5,6 +5,7 @@ use crate::backend::{
     BackendCapabilities, DirEntry, FileInfo, FileTimes, Handle, OpenAction, OpenIntent,
     OpenOptions, ShareBackend,
 };
+use crate::ea::{self, Ea};
 use crate::error::{SmbError, SmbResult};
 use crate::path::SmbPath;
 use crate::stream::{StreamInfo, StreamName};
@@ -19,7 +20,8 @@ pub const DIR_MODE: u32 = 0o040_755;
 /// In-memory backend for unit tests. Files and directories are keyed by
 /// backslash-joined path. Clones share the same files. Files and
 /// directories have named streams, unless made with
-/// [`MemFsBackend::without_streams`].
+/// [`MemFsBackend::without_streams`], and extended attributes, unless made
+/// with [`MemFsBackend::without_eas`].
 #[derive(Clone)]
 pub struct MemFsBackend {
     inner: std::sync::Arc<Mutex<MemInner>>,
@@ -49,8 +51,19 @@ struct MemInner {
     next_id: u64,
     /// Named streams of each entry by id, in creation order.
     streams: HashMap<u64, Vec<MemStream>>,
+    /// Extended attributes of each entry by id, in the order they were
+    /// added; a replaced one keeps its place and spelling.
+    eas: HashMap<u64, Vec<Ea>>,
     /// The backend reports no named streams.
     no_streams: bool,
+    /// The backend reports no extended attributes.
+    no_eas: bool,
+    /// Most bytes the extended attributes of one entry take.
+    ea_room: Option<u32>,
+    /// Calls of `set_eas`.
+    ea_sets: usize,
+    /// Opens that would overwrite an existing file fail.
+    fail_overwrites: bool,
     /// Handles opened and not yet closed.
     open_handles: usize,
 }
@@ -101,11 +114,26 @@ impl MemInner {
             .unwrap_or_default()
     }
 
-    /// Drops the entry `key`'s id and streams.
+    /// Drops the entry `key`'s id, streams and extended attributes.
     fn forget(&mut self, key: &str) {
         if let Some(id) = self.ids.remove(key) {
             self.streams.remove(&id);
+            self.eas.remove(&id);
         }
+    }
+
+    /// The extended attributes of the entry `key`.
+    fn eas_of(&self, key: &str) -> &[Ea] {
+        self.ids
+            .get(key)
+            .and_then(|id| self.eas.get(id))
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
+    /// [`FileInfo::ea_size`] of the entry `key`.
+    fn ea_size(&self, key: &str) -> u32 {
+        ea_size(self.eas_of(key))
     }
 
     /// Moves the ids of `from`, and of the entries below it, to `to`.
@@ -194,6 +222,54 @@ impl MemFsBackend {
         self
     }
 
+    /// A backend that reports no extended attributes.
+    pub fn without_eas(self) -> Self {
+        self.inner.lock().unwrap().no_eas = true;
+        self
+    }
+
+    /// A backend that gives the extended attributes of one entry at most
+    /// `room` bytes, and fails a set that needs more with
+    /// [`SmbError::EaTooLarge`].
+    pub fn with_ea_room(self, room: u32) -> Self {
+        self.inner.lock().unwrap().ea_room = Some(room);
+        self
+    }
+
+    /// Gives the entry `path` the extended attribute `ea`.
+    pub fn with_ea(self, path: &str, ea: Ea) -> Self {
+        {
+            let mut g = self.inner.lock().unwrap();
+            let id = g.id_of(path);
+            g.eas.entry(id).or_default().push(ea);
+        }
+        self
+    }
+
+    /// The extended attributes of `path`, as stored.
+    pub fn eas(&self, path: &str) -> Vec<Ea> {
+        self.inner.lock().unwrap().eas_of(path).to_vec()
+    }
+
+    /// A backend whose opens that would overwrite an existing file fail
+    /// with [`SmbError::AccessDenied`].
+    pub fn failing_overwrites(self) -> Self {
+        self.inner.lock().unwrap().fail_overwrites = true;
+        self
+    }
+
+    /// How many times `set_eas` was called.
+    pub fn ea_sets(&self) -> usize {
+        self.inner.lock().unwrap().ea_sets
+    }
+
+    /// Removes the file `path` as a change outside the server would.
+    pub fn remove(&self, path: &str) {
+        let mut g = self.inner.lock().unwrap();
+        g.files.remove(path);
+        g.forget(path);
+    }
+
     /// The names of the named streams of `path`, in creation order.
     pub fn stream_names(&self, path: &str) -> Vec<String> {
         let g = self.inner.lock().unwrap();
@@ -204,6 +280,11 @@ impl MemFsBackend {
     pub fn contents(&self, path: &str) -> Option<Vec<u8>> {
         self.inner.lock().unwrap().files.get(path).cloned()
     }
+}
+
+/// [`FileInfo::ea_size`] of `eas`.
+fn ea_size(eas: &[Ea]) -> u32 {
+    ea::list_length(eas.iter().map(|ea| (ea.name.len(), ea.value.len())))
 }
 
 fn key(path: &SmbPath) -> String {
@@ -260,6 +341,15 @@ impl ShareBackend for MemFsBackend {
                 OpenIntent::Create => Err(SmbError::Exists),
                 _ => Err(SmbError::IsDirectory),
             };
+        }
+        if g.fail_overwrites
+            && exists_file
+            && matches!(
+                opts.intent,
+                OpenIntent::Truncate | OpenIntent::OverwriteOrCreate
+            )
+        {
+            return Err(SmbError::AccessDenied);
         }
         let action = match opts.intent {
             OpenIntent::Open => {
@@ -358,10 +448,12 @@ impl ShareBackend for MemFsBackend {
     }
 
     fn capabilities(&self) -> BackendCapabilities {
+        let g = self.inner.lock().unwrap();
         BackendCapabilities {
             is_read_only: false,
             case_sensitive: false,
-            named_streams: !self.inner.lock().unwrap().no_streams,
+            named_streams: !g.no_streams,
+            extended_attributes: !g.no_eas,
         }
     }
 
@@ -610,6 +702,7 @@ impl Handle for MemHandle {
             read_only: g.read_only.contains(&key),
             file_index: 0,
             unix_mode: Some(if self.is_dir { DIR_MODE } else { FILE_MODE }),
+            ea_size: g.ea_size(&key),
         })
     }
 
@@ -683,6 +776,7 @@ impl Handle for MemHandle {
                         read_only: g.read_only.contains(k),
                         file_index: 0,
                         unix_mode: Some(FILE_MODE),
+                        ea_size: g.ea_size(k),
                     },
                 });
             }
@@ -705,6 +799,7 @@ impl Handle for MemHandle {
                         read_only: false,
                         file_index: 0,
                         unix_mode: Some(DIR_MODE),
+                        ea_size: g.ea_size(k),
                     },
                 });
             }
@@ -714,6 +809,42 @@ impl Handle for MemHandle {
 
     async fn close(self: Box<Self>) -> SmbResult<()> {
         self.inner.lock().unwrap().open_handles -= 1;
+        Ok(())
+    }
+
+    async fn eas(&self) -> SmbResult<Vec<Ea>> {
+        assert!(self.stream.is_none(), "extended attributes of a stream");
+        let g = self.inner.lock().unwrap();
+        Ok(g.eas_of(&self.path(&g)?).to_vec())
+    }
+
+    async fn set_eas(&self, eas: &[Ea]) -> SmbResult<()> {
+        assert!(self.stream.is_none(), "extended attributes of a stream");
+        let mut g = self.inner.lock().unwrap();
+        g.ea_sets += 1;
+        let key = self.path(&g)?;
+        let mut list = g.eas_of(&key).to_vec();
+        for change in eas {
+            let at = list
+                .iter()
+                .position(|ea| ea.name.eq_ignore_ascii_case(&change.name));
+            match (at, change.value.is_empty()) {
+                (Some(at), true) => {
+                    list.remove(at);
+                }
+                (Some(at), false) => {
+                    list[at].value = change.value.clone();
+                    list[at].needed = change.needed;
+                }
+                (None, true) => {}
+                (None, false) => list.push(change.clone()),
+            }
+        }
+        if g.ea_room.is_some_and(|room| ea_size(&list) > room) {
+            return Err(SmbError::EaTooLarge);
+        }
+        let id = g.id_of(&key);
+        g.eas.insert(id, list);
         Ok(())
     }
 

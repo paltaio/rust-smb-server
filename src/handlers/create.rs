@@ -1,5 +1,6 @@
 //! CREATE handler: open or create a file/directory and allocate a FileId.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -7,7 +8,8 @@ use crate::proto::header::{SMB2_FLAGS_REPLAY_OPERATION, Smb2Header};
 use crate::proto::messages::change_notify::{
     FILE_ACTION_ADDED, FILE_ACTION_ADDED_STREAM, FILE_ACTION_MODIFIED, FILE_ACTION_MODIFIED_STREAM,
     FILE_ACTION_REMOVED_STREAM, FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_DIR_NAME,
-    FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_STREAM_NAME,
+    FILE_NOTIFY_CHANGE_EA, FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE,
+    FILE_NOTIFY_CHANGE_STREAM_NAME,
 };
 use crate::proto::messages::{
     AaplQuery, CreateContext, CreateRequest, CreateResponse, Dialect, DurableReconnect,
@@ -29,11 +31,12 @@ use crate::backend::{
 use crate::conn::pending::{Stop, stopped};
 use crate::conn::state::{Connection, Open};
 use crate::dispatch::HandlerResponse;
+use crate::ea::{self, Ea};
 use crate::error::SmbError;
 use crate::files::{
-    BreakWait, CONTENT_CHANGED, Change, Durability, FileRef, Granted, LeaseId, LeaseRef,
+    BreakWait, CONTENT_CHANGED, Change, Closing, Durability, FileRef, Granted, LeaseId, LeaseRef,
     LeaseRequest, LeaseState, LeaseVersion, MAX_BREAK_WAIT, OpenRequest, OpenSlot, Refused,
-    STREAM_CHANGED, Sharing, Trigger, v2_timeout,
+    STREAM_CHANGED, Sharing, Trigger, finish_close, v2_timeout,
 };
 use crate::handlers::aapl;
 use crate::handlers::reconnect::{self, Reconnect};
@@ -58,6 +61,7 @@ const FILE_SYNCHRONOUS_IO_ALERT: u32 = 0x0000_0010;
 const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x0000_0020;
 const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
 const FILE_COMPLETE_IF_OPLOCKED: u32 = 0x0000_0100;
+const FILE_NO_EA_KNOWLEDGE: u32 = 0x0000_0200;
 const FILE_OPEN_REMOTE_INSTANCE: u32 = 0x0000_0400;
 const FILE_DELETE_ON_CLOSE: u32 = 0x0000_1000;
 const FILE_OPEN_BY_FILE_ID: u32 = 0x0000_2000;
@@ -121,8 +125,8 @@ pub(super) struct ContextQueries {
     /// QUERY_MAXIMAL_ACCESS, with its timestamp if it has one.
     maximal_access: Option<Option<u64>>,
     query_on_disk_id: bool,
-    /// An EA buffer, which needs extended attributes (MS-SMB2 3.3.5.9.1).
-    ea_buffer: bool,
+    /// Data of an EA buffer (MS-SMB2 3.3.5.9.1).
+    ea_buffer: Option<Vec<u8>>,
     /// A timewarp token, which needs snapshots (MS-SMB2 3.3.5.9.4).
     timewarp: bool,
     /// Data of a lease request.
@@ -211,7 +215,7 @@ impl ContextQueries {
         Some(Self {
             maximal_access,
             query_on_disk_id,
-            ea_buffer: find(CreateContext::NAME_EXTA).is_some(),
+            ea_buffer: find(CreateContext::NAME_EXTA).map(|c| c.data.clone()),
             timewarp: find(CreateContext::NAME_TWRP).is_some(),
             lease: find(CreateContext::NAME_RQLS).map(|c| c.data.clone()),
             durable: durable_ask(&contexts, dialect).ok()?,
@@ -339,6 +343,15 @@ struct CreateArgs {
     delete_on_close: bool,
     /// Attributes for a file this CREATE makes or overwrites.
     new_attributes: u32,
+    /// Extended attributes for a file this CREATE makes, overwrites or
+    /// supersedes, or the status that refuses them there.
+    eas: Result<Vec<Ea>, u32>,
+    /// The CREATE opens a named stream and carries an `ExtA` context,
+    /// which needs the stream's file to exist.
+    stream_exta: bool,
+    /// FILE_NO_EA_KNOWLEDGE on a share with extended attributes, on an
+    /// open of a file's default stream or of a directory.
+    no_ea_knowledge: bool,
     opts: OpenOptions,
     sharing: Sharing,
     queries: ContextQueries,
@@ -418,6 +431,15 @@ impl CreateArgs {
             && !share.named_streams
         {
             debug!(path = %path, stream = ?name.as_str(), "share without named streams");
+            // A volume with neither refuses the extended attributes first.
+            if queries
+                .ea_buffer
+                .as_ref()
+                .is_some_and(|data| !data.is_empty())
+                && !share.extended_attributes
+            {
+                return Err(ntstatus::STATUS_EAS_NOT_SUPPORTED);
+            }
             return Err(ntstatus::STATUS_OBJECT_NAME_INVALID);
         }
 
@@ -472,13 +494,8 @@ impl CreateArgs {
             // There are no snapshots, so none matches the token.
             return Err(ntstatus::STATUS_OBJECT_NAME_NOT_FOUND);
         }
-        if queries.ea_buffer {
-            // Extended attributes belong to the file, not to a stream.
-            if named.is_some() {
-                return Err(ntstatus::STATUS_INVALID_PARAMETER);
-            }
-            return Err(ntstatus::STATUS_EAS_NOT_SUPPORTED);
-        }
+        let no_ea_knowledge =
+            options & FILE_NO_EA_KNOWLEDGE != 0 && share.extended_attributes && named.is_none();
         let aapl = match (&queries.aapl, &server.config.apple_model) {
             (Some(data), Some(_)) => {
                 Some(AaplQuery::parse(data).map_err(|_| ntstatus::STATUS_INVALID_PARAMETER)?)
@@ -541,6 +558,11 @@ impl CreateArgs {
             }
         }
 
+        let (eas, stream_exta) = match &queries.ea_buffer {
+            Some(data) => create_eas(&share, data, named.is_some(), options)?,
+            None => (Ok(Vec::new()), false),
+        };
+
         if stream == StreamPart::Directory
             && matches!(intent, OpenIntent::OverwriteOrCreate | OpenIntent::Truncate)
         {
@@ -567,6 +589,9 @@ impl CreateArgs {
             maximal,
             delete_on_close,
             new_attributes,
+            eas,
+            stream_exta,
+            no_ea_knowledge,
             opts,
             sharing: Sharing {
                 access: open_access,
@@ -603,6 +628,9 @@ struct Reserved {
     /// it after the wait, so data the clients write back first is not lost
     /// to the truncation.
     opened: Option<(HeldHandle, OpenAction)>,
+    /// The open made the file, which has yet to get the extended
+    /// attributes of the CREATE; a CREATE that gives up removes it again.
+    made_without_eas: bool,
 }
 
 /// A backend handle a waiting CREATE keeps. One dropped without
@@ -633,14 +661,36 @@ impl Stage {
         matches!(self, Stage::Start)
     }
 
-    /// Gives up what a waiting CREATE holds, closing its backend handle.
+    /// Gives up what a waiting CREATE holds, closing its backend handle. A
+    /// file it made that still lacks the CREATE's extended attributes goes
+    /// again, as on delete-on-close.
     async fn release(self) {
         if let Stage::Reserved(reserved) = self {
-            let Reserved { file, opened, .. } = *reserved;
-            if let Some((handle, _)) = opened {
-                let _ = handle.take().close().await;
+            let Reserved {
+                file,
+                opened,
+                made_without_eas,
+                ..
+            } = *reserved;
+            match opened {
+                Some((handle, _)) if made_without_eas => {
+                    let is_directory = file.is_directory();
+                    finish_close(
+                        Some(handle.take()),
+                        Some(file),
+                        true,
+                        is_directory,
+                        Closing::ReadOnly,
+                        false,
+                    )
+                    .await;
+                }
+                Some((handle, _)) => {
+                    let _ = handle.take().close().await;
+                    drop(file);
+                }
+                None => drop(file),
             }
-            drop(file);
         }
     }
 }
@@ -759,6 +809,12 @@ async fn attempt(
     // file table under `path`, so the open, and the change it reports,
     // carry the name the file had.
     let names = share.files.names_lock().await;
+    if args.stream_exta
+        && matches!(stage, Stage::Start)
+        && let Err(status) = refuse_stream_exta(&share, path, args.create_disposition).await
+    {
+        return fail(status);
+    }
 
     let stream = args.stream.as_ref();
     let open_request = |overwrite, break_handles| OpenRequest {
@@ -803,6 +859,7 @@ async fn attempt(
                 slot,
                 lease_ref,
                 opened,
+                ..
             } = *reserved;
             let opened = opened.map(|(handle, action)| (handle.take(), action));
             let registered = opened.is_some();
@@ -837,13 +894,18 @@ async fn attempt(
                     break (None, None);
                 }
                 let request = open_request(true, break_handles);
-                match reserve_existing(&share, path, stream, args.opts, request).await {
+                let checks = Checks {
+                    delete_on_close: args.opts.delete_on_close,
+                    no_ea_knowledge: args.no_ea_knowledge,
+                };
+                match reserve_existing(&share, path, stream, args.opts, checks, request).await {
                     Ok(Probe::Reserved(file, Some(wait))) => {
                         let reserved = Reserved {
                             file,
                             slot,
                             lease_ref,
                             opened: None,
+                            made_without_eas: false,
                         };
                         return Step::Wait(wait, Stage::Reserved(Box::new(reserved)));
                     }
@@ -852,11 +914,16 @@ async fn attempt(
                         return open_failed(e);
                     }
                     Ok(Probe::Missing(_)) => {
+                        if stream.is_none()
+                            && let Err(status) = &args.eas
+                        {
+                            return fail(*status);
+                        }
                         let create = OpenOptions {
                             intent: OpenIntent::Create,
                             ..args.opts
                         };
-                        match open_reported(&share, path, stream, create).await {
+                        match open_reported(&share, path, stream, create, false).await {
                             Ok(opened) => break (None, Some(opened)),
                             Err(Failed::Backend(SmbError::Exists)) if tries < 2 => tries += 1,
                             Err(e) => return open_failed(e),
@@ -869,12 +936,45 @@ async fn attempt(
         }
     };
 
+    // An overwrite or supersede replaces the file's extended attributes
+    // before it truncates the file, so a set that fails leaves the file
+    // as it was.
+    // A directory, which the truncating open refuses, keeps them.
+    let mut replaced = None;
+    if let (Some(file), None) = (&reserved, &opened)
+        && stream.is_none()
+        && share.extended_attributes
+        && !file.is_directory()
+    {
+        match replace_eas_of(&share, path, file, args).await {
+            Ok(old) => replaced = old,
+            Err(status) => return fail(status),
+        }
+    }
+    // A CREATE that would make a file with extended attributes it refuses
+    // fails, unless the file is there and the CREATE opens it.
+    if let (None, None, Err(status)) = (&reserved, &opened, &args.eas)
+        && stream.is_none()
+        && matches!(args.intent, OpenIntent::Create | OpenIntent::OpenOrCreate)
+        && !exists(&share, path, args.opts).await
+    {
+        return fail(*status);
+    }
+
     // The open this attempt made, or the one a waiting CREATE kept.
     let (handle, action) = match opened {
         Some(opened) => opened,
-        None => match open_reported(&share, path, stream, args.opts).await {
+        None => match open_reported(&share, path, stream, args.opts, replaced.is_some()).await {
             Ok(opened) => opened,
-            Err(e) => return open_failed(e),
+            Err(e) => {
+                // The file stays as it was, its extended attributes too.
+                if let (Some(old), Some(file)) = (&replaced, &reserved)
+                    && let Err(status) = restore_eas(&share, path, file, &args.eas, old).await
+                {
+                    return fail(status);
+                }
+                return open_failed(e);
+            }
         },
     };
 
@@ -891,6 +991,13 @@ async fn attempt(
         let _ = handle.close().await;
         return fail(ntstatus::STATUS_CANNOT_DELETE);
     }
+    if action == OpenAction::Opened
+        && args.no_ea_knowledge
+        && let Err(status) = refuse_needed_eas(handle.as_ref()).await
+    {
+        let _ = handle.close().await;
+        return fail(status);
+    }
     let mut file = match reserved {
         Some(file) if registered || file.is_for(&info, path) => file,
         // The file was replaced between the two opens, or did not exist.
@@ -905,6 +1012,9 @@ async fn attempt(
                         slot,
                         lease_ref,
                         opened: Some((HeldHandle(Some(handle)), action)),
+                        made_without_eas: action == OpenAction::Created
+                            && stream.is_none()
+                            && args.eas.as_ref().is_ok_and(|eas| !eas.is_empty()),
                     };
                     return Step::Wait(wait, Stage::Reserved(Box::new(reserved)));
                 }
@@ -924,6 +1034,36 @@ async fn attempt(
     };
     drop(names);
     file.remove_streams(unopened).await;
+    // A new file whose extended attributes cannot be set goes again, as a
+    // delete-on-close open of it would, once no other open is on it.
+    let new_eas = match &args.eas {
+        Ok(eas) if action == OpenAction::Created && stream.is_none() => Ok(eas.as_slice()),
+        Err(status) if action == OpenAction::Created && stream.is_none() => Err(*status),
+        _ => Ok(&[][..]),
+    };
+    let made_with_eas = new_eas.is_ok_and(|eas| !eas.is_empty());
+    let set = match new_eas {
+        Ok(eas) if !eas.is_empty() => {
+            let _setting = file.lock_eas().await;
+            handle.set_eas(eas).await.map_err(|e| e.to_nt_status())
+        }
+        Ok(_) => Ok(()),
+        Err(status) => Err(status),
+    };
+    if let Err(status) = set {
+        debug!(status, path = %path, "extended attributes of a new file not set");
+        let is_directory = info.is_directory;
+        finish_close(
+            Some(handle),
+            Some(file),
+            true,
+            is_directory,
+            Closing::ReadOnly,
+            false,
+        )
+        .await;
+        return fail(status);
+    }
     let mut granted = None;
     let mut after_send = None;
     if let (Some(lease), Some(lease_ref)) = (args.lease, lease_ref)
@@ -1044,6 +1184,8 @@ async fn attempt(
         wrote: Default::default(),
         created: action != OpenAction::Opened,
         marked_deleted: Default::default(),
+        ea_cursor: Default::default(),
+        eas_changed: AtomicBool::new(made_with_eas),
         resized: AtomicBool::new(stream.is_some() && action == OpenAction::Overwritten),
         moved_data: false,
     };
@@ -1104,12 +1246,14 @@ async fn attempt(
 /// after the backend call, so a CREATE that then waits for a lease break,
 /// or fails, reports the change it made once. A creation is noted before
 /// the call, so the backend's own report of it is left out whenever it
-/// arrives.
+/// arrives. An overwrite of a file whose extended attributes the CREATE
+/// replaced (`eas_replaced`) reports that with it.
 async fn open_reported(
     share: &ShareBindings,
     path: &SmbPath,
     stream: Option<&StreamName>,
     opts: OpenOptions,
+    eas_replaced: bool,
 ) -> Result<(Box<dyn Handle>, OpenAction), Failed> {
     let names = if opts.directory {
         FILE_NOTIFY_CHANGE_DIR_NAME
@@ -1187,7 +1331,14 @@ async fn open_reported(
         seen: false,
     };
     match (action, stream) {
-        (Some(OpenAction::Overwritten), None) => changes.push(modified(CONTENT_CHANGED)),
+        (Some(OpenAction::Overwritten), None) => {
+            let eas = if eas_replaced {
+                FILE_NOTIFY_CHANGE_EA
+            } else {
+                0
+            };
+            changes.push(modified(CONTENT_CHANGED | eas));
+        }
         (Some(OpenAction::Overwritten), Some(_)) => {
             changes.push(modified(FILE_NOTIFY_CHANGE_LAST_WRITE));
             changes.push(of_stream(FILE_ACTION_MODIFIED_STREAM, STREAM_CHANGED));
@@ -1449,6 +1600,7 @@ async fn reserve_existing(
     path: &SmbPath,
     stream: Option<&StreamName>,
     opts: OpenOptions,
+    checks: Checks,
     req: OpenRequest,
 ) -> Result<Probe, Refused> {
     let probe = OpenOptions {
@@ -1472,15 +1624,231 @@ async fn reserve_existing(
         Err(e) => return Err(e.status().into()),
     };
     let result = match handle.stat().await {
-        Ok(info) if opts.delete_on_close && info.read_only => {
+        Ok(info) if checks.delete_on_close && info.read_only => {
             Err(ntstatus::STATUS_CANNOT_DELETE.into())
         }
-        Ok(info) => FileRef::register(share, &info, path, req)
-            .map(|(file, wait)| Probe::Reserved(file, wait)),
+        Ok(info) => {
+            let needed = if checks.no_ea_knowledge {
+                refuse_needed_eas(handle.as_ref()).await
+            } else {
+                Ok(())
+            };
+            needed
+                .map_err(Refused::from)
+                .and_then(|()| FileRef::register(share, &info, path, req))
+                .map(|(file, wait)| Probe::Reserved(file, wait))
+        }
         Err(e) => Err(e.to_nt_status().into()),
     };
     let _ = handle.close().await;
     result
+}
+
+/// What [`reserve_existing`] checks of the existing file before it takes
+/// its place in the table.
+#[derive(Clone, Copy)]
+struct Checks {
+    /// The open asks for delete-on-close, which a read-only file refuses.
+    delete_on_close: bool,
+    /// The open asks for FILE_NO_EA_KNOWLEDGE.
+    no_ea_knowledge: bool,
+}
+
+/// STATUS_ACCESS_DENIED for a file that has an extended attribute with
+/// FILE_NEED_EA, which an open with FILE_NO_EA_KNOWLEDGE cannot open
+/// (MS-FSA 2.1.5.1.2). A file whose attributes cannot be read needs none.
+async fn refuse_needed_eas(handle: &dyn Handle) -> Result<(), u32> {
+    match handle.eas().await {
+        Ok(eas) if eas.iter().any(|ea| ea.needed) => Err(ntstatus::STATUS_ACCESS_DENIED),
+        Ok(_) => Ok(()),
+        Err(e) => {
+            debug!(error = %e, "extended attributes not read for FILE_NO_EA_KNOWLEDGE");
+            Ok(())
+        }
+    }
+}
+
+/// The extended attributes of an `ExtA` create context with `data`
+/// (MS-SMB2 2.2.13.2.1, 3.3.5.9.1), for a file the CREATE makes,
+/// overwrites or supersedes, or the status that refuses them there, and
+/// whether the CREATE opens a named stream with them. Empty data carries
+/// none. A share without extended attributes fails the CREATE with
+/// STATUS_EAS_NOT_SUPPORTED, an open with FILE_NO_EA_KNOWLEDGE with
+/// STATUS_ACCESS_DENIED (MS-SMB2 2.2.13), and a malformed list with
+/// STATUS_EA_LIST_INCONSISTENT. Names, flags and the size limit count only
+/// where the attributes apply. They belong to the file, so an open of one
+/// of its named streams leaves them out.
+fn create_eas(
+    share: &ShareBindings,
+    data: &[u8],
+    on_stream: bool,
+    options: u32,
+) -> Result<(Result<Vec<Ea>, u32>, bool), u32> {
+    if data.is_empty() {
+        return Ok((Ok(Vec::new()), false));
+    }
+    if !share.extended_attributes {
+        return Err(ntstatus::STATUS_EAS_NOT_SUPPORTED);
+    }
+    if options & FILE_NO_EA_KNOWLEDGE != 0 {
+        return Err(ntstatus::STATUS_ACCESS_DENIED);
+    }
+    ea::check_full_list(data)?;
+    if on_stream {
+        return Ok((Ok(Vec::new()), true));
+    }
+    let eas = ea::parse_full_list(data).and_then(|mut eas| {
+        ea::dedup(&mut eas);
+        eas.retain(|ea| !ea.value.is_empty());
+        if ea::stored_length(&eas) > ea::MAX_STORED_LENGTH {
+            return Err(ntstatus::STATUS_EA_TOO_LARGE);
+        }
+        Ok(eas)
+    });
+    Ok((eas, false))
+}
+
+/// Refuses an open of a named stream that carries an `ExtA` context:
+/// with STATUS_ACCESS_DENIED when the stream's file is missing, and with
+/// STATUS_INVALID_PARAMETER when the open would overwrite the stream.
+async fn refuse_stream_exta(
+    share: &ShareBindings,
+    path: &SmbPath,
+    disposition: u32,
+) -> Result<(), u32> {
+    match share.backend.open(path, OpenOptions::default()).await {
+        Ok((file, _)) => {
+            let _ = file.close().await;
+        }
+        Err(SmbError::NotFound) => return Err(ntstatus::STATUS_ACCESS_DENIED),
+        Err(e) => return Err(stream_error(e).to_nt_status()),
+    }
+    if matches!(
+        disposition,
+        FILE_SUPERSEDE | FILE_OVERWRITE | FILE_OVERWRITE_IF
+    ) {
+        return Err(ntstatus::STATUS_INVALID_PARAMETER);
+    }
+    Ok(())
+}
+
+/// Whether a file is at `path`, for a CREATE that would make one with
+/// extended attributes it refuses: then it fails, and makes nothing.
+async fn exists(share: &ShareBindings, path: &SmbPath, opts: OpenOptions) -> bool {
+    let probe = OpenOptions {
+        read: true,
+        write: false,
+        write_attributes: false,
+        intent: OpenIntent::Open,
+        delete_on_close: false,
+        ..opts
+    };
+    match share.backend.open(path, probe).await {
+        Ok((file, _)) => {
+            let _ = file.close().await;
+            true
+        }
+        Err(e) => !matches!(e, SmbError::NotFound),
+    }
+}
+
+/// Gives the existing file at `path`, which `file` holds the place of in
+/// the table, the extended attributes `args` carries in place of its own,
+/// as an overwrite or supersede does. Returns the attributes it had when
+/// that changed any.
+async fn replace_eas_of(
+    share: &ShareBindings,
+    path: &SmbPath,
+    file: &FileRef,
+    args: &CreateArgs,
+) -> Result<Option<Vec<Ea>>, u32> {
+    let eas = args.eas.as_deref().map_err(|&status| status)?;
+    let opts = OpenOptions {
+        read: true,
+        write: false,
+        write_attributes: false,
+        intent: OpenIntent::Open,
+        delete_on_close: false,
+        ..args.opts
+    };
+    let (handle, _) = share
+        .backend
+        .open(path, opts)
+        .await
+        .map_err(|e| e.to_nt_status())?;
+    let setting = file.lock_eas().await;
+    let replaced = replace_eas(handle.as_ref(), eas).await;
+    drop(setting);
+    let _ = handle.close().await;
+    if matches!(replaced, Ok(Some(_))) {
+        file.count_ea_change();
+    }
+    replaced
+}
+
+/// Puts back `old`, the extended attributes the file at `path` had before
+/// [`replace_eas_of`] gave it `new`, when the overwrite then failed. A
+/// failure to put them back fails the CREATE with an I/O error.
+async fn restore_eas(
+    share: &ShareBindings,
+    path: &SmbPath,
+    file: &FileRef,
+    new: &Result<Vec<Ea>, u32>,
+    old: &[Ea],
+) -> Result<(), u32> {
+    let new = new.as_deref().unwrap_or_default();
+    let restored = async {
+        let (handle, _) = share.backend.open(path, OpenOptions::default()).await?;
+        let setting = file.lock_eas().await;
+        let kept: HashSet<String> = old.iter().map(|ea| ea::name_key(&ea.name)).collect();
+        let mut changes: Vec<Ea> = new
+            .iter()
+            .filter(|ea| !kept.contains(&ea::name_key(&ea.name)))
+            .map(|ea| Ea::new(ea.name.as_str(), Vec::new()))
+            .collect();
+        changes.extend_from_slice(old);
+        let result = handle.set_eas(&changes).await;
+        drop(setting);
+        let _ = handle.close().await;
+        result
+    };
+    match restored.await {
+        Ok(()) => {
+            file.count_ea_change();
+            Ok(())
+        }
+        Err(e) => {
+            warn!(error = %e, path = %path, "extended attributes of a file not put back");
+            Err(ntstatus::STATUS_UNEXPECTED_IO_ERROR)
+        }
+    }
+}
+
+/// Replaces the extended attributes of the file `handle` is open on with
+/// `eas`. Returns the attributes it had when that changed any.
+async fn replace_eas(handle: &dyn Handle, eas: &[Ea]) -> Result<Option<Vec<Ea>>, u32> {
+    let new: HashSet<String> = eas.iter().map(|ea| ea::name_key(&ea.name)).collect();
+    let old: Vec<Ea> = handle
+        .eas()
+        .await
+        .map_err(|e| e.to_nt_status())?
+        .into_iter()
+        .filter(|old| ea::valid_name(old.name.as_bytes()))
+        .collect();
+    let mut changes: Vec<Ea> = old
+        .iter()
+        .filter(|old| !new.contains(&ea::name_key(&old.name)))
+        .map(|old| Ea::new(old.name.as_str(), Vec::new()))
+        .collect();
+    changes.extend_from_slice(eas);
+    if changes.is_empty() {
+        return Ok(None);
+    }
+    handle
+        .set_eas(&changes)
+        .await
+        .map_err(|e| e.to_nt_status())?;
+    Ok(Some(old))
 }
 
 /// What an overwrite or supersede of `path` as a directory stream
