@@ -42,6 +42,8 @@ Shares: `public` (anon rw), `media` (anon ro), `home` (alice rw, bob ro).
 SMB_DISCOVERY=1 SMB_LISTEN='[::]:4445' cargo run -p minimal-smb-example --features discovery
 ```
 
+`SMB_STREAMS=0` turns named streams off on the example's shares.
+
 ## Embed
 
 ```rust
@@ -136,6 +138,8 @@ Where encryption is required, clients that cannot encrypt are refused: SMB 2.x, 
 
 Files on every share get SMB2 leases with read, handle and write caching: a client caches what it reads, keeps files open after its applications close them, and caches writes while every other open of the file holds the same lease or only reads attributes. An open, write, lock, rename or delete through any open that doesn't hold the lease, including the same client's opens under another lease key or none, breaks it when it needs what the lease caches. An open or rename that needs the client to write back or close its handles first waits until the client acknowledges or closes, or until 35 seconds after the break is sent; a lock is refused until the client has written back.
 
+Each named stream of a file has leases of its own. Opens of the file or of its other streams break none of them, except that an overwrite of the file breaks their handle caching.
+
 Changes made outside the server, or through another share over the same directory, break no lease, so clients keep serving their cached copies. Call `.leases(false)` on such a `Share` to turn leases off there.
 
 ## Durable handles
@@ -149,6 +153,28 @@ A file opened with a durable handle request, version 1 or 2, and a lease that ca
 A client watching a folder, as Explorer and the Finder do for an open window, hears when a file or folder in it, or below it when the client watches the whole tree, is created, deleted, renamed, written, truncated or overwritten, or has its attributes or times set, through any connection to the share. A write is reported when the open that wrote closes. New contents are reported under SIZE, LAST_WRITE and ATTRIBUTES.
 
 Changes made outside the server, or through another share over the same directory, are reported only by a backend that watches for them. `LocalFsBackend` does on Linux, through inotify, for the entries directly in a watched folder; `.watch_host_changes(false)` on the backend turns that off. One backend holds at most 4096 kernel watches, and a folder past that, or past `fs.inotify.max_user_watches` or `fs.inotify.max_user_instances`, gets only the changes made through the server, with a warning logged once. Call `.change_notify(false)` on a `Share` to turn change notifications off there.
+
+## Named streams and macOS metadata
+
+A share whose backend stores named streams serves them, and reports FILE_NAMED_STREAMS, unless `.named_streams(false)` on the `Share` turns them off. On a share without them, a CREATE that names a stream fails with STATUS_OBJECT_NAME_INVALID. Windows clients read and write alternate data streams such as `file.txt:name`. `dir /r` and `Get-Item -Stream *` list them, and `copy` and `robocopy` copy them with the file. macOS clients keep Finder info, resource forks, tags, comments and other extended attributes of files and folders in streams, and write no `._` files.
+
+`LocalFsBackend` keeps named streams on the host:
+
+- On Linux, in extended attributes named `user.DosStream.<name>:$DATA`, each holding the stream followed by a NUL byte, the layout of Samba's `vfs_streams_xattr`. A stream that outgrows its extended attribute, past 65535 bytes or past the room the filesystem gives a file's extended attributes (one block for all of them on ext4), moves to the share's stream store. A share whose root is on a filesystem without user extended attributes has no named streams, and macOS clients write `._` files there.
+- On macOS, in the file's extended attributes, which the host's Finder shows as the tags, labels, comments and icons clients set. `AFP_AfpInfo` is `com.apple.FinderInfo`, `AFP_Resource` is `com.apple.ResourceFork`, and every other stream is the attribute of the same name. A resource fork past 16 MiB, or another stream past 1 MiB, fails with STATUS_DISK_FULL.
+- On Windows, in NTFS alternate data streams under the names clients send. Shares on FAT and exFAT volumes have no named streams.
+
+On Linux, the stream store is the directory `.smb-streams` in the share root, mode 0700, created on the first request to a writable share; `LocalFsBackend::stream_store` names a directory outside the share instead. Clients cannot list, open or create it. Each file with streams in the store names its entry there in the extended attribute `user.smb-server.streams`. Its streams follow it through renames and hard links, including those made on the host, and a copy of the file made with its extended attributes reads the original's streams until one of them changes, and then gets its own copy of them. Back up, restore or move a share with its extended attributes and its store, for example with `rsync -aX`; a copy without extended attributes has no streams. Samba serving the same directory sees only the streams kept in extended attributes, and lists `.smb-streams` as a folder. The store keeps the streams of deleted files, and of files replaced on the host without their extended attributes, until two calls of `LocalFsBackend::sweep_streams` in a row find no file that uses them and no request used them in between.
+
+macOS clients put Apple's `AAPL` create context in the first CREATE on a share they mount. The server answers it with the model string `smb-server`, or the one `apple_model` on the builder sets, and on Unix hosts reports itself as a Unix server. On shares with named streams, Finder listings then carry each entry's Finder info from its `AFP_AfpInfo` stream, its resource fork size and its Unix mode. `apple_extensions(false)` on the builder makes the server ignore the context.
+
+`._` files that macOS clients wrote while a share had no named streams stay as they are, and clients list them as ordinary files. `dot_clean -m` on the mounted share, run on a Mac, moves the contents of each `._` file into the streams of its file and deletes the `._` file.
+
+## Extended attributes
+
+A share whose backend stores extended attributes serves them, and reports FILE_SUPPORTS_EXTENDED_ATTRIBUTES, unless `.extended_attributes(false)` on the `Share` turns them off. Linux clients read and set them as `user.*` attributes on a cifs mount.
+
+On Linux, `LocalFsBackend` keeps them in extended attributes named `user.<name>`, the layout Samba uses, when the share root's filesystem stores user extended attributes. On Windows it keeps them in NTFS extended attributes. Shares on macOS hosts have none; every extended attribute there is a named stream. On Linux, these attributes of the server and of Samba are hidden from clients, and a set of one of their names fails with STATUS_ACCESS_DENIED: `user.DosStream.*`, `user.smb-server.*`, `user.DOSATTRIB`, `user.SAMBA_PAI`, `user.SAMBA_STREAMS`, `user.SmbReparse` and `user.org.netatalk.Metadata`. A set that does not fit in the room the filesystem gives a file's extended attributes fails with STATUS_EA_TOO_LARGE. A set on a read-only file fails with STATUS_ACCESS_DENIED unless the server runs as a user that can write any file regardless of its mode, such as root.
 
 ## Share listing
 
@@ -208,10 +234,11 @@ Not supported:
 - DFS
 - multichannel and compression
 - transports other than direct TCP: NetBIOS sessions, QUIC and RDMA
-- alternate data streams and extended attributes
+- extended attributes with `LocalFsBackend` on macOS
 - security descriptors and quotas
 - server-side copy and reparse points
 - snapshots for Previous Versions
+- Time Machine backups
 - network discovery over NetBIOS
 
 ## License

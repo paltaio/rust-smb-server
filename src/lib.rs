@@ -52,7 +52,8 @@ SmbServer::builder()
 //! [`OpenAction`] it took; CREATE reports the action to the client. The
 //! handle serves READ, WRITE, FLUSH, QUERY_INFO, QUERY_DIRECTORY and
 //! SET_INFO on that open until the open is closed. `LocalFsBackend`
-//! (feature `localfs`) is the reference implementation.
+//! (feature `localfs`) is the reference implementation; its documentation
+//! says where it keeps named streams and extended attributes on each host.
 //!
 //! What the protocol layer does around the backend calls:
 //!
@@ -64,8 +65,9 @@ SmbServer::builder()
 //!   set. The empty path is the share root.
 //! - A named stream (`file.txt:name`) arrives as a [`StreamName`] beside
 //!   the file's path, on shares whose backend reports
-//!   [`BackendCapabilities::named_streams`]: CREATE opens the file with
-//!   `open`, creating it when the disposition allows, then the stream with
+//!   [`BackendCapabilities::named_streams`] unless [`Share::named_streams`]
+//!   turns them off: CREATE opens the file with `open`, creating it when
+//!   the disposition allows, then the stream with
 //!   [`ShareBackend::open_stream`], which gets the file's handle. An
 //!   overwrite of the file removes its named streams through
 //!   [`ShareBackend::remove_stream`], each once no open is on it. A rename
@@ -88,6 +90,19 @@ SmbServer::builder()
 //!   and directory listings is [`FileInfo::ea_size`]. A set breaks no
 //!   lease and is reported, under EA and ATTRIBUTES, when the open that
 //!   made it closes. A named stream has none of its own.
+//! - Apple's extensions: unless [`SmbServerBuilder::apple_extensions`]
+//!   turns them off, a CREATE that carries the `AAPL` server query, as
+//!   macOS clients send when they mount a share, gets a reply with the
+//!   model string of [`SmbServerBuilder::apple_model`], UNIX_BASED on Unix
+//!   hosts and the case sensitivity the backend reports. A client that
+//!   asks for READ_DIR_ATTR on a share with named streams gets it for its
+//!   connection. FileIdBothDirectoryInformation listings on that
+//!   connection then carry Finder data in place of EaSize and the short
+//!   name: the access the client may ask for, the low 16 bits of
+//!   [`FileInfo::unix_mode`], and, on shares with named streams, the
+//!   Finder info of each entry's `AFP_AfpInfo` stream and the size of its
+//!   `AFP_Resource` stream, both read through
+//!   [`ShareBackend::peek_stream`].
 //! - `open` fails with [`SmbError::PathNotFound`] when a directory on the
 //!   way to the path is missing, and with [`SmbError::NotFound`] when only
 //!   the last component is. Clients see STATUS_OBJECT_PATH_NOT_FOUND and

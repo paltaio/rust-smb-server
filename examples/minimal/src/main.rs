@@ -10,7 +10,8 @@
 //!   read-only), `home` (alice = read+write, bob = read),
 //! - not announced on the network; `SMB_DISCOVERY=1` announces it when
 //!   built with the `discovery` feature and listening on an address other
-//!   than loopback.
+//!   than loopback,
+//! - named streams on every share; `SMB_STREAMS=0` turns them off.
 
 use std::path::PathBuf;
 
@@ -46,6 +47,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let discovery = std::env::var("SMB_DISCOVERY").is_ok_and(|v| v == "1");
+    let streams = !std::env::var("SMB_STREAMS").is_ok_and(|v| v == "0");
 
     tracing::info!(?listen, ?root, "starting example smb server");
 
@@ -53,18 +55,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .listen(listen)
         .user("alice", password.as_str())
         .user("bob", password.as_str())
-        .share(Share::new("public", LocalFsBackend::new(root.join("public"))?).public())
+        .share(
+            Share::new("public", LocalFsBackend::new(root.join("public"))?)
+                .public()
+                .named_streams(streams),
+        )
         .share(
             Share::new(
                 "media",
                 LocalFsBackend::new(root.join("media"))?.read_only(),
             )
-            .public_read_only(),
+            .public_read_only()
+            .named_streams(streams),
         )
         .share(
             Share::new("home", LocalFsBackend::new(root.join("home"))?)
                 .user("alice", Access::ReadWrite)
-                .user("bob", Access::Read),
+                .user("bob", Access::Read)
+                .named_streams(streams),
         );
     #[cfg(feature = "discovery")]
     let builder = if discovery {
