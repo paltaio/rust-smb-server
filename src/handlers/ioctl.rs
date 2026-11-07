@@ -1,7 +1,8 @@
 //! IOCTL handler (MS-SMB2 3.3.5.15): FSCTL_VALIDATE_NEGOTIATE_INFO,
-//! FSCTL_SRV_ENUMERATE_SNAPSHOTS with no snapshots, the resume key and
-//! copy FSCTLs, STATUS_FS_DRIVER_REQUIRED for DFS referrals and
-//! STATUS_NOT_SUPPORTED for the rest.
+//! FSCTL_SRV_ENUMERATE_SNAPSHOTS with no snapshots, the resume key, copy and
+//! duplicate extents FSCTLs, FSCTL_SET_SPARSE on shares that clone,
+//! STATUS_FS_DRIVER_REQUIRED for DFS referrals and STATUS_NOT_SUPPORTED for
+//! the rest.
 
 use std::sync::Arc;
 
@@ -40,18 +41,25 @@ pub async fn handle(
         Ok(checked) => checked,
         Err(status) => return Outcome::Done(HandlerResponse::err(status)),
     };
-    if matches!(
-        req.fsctl(),
-        Fsctl::SrvRequestResumeKey | Fsctl::SrvCopychunk | Fsctl::SrvCopychunkWrite
-    ) && let Some(open) = &open
-    {
+    if let Some(open) = &open {
         let call = copy::Call {
             hdr,
             req: &req,
             input,
             retained,
         };
-        return copy::handle(server, conn, &call, &tree, open).await;
+        match req.fsctl() {
+            Fsctl::SrvRequestResumeKey | Fsctl::SrvCopychunk | Fsctl::SrvCopychunkWrite => {
+                return copy::handle(server, conn, &call, &tree, open).await;
+            }
+            Fsctl::DuplicateExtentsToFile | Fsctl::DuplicateExtentsToFileEx => {
+                return copy::duplicate_extents(conn, &call, &tree, open).await;
+            }
+            Fsctl::SetSparse => {
+                return Outcome::Done(copy::set_sparse(&req, &tree, open).await);
+            }
+            _ => {}
+        }
     }
     Outcome::Done(answer(server, conn, &req, open, input).await)
 }

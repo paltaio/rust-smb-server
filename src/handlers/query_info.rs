@@ -24,6 +24,7 @@ const FILE_CASE_PRESERVED_NAMES: u32 = 0x0000_0002;
 const FILE_UNICODE_ON_DISK: u32 = 0x0000_0004;
 const FILE_NAMED_STREAMS: u32 = 0x0004_0000;
 const FILE_SUPPORTS_EXTENDED_ATTRIBUTES: u32 = 0x0080_0000;
+const FILE_SUPPORTS_BLOCK_REFCOUNTING: u32 = 0x0800_0000;
 
 // Access mask bits (MS-SMB2 2.2.13.1.1)
 const FILE_READ_EA: u32 = 0x0000_0008;
@@ -337,10 +338,16 @@ async fn query_filesystem(open: &Open, share: &ShareBindings, class: u8, cap: us
             } else {
                 0
             };
+            let block_cloning = if share.block_cloning {
+                FILE_SUPPORTS_BLOCK_REFCOUNTING
+            } else {
+                0
+            };
             ic::encode_fs_attribute_information(
                 case_sensitive
                     | named_streams
                     | eas
+                    | block_cloning
                     | FILE_CASE_PRESERVED_NAMES
                     | FILE_UNICODE_ON_DISK,
                 volume.max_name_length,

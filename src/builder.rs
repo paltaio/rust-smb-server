@@ -220,9 +220,15 @@ impl Share {
     /// Explorer, Linux `cp` and the macOS Finder send such a request for a
     /// copy within a share; Windows and Linux also for a copy between two
     /// shares of one session, which needs this on both. When off, the
-    /// requests fail with STATUS_NOT_SUPPORTED, or with
-    /// STATUS_INVALID_DEVICE_REQUEST on a named stream, and clients read and
-    /// write the data themselves. On by default.
+    /// requests fail with STATUS_NOT_SUPPORTED, a macOS whole-file copy of a
+    /// file fails with STATUS_ACCESS_DENIED, and a request on a named stream
+    /// fails with STATUS_INVALID_DEVICE_REQUEST; clients then read and write
+    /// the data themselves. The requests to clone a range of a file that a
+    /// backend with [`BackendCapabilities::block_cloning`] serves fail with
+    /// STATUS_INVALID_DEVICE_REQUEST too, and the share does not report
+    /// FILE_SUPPORTS_BLOCK_REFCOUNTING. On by default.
+    ///
+    /// [`BackendCapabilities::block_cloning`]: crate::BackendCapabilities::block_cloning
     pub fn server_side_copy(mut self, enabled: bool) -> Self {
         self.server_side_copy = enabled;
         self

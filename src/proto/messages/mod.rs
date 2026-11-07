@@ -13,6 +13,7 @@ pub mod change_notify;
 pub mod close;
 pub mod copychunk;
 pub mod create;
+pub mod duplicate_extents;
 pub mod durable;
 pub mod echo;
 pub mod error_response;

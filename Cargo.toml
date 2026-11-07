@@ -76,7 +76,7 @@ windows-sys = { version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_Fil
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["fs"], optional = true }
-libc = "0.2"
+libc = "0.2.173"
 quick-xml = { version = "0.42", optional = true }
 
 [target.'cfg(all(unix, not(target_vendor = "apple")))'.dependencies]

@@ -514,6 +514,7 @@ impl ShareBackend for MemFsBackend {
             case_sensitive: false,
             named_streams: !g.no_streams,
             extended_attributes: !g.no_eas,
+            block_cloning: false,
         }
     }
 

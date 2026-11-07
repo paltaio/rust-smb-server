@@ -607,11 +607,14 @@ pub mod fuzzing {
     /// Parses `data` as the input of a copy request and checks the limits and
     /// the fields read. Reads the first 24 bytes as a resume key and checks
     /// that it maps to the FileId it holds, and to nothing under another tag.
+    /// Parses `data` as the input of a duplicate extents request too, and
+    /// checks the fields read and the end of the source range.
     pub fn copychunk(data: &[u8]) {
         use crate::proto::messages::copychunk::{
             CopychunkRequest, MAX_CHUNK_LEN, MAX_CHUNKS, MAX_COPY_LEN, resume_key,
             resume_key_file_id,
         };
+        use crate::proto::messages::duplicate_extents::DuplicateExtentsRequest;
         match CopychunkRequest::parse(data) {
             Ok(request) => {
                 assert_eq!(request.source_key, data[..24]);
@@ -646,6 +649,19 @@ pub mod fuzzing {
             let id = resume_key_file_id(key, &tag).expect("a key ends in its tag");
             assert_eq!(resume_key(id, &tag), *key);
             assert_eq!(resume_key_file_id(key, &tag.map(|b| !b)), None);
+        }
+        match DuplicateExtentsRequest::parse(data) {
+            Some(request) => {
+                assert!(data.len() >= 40);
+                assert_eq!(request.source.persistent.to_le_bytes(), data[..8]);
+                assert_eq!(request.source.volatile.to_le_bytes(), data[8..16]);
+                assert_eq!(request.source_offset.to_le_bytes(), data[16..24]);
+                assert_eq!(request.target_offset.to_le_bytes(), data[24..32]);
+                assert_eq!(request.byte_count.to_le_bytes(), data[32..40]);
+                let end = u128::from(request.source_offset) + u128::from(request.byte_count);
+                assert_eq!(request.source_end(), u64::try_from(end).ok());
+            }
+            None => assert!(data.len() < 40),
         }
     }
 

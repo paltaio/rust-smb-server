@@ -60,6 +60,15 @@ pub enum SmbError {
 }
 
 impl SmbError {
+    /// Whether a failed `clone_range` left its target as it was. Any other
+    /// error may follow a clone of part of the range.
+    pub(crate) fn leaves_target_unchanged(&self) -> bool {
+        matches!(
+            self,
+            SmbError::NotSupported | SmbError::InvalidParameter | SmbError::NotSameDevice
+        )
+    }
+
     /// NTSTATUS code for this error.
     pub fn to_nt_status(&self) -> u32 {
         match self {

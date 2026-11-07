@@ -10,6 +10,8 @@ mod macos_streams;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod open_streams;
 #[cfg(target_os = "linux")]
+mod reflink;
+#[cfg(target_os = "linux")]
 mod streams;
 #[cfg(windows)]
 mod windows_eas;

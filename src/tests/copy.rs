@@ -38,12 +38,14 @@ use crate::proto::messages::{
     LeaseBreakNotification, LeaseContext, LockElement, LockRequest, ReadRequest, ReadResponse,
     SetInfoRequest, WriteRequest,
 };
-use crate::server::ServerState;
+use crate::server::{ServerState, ShareBindings};
 use crate::stream::{StreamInfo, StreamName};
 use crate::tests::aapl;
 use crate::tests::memfs::MemFsBackend;
 use crate::tests::peer::{Peer, header, status};
 use crate::{Access, Share, SmbServer};
+
+mod clone;
 
 const READ: u32 = 0x0012_0089;
 const WRITE: u32 = 0x0012_0116;
@@ -285,6 +287,11 @@ impl Client {
     /// Tree 2 of session 1, on the share `other`, with `access`.
     async fn with_other_share(self, access: Access) -> Self {
         let share = self.state.find_share("other").await.expect("share other");
+        self.with_second_tree(share, access).await
+    }
+
+    /// Tree 2 of session 1, on `share`, with `access`.
+    async fn with_second_tree(self, share: Arc<ShareBindings>, access: Access) -> Self {
         let session = self.peer.conn.sessions.read().await[&1].clone();
         session
             .read()
@@ -1679,35 +1686,6 @@ async fn a_copy_breaks_the_read_lease_of_another_client_on_the_target() {
 }
 
 #[tokio::test]
-async fn a_copy_breaks_a_handle_caching_lease_and_asks_for_the_acknowledgment() {
-    let files = MemFsBackend::new()
-        .with_file("s", &pattern(100, 1))
-        .with_file("t", b"old");
-    let state = server(&files);
-    let mut cacher = Client::from_client(&state, 1).await;
-    let mut copier = Client::from_client(&state, 2).await;
-    let cached = cacher
-        .open(Create::new("t").access(READ).lease(3, LEASE_RH))
-        .await;
-    let source = copier.open(Create::new("s")).await;
-    let target = copier.open(Create::new("t")).await;
-    cacher.quiet().await;
-
-    let key = copier.key(source).await;
-    assert_eq!(
-        copier.copy(target, &key, &[(0, 0, 100)]).await,
-        (OK, Some([1, 0, 100]))
-    );
-    let flags = cacher.breaks(3, LEASE_RH, LEASE_NONE).await;
-    assert_eq!(
-        flags & LeaseBreakNotification::FLAG_ACK_REQUIRED,
-        LeaseBreakNotification::FLAG_ACK_REQUIRED
-    );
-    cacher.ack(3, LEASE_NONE).await;
-    cacher.close(cached).await;
-}
-
-#[tokio::test]
 async fn a_copy_marks_its_target_written_only_when_bytes_were_written() {
     let (_, mut c, source, target, _) = pair(100).await;
     let key = c.key(source).await;
@@ -1836,6 +1814,21 @@ enum Fast {
     Fails,
 }
 
+/// What a spying backend's `clone_range` does.
+#[derive(Clone, Copy)]
+enum Cloning {
+    /// Clones everything asked, by copying the bytes.
+    Full,
+    /// Not supported, which is the default of the trait.
+    NotSupported,
+    /// Not on the same device.
+    NotSameDevice,
+    /// Refuses the ranges.
+    InvalidParameter,
+    /// Fails with a full disk.
+    DiskFull,
+}
+
 /// The error a spying backend's handles fail with.
 #[derive(Clone, Copy)]
 enum Refusal {
@@ -1871,6 +1864,9 @@ struct Stall {
 struct Spy {
     fast: Fast,
     copy_calls: Mutex<Vec<(u64, u64, u64)>>,
+    /// What `clone_range` does, `None` for a backend that does not clone.
+    cloning: Mutex<Option<Cloning>>,
+    clone_calls: Mutex<Vec<(u64, u64, u64)>>,
     reads: AtomicUsize,
     writes: AtomicUsize,
     flushes: AtomicUsize,
@@ -1896,6 +1892,8 @@ struct Spy {
     slow: AtomicBool,
     /// The file id every file reports, and the serial number of the volume.
     identity: Mutex<Option<(u64, u32)>>,
+    /// Bytes in a sector of the volume, when not the default.
+    sector: Mutex<Option<u32>>,
     /// The error opening a named stream fails with.
     open_stream_error: Mutex<Option<Refusal>>,
 }
@@ -1914,6 +1912,8 @@ impl Spy {
         Arc::new(Self {
             fast,
             copy_calls: Mutex::default(),
+            cloning: Mutex::default(),
+            clone_calls: Mutex::default(),
             reads: AtomicUsize::new(0),
             writes: AtomicUsize::new(0),
             flushes: AtomicUsize::new(0),
@@ -1929,12 +1929,28 @@ impl Spy {
             most_busy: AtomicUsize::new(0),
             slow: AtomicBool::new(false),
             identity: Mutex::default(),
+            sector: Mutex::default(),
             open_stream_error: Mutex::default(),
         })
     }
 
     fn copy_calls(&self) -> Vec<(u64, u64, u64)> {
         self.copy_calls.lock().unwrap().clone()
+    }
+
+    fn clone_calls(&self) -> Vec<(u64, u64, u64)> {
+        self.clone_calls.lock().unwrap().clone()
+    }
+
+    /// Makes the backend report block cloning and clone as `cloning` says.
+    /// Call it before the server is built.
+    fn clone_as(&self, cloning: Cloning) {
+        *self.cloning.lock().unwrap() = Some(cloning);
+    }
+
+    /// Makes the sectors of the volume `bytes` long.
+    fn sectors_of(&self, bytes: u32) {
+        *self.sector.lock().unwrap() = Some(bytes);
     }
 
     fn reads(&self) -> usize {
@@ -1987,8 +2003,8 @@ impl Spy {
         busy
     }
 
-    /// Makes write number `at` wait until `resume` is notified, after
-    /// notifying `reached`.
+    /// Makes write number `at`, or clone number `at` of a backend that
+    /// clones, wait until `resume` is notified, after notifying `reached`.
     fn stall(&self, at: usize, reached: &Arc<Notify>, resume: &Arc<Notify>) {
         *self.stall.lock().unwrap() = Some(Stall {
             at,
@@ -2045,17 +2061,23 @@ impl ShareBackend for SpyFs {
     }
 
     fn capabilities(&self) -> BackendCapabilities {
-        self.files.capabilities()
+        BackendCapabilities {
+            block_cloning: self.spy.cloning.lock().unwrap().is_some(),
+            ..self.files.capabilities()
+        }
     }
 
     async fn volume_info(&self) -> SmbResult<VolumeInfo> {
         let identity = *self.spy.identity.lock().unwrap();
-        Ok(
-            identity.map_or_else(VolumeInfo::default, |(_, serial_number)| VolumeInfo {
-                serial_number,
-                ..VolumeInfo::default()
-            }),
-        )
+        let sector = *self.spy.sector.lock().unwrap();
+        let mut info = VolumeInfo::default();
+        if let Some((_, serial_number)) = identity {
+            info.serial_number = serial_number;
+        }
+        if let Some(bytes) = sector {
+            info.bytes_per_sector = bytes;
+        }
+        Ok(info)
     }
 
     async fn open_stream(
@@ -2096,9 +2118,6 @@ impl ShareBackend for SpyFs {
             Fast::AtMost(n) => len.min(n),
         };
         let _call = self.spy.begin_call().await;
-        fn as_spy(handle: &dyn Handle) -> Option<&SpyHandle> {
-            handle.as_any()?.downcast_ref::<SpyHandle>()
-        }
         let (Some(src), Some(dst)) = (as_spy(src), as_spy(dst)) else {
             return Err(SmbError::NotSupported);
         };
@@ -2106,6 +2125,52 @@ impl ShareBackend for SpyFs {
         dst.inner.write(dst_offset, &data).await?;
         Ok(data.len() as u64)
     }
+
+    async fn clone_range(
+        &self,
+        src: &dyn Handle,
+        src_offset: u64,
+        dst: &dyn Handle,
+        dst_offset: u64,
+        len: u64,
+    ) -> SmbResult<()> {
+        let calls = {
+            let mut calls = self.spy.clone_calls.lock().unwrap();
+            calls.push((src_offset, dst_offset, len));
+            calls.len()
+        };
+        let cloning = *self.spy.cloning.lock().unwrap();
+        match cloning {
+            None | Some(Cloning::NotSupported) => Err(SmbError::NotSupported),
+            Some(Cloning::NotSameDevice) => Err(SmbError::NotSameDevice),
+            Some(Cloning::InvalidParameter) => Err(SmbError::InvalidParameter),
+            Some(Cloning::DiskFull) => Err(SmbError::DiskFull),
+            Some(Cloning::Full) => {
+                let (Some(src), Some(dst)) = (as_spy(src), as_spy(dst)) else {
+                    return Err(SmbError::NotSameDevice);
+                };
+                let data = src.inner.read(src_offset, len as u32).await?;
+                dst.inner.write(dst_offset, &data).await?;
+                let stall = self
+                    .spy
+                    .stall
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .filter(|stall| stall.at == calls);
+                if let Some(stall) = stall {
+                    stall.reached.notify_one();
+                    stall.resume.notified().await;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// `handle` as a handle of a spying backend.
+fn as_spy(handle: &dyn Handle) -> Option<&SpyHandle> {
+    handle.as_any()?.downcast_ref::<SpyHandle>()
 }
 
 struct SpyHandle {

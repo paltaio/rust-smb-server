@@ -5,6 +5,9 @@
 //!
 //! A request without chunks from a connection offered Apple's whole-file
 //! copy copies the file and its named streams, and answers when it is done.
+//!
+//! FSCTL_DUPLICATE_EXTENTS_TO_FILE shares the storage of a range of one file
+//! with another instead of copying it.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -30,7 +33,10 @@ use crate::proto::messages::copychunk::{
 use crate::proto::messages::{FileId, Fsctl, IoctlRequest};
 use crate::server::{ServerState, ShareBindings};
 
+mod duplicate;
 mod whole_file;
+
+pub(super) use duplicate::{duplicate_extents, set_sparse};
 
 /// How a copy request ended short of its last chunk: the status, and the
 /// bytes of the chunk it stopped in that were written.
@@ -155,7 +161,8 @@ impl<'a> Guards<'a> {
     }
 }
 
-/// A request of one of the three FSCTLs, as the IOCTL handler read it.
+/// An IOCTL request for one of the copy or duplicate-extents FSCTLs, as the
+/// IOCTL handler read it.
 pub(super) struct Call<'a> {
     pub hdr: &'a Smb2Header,
     pub req: &'a IoctlRequest,
@@ -283,6 +290,12 @@ async fn find_source(
     key: &[u8; RESUME_KEY_LEN],
 ) -> Option<Side> {
     let file_id = resume_key_file_id(key, &server.resume_tag)?;
+    find_open(conn, session_id, file_id).await
+}
+
+/// The open `file_id` among the opens of the session `session_id`, on any
+/// of its trees, with its share.
+async fn find_open(conn: &Arc<Connection>, session_id: u64, file_id: FileId) -> Option<Side> {
     let session = lookup_session(conn, session_id).await.ok()?;
     let trees: Vec<_> = session
         .read()

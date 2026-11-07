@@ -107,6 +107,9 @@ pub struct ShareBindings {
     pub(crate) extended_attributes: bool,
     /// Clients may ask the server to copy file data on the share.
     pub(crate) server_side_copy: bool,
+    /// Clients may ask the server to clone ranges of files on the share:
+    /// server-side copy is on and the backend clones ranges.
+    pub(crate) block_cloning: bool,
     /// The directories clients watch for changes, on any connection.
     pub(crate) watches: crate::files::WatchTable,
 }
@@ -138,6 +141,7 @@ impl ShareBindings {
             named_streams: !is_ipc && capabilities.named_streams,
             extended_attributes: !is_ipc && capabilities.extended_attributes,
             server_side_copy: !is_ipc,
+            block_cloning: !is_ipc && capabilities.block_cloning,
             watches,
         })
     }
@@ -163,6 +167,7 @@ impl ShareBindings {
             named_streams: share.named_streams && capabilities.named_streams,
             extended_attributes: share.extended_attributes && capabilities.extended_attributes,
             server_side_copy: share.server_side_copy,
+            block_cloning: share.server_side_copy && capabilities.block_cloning,
             watches,
         })
     }

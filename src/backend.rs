@@ -271,6 +271,15 @@ pub struct BackendCapabilities {
     /// [`Share::extended_attributes`](crate::Share::extended_attributes)
     /// describes for a share that turns them off.
     pub extended_attributes: bool,
+    /// The backend can make a range of one file share its storage with a
+    /// range of another file on the same volume, served by
+    /// [`ShareBackend::clone_range`]. On a share that leaves
+    /// [`Share::server_side_copy`](crate::Share::server_side_copy) on,
+    /// FileFsAttributeInformation then reports
+    /// FILE_SUPPORTS_BLOCK_REFCOUNTING and FSCTL_DUPLICATE_EXTENTS_TO_FILE
+    /// reaches the backend. Without it, that FSCTL fails with
+    /// STATUS_INVALID_DEVICE_REQUEST.
+    pub block_cloning: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -454,6 +463,43 @@ pub trait ShareBackend: Send + Sync + 'static {
         _dst_offset: u64,
         _len: u64,
     ) -> SmbResult<u64> {
+        Err(SmbError::NotSupported)
+    }
+
+    /// Makes the `len` bytes at `dst_offset` of `dst` share their storage
+    /// with the `len` bytes at `src_offset` of `src`, for a client's
+    /// duplicate extents request: the bytes read the same, and a later write
+    /// to either file leaves the other as it is. `dst` is a handle this
+    /// backend gave. `src` may be a handle of another backend or share.
+    ///
+    /// Called only when [`BackendCapabilities::block_cloning`] is set, with a
+    /// `len` other than 0. The server has checked that `src` and `dst` are
+    /// files open with the access a clone needs, that both offsets are
+    /// multiples of the allocation unit [`ShareBackend::volume_info`]
+    /// reports, that `len` is a multiple of it too or the range of `src`
+    /// ends at the end of `src` and the range of `dst` at the end of `dst`,
+    /// that each range lies inside its file, and that no byte-range lock of
+    /// another open covers either range. Byte-range locks, leases and change
+    /// reports are the server's.
+    ///
+    /// Return [`SmbError::NotSameDevice`] when `src` is on another volume
+    /// than `dst`, which includes a handle of another backend,
+    /// [`SmbError::NotSupported`] when the storage cannot share blocks
+    /// between these two files, and [`SmbError::InvalidParameter`] for ranges
+    /// it refuses, such as overlapping ranges of one file. Clients see
+    /// STATUS_INVALID_PARAMETER for the first and the last, and
+    /// STATUS_INVALID_DEVICE_REQUEST for `NotSupported`. These three leave
+    /// `dst` as it was. A clone that fails with another error may have
+    /// changed part of the range. The default returns
+    /// [`SmbError::NotSupported`].
+    async fn clone_range(
+        &self,
+        _src: &dyn Handle,
+        _src_offset: u64,
+        _dst: &dyn Handle,
+        _dst_offset: u64,
+        _len: u64,
+    ) -> SmbResult<()> {
         Err(SmbError::NotSupported)
     }
 }
@@ -742,6 +788,7 @@ impl ShareBackend for NotSupportedBackend {
             case_sensitive: false,
             named_streams: false,
             extended_attributes: false,
+            block_cloning: false,
         }
     }
 }

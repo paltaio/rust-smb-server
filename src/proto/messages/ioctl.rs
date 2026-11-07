@@ -36,6 +36,12 @@ pub enum Fsctl {
     SrvCopychunk,
     /// `FSCTL_SRV_COPYCHUNK_WRITE`.
     SrvCopychunkWrite,
+    /// `FSCTL_SET_SPARSE`.
+    SetSparse,
+    /// `FSCTL_DUPLICATE_EXTENTS_TO_FILE`.
+    DuplicateExtentsToFile,
+    /// `FSCTL_DUPLICATE_EXTENTS_TO_FILE_EX`.
+    DuplicateExtentsToFileEx,
     /// Anything else.
     Other(u32),
 }
@@ -53,6 +59,9 @@ impl Fsctl {
     pub const SRV_REQUEST_RESUME_KEY: u32 = 0x0014_0078;
     pub const SRV_COPYCHUNK: u32 = 0x0014_40F2;
     pub const SRV_COPYCHUNK_WRITE: u32 = 0x0014_80F2;
+    pub const SET_SPARSE: u32 = 0x0009_00C4;
+    pub const DUPLICATE_EXTENTS_TO_FILE: u32 = 0x0009_8344;
+    pub const DUPLICATE_EXTENTS_TO_FILE_EX: u32 = 0x0009_83E8;
 
     pub fn from_u32(code: u32) -> Self {
         match code {
@@ -68,6 +77,9 @@ impl Fsctl {
             Self::SRV_REQUEST_RESUME_KEY => Self::SrvRequestResumeKey,
             Self::SRV_COPYCHUNK => Self::SrvCopychunk,
             Self::SRV_COPYCHUNK_WRITE => Self::SrvCopychunkWrite,
+            Self::SET_SPARSE => Self::SetSparse,
+            Self::DUPLICATE_EXTENTS_TO_FILE => Self::DuplicateExtentsToFile,
+            Self::DUPLICATE_EXTENTS_TO_FILE_EX => Self::DuplicateExtentsToFileEx,
             other => Self::Other(other),
         }
     }
@@ -86,6 +98,9 @@ impl Fsctl {
             Self::SrvRequestResumeKey => Self::SRV_REQUEST_RESUME_KEY,
             Self::SrvCopychunk => Self::SRV_COPYCHUNK,
             Self::SrvCopychunkWrite => Self::SRV_COPYCHUNK_WRITE,
+            Self::SetSparse => Self::SET_SPARSE,
+            Self::DuplicateExtentsToFile => Self::DUPLICATE_EXTENTS_TO_FILE,
+            Self::DuplicateExtentsToFileEx => Self::DUPLICATE_EXTENTS_TO_FILE_EX,
             Self::Other(c) => c,
         }
     }
@@ -178,7 +193,7 @@ mod tests {
         assert_eq!(Fsctl::Other(0xDEAD_BEEF).as_u32(), 0xDEAD_BEEF);
     }
 
-    /// Codes from the MS-SMB2 2.2.31 CtlCode table.
+    /// Codes from the MS-SMB2 2.2.31 and MS-FSCC 2.3 CtlCode tables.
     #[test]
     fn fsctl_codes_match_the_ctlcode_tables() {
         for (code, fsctl) in [
@@ -193,6 +208,9 @@ mod tests {
             (0x0014_01FC, Fsctl::QueryNetworkInterfaceInfo),
             (0x0014_0204, Fsctl::ValidateNegotiateInfo),
             (0x0006_01B0, Fsctl::DfsGetReferralsEx),
+            (0x0009_00C4, Fsctl::SetSparse),
+            (0x0009_8344, Fsctl::DuplicateExtentsToFile),
+            (0x0009_83E8, Fsctl::DuplicateExtentsToFileEx),
         ] {
             assert_eq!(Fsctl::from_u32(code), fsctl, "0x{code:08X}");
             assert_eq!(fsctl.as_u32(), code);
