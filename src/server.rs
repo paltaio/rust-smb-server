@@ -24,6 +24,8 @@ use crate::conn::limits::Limits;
 use crate::conn::listener::{AcceptBackoff, configure_socket};
 use crate::conn::state::Connection;
 use crate::files::{DurableTable, close_opens};
+use crate::proto::messages::copychunk::RESUME_TAG_LEN;
+use crate::utils::fill_random;
 
 // ---------------------------------------------------------------------------
 // ShareMode / ShareBindings
@@ -103,6 +105,8 @@ pub struct ShareBindings {
     /// Extended attributes are served: the share allows them and the
     /// backend stores them.
     pub(crate) extended_attributes: bool,
+    /// Clients may ask the server to copy file data on the share.
+    pub(crate) server_side_copy: bool,
     /// The directories clients watch for changes, on any connection.
     pub(crate) watches: crate::files::WatchTable,
 }
@@ -133,6 +137,7 @@ impl ShareBindings {
             change_notify: !is_ipc,
             named_streams: !is_ipc && capabilities.named_streams,
             extended_attributes: !is_ipc && capabilities.extended_attributes,
+            server_side_copy: !is_ipc,
             watches,
         })
     }
@@ -157,6 +162,7 @@ impl ShareBindings {
             change_notify: share.change_notify,
             named_streams: share.named_streams && capabilities.named_streams,
             extended_attributes: share.extended_attributes && capabilities.extended_attributes,
+            server_side_copy: share.server_side_copy,
             watches,
         })
     }
@@ -341,6 +347,8 @@ pub struct ServerState {
     pub(crate) leases: Arc<crate::files::LeaseTable>,
     /// Every durable open, and the ones kept after their session ended.
     pub(crate) durable: Arc<DurableTable>,
+    /// The last 8 bytes of every resume key this server hands out.
+    pub(crate) resume_tag: [u8; RESUME_TAG_LEN],
 }
 
 impl ServerState {
@@ -349,6 +357,8 @@ impl ServerState {
             config.limits.durable_handle_timeout,
             config.limits.max_disconnected_opens,
         ));
+        let mut resume_tag = [0; RESUME_TAG_LEN];
+        fill_random(&mut resume_tag).expect("the OS random number generator works");
         Self {
             config,
             users,
@@ -365,6 +375,7 @@ impl ServerState {
             ),
             leases: Arc::default(),
             durable,
+            resume_tag,
         }
     }
 

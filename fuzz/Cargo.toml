@@ -74,6 +74,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "copychunk"
+path = "fuzz_targets/copychunk.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "ea_list"
 path = "fuzz_targets/ea_list.rs"
 test = false

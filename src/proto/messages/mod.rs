@@ -1,8 +1,7 @@
-//! Per-command request/response wire structs.
-//!
-//! One submodule per SMB2 command (MS-SMB2 §2.2.3 to §2.2.40), plus the ERROR
-//! response (§2.2.2). The structs are `binrw` encoders and decoders for the
-//! wire bytes only.
+//! SMB2 wire structs: one submodule per command (MS-SMB2 2.2.3 to 2.2.40),
+//! the ERROR response (2.2.2), the create contexts and the FSCTL inputs and
+//! outputs the server reads and writes. They encode and decode the wire
+//! bytes only.
 
 use binrw::io::SeekFrom;
 
@@ -12,6 +11,7 @@ pub mod aapl;
 pub mod cancel;
 pub mod change_notify;
 pub mod close;
+pub mod copychunk;
 pub mod create;
 pub mod durable;
 pub mod echo;

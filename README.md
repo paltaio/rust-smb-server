@@ -236,7 +236,7 @@ Not supported:
 - transports other than direct TCP: NetBIOS sessions, QUIC and RDMA
 - SMB extended attributes with `LocalFsBackend` on macOS; the xattrs macOS clients set travel as named streams and work there
 - security descriptors and quotas
-- server-side copy and reparse points
+- reparse points
 - snapshots for Previous Versions
 - Time Machine backups
 - network discovery over NetBIOS

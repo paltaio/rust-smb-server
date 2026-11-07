@@ -2437,7 +2437,7 @@ async fn stream_requests_never_answer_not_supported() {
     );
     const SECURITY: u8 = 3;
     const QUOTA: u8 = 4;
-    const FSCTL_SRV_REQUEST_RESUME_KEY: u32 = 0x0014_0078;
+    const FSCTL_OFFLOAD_READ: u32 = 0x0009_4264;
     assert_eq!(
         a.query(s, QUOTA, 0, 1024).await.0,
         ntstatus::STATUS_INVALID_PARAMETER
@@ -2471,11 +2471,11 @@ async fn stream_requests_never_answer_not_supported() {
         ntstatus::STATUS_NOT_SUPPORTED
     );
     assert_eq!(
-        a.fsctl(s, FSCTL_SRV_REQUEST_RESUME_KEY).await,
+        a.fsctl(s, FSCTL_OFFLOAD_READ).await,
         ntstatus::STATUS_INVALID_PARAMETER
     );
     assert_eq!(
-        a.fsctl(base, FSCTL_SRV_REQUEST_RESUME_KEY).await,
+        a.fsctl(base, FSCTL_OFFLOAD_READ).await,
         ntstatus::STATUS_NOT_SUPPORTED
     );
     let by_id = Create::new("f.txt:s").options(0x2000);

@@ -400,6 +400,7 @@ mod stream;
 mod tests {
     mod aapl;
     mod async_requests;
+    mod copy;
     #[cfg(feature = "discovery")]
     mod discovery;
     mod durable;
@@ -599,6 +600,51 @@ pub mod fuzzing {
             at += 8 + units.len();
         }
         assert_eq!(reply.len(), at);
+    }
+
+    /// Parses `data` as the input of a copy request and checks the limits and
+    /// the fields read. Reads the first 24 bytes as a resume key and checks
+    /// that it maps to the FileId it holds, and to nothing under another tag.
+    pub fn copychunk(data: &[u8]) {
+        use crate::proto::messages::copychunk::{
+            CopychunkRequest, MAX_CHUNK_LEN, MAX_CHUNKS, MAX_COPY_LEN, resume_key,
+            resume_key_file_id,
+        };
+        match CopychunkRequest::parse(data) {
+            Ok(request) => {
+                assert_eq!(request.source_key, data[..24]);
+                assert_eq!(
+                    request.chunks.len() as u32,
+                    u32::from_le_bytes(data[24..28].try_into().expect("4 bytes"))
+                );
+                assert!(request.chunks.len() <= MAX_CHUNKS as usize);
+                let mut total = 0u64;
+                for (chunk, raw) in request.chunks.iter().zip(data[32..].chunks_exact(24)) {
+                    assert_eq!(chunk.source_offset.to_le_bytes(), raw[..8]);
+                    assert_eq!(chunk.target_offset.to_le_bytes(), raw[8..16]);
+                    assert_eq!(chunk.length.to_le_bytes(), raw[16..20]);
+                    assert!((1..=MAX_CHUNK_LEN).contains(&chunk.length));
+                    assert!(
+                        chunk.target_offset <= i64::MAX as u64 || chunk.target_offset == u64::MAX
+                    );
+                    total += u64::from(chunk.length);
+                }
+                assert!(total <= u64::from(MAX_COPY_LEN));
+            }
+            Err(over) => match over.source_key {
+                Some(key) => {
+                    assert!(data.len() >= 32);
+                    assert_eq!(key, data[..24]);
+                }
+                None => assert!(data.len() < 32),
+            },
+        }
+        if let Some(key) = data.first_chunk::<24>() {
+            let tag: [u8; 8] = key[16..].try_into().expect("8 bytes");
+            let id = resume_key_file_id(key, &tag).expect("a key ends in its tag");
+            assert_eq!(resume_key(id, &tag), *key);
+            assert_eq!(resume_key_file_id(key, &tag.map(|b| !b)), None);
+        }
     }
 
     /// Parses `data` as a FILE_FULL_EA_INFORMATION list and as a

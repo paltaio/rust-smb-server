@@ -1,6 +1,7 @@
 //! IOCTL handler (MS-SMB2 3.3.5.15): FSCTL_VALIDATE_NEGOTIATE_INFO,
-//! FSCTL_SRV_ENUMERATE_SNAPSHOTS with no snapshots, STATUS_FS_DRIVER_REQUIRED
-//! for DFS referrals and STATUS_NOT_SUPPORTED for the rest.
+//! FSCTL_SRV_ENUMERATE_SNAPSHOTS with no snapshots, the resume key and
+//! copy FSCTLs, STATUS_FS_DRIVER_REQUIRED for DFS referrals and
+//! STATUS_NOT_SUPPORTED for the rest.
 
 use std::sync::Arc;
 
@@ -10,6 +11,7 @@ use tracing::warn;
 
 use crate::conn::state::Connection;
 use crate::dispatch::HandlerResponse;
+use crate::handlers::copy;
 use crate::handlers::negotiate::{select_dialect, server_capabilities, server_security_mode};
 use crate::handlers::shared::{lookup_open, lookup_session_tree};
 use crate::ntstatus;
@@ -66,6 +68,15 @@ pub async fn handle(
     let Some(input) = input_buffer(&req, body) else {
         return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
     };
+
+    if matches!(
+        fsctl,
+        Fsctl::SrvRequestResumeKey | Fsctl::SrvCopychunk | Fsctl::SrvCopychunkWrite
+    ) && let Some(open) = &open
+    {
+        let share = Arc::clone(&tree.read().await.share);
+        return copy::handle(server, conn, hdr.session_id, &share, open, &req, input).await;
+    }
 
     match fsctl {
         Fsctl::ValidateNegotiateInfo => validate_negotiate_info(server, conn, &req, input).await,

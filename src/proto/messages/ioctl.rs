@@ -10,6 +10,7 @@ use crate::proto::error::ProtoResult;
 ///
 /// MS-FSCC lists the full set. Unknown codes round-trip via [`Fsctl::Other`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Fsctl {
     /// `FSCTL_VALIDATE_NEGOTIATE_INFO`.
     ValidateNegotiateInfo,
@@ -29,6 +30,12 @@ pub enum Fsctl {
     QueryNetworkInterfaceInfo,
     /// `FSCTL_SRV_ENUMERATE_SNAPSHOTS`.
     SrvEnumerateSnapshots,
+    /// `FSCTL_SRV_REQUEST_RESUME_KEY`.
+    SrvRequestResumeKey,
+    /// `FSCTL_SRV_COPYCHUNK`.
+    SrvCopychunk,
+    /// `FSCTL_SRV_COPYCHUNK_WRITE`.
+    SrvCopychunkWrite,
     /// Anything else.
     Other(u32),
 }
@@ -43,6 +50,9 @@ impl Fsctl {
     pub const LMR_REQUEST_RESILIENCY: u32 = 0x0014_01D4;
     pub const QUERY_NETWORK_INTERFACE_INFO: u32 = 0x0014_01FC;
     pub const SRV_ENUMERATE_SNAPSHOTS: u32 = 0x0014_4064;
+    pub const SRV_REQUEST_RESUME_KEY: u32 = 0x0014_0078;
+    pub const SRV_COPYCHUNK: u32 = 0x0014_40F2;
+    pub const SRV_COPYCHUNK_WRITE: u32 = 0x0014_80F2;
 
     pub fn from_u32(code: u32) -> Self {
         match code {
@@ -55,6 +65,9 @@ impl Fsctl {
             Self::LMR_REQUEST_RESILIENCY => Self::LmrRequestResiliency,
             Self::QUERY_NETWORK_INTERFACE_INFO => Self::QueryNetworkInterfaceInfo,
             Self::SRV_ENUMERATE_SNAPSHOTS => Self::SrvEnumerateSnapshots,
+            Self::SRV_REQUEST_RESUME_KEY => Self::SrvRequestResumeKey,
+            Self::SRV_COPYCHUNK => Self::SrvCopychunk,
+            Self::SRV_COPYCHUNK_WRITE => Self::SrvCopychunkWrite,
             other => Self::Other(other),
         }
     }
@@ -70,6 +83,9 @@ impl Fsctl {
             Self::LmrRequestResiliency => Self::LMR_REQUEST_RESILIENCY,
             Self::QueryNetworkInterfaceInfo => Self::QUERY_NETWORK_INTERFACE_INFO,
             Self::SrvEnumerateSnapshots => Self::SRV_ENUMERATE_SNAPSHOTS,
+            Self::SrvRequestResumeKey => Self::SRV_REQUEST_RESUME_KEY,
+            Self::SrvCopychunk => Self::SRV_COPYCHUNK,
+            Self::SrvCopychunkWrite => Self::SRV_COPYCHUNK_WRITE,
             Self::Other(c) => c,
         }
     }
@@ -164,12 +180,15 @@ mod tests {
 
     /// Codes from the MS-SMB2 2.2.31 CtlCode table.
     #[test]
-    fn fsctl_codes_match_ms_smb2() {
+    fn fsctl_codes_match_the_ctlcode_tables() {
         for (code, fsctl) in [
             (0x0006_0194, Fsctl::DfsGetReferrals),
             (0x0011_0018, Fsctl::PipeWait),
             (0x0011_C017, Fsctl::PipeTransceive),
             (0x0014_4064, Fsctl::SrvEnumerateSnapshots),
+            (0x0014_0078, Fsctl::SrvRequestResumeKey),
+            (0x0014_40F2, Fsctl::SrvCopychunk),
+            (0x0014_80F2, Fsctl::SrvCopychunkWrite),
             (0x0014_01D4, Fsctl::LmrRequestResiliency),
             (0x0014_01FC, Fsctl::QueryNetworkInterfaceInfo),
             (0x0014_0204, Fsctl::ValidateNegotiateInfo),

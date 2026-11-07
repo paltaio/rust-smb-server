@@ -20,6 +20,7 @@ use crate::server::ServerState;
 mod aapl;
 mod change_notify;
 mod close;
+mod copy;
 pub(crate) mod create;
 mod echo;
 mod flush;

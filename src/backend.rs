@@ -421,6 +421,41 @@ pub trait ShareBackend: Send + Sync + 'static {
     ) -> SmbResult<()> {
         Err(SmbError::NotSupported)
     }
+
+    /// Copies `len` bytes from `src_offset` of `src` to `dst_offset` of
+    /// `dst` inside the storage, for a client's server-side copy, and
+    /// returns the number copied. `dst` is a handle this backend gave. `src`
+    /// may be a handle of another backend or share, or of the same file as
+    /// `dst`. A copy past the end of `dst` leaves a gap that reads as
+    /// zeros, as [`Handle::write`] does.
+    ///
+    /// The ranges can overlap when `src` and `dst` are one file; the server
+    /// cannot tell for two shares over one directory, or for hard links on a
+    /// backend without file ids. Copy such a range in full as a buffered
+    /// copy would, fail with an error, or return [`SmbError::NotSupported`]
+    /// to have the server copy it; never return a short count for it.
+    ///
+    /// Return [`SmbError::NotSupported`] or [`SmbError::NotSameDevice`] when
+    /// the backend has no faster way to copy between these two handles than
+    /// reading one and writing the other, such as when [`Handle::as_any`] of
+    /// either is `None`, as this crate's named-stream handles do. The
+    /// server then reads `src` and writes `dst` with [`Handle::read`] and
+    /// [`Handle::write`], and does the same for what is left when this
+    /// returns fewer than `len` bytes. Outside an overlapping copy, a
+    /// backend that copied some bytes and then fails returns the number
+    /// copied, and an error only when it copied nothing. Byte-range locks,
+    /// leases and change reports are the server's. The default returns
+    /// [`SmbError::NotSupported`].
+    async fn copy_range(
+        &self,
+        _src: &dyn Handle,
+        _src_offset: u64,
+        _dst: &dyn Handle,
+        _dst_offset: u64,
+        _len: u64,
+    ) -> SmbResult<u64> {
+        Err(SmbError::NotSupported)
+    }
 }
 
 /// A live open file or directory handle.
@@ -607,6 +642,14 @@ pub trait Handle: Send + Sync {
     /// [`SmbError::NotSupported`].
     async fn set_eas(&self, _eas: &[Ea]) -> SmbResult<()> {
         Err(SmbError::NotSupported)
+    }
+
+    /// This handle as [`Any`](std::any::Any), for [`ShareBackend::copy_range`]
+    /// to tell the handles its backend gave from others. A handle that wraps
+    /// another and changes what it does must not forward it. The default
+    /// returns `None`.
+    fn as_any(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
+        None
     }
 }
 

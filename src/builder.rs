@@ -54,6 +54,7 @@ pub struct Share {
     pub(crate) change_notify: bool,
     pub(crate) named_streams: bool,
     pub(crate) extended_attributes: bool,
+    pub(crate) server_side_copy: bool,
     pub(crate) listed: bool,
     pub(crate) remark: String,
 }
@@ -72,6 +73,7 @@ impl Share {
             change_notify: true,
             named_streams: true,
             extended_attributes: true,
+            server_side_copy: true,
             listed: true,
             remark: String::new(),
         }
@@ -211,6 +213,18 @@ impl Share {
     /// [`BackendCapabilities::extended_attributes`]: crate::BackendCapabilities::extended_attributes
     pub fn extended_attributes(mut self, enabled: bool) -> Self {
         self.extended_attributes = enabled;
+        self
+    }
+
+    /// Copy file data on the server when a client asks for it. Windows
+    /// Explorer, Linux `cp` and the macOS Finder send such a request for a
+    /// copy within a share; Windows and Linux also for a copy between two
+    /// shares of one session, which needs this on both. When off, the
+    /// requests fail with STATUS_NOT_SUPPORTED, or with
+    /// STATUS_INVALID_DEVICE_REQUEST on a named stream, and clients read and
+    /// write the data themselves. On by default.
+    pub fn server_side_copy(mut self, enabled: bool) -> Self {
+        self.server_side_copy = enabled;
         self
     }
 
