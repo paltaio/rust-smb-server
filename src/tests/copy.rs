@@ -7,7 +7,7 @@
 use std::any::Any;
 use std::future::poll_fn;
 use std::pin::pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use std::time::Duration;
@@ -20,8 +20,9 @@ use uuid::Uuid;
 use crate::access_mask::FILE_APPEND_DATA;
 use crate::backend::{
     BackendCapabilities, DirEntry, FileInfo, FileTimes, Handle, OpenAction, OpenOptions,
-    ShareBackend,
+    ShareBackend, VolumeInfo,
 };
+use crate::conn::pending::MAX_PENDING_REQUESTS;
 use crate::conn::state::{Open, Session, TreeConnect};
 use crate::ea::Ea;
 use crate::error::{SmbError, SmbResult};
@@ -29,16 +30,17 @@ use crate::handlers::shared::lookup_open;
 use crate::ntstatus;
 use crate::path::SmbPath;
 use crate::proto::auth::ntlm::Identity;
-use crate::proto::header::{Command, SMB2_HEADER_LEN};
+use crate::proto::header::{Command, SMB2_HEADER_LEN, Smb2Header};
 use crate::proto::messages::copychunk::resume_key;
 use crate::proto::messages::{
     ChangeNotifyRequest, ChangeNotifyResponse, CloseRequest, CreateContext, CreateRequest,
     CreateResponse, FileId, Fsctl, IoctlRequest, IoctlResponse, LeaseBreakAck,
     LeaseBreakNotification, LeaseContext, LockElement, LockRequest, ReadRequest, ReadResponse,
-    SetInfoRequest,
+    SetInfoRequest, WriteRequest,
 };
 use crate::server::ServerState;
 use crate::stream::{StreamInfo, StreamName};
+use crate::tests::aapl;
 use crate::tests::memfs::MemFsBackend;
 use crate::tests::peer::{Peer, header, status};
 use crate::{Access, Share, SmbServer};
@@ -48,9 +50,11 @@ const WRITE: u32 = 0x0012_0116;
 const RW: u32 = READ | WRITE;
 const READ_ATTRIBUTES: u32 = 0x80;
 const SHARE_ALL: u32 = 0x7;
+const SHARE_READ: u32 = 0x1;
 
 const FILE_OPEN: u32 = 1;
 const FILE_CREATE: u32 = 2;
+const FILE_OPEN_IF: u32 = 3;
 const FILE_DIRECTORY_FILE: u32 = 0x1;
 const FILE_WRITE_THROUGH: u32 = 0x2;
 
@@ -59,6 +63,7 @@ const LEASE_RH: u32 = 0x3;
 const LEASE_NONE: u32 = 0;
 
 const MODIFIED: u32 = 3;
+const ADDED_STREAM: u32 = 6;
 const MODIFIED_STREAM: u32 = 8;
 
 const COPYCHUNK: u32 = Fsctl::SRV_COPYCHUNK;
@@ -74,6 +79,11 @@ const LOCKED: u32 = ntstatus::STATUS_FILE_LOCK_CONFLICT;
 const DEVICE: u32 = ntstatus::STATUS_INVALID_DEVICE_REQUEST;
 const UNSUPPORTED: u32 = ntstatus::STATUS_NOT_SUPPORTED;
 const DISK_FULL: u32 = ntstatus::STATUS_DISK_FULL;
+const SHARING: u32 = ntstatus::STATUS_SHARING_VIOLATION;
+const CANCELLED: u32 = ntstatus::STATUS_CANCELLED;
+const SESSION_DELETED: u32 = ntstatus::STATUS_USER_SESSION_DELETED;
+const TREE_DELETED: u32 = ntstatus::STATUS_NETWORK_NAME_DELETED;
+const FILE_CLOSED: u32 = ntstatus::STATUS_FILE_CLOSED;
 
 const MIB: u32 = 1 << 20;
 
@@ -124,6 +134,8 @@ struct Create<'a> {
     lease: Option<(u8, u32)>,
     durable: bool,
     reconnect: Option<FileId>,
+    share: u32,
+    aapl: bool,
 }
 
 impl<'a> Create<'a> {
@@ -136,7 +148,19 @@ impl<'a> Create<'a> {
             lease: None,
             durable: false,
             reconnect: None,
+            share: SHARE_ALL,
+            aapl: false,
         }
+    }
+
+    /// Shares only `share` with other opens.
+    fn share(self, share: u32) -> Self {
+        Self { share, ..self }
+    }
+
+    /// Carries the `AAPL` server query a macOS client sends when it mounts.
+    fn aapl(self) -> Self {
+        Self { aapl: true, ..self }
     }
 
     fn access(self, access: u32) -> Self {
@@ -192,6 +216,12 @@ impl<'a> Create<'a> {
                 data,
             });
         }
+        if self.aapl {
+            list.push(CreateContext {
+                name: CreateContext::NAME_AAPL.to_vec(),
+                data: aapl::QUERY.to_vec(),
+            });
+        }
         let mut contexts = Vec::new();
         CreateContext::encode_chain(&list, &mut contexts).expect("contexts");
         let mut body = Vec::new();
@@ -204,7 +234,7 @@ impl<'a> Create<'a> {
             reserved: 0,
             desired_access: self.access,
             file_attributes: 0,
-            share_access: SHARE_ALL,
+            share_access: self.share,
             create_disposition: self.disposition,
             create_options: self.options,
             name_offset: 0x78,
@@ -363,6 +393,26 @@ impl Client {
         ReadResponse::parse(&body).expect("read response").data
     }
 
+    async fn write(&mut self, file_id: FileId, offset: u64, data: &[u8]) {
+        let mut body = Vec::new();
+        WriteRequest {
+            structure_size: 49,
+            data_offset: WriteRequest::STANDARD_DATA_OFFSET,
+            length: data.len() as u32,
+            offset,
+            file_id,
+            channel: 0,
+            remaining_bytes: 0,
+            write_channel_info_offset: 0,
+            write_channel_info_length: 0,
+            flags: 0,
+            data: data.to_vec(),
+        }
+        .write_to(&mut body)
+        .expect("write");
+        assert_eq!(self.send(Command::Write, &body).await.0, 0, "write");
+    }
+
     /// A LOCK of `length` bytes at `offset`: exclusive, or an unlock.
     async fn lock(&mut self, file_id: FileId, offset: u64, length: u64, unlock: bool) -> u32 {
         let flags = if unlock {
@@ -398,35 +448,9 @@ impl Client {
         input: &[u8],
         max_output: u32,
     ) -> (u32, Option<Vec<u8>>) {
-        let mut body = Vec::new();
-        IoctlRequest {
-            structure_size: 57,
-            reserved: 0,
-            ctl_code,
-            file_id,
-            input_offset: 0x78,
-            input_count: input.len() as u32,
-            max_input_response: 0,
-            output_offset: 0,
-            output_count: 0,
-            max_output_response: max_output,
-            flags: IoctlRequest::FLAG_IS_FSCTL,
-            reserved2: 0,
-            input: input.to_vec(),
-        }
-        .write_to(&mut body)
-        .expect("ioctl");
+        let body = ioctl_body(ctl_code, file_id, input, max_output);
         let (status, body) = self.send_at(at, Command::Ioctl, &body).await;
-        let response = IoctlResponse::parse(&body)
-            .ok()
-            .filter(|r| r.structure_size == 49);
-        if let Some(response) = &response {
-            assert_eq!(response.ctl_code, ctl_code);
-            assert_eq!(response.file_id, file_id);
-            assert_eq!(response.flags, 0);
-            assert_eq!(response.output_count as usize, response.output.len());
-        }
-        (status, response.map(|r| r.output))
+        (status, ioctl_output(ctl_code, file_id, &body))
     }
 
     /// The resume key of the open `file_id` on [`HOME`].
@@ -478,11 +502,93 @@ impl Client {
         max_output: u32,
     ) -> (u32, Option<Counts>) {
         let (status, out) = self.fsctl(at, code, target, input, max_output).await;
-        let counts = out.map(|out| {
-            assert_eq!(out.len(), 12);
-            [0, 4, 8].map(|at| u32::from_le_bytes(out[at..at + 4].try_into().unwrap()))
-        });
-        (status, counts)
+        (status, out.map(counts_of))
+    }
+
+    /// Sends a COPYCHUNK without chunks to the open `target` at `at`, which
+    /// the server answers asynchronously: the MessageId of the request and
+    /// the AsyncId of its interim response.
+    async fn start_whole_file(&mut self, at: At, target: FileId, key: &[u8; 24]) -> (u64, u64) {
+        let input = copy_input(key, 0, &[]);
+        let body = ioctl_body(COPYCHUNK, target, &input, 12);
+        let (mid, mut msg) = self.peer.message(Command::Ioctl, &body);
+        if at != HOME {
+            msg[36..40].copy_from_slice(&at.tree.to_le_bytes());
+        }
+        let interim = self
+            .peer
+            .dispatch(&self.state, &msg)
+            .await
+            .expect("a response");
+        assert_eq!(status(&interim), ntstatus::STATUS_PENDING);
+        let async_id = header(&interim).async_id().expect("an AsyncId");
+        (mid, async_id)
+    }
+
+    /// The final responses to the requests that went asynchronous, in the
+    /// order they come: `(AsyncId, target)` for each. Returns the status and
+    /// the counts of each, in the order given.
+    async fn whole_files_done(&mut self, copies: &[(u64, FileId)]) -> Vec<(u32, Option<Counts>)> {
+        let mut done = vec![None; copies.len()];
+        for _ in copies {
+            let frame = tokio::time::timeout(Duration::from_secs(5), self.peer.next())
+                .await
+                .expect("a final response in time");
+            let hdr = header(&frame);
+            assert_eq!(hdr.command, Command::Ioctl);
+            let at = copies
+                .iter()
+                .position(|&(async_id, _)| hdr.async_id() == Some(async_id))
+                .expect("the response of a copy that was started");
+            let body = &frame[SMB2_HEADER_LEN..];
+            let counts = ioctl_output(COPYCHUNK, copies[at].1, body).map(counts_of);
+            assert!(done[at].replace((status(&frame), counts)).is_none());
+        }
+        done.into_iter().flatten().collect()
+    }
+
+    /// The final response to the request `async_id` that went asynchronous:
+    /// the status, and the counts when it carries them.
+    async fn whole_file_done(&mut self, target: FileId, async_id: u64) -> (u32, Option<Counts>) {
+        self.whole_files_done(&[(async_id, target)]).await.remove(0)
+    }
+
+    /// A whole-file copy of the source `key` into `target` at `at`, run to
+    /// its end.
+    async fn copy_whole_file_at(
+        &mut self,
+        at: At,
+        target: FileId,
+        key: &[u8; 24],
+    ) -> (u32, Option<Counts>) {
+        let (_, async_id) = self.start_whole_file(at, target, key).await;
+        self.whole_file_done(target, async_id).await
+    }
+
+    /// [`Client::copy_whole_file_at`] to [`HOME`].
+    async fn copy_whole_file(&mut self, target: FileId, key: &[u8; 24]) -> (u32, Option<Counts>) {
+        self.copy_whole_file_at(HOME, target, key).await
+    }
+
+    /// Mounts the share with an `AAPL` server query; returns the server caps
+    /// of the reply.
+    async fn mount(&mut self) -> u64 {
+        let root = Create::new("")
+            .access(READ_ATTRIBUTES)
+            .options(FILE_DIRECTORY_FILE)
+            .aapl();
+        let created = self.create_at(HOME, root).await.expect("the share root");
+        self.close(created.file_id).await;
+        let contexts = CreateContext::parse_chain(&created.create_contexts).expect("contexts");
+        aapl::server_caps(&contexts)
+    }
+
+    /// Cancels the request `mid`.
+    async fn cancel(&mut self, mid: u64) {
+        let cancel = self
+            .peer
+            .message_with(Command::Cancel, mid, 1, &[4, 0, 0, 0]);
+        assert!(self.peer.dispatch(&self.state, &cancel).await.is_none());
     }
 
     /// The open `file_id` of [`HOME`].
@@ -530,25 +636,29 @@ impl Client {
             .expect("a final response in time");
         assert_eq!(header(&frame).async_id(), Some(async_id));
         assert_eq!(status(&frame), 0);
-        let buf = ChangeNotifyResponse::parse(&frame[SMB2_HEADER_LEN..])
-            .expect("notify response")
-            .buffer;
-        let u32_at = |at: usize| u32::from_le_bytes(buf[at..at + 4].try_into().unwrap());
-        let mut events = Vec::new();
-        let mut at = 0;
-        loop {
-            let next = u32_at(at) as usize;
-            let len = u32_at(at + 8) as usize;
-            let units: Vec<u16> = buf[at + 12..at + 12 + len]
-                .chunks_exact(2)
-                .map(|c| u16::from_le_bytes([c[0], c[1]]))
-                .collect();
-            events.push((u32_at(at + 4), String::from_utf16(&units).unwrap()));
-            if next == 0 {
-                return events;
-            }
-            at += next;
+        parse_events(&frame)
+    }
+
+    /// The changes the watch of `dir` kept while no request waited: a
+    /// CHANGE_NOTIFY that is answered at once.
+    async fn kept_events(&mut self, dir: FileId) -> Vec<(u32, String)> {
+        let mut body = Vec::new();
+        ChangeNotifyRequest {
+            structure_size: 32,
+            flags: 0,
+            output_buffer_length: 4096,
+            file_id: dir,
+            completion_filter: 0xFFF,
+            reserved: 0,
         }
+        .write_to(&mut body)
+        .expect("change notify");
+        let (_, frame) = self
+            .peer
+            .request(&self.state, Command::ChangeNotify, &body)
+            .await;
+        assert_eq!(status(&frame), 0, "changes were kept");
+        parse_events(&frame)
     }
 
     /// Asserts that nothing was sent to this connection outside its
@@ -612,6 +722,71 @@ impl Client {
         .expect("ack");
         assert_eq!(self.send(Command::OplockBreak, &body).await.0, 0);
     }
+}
+
+/// The actions and names a CHANGE_NOTIFY response frame reports.
+fn parse_events(frame: &[u8]) -> Vec<(u32, String)> {
+    let buf = ChangeNotifyResponse::parse(&frame[SMB2_HEADER_LEN..])
+        .expect("notify response")
+        .buffer;
+    let u32_at = |at: usize| u32::from_le_bytes(buf[at..at + 4].try_into().unwrap());
+    let mut events = Vec::new();
+    let mut at = 0;
+    loop {
+        let next = u32_at(at) as usize;
+        let len = u32_at(at + 8) as usize;
+        let units: Vec<u16> = buf[at + 12..at + 12 + len]
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        events.push((u32_at(at + 4), String::from_utf16(&units).unwrap()));
+        if next == 0 {
+            return events;
+        }
+        at += next;
+    }
+}
+
+/// An IOCTL request body.
+fn ioctl_body(ctl_code: u32, file_id: FileId, input: &[u8], max_output: u32) -> Vec<u8> {
+    let mut body = Vec::new();
+    IoctlRequest {
+        structure_size: 57,
+        reserved: 0,
+        ctl_code,
+        file_id,
+        input_offset: 0x78,
+        input_count: input.len() as u32,
+        max_input_response: 0,
+        output_offset: 0,
+        output_count: 0,
+        max_output_response: max_output,
+        flags: IoctlRequest::FLAG_IS_FSCTL,
+        reserved2: 0,
+        input: input.to_vec(),
+    }
+    .write_to(&mut body)
+    .expect("ioctl");
+    body
+}
+
+/// The output buffer of an IOCTL response `body`, `None` for the body of an
+/// error response.
+fn ioctl_output(ctl_code: u32, file_id: FileId, body: &[u8]) -> Option<Vec<u8>> {
+    let response = IoctlResponse::parse(body)
+        .ok()
+        .filter(|r| r.structure_size == 49)?;
+    assert_eq!(response.ctl_code, ctl_code);
+    assert_eq!(response.file_id, file_id);
+    assert_eq!(response.flags, 0);
+    assert_eq!(response.output_count as usize, response.output.len());
+    Some(response.output)
+}
+
+/// The counts of a copy response's output buffer.
+fn counts_of(out: Vec<u8>) -> Counts {
+    assert_eq!(out.len(), 12);
+    [0, 4, 8].map(|at| u32::from_le_bytes(out[at..at + 4].try_into().unwrap()))
 }
 
 /// The input of a copy FSCTL that says it holds `count` chunks and holds
@@ -1713,6 +1888,25 @@ struct Spy {
     /// Runs after each write.
     after_write: Mutex<Option<AfterWrite>>,
     stall: Mutex<Option<Stall>>,
+    /// Calls that copy, write, truncate or flush running now, and the most at
+    /// once.
+    busy: AtomicUsize,
+    most_busy: AtomicUsize,
+    /// Those calls give the other tasks a turn while they run.
+    slow: AtomicBool,
+    /// The file id every file reports, and the serial number of the volume.
+    identity: Mutex<Option<(u64, u32)>>,
+    /// The error opening a named stream fails with.
+    open_stream_error: Mutex<Option<Refusal>>,
+}
+
+/// A call of a spying backend, counted until it is dropped.
+struct Busy<'a>(&'a Spy);
+
+impl Drop for Busy<'_> {
+    fn drop(&mut self) {
+        self.0.busy.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl Spy {
@@ -1731,6 +1925,11 @@ impl Spy {
             extra_size: Mutex::default(),
             after_write: Mutex::default(),
             stall: Mutex::default(),
+            busy: AtomicUsize::new(0),
+            most_busy: AtomicUsize::new(0),
+            slow: AtomicBool::new(false),
+            identity: Mutex::default(),
+            open_stream_error: Mutex::default(),
         })
     }
 
@@ -1752,6 +1951,40 @@ impl Spy {
 
     fn times(&self) -> Vec<FileTimes> {
         self.times.lock().unwrap().clone()
+    }
+
+    fn most_calls_at_once(&self) -> usize {
+        self.most_busy.load(Ordering::SeqCst)
+    }
+
+    /// Makes every file report the file id `file_index` and the volume the
+    /// serial number `serial`.
+    fn identify(&self, file_index: u64, serial: u32) {
+        *self.identity.lock().unwrap() = Some((file_index, serial));
+    }
+
+    /// Makes the open of a named stream fail with `refusal`.
+    fn refuse_streams(&self, refusal: Refusal) {
+        *self.open_stream_error.lock().unwrap() = Some(refusal);
+    }
+
+    /// Makes each call that copies, writes, truncates or flushes give the
+    /// other tasks a turn while it runs.
+    fn slow_calls(&self) {
+        self.slow.store(true, Ordering::SeqCst);
+    }
+
+    /// Counts a call that runs until the result is dropped.
+    async fn begin_call(&self) -> Busy<'_> {
+        let now = self.busy.fetch_add(1, Ordering::SeqCst) + 1;
+        self.most_busy.fetch_max(now, Ordering::SeqCst);
+        let busy = Busy(self);
+        if self.slow.load(Ordering::SeqCst) {
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+        }
+        busy
     }
 
     /// Makes write number `at` wait until `resume` is notified, after
@@ -1815,6 +2048,16 @@ impl ShareBackend for SpyFs {
         self.files.capabilities()
     }
 
+    async fn volume_info(&self) -> SmbResult<VolumeInfo> {
+        let identity = *self.spy.identity.lock().unwrap();
+        Ok(
+            identity.map_or_else(VolumeInfo::default, |(_, serial_number)| VolumeInfo {
+                serial_number,
+                ..VolumeInfo::default()
+            }),
+        )
+    }
+
     async fn open_stream(
         &self,
         file: Box<dyn Handle>,
@@ -1822,6 +2065,11 @@ impl ShareBackend for SpyFs {
         stream: &StreamName,
         opts: OpenOptions,
     ) -> SmbResult<(Box<dyn Handle>, OpenAction)> {
+        let refusal = *self.spy.open_stream_error.lock().unwrap();
+        if let Some(refusal) = refusal {
+            let _ = file.close().await;
+            return Err(refusal.error());
+        }
         let (handle, action) = self.files.open_stream(file, path, stream, opts).await?;
         Ok((self.wrap(handle), action))
     }
@@ -1847,6 +2095,7 @@ impl ShareBackend for SpyFs {
             Fast::Full | Fast::Once => len,
             Fast::AtMost(n) => len.min(n),
         };
+        let _call = self.spy.begin_call().await;
         fn as_spy(handle: &dyn Handle) -> Option<&SpyHandle> {
             handle.as_any()?.downcast_ref::<SpyHandle>()
         }
@@ -1879,6 +2128,7 @@ impl Handle for SpyHandle {
 
     async fn write(&self, offset: u64, data: &[u8]) -> SmbResult<u32> {
         let writes = self.spy.writes.fetch_add(1, Ordering::SeqCst) + 1;
+        let _call = self.spy.begin_call().await;
         let max = *self.spy.max_write.lock().unwrap();
         let data = &data[..max.map_or(data.len(), |m| data.len().min(m as usize))];
         let accepted = match self.spy.space.lock().unwrap().as_mut() {
@@ -1908,12 +2158,16 @@ impl Handle for SpyHandle {
 
     async fn flush(&self) -> SmbResult<()> {
         self.spy.flushes.fetch_add(1, Ordering::SeqCst);
+        let _call = self.spy.begin_call().await;
         self.inner.flush().await
     }
 
     async fn stat(&self) -> SmbResult<FileInfo> {
         let mut info = self.inner.stat().await?;
         info.end_of_file += *self.spy.extra_size.lock().unwrap();
+        if let Some((file_index, _)) = *self.spy.identity.lock().unwrap() {
+            info.file_index = file_index;
+        }
         Ok(info)
     }
 
@@ -1927,6 +2181,7 @@ impl Handle for SpyHandle {
     }
 
     async fn truncate(&self, len: u64) -> SmbResult<()> {
+        let _call = self.spy.begin_call().await;
         self.inner.truncate(len).await
     }
 
@@ -2161,6 +2416,929 @@ async fn a_backend_that_copied_part_of_a_chunk_before_the_write_failed_is_counte
 }
 
 // ---------------------------------------------------------------------------
+// Apple's whole-file copy
+// ---------------------------------------------------------------------------
+
+const CREATED_AT: u64 = 0x01DA_1111_0000_0001;
+const WRITTEN_AT: u64 = 0x01DB_2222_0000_0002;
+
+/// A file a macOS client copies: its data, Finder info and resource fork.
+struct Apple {
+    files: MemFsBackend,
+    data: Vec<u8>,
+    info: Vec<u8>,
+    fork: Vec<u8>,
+}
+
+/// A source `s` of `len` bytes with `AFP_AfpInfo` and `AFP_Resource` and
+/// times the empty target `t` does not have.
+fn apple_files(len: usize) -> Apple {
+    let data = pattern(len, 0x21);
+    let info = pattern(60, 0x5A);
+    let fork = pattern(300_000, 0x77);
+    let files = MemFsBackend::new()
+        .with_file("s", &data)
+        .with_stream("s", "AFP_AfpInfo", &info)
+        .with_stream("s", "AFP_Resource", &fork)
+        .with_times("s", CREATED_AT, WRITTEN_AT)
+        .with_file("t", b"");
+    Apple {
+        files,
+        data,
+        info,
+        fork,
+    }
+}
+
+/// A client that mounted the share `home` and has the share `other`
+/// connected.
+async fn mounted_with_other_share(state: &Arc<ServerState>) -> Client {
+    let mut c = Client::new(state)
+        .await
+        .with_other_share(Access::ReadWrite)
+        .await;
+    assert_ne!(c.mount().await & aapl::OSX_COPYFILE, 0);
+    c
+}
+
+/// A client that mounted the share, with the source `s` open for read
+/// sharing read, the target `t` open sharing nothing, and the source's
+/// resume key.
+async fn finder(state: &Arc<ServerState>) -> (Client, FileId, FileId, [u8; 24]) {
+    let mut c = Client::new(state).await;
+    assert_ne!(c.mount().await & aapl::OSX_COPYFILE, 0);
+    let source = c
+        .open(Create::new("s").access(READ).share(SHARE_READ))
+        .await;
+    let target = c.open(Create::new("t").share(0)).await;
+    let key = c.key(source).await;
+    (c, source, target, key)
+}
+
+#[tokio::test]
+async fn a_whole_file_copy_carries_the_data_every_stream_and_the_times() {
+    // Two whole pieces and a half.
+    let a = apple_files(5 * MIB as usize / 2);
+    let state = server(&a.files);
+    let (mut c, source, target, key) = finder(&state).await;
+
+    let (_, async_id) = c.start_whole_file(HOME, target, &key).await;
+    assert_eq!(c.peer.conn.pending.len(), 1);
+    assert_eq!(
+        c.whole_file_done(target, async_id).await,
+        (OK, Some([0, 0, 5 * MIB / 2]))
+    );
+    assert_eq!(c.peer.conn.pending.len(), 0);
+
+    assert_eq!(a.files.contents("t"), Some(a.data.clone()));
+    assert_eq!(a.files.stream_names("t"), ["AFP_AfpInfo", "AFP_Resource"]);
+    assert_eq!(
+        a.files.stream_contents("t", "AFP_AfpInfo"),
+        Some(a.info.clone())
+    );
+    assert_eq!(
+        a.files.stream_contents("t", "AFP_Resource"),
+        Some(a.fork.clone())
+    );
+    assert_eq!(a.files.times("t"), (CREATED_AT, WRITTEN_AT));
+    assert_eq!(a.files.contents("s"), Some(a.data));
+    assert_eq!(a.files.stream_contents("s", "AFP_Resource"), Some(a.fork));
+    assert_eq!(
+        a.files.open_handles(),
+        2,
+        "the copy closed the streams it opened"
+    );
+    c.close(source).await;
+    c.close(target).await;
+}
+
+#[tokio::test]
+async fn a_copy_of_an_empty_file_is_answered_with_no_bytes() {
+    let files = MemFsBackend::new()
+        .with_file("s", b"")
+        .with_times("s", CREATED_AT, WRITTEN_AT)
+        .with_file("t", &pattern(3 * MIB as usize, 4));
+    let state = server(&files);
+    let (mut c, _, target, key) = finder(&state).await;
+    assert_eq!(c.copy_whole_file(target, &key).await, (OK, Some([0, 0, 0])));
+    assert_eq!(files.contents("t"), Some(Vec::new()));
+    assert_eq!(files.times("t"), (CREATED_AT, WRITTEN_AT));
+}
+
+#[tokio::test]
+async fn a_share_without_streams_gets_the_data_alone() {
+    let home = MemFsBackend::new();
+    let data = pattern(MIB as usize + 10, 8);
+    let other = MemFsBackend::new()
+        .with_file("s", &data)
+        .with_stream("s", "AFP_AfpInfo", &pattern(60, 1))
+        .with_times("s", CREATED_AT, WRITTEN_AT)
+        .with_file("t", b"")
+        .without_streams();
+    let state = server_of_two(&home, &other);
+    let mut c = mounted_with_other_share(&state).await;
+    let source = c.open_at(OTHER, Create::new("s")).await;
+    let target = c.open_at(OTHER, Create::new("t")).await;
+    let key = c.key_at(OTHER, source).await;
+    assert_eq!(
+        c.copy_whole_file_at(OTHER, target, &key).await,
+        (OK, Some([0, 0, MIB + 10]))
+    );
+    assert_eq!(other.contents("t"), Some(data));
+    assert!(other.stream_names("t").is_empty());
+    assert_eq!(other.times("t"), (CREATED_AT, WRITTEN_AT));
+}
+
+#[tokio::test]
+async fn a_whole_file_copy_between_shares_copies_the_streams() {
+    let a = apple_files(1000);
+    let home = a.files.clone();
+    let other = MemFsBackend::new().with_file("t", b"");
+    let state = server_of_two(&home, &other);
+    let mut c = mounted_with_other_share(&state).await;
+    let source = c.open(Create::new("s").access(READ)).await;
+    let target = c.open_at(OTHER, Create::new("t")).await;
+    let key = c.key(source).await;
+    assert_eq!(
+        c.copy_whole_file_at(OTHER, target, &key).await,
+        (OK, Some([0, 0, 1000]))
+    );
+    assert_eq!(other.contents("t"), Some(a.data));
+    assert_eq!(other.stream_contents("t", "AFP_AfpInfo"), Some(a.info));
+    assert_eq!(other.stream_contents("t", "AFP_Resource"), Some(a.fork));
+    assert_eq!(other.times("t"), (CREATED_AT, WRITTEN_AT));
+}
+
+#[tokio::test]
+async fn a_file_copied_onto_itself_is_left_as_it_is() {
+    let a = apple_files(1000);
+    let state = server(&a.files);
+    let mut c = Client::new(&state).await;
+    c.mount().await;
+    let source = c.open(Create::new("s")).await;
+    let same = c.open(Create::new("s")).await;
+    let key = c.key(source).await;
+    assert_eq!(c.copy(same, &key, &[]).await, (OK, Some([0, 0, 1000])));
+    assert_eq!(a.files.contents("s"), Some(a.data));
+    assert_eq!(a.files.stream_contents("s", "AFP_Resource"), Some(a.fork));
+}
+
+#[tokio::test]
+async fn a_whole_file_copy_is_denied_unless_both_opens_are_files_with_data_rights() {
+    let files = MemFsBackend::new()
+        .with_file("s", b"data")
+        .with_stream("s", "x", b"stream")
+        .with_file("t", b"")
+        .with_stream("t", "x", b"")
+        .with_dir("d");
+    let state = server(&files);
+    let mut c = Client::new(&state).await;
+    c.mount().await;
+    let source = c.open(Create::new("s")).await;
+    let target = c.open(Create::new("t")).await;
+    let key = c.key(source).await;
+    let append_only = c
+        .open(Create::new("t").access(READ | FILE_APPEND_DATA))
+        .await;
+    let source_stream = c.open(Create::new("s:x").access(READ)).await;
+    let target_stream = c.open(Create::new("t:x")).await;
+    let dir = c
+        .open(Create::new("d").access(READ).options(FILE_DIRECTORY_FILE))
+        .await;
+    let stream_key = c.key(source_stream).await;
+    let dir_key = c.key(dir).await;
+    let denied = (DENIED, None);
+    assert_eq!(c.copy(append_only, &key, &[]).await, denied);
+    assert_eq!(c.copy(target_stream, &key, &[]).await, denied);
+    assert_eq!(c.copy(target, &stream_key, &[]).await, denied);
+    assert_eq!(c.copy(target, &dir_key, &[]).await, denied);
+    assert_eq!(c.copy(dir, &key, &[]).await, denied);
+    let attributes = c.open(Create::new("s").access(READ_ATTRIBUTES)).await;
+    let attributes_key = c.key(attributes).await;
+    assert_eq!(c.copy(target, &attributes_key, &[]).await, denied);
+    assert_eq!(files.contents("t"), Some(Vec::new()));
+}
+
+#[tokio::test]
+async fn a_share_with_copies_off_refuses_a_whole_file_copy_the_cap_was_sent_for() {
+    let home = MemFsBackend::new().with_file("s", b"data");
+    let other = MemFsBackend::new()
+        .with_file("t", b"")
+        .with_stream("t", "x", b"");
+    let state = server_on(vec![
+        Share::new("home", home.clone()).public(),
+        Share::new("other", other.clone())
+            .public()
+            .server_side_copy(false),
+    ]);
+    let mut c = Client::new(&state)
+        .await
+        .with_other_share(Access::ReadWrite)
+        .await;
+    let source = c.open(Create::new("s")).await;
+    let target = c.open_at(OTHER, Create::new("t")).await;
+    let target_stream = c.open_at(OTHER, Create::new("t:x")).await;
+    let key = c.key(source).await;
+    let forged = resume_key(target, &state.resume_tag);
+    let into_home = c.open(Create::new("s")).await;
+    assert_eq!(
+        c.copy_at(OTHER, COPYCHUNK, target, &key, &[]).await,
+        (UNSUPPORTED, None),
+        "without the cap"
+    );
+
+    assert_ne!(c.mount().await & aapl::OSX_COPYFILE, 0);
+    assert_eq!(
+        c.copy_at(OTHER, COPYCHUNK, target, &key, &[]).await,
+        (DENIED, None),
+        "a target on a share with copies off"
+    );
+    assert_eq!(
+        c.copy_at(OTHER, COPYCHUNK, target_stream, &key, &[]).await,
+        (DEVICE, None),
+        "a named stream of it"
+    );
+    assert_eq!(
+        c.copy(into_home, &forged, &[]).await,
+        (DENIED, None),
+        "a source on a share with copies off"
+    );
+    assert_eq!(
+        c.copy_at(OTHER, COPYCHUNK, target, &key, &[(0, 0, 4)])
+            .await,
+        (UNSUPPORTED, None),
+        "a copy with chunks"
+    );
+    assert_eq!(other.contents("t"), Some(Vec::new()));
+}
+
+#[tokio::test]
+async fn the_cap_belongs_to_the_connection_it_was_sent_on() {
+    let a = apple_files(100);
+    let state = server(&a.files);
+    let mut other = Client::new(&state).await;
+    other.mount().await;
+    let mut c = Client::new(&state).await;
+    let source = c.open(Create::new("s")).await;
+    let target = c.open(Create::new("t")).await;
+    let key = c.key(source).await;
+    assert_eq!(c.copy(target, &key, &[]).await, (OK, Some([0, 0, 0])));
+    assert_eq!(a.files.contents("t"), Some(Vec::new()));
+}
+
+#[tokio::test]
+async fn a_whole_file_copy_counts_against_the_pending_requests() {
+    let a = apple_files(100);
+    let state = server(&a.files);
+    let (mut c, _, target, key) = finder(&state).await;
+    let hdr = Smb2Header::default();
+    let held: Vec<_> = (0..MAX_PENDING_REQUESTS)
+        .map(|_| c.peer.conn.pending.reserve(&hdr, None, 0).expect("a slot"))
+        .collect();
+    assert_eq!(
+        c.copy(target, &key, &[]).await,
+        (ntstatus::STATUS_INSUFFICIENT_RESOURCES, None)
+    );
+    assert_eq!(a.files.contents("t"), Some(Vec::new()));
+    for (op, _) in held {
+        c.peer.conn.pending.finish(op.async_id);
+    }
+    assert_eq!(
+        c.copy_whole_file(target, &key).await,
+        (OK, Some([0, 0, 100]))
+    );
+}
+
+/// A whole-file copy of three pieces and a little that is held in the
+/// write of its first, and a second pair of files for another copy.
+struct Stalled {
+    files: MemFsBackend,
+    spy: Arc<Spy>,
+    state: Arc<ServerState>,
+    c: Client,
+    target: FileId,
+    mid: u64,
+    async_id: u64,
+    resume: Arc<Notify>,
+}
+
+impl Stalled {
+    async fn new() -> Self {
+        let files = MemFsBackend::new()
+            .with_file("s", &pattern(3 * MIB as usize + 100, 6))
+            .with_file("t", b"")
+            .with_file("s2", &pattern(MIB as usize + 5, 7))
+            .with_file("t2", b"old");
+        let spy = Spy::new(Fast::Unsupported);
+        let state = server_on(vec![Share::new("home", SpyFs::new(&files, &spy)).public()]);
+        let (reached, resume) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+        spy.stall(1, &reached, &resume);
+        let (mut c, _, target, key) = finder(&state).await;
+        let (mid, async_id) = c.start_whole_file(HOME, target, &key).await;
+        reached.notified().await;
+        Self {
+            files,
+            spy,
+            state,
+            c,
+            target,
+            mid,
+            async_id,
+            resume,
+        }
+    }
+
+    /// The final response, once the held write goes on.
+    async fn finish(mut self) -> ((u32, Option<Counts>), MemFsBackend, Arc<Spy>) {
+        self.resume.notify_one();
+        let done = self.c.whole_file_done(self.target, self.async_id).await;
+        (done, self.files, self.spy)
+    }
+}
+
+/// Lets the held write of a [`Stalled`] copy go on once `ended` holds. A
+/// request that ends the copy's session, tree or target takes it away
+/// first and then waits for the write.
+async fn resume_once(resume: &Notify, ended: impl AsyncFn() -> bool) {
+    let waiting = async {
+        while !ended().await {
+            tokio::task::yield_now().await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), waiting)
+        .await
+        .expect("the request takes away what it ends");
+    resume.notify_one();
+}
+
+#[tokio::test]
+async fn a_cancel_in_the_middle_ends_the_copy_with_status_cancelled() {
+    let mut s = Stalled::new().await;
+    s.c.cancel(s.mid).await;
+    let ((status, counts), files, spy) = s.finish().await;
+    assert_eq!((status, counts), (CANCELLED, None));
+    assert_eq!(spy.writes(), 1, "no piece after the cancel");
+    assert_eq!(files.contents("t").map(|t| t.len()), Some(MIB as usize));
+}
+
+#[tokio::test]
+async fn a_logoff_in_the_middle_ends_the_copy_with_the_session() {
+    let mut s = Stalled::new().await;
+    let conn = Arc::clone(&s.c.peer.conn);
+    let logoff = s.c.peer.request(&s.state, Command::Logoff, &[4, 0, 0, 0]);
+    let resume = resume_once(&s.resume, async || {
+        !conn.sessions.read().await.contains_key(&1)
+    });
+    let ((_, reply), ()) = tokio::join!(logoff, resume);
+    assert_eq!(status(&reply), OK);
+    let done = s.c.whole_file_done(s.target, s.async_id).await;
+    assert_eq!(done, (SESSION_DELETED, None));
+    assert_eq!(s.spy.writes(), 1);
+    assert_eq!(s.files.open_handles(), 0);
+}
+
+#[tokio::test]
+async fn a_tree_disconnect_in_the_middle_ends_the_copy_with_the_tree() {
+    let mut s = Stalled::new().await;
+    let conn = Arc::clone(&s.c.peer.conn);
+    let disconnect =
+        s.c.peer
+            .request(&s.state, Command::TreeDisconnect, &[4, 0, 0, 0]);
+    let resume = resume_once(&s.resume, async || {
+        let session = conn.sessions.read().await[&1].clone();
+        !session.read().await.trees.read().await.contains_key(&1)
+    });
+    let ((_, reply), ()) = tokio::join!(disconnect, resume);
+    assert_eq!(status(&reply), OK);
+    let done = s.c.whole_file_done(s.target, s.async_id).await;
+    assert_eq!(done, (TREE_DELETED, None));
+    assert_eq!(s.spy.writes(), 1);
+    assert_eq!(s.files.open_handles(), 0);
+}
+
+#[tokio::test]
+async fn closing_the_target_in_the_middle_ends_the_copy_with_a_closed_file() {
+    let mut s = Stalled::new().await;
+    let tree = {
+        let session = s.c.peer.conn.sessions.read().await[&1].clone();
+        session.read().await.trees.read().await[&1].clone()
+    };
+    let target = s.target;
+    let close = s.c.close(target);
+    let resume = resume_once(&s.resume, async || {
+        lookup_open(&tree, target).await.is_none()
+    });
+    tokio::join!(close, resume);
+    let done = s.c.whole_file_done(s.target, s.async_id).await;
+    assert_eq!(done, (FILE_CLOSED, None));
+    assert_eq!(s.spy.writes(), 1);
+    assert_eq!(s.files.open_handles(), 1, "only the source is open");
+}
+
+#[tokio::test]
+async fn a_copy_waiting_for_its_turn_is_cancelled_with_status_cancelled() {
+    let mut s = Stalled::new().await;
+    let source = s.c.open(Create::new("s2").access(READ)).await;
+    let target = s.c.open(Create::new("t2")).await;
+    let key = s.c.key(source).await;
+    let (mid, async_id) = s.c.start_whole_file(HOME, target, &key).await;
+    // It waits for the turn the held piece has, before it empties its target.
+    s.c.quiet().await;
+    s.c.cancel(mid).await;
+    assert_eq!(
+        s.c.whole_file_done(target, async_id).await,
+        (CANCELLED, None)
+    );
+    assert_eq!(s.files.contents("t2"), Some(b"old".to_vec()));
+    assert_eq!(s.spy.writes(), 1, "no piece of the cancelled copy");
+    let ((status, counts), files, _) = s.finish().await;
+    assert_eq!((status, counts), (OK, Some([0, 0, 3 * MIB + 100])));
+    assert_eq!(
+        files.contents("t"),
+        Some(pattern(3 * MIB as usize + 100, 6))
+    );
+}
+
+#[tokio::test]
+async fn the_copies_of_a_connection_take_turns_to_empty_copy_and_flush() {
+    let (first, second) = (
+        pattern(3 * MIB as usize + 7, 1),
+        pattern(2 * MIB as usize + 9, 2),
+    );
+    let files = MemFsBackend::new()
+        .with_file("s1", &first)
+        .with_file("t1", b"")
+        .with_file("s2", &second)
+        .with_file("t2", b"old");
+    let spy = Spy::new(Fast::Unsupported);
+    spy.slow_calls();
+    let (reached, resume) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+    spy.stall(1, &reached, &resume);
+    let state = server_on(vec![Share::new("home", SpyFs::new(&files, &spy)).public()]);
+    let mut c = Client::new(&state).await;
+    c.mount().await;
+    let mut started = Vec::new();
+    for (source, target) in [("s1", "t1"), ("s2", "t2")] {
+        let source = c.open(Create::new(source).access(READ)).await;
+        let target = c
+            .open(Create::new(target).options(FILE_WRITE_THROUGH))
+            .await;
+        let key = c.key(source).await;
+        let (_, async_id) = c.start_whole_file(HOME, target, &key).await;
+        started.push((async_id, target));
+        if started.len() == 1 {
+            // The first copy is in the middle of a piece when the second starts.
+            reached.notified().await;
+        }
+    }
+    c.quiet().await;
+    assert_eq!(
+        files.contents("t2"),
+        Some(b"old".to_vec()),
+        "the second copy waits for its turn to empty its target"
+    );
+    resume.notify_one();
+    assert_eq!(
+        c.whole_files_done(&started).await,
+        [
+            (OK, Some([0, 0, 3 * MIB + 7])),
+            (OK, Some([0, 0, 2 * MIB + 9]))
+        ]
+    );
+    assert_eq!(files.contents("t1"), Some(first));
+    assert_eq!(files.contents("t2"), Some(second));
+    assert_eq!(spy.copy_calls().len(), 7, "four pieces and three");
+    assert_eq!(spy.flushes(), 2);
+    assert_eq!(spy.most_calls_at_once(), 1);
+    assert_eq!(c.peer.conn.copy_turn.available_permits(), 1);
+}
+
+#[tokio::test]
+async fn a_target_stream_held_open_without_share_write_fails_the_copy() {
+    let a = apple_files(1000);
+    let files = a.files.clone().with_stream("t", "AFP_Resource", b"old");
+    let state = server(&files);
+    let (mut c, _, target, key) = finder(&state).await;
+    let holder = c
+        .open(Create::new("t:AFP_Resource").access(READ).share(SHARE_READ))
+        .await;
+    assert_eq!(
+        c.copy_whole_file(target, &key).await,
+        (SHARING, Some([0, 0, 1000])),
+        "the data is copied and the stream is not"
+    );
+    assert_eq!(
+        files.stream_contents("t", "AFP_Resource"),
+        Some(b"old".to_vec()),
+        "the stream is not emptied first"
+    );
+    assert_eq!(files.stream_contents("t", "AFP_AfpInfo"), Some(a.info));
+    assert_eq!(files.open_handles(), 3, "the copy closed its stream opens");
+    c.close(holder).await;
+}
+
+#[tokio::test]
+async fn a_source_stream_held_open_without_share_read_fails_the_copy() {
+    let a = apple_files(1000);
+    let state = server(&a.files);
+    let (mut c, _, target, key) = finder(&state).await;
+    let holder = c
+        .open(Create::new("s:AFP_AfpInfo").access(READ).share(0))
+        .await;
+    assert_eq!(
+        c.copy_whole_file(target, &key).await,
+        (SHARING, Some([0, 0, 1000]))
+    );
+    assert!(a.files.stream_names("t").is_empty());
+    c.close(holder).await;
+}
+
+/// A whole-file copy whose open of the target stream `AFP_Resource` waits
+/// for another client to give up the handle it caches.
+struct Waiting {
+    files: MemFsBackend,
+    state: Arc<ServerState>,
+    cacher: Client,
+    cached: FileId,
+    copier: Client,
+    target: FileId,
+    mid: u64,
+    async_id: u64,
+    fork: Vec<u8>,
+}
+
+impl Waiting {
+    async fn new() -> Self {
+        let a = apple_files(100);
+        let files = a.files.clone().with_stream("t", "AFP_Resource", b"old");
+        let state = server(&files);
+        let mut cacher = Client::from_client(&state, 1).await;
+        let mut copier = Client::from_client(&state, 2).await;
+        copier.mount().await;
+        let cached = cacher
+            .open(
+                Create::new("t:AFP_Resource")
+                    .access(READ)
+                    .share(SHARE_READ)
+                    .lease(3, LEASE_RH),
+            )
+            .await;
+        let source = copier.open(Create::new("s").access(READ)).await;
+        let target = copier.open(Create::new("t")).await;
+        let key = copier.key(source).await;
+        let (mid, async_id) = copier.start_whole_file(HOME, target, &key).await;
+        let flags = cacher.breaks(3, LEASE_RH, LEASE_R).await;
+        assert_eq!(
+            flags & LeaseBreakNotification::FLAG_ACK_REQUIRED,
+            LeaseBreakNotification::FLAG_ACK_REQUIRED
+        );
+        assert_eq!(
+            files.stream_contents("t", "AFP_Resource"),
+            Some(b"old".to_vec()),
+            "the stream is not emptied while the copy waits"
+        );
+        Self {
+            files,
+            state,
+            cacher,
+            cached,
+            copier,
+            target,
+            mid,
+            async_id,
+            fork: a.fork,
+        }
+    }
+
+    async fn done(&mut self) -> (u32, Option<Counts>) {
+        self.copier
+            .whole_file_done(self.target, self.async_id)
+            .await
+    }
+}
+
+#[tokio::test]
+async fn a_stream_open_waits_while_a_client_gives_up_a_cached_handle() {
+    let mut w = Waiting::new().await;
+    w.cacher.close(w.cached).await;
+    assert_eq!(w.done().await, (OK, Some([0, 0, 100])));
+    assert_eq!(w.files.stream_contents("t", "AFP_Resource"), Some(w.fork));
+}
+
+#[tokio::test]
+async fn a_cancel_while_a_stream_open_waits_ends_the_copy_with_status_cancelled() {
+    let mut w = Waiting::new().await;
+    w.copier.cancel(w.mid).await;
+    assert_eq!(w.done().await, (CANCELLED, None));
+    assert_eq!(
+        w.files.stream_contents("t", "AFP_Resource"),
+        Some(b"old".to_vec())
+    );
+    assert_eq!(
+        w.files.open_handles(),
+        3,
+        "the copy closed its stream opens"
+    );
+}
+
+#[tokio::test]
+async fn a_tree_disconnect_while_a_stream_open_waits_ends_the_copy_with_the_tree() {
+    let mut w = Waiting::new().await;
+    let (_, reply) = w
+        .copier
+        .peer
+        .request(&w.state, Command::TreeDisconnect, &[4, 0, 0, 0])
+        .await;
+    assert_eq!(status(&reply), OK);
+    assert_eq!(w.done().await, (TREE_DELETED, None));
+}
+
+#[tokio::test]
+async fn a_whole_file_copy_reports_the_streams_it_adds_and_changes() {
+    let a = apple_files(1000);
+    let state = server(&a.files);
+    let mut watcher = Client::new(&state).await;
+    let root = watcher
+        .open(Create::new("").access(READ).options(FILE_DIRECTORY_FILE))
+        .await;
+    let (mut c, source, target, key) = finder(&state).await;
+
+    let w = watcher.watch(root).await;
+    assert_eq!(
+        c.copy_whole_file(target, &key).await,
+        (OK, Some([0, 0, 1000]))
+    );
+    c.close(source).await;
+    c.close(target).await;
+    let mut events = watcher.events(w).await;
+    events.extend(watcher.kept_events(root).await);
+    let stream = |action, name: &str| (action, format!("t:{name}"));
+    for name in ["AFP_AfpInfo", "AFP_Resource"] {
+        assert!(events.contains(&stream(ADDED_STREAM, name)), "{events:?}");
+        assert!(
+            events.contains(&stream(MODIFIED_STREAM, name)),
+            "{events:?}"
+        );
+    }
+    assert_eq!(
+        events.last(),
+        Some(&(MODIFIED, "t".to_string())),
+        "the target reports its contents when it closes"
+    );
+    assert!(
+        events.iter().all(|(_, name)| name.starts_with('t')),
+        "the source reports nothing: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_stream_the_copy_empties_is_reported_changed_and_not_added() {
+    let files = MemFsBackend::new()
+        .with_file("s", b"data")
+        .with_stream("s", "x", b"")
+        .with_file("t", b"")
+        .with_stream("t", "x", b"old");
+    let state = server(&files);
+    let mut watcher = Client::new(&state).await;
+    let root = watcher
+        .open(Create::new("").access(READ).options(FILE_DIRECTORY_FILE))
+        .await;
+    let (mut c, source, target, key) = finder(&state).await;
+
+    let w = watcher.watch(root).await;
+    assert_eq!(c.copy_whole_file(target, &key).await, (OK, Some([0, 0, 4])));
+    c.close(source).await;
+    c.close(target).await;
+    let mut events = watcher.events(w).await;
+    events.extend(watcher.kept_events(root).await);
+    assert!(
+        events.contains(&(MODIFIED_STREAM, "t:x".to_string())),
+        "{events:?}"
+    );
+    assert!(
+        !events.contains(&(ADDED_STREAM, "t:x".to_string())),
+        "{events:?}"
+    );
+    assert_eq!(files.stream_contents("t", "x"), Some(Vec::new()));
+}
+
+#[tokio::test]
+async fn a_whole_file_copy_breaks_the_read_lease_of_another_client_on_the_target() {
+    let files = MemFsBackend::new()
+        .with_file("s", b"")
+        .with_file("t", b"old");
+    let state = server(&files);
+    let mut reader = Client::from_client(&state, 1).await;
+    let mut copier = Client::from_client(&state, 2).await;
+    copier.mount().await;
+    let cached = reader
+        .open(Create::new("t").access(READ).lease(1, LEASE_R))
+        .await;
+    let source = copier.open(Create::new("s").access(READ)).await;
+    let target = copier.open(Create::new("t").lease(2, LEASE_R)).await;
+    reader.quiet().await;
+
+    let key = copier.key(source).await;
+    assert_eq!(
+        copier.copy_whole_file(target, &key).await,
+        (OK, Some([0, 0, 0]))
+    );
+    let flags = reader.breaks(1, LEASE_R, LEASE_NONE).await;
+    assert_eq!(flags & LeaseBreakNotification::FLAG_ACK_REQUIRED, 0);
+    copier.quiet().await;
+    reader.close(cached).await;
+}
+
+#[tokio::test]
+async fn the_copied_write_time_wins_over_the_one_the_target_fixed() {
+    const FIXED: i64 = 0x01D5_0000_0000_0000;
+    let a = apple_files(100);
+    let state = server(&a.files);
+    let (mut c, _, target, key) = finder(&state).await;
+    assert_eq!(c.set_times(target, [0, 0, FIXED, 0]).await, OK);
+    assert_eq!(a.files.times("t").1, FIXED as u64);
+
+    assert_eq!(
+        c.copy_whole_file(target, &key).await,
+        (OK, Some([0, 0, 100]))
+    );
+    assert_eq!(a.files.times("t"), (CREATED_AT, WRITTEN_AT));
+    c.close(target).await;
+    assert_eq!(
+        a.files.times("t"),
+        (CREATED_AT, WRITTEN_AT),
+        "the close does not put the fixed time back"
+    );
+}
+
+#[tokio::test]
+async fn data_is_copied_by_the_backend_in_pieces_and_streams_by_read_and_write() {
+    let data = pattern(2 * MIB as usize + 5, 9);
+    let files = MemFsBackend::new()
+        .with_file("s", &data)
+        .with_stream("s", "AFP_AfpInfo", &pattern(60, 2))
+        .with_file("t", b"");
+    let spy = Spy::new(Fast::Full);
+    let state = server_on(vec![Share::new("home", SpyFs::new(&files, &spy)).public()]);
+    let (mut c, _, target, key) = finder(&state).await;
+    assert_eq!(
+        c.copy_whole_file(target, &key).await,
+        (OK, Some([0, 0, 2 * MIB + 5]))
+    );
+    let piece = u64::from(MIB);
+    assert_eq!(
+        spy.copy_calls(),
+        [
+            (0, 0, piece),
+            (piece, piece, piece),
+            (2 * piece, 2 * piece, 5),
+            (0, 0, 60)
+        ]
+    );
+    assert_eq!(files.contents("t"), Some(data));
+    assert_eq!(
+        files.stream_contents("t", "AFP_AfpInfo"),
+        Some(pattern(60, 2))
+    );
+    assert_eq!(
+        (spy.reads(), spy.writes()),
+        (1, 1),
+        "the stream is read and written"
+    );
+}
+
+#[tokio::test]
+async fn a_write_through_target_is_flushed_with_each_stream() {
+    let a = apple_files(100);
+    let spy = Spy::new(Fast::Unsupported);
+    let state = server_on(vec![
+        Share::new("home", SpyFs::new(&a.files, &spy)).public(),
+    ]);
+    let mut c = Client::new(&state).await;
+    c.mount().await;
+    let source = c.open(Create::new("s").access(READ)).await;
+    let target = c.open(Create::new("t").options(FILE_WRITE_THROUGH)).await;
+    let key = c.key(source).await;
+    assert_eq!(
+        c.copy_whole_file(target, &key).await,
+        (OK, Some([0, 0, 100]))
+    );
+    assert_eq!(spy.flushes(), 3, "the data and two streams");
+}
+
+#[tokio::test]
+async fn a_stream_open_that_fails_is_answered_as_a_stream_request_is() {
+    for (refusal, expected) in [
+        (Refusal::InvalidParameter, DEVICE),
+        (Refusal::NotSupported, DENIED),
+        (Refusal::DiskFull, DISK_FULL),
+    ] {
+        let a = apple_files(100);
+        let spy = Spy::new(Fast::Unsupported);
+        spy.refuse_streams(refusal);
+        let state = server_on(vec![
+            Share::new("home", SpyFs::new(&a.files, &spy)).public(),
+        ]);
+        let (mut c, _, target, key) = finder(&state).await;
+        assert_eq!(
+            c.copy_whole_file(target, &key).await,
+            (expected, Some([0, 0, 100])),
+            "{expected:#x}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_stream_opened_on_another_file_than_the_copy_names_fails_it() {
+    let a = apple_files(100);
+    let other = MemFsBackend::new()
+        .with_file("t", b"")
+        .with_stream("t", "AFP_AfpInfo", b"keep");
+    let (home_spy, other_spy) = (Spy::new(Fast::Unsupported), Spy::new(Fast::Unsupported));
+    home_spy.identify(7, 1);
+    other_spy.identify(9, 1);
+    // The file the target path names changes once data is written.
+    let moved = Arc::downgrade(&other_spy);
+    other_spy.after_write(move |_| {
+        if let Some(spy) = moved.upgrade() {
+            spy.identify(10, 1);
+        }
+    });
+    let state = server_on(vec![
+        Share::new("home", SpyFs::new(&a.files, &home_spy)).public(),
+        Share::new("other", SpyFs::new(&other, &other_spy)).public(),
+    ]);
+    let mut c = mounted_with_other_share(&state).await;
+    let source = c.open(Create::new("s").access(READ)).await;
+    let target = c.open_at(OTHER, Create::new("t")).await;
+    let key = c.key(source).await;
+    assert_eq!(
+        c.copy_whole_file_at(OTHER, target, &key).await,
+        (NOT_FOUND, Some([0, 0, 100]))
+    );
+    assert_eq!(other.contents("t"), Some(a.data));
+    assert_eq!(
+        other.stream_contents("t", "AFP_AfpInfo"),
+        Some(b"keep".to_vec()),
+        "a stream of the file the path names is not emptied"
+    );
+    assert_eq!(
+        (a.files.open_handles(), other.open_handles()),
+        (1, 1),
+        "the copy closed its stream opens"
+    );
+}
+
+#[tokio::test]
+async fn a_file_copied_onto_itself_through_two_shares_is_left_as_it_is() {
+    let a = apple_files(1000);
+    let spy = Spy::new(Fast::Full);
+    spy.identify(7, 1);
+    let state = server_on(vec![
+        Share::new("home", SpyFs::new(&a.files, &spy)).public(),
+        Share::new("other", SpyFs::new(&a.files, &spy)).public(),
+    ]);
+    let mut c = mounted_with_other_share(&state).await;
+    let source = c.open(Create::new("s").access(READ)).await;
+    let same = c.open_at(OTHER, Create::new("s")).await;
+    let key = c.key(source).await;
+    assert_eq!(
+        c.copy_at(OTHER, COPYCHUNK, same, &key, &[]).await,
+        (OK, Some([0, 0, 1000]))
+    );
+    assert_eq!(a.files.contents("s"), Some(a.data));
+    assert_eq!(a.files.stream_contents("s", "AFP_Resource"), Some(a.fork));
+    assert_eq!(a.files.times("s"), (CREATED_AT, WRITTEN_AT));
+    assert_eq!((spy.reads(), spy.writes()), (0, 0));
+}
+
+#[tokio::test]
+async fn files_of_two_shares_that_differ_in_id_or_volume_are_not_one_file() {
+    let cases = [((7, 1), (7, 2)), ((7, 1), (8, 1)), ((0, 1), (0, 1))];
+    for (home_identity, other_identity) in cases {
+        let a = apple_files(1000);
+        let other = MemFsBackend::new().with_file("t", b"old");
+        let (home_spy, other_spy) = (Spy::new(Fast::Full), Spy::new(Fast::Full));
+        home_spy.identify(home_identity.0, home_identity.1);
+        other_spy.identify(other_identity.0, other_identity.1);
+        let state = server_on(vec![
+            Share::new("home", SpyFs::new(&a.files, &home_spy)).public(),
+            Share::new("other", SpyFs::new(&other, &other_spy)).public(),
+        ]);
+        let mut c = mounted_with_other_share(&state).await;
+        let source = c.open(Create::new("s").access(READ)).await;
+        let target = c.open_at(OTHER, Create::new("t")).await;
+        let key = c.key(source).await;
+        assert_eq!(
+            c.copy_whole_file_at(OTHER, target, &key).await,
+            (OK, Some([0, 0, 1000])),
+            "{home_identity:?} {other_identity:?}"
+        );
+        assert_eq!(other.contents("t"), Some(a.data), "{home_identity:?}");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Files on the host
 // ---------------------------------------------------------------------------
 
@@ -2254,6 +3432,124 @@ mod local {
             (OK, Some([2, 0, MIB + 451_424]))
         );
         assert_eq!(std::fs::read(shm.path().join("t")).unwrap(), data);
+    }
+
+    /// The first `len` bytes of the open `file_id`, read in pieces.
+    async fn read_len(c: &mut Client, file_id: FileId, len: usize) -> Vec<u8> {
+        let mut data = Vec::new();
+        while data.len() < len {
+            let want = (len - data.len()).min(60_000) as u32;
+            data.extend(c.read(file_id, data.len() as u64, want).await);
+        }
+        data
+    }
+
+    #[tokio::test]
+    async fn a_whole_file_copy_carries_the_streams_and_write_time_of_the_host() {
+        use std::time::SystemTime;
+
+        let exe = std::env::current_exe().unwrap();
+        let td = tempfile::tempdir_in(exe.parent().unwrap()).unwrap();
+        let backend = LocalFsBackend::new(td.path()).unwrap();
+        if !backend.capabilities().named_streams {
+            eprintln!("skipping: no named streams on {}", td.path().display());
+            return;
+        }
+        let data = pattern(MIB as usize + 777, 0x31);
+        let (source_path, target_path) = (td.path().join("s"), td.path().join("t"));
+        std::fs::write(&source_path, &data).unwrap();
+        std::fs::write(&target_path, b"old contents").unwrap();
+        let state = server_on(vec![Share::new("home", backend).public()]);
+        let mut c = Client::new(&state).await;
+        // A macOS host reads AFP_AfpInfo back with version 0x100 and the
+        // backup time "never" in its header.
+        let mut info = vec![0; 60];
+        info[..16].copy_from_slice(b"AFP\0\0\0\x01\0\0\0\0\0\x80\0\0\0");
+        info[16..48].copy_from_slice(&pattern(32, 1));
+        // The fork is more than one piece of the copy, and within the 16 MiB
+        // a macOS host holds in AFP_Resource.
+        let streams = [
+            ("AFP_AfpInfo", info),
+            ("AFP_Resource", pattern(1_286_166, 2)),
+            ("note", pattern(500, 3)),
+        ];
+        for (name, bytes) in &streams {
+            let name = format!("s:{name}");
+            let stream = c.open(Create::new(&name).disposition(FILE_OPEN_IF)).await;
+            for (at, piece) in bytes.chunks(60_000).enumerate() {
+                c.write(stream, 60_000 * at as u64, piece).await;
+            }
+            c.close(stream).await;
+        }
+        let written = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&source_path)
+            .unwrap()
+            .set_modified(written)
+            .unwrap();
+
+        assert_ne!(c.mount().await & aapl::OSX_COPYFILE, 0);
+        let source = c.open(Create::new("s").access(READ)).await;
+        let target = c.open(Create::new("t").share(0)).await;
+        let key = c.key(source).await;
+        assert_eq!(
+            c.copy_whole_file(target, &key).await,
+            (OK, Some([0, 0, MIB + 777]))
+        );
+        c.close(target).await;
+
+        assert_eq!(std::fs::read(&target_path).unwrap(), data);
+        assert_eq!(
+            std::fs::metadata(&target_path).unwrap().modified().unwrap(),
+            written
+        );
+        #[cfg(any(target_os = "macos", windows))]
+        {
+            let created = |path: &Path| {
+                let since_epoch = std::fs::metadata(path)
+                    .unwrap()
+                    .created()
+                    .unwrap()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap();
+                since_epoch.as_nanos()
+            };
+            // The time travels as a FILETIME, in ticks of 100 ns.
+            let two_ticks = 200;
+            assert!(created(&source_path).abs_diff(created(&target_path)) < two_ticks);
+        }
+        for (name, bytes) in &streams {
+            let to = c.open(Create::new(&format!("t:{name}")).access(READ)).await;
+            let copied = read_len(&mut c, to, bytes.len()).await;
+            assert_eq!(&copied, bytes, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_file_is_not_copied_onto_itself_through_two_shares_of_one_directory() {
+        let exe = std::env::current_exe().unwrap();
+        let td = tempfile::tempdir_in(exe.parent().unwrap()).unwrap();
+        let backend = LocalFsBackend::new(td.path()).unwrap();
+        if !backend.capabilities().named_streams {
+            eprintln!("skipping: no named streams on {}", td.path().display());
+            return;
+        }
+        let data = pattern(2 * MIB as usize + 3, 0x41);
+        std::fs::write(td.path().join("f"), &data).unwrap();
+        let state = server_on(vec![
+            Share::new("home", backend).public(),
+            share("other", td.path()),
+        ]);
+        let mut c = mounted_with_other_share(&state).await;
+        let source = c.open(Create::new("f").access(READ)).await;
+        let target = c.open_at(OTHER, Create::new("f")).await;
+        let key = c.key(source).await;
+        assert_eq!(
+            c.copy_at(OTHER, COPYCHUNK, target, &key, &[]).await,
+            (OK, Some([0, 0, 2 * MIB + 3]))
+        );
+        assert_eq!(std::fs::read(td.path().join("f")).unwrap(), data);
     }
 
     #[tokio::test]

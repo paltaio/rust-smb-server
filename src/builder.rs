@@ -353,6 +353,7 @@ pub struct SmbServerBuilder {
     share_listing: bool,
     apple_extensions: bool,
     apple_model: String,
+    apple_copyfile: bool,
     #[cfg(feature = "discovery")]
     discovery: Option<crate::discovery::Discovery>,
 }
@@ -381,6 +382,7 @@ impl SmbServerBuilder {
             share_listing: true,
             apple_extensions: true,
             apple_model: DEFAULT_APPLE_MODEL.to_string(),
+            apple_copyfile: true,
             #[cfg(feature = "discovery")]
             discovery: None,
         }
@@ -621,6 +623,18 @@ impl SmbServerBuilder {
         self
     }
 
+    /// Offers macOS clients the whole-file copy: a COPYCHUNK or
+    /// COPYCHUNK_WRITE without chunks copies a file with its named streams
+    /// and its creation and write times in one request. Offered on shares
+    /// that serve named streams and allow server-side copies, while
+    /// [`apple_extensions`](Self::apple_extensions) is on. A connection
+    /// keeps the offer for every share, and a copy onto a share without
+    /// named streams carries the data only. On by default.
+    pub fn apple_copyfile(mut self, enabled: bool) -> Self {
+        self.apple_copyfile = enabled;
+        self
+    }
+
     pub fn build(self) -> Result<SmbServer, BuildError> {
         let limits = &self.limits;
         if limits.max_connections == 0 {
@@ -743,6 +757,7 @@ impl SmbServerBuilder {
             limits: self.limits,
             share_listing: self.share_listing,
             apple_model: self.apple_extensions.then_some(self.apple_model),
+            apple_copyfile: self.apple_copyfile,
             #[cfg(feature = "discovery")]
             discovery,
         };

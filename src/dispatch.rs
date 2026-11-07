@@ -562,8 +562,9 @@ async fn push_reply(
         if req_hdr.command == Command::Create
             && read_u32(&reply.bytes, 0x08) == ntstatus::STATUS_SUCCESS
             && let Some(file_id) = created_file_id(&reply.bytes)
+            && let Ok(tree) = handlers::shared::lookup_session_tree(conn, req_hdr).await
         {
-            discard_open(conn, req_hdr, file_id).await;
+            handlers::shared::discard_open(&tree, file_id).await;
         }
         drop(std::mem::take(&mut reply.after_send));
         let mut error = HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
@@ -582,21 +583,6 @@ fn created_file_id(response: &[u8]) -> Option<FileId> {
     let at = SMB2_HEADER_LEN + 64;
     let bytes = response.get(at..at + 16)?;
     Some(FileId::new(read_u64(bytes, 0), read_u64(bytes, 8)))
-}
-
-/// Closes the open or pipe `file_id` that the CREATE `req_hdr` made.
-async fn discard_open(conn: &Arc<Connection>, req_hdr: &Smb2Header, file_id: FileId) {
-    let Ok(tree) = handlers::shared::lookup_session_tree(conn, req_hdr).await else {
-        return;
-    };
-    let tree = tree.read().await;
-    let removed = tree.opens.write().await.remove(&file_id);
-    if let Some(open) = removed {
-        drop(tree);
-        crate::files::close_open(&open, false).await;
-    } else {
-        handlers::pipes(&tree).remove(&file_id);
-    }
 }
 
 /// Joins the replies of a frame and encrypts the frame when it must be.

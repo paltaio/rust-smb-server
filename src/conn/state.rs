@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use crate::proto::auth::ntlm::{Identity, NtlmServer};
 use crate::proto::crypto::{Cipher, PreauthIntegrity, SessionCipher, SigningAlgo};
 use crate::proto::messages::{Dialect, FileId};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 use uuid::Uuid;
 
 use crate::backend::{FileTimes, Handle};
@@ -107,6 +107,16 @@ pub struct Connection {
     /// after which directory listings carry Finder data. It covers the
     /// client's session because no other channel can be bound to it.
     pub(crate) aapl_read_dir_attr: AtomicBool,
+
+    /// Set once an `AAPL` reply on the connection carried OSX_COPYFILE,
+    /// after which a COPYCHUNK or COPYCHUNK_WRITE without chunks copies a
+    /// whole file. The client keeps the caps for its session, so it holds on
+    /// every share.
+    pub(crate) aapl_copyfile: AtomicBool,
+
+    /// Whole-file copies of a connection take turns: one permit, held while
+    /// a copy copies a piece, empties its target or flushes it.
+    pub(crate) copy_turn: Semaphore,
 }
 
 impl Connection {
@@ -136,6 +146,8 @@ impl Connection {
             pipe_budget: Arc::default(),
             notify_budget: Arc::default(),
             aapl_read_dir_attr: AtomicBool::new(false),
+            aapl_copyfile: AtomicBool::new(false),
+            copy_turn: Semaphore::new(1),
         }
     }
 

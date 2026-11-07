@@ -8,6 +8,8 @@ use tokio::sync::RwLock;
 use tracing::warn;
 
 use crate::conn::state::{Connection, Open, Session, TreeConnect};
+use crate::files::close_open;
+use crate::handlers::pipes;
 use crate::ntstatus;
 
 /// Look up the session and tree referenced by `hdr`, returning the tree
@@ -17,7 +19,17 @@ pub async fn lookup_session_tree(
     hdr: &Smb2Header,
 ) -> Result<Arc<RwLock<TreeConnect>>, u32> {
     let tid = hdr.tree_id().ok_or(ntstatus::STATUS_INVALID_PARAMETER)?;
-    let sess_arc = lookup_session(conn, hdr.session_id).await?;
+    lookup_tree(conn, hdr.session_id, tid).await
+}
+
+/// The tree `tid` of the session `sid`, or the status of a request on it
+/// when either is gone.
+pub async fn lookup_tree(
+    conn: &Arc<Connection>,
+    sid: u64,
+    tid: u32,
+) -> Result<Arc<RwLock<TreeConnect>>, u32> {
+    let sess_arc = lookup_session(conn, sid).await?;
     let sess = sess_arc.read().await;
     let trees = sess.trees.read().await;
     trees
@@ -44,6 +56,19 @@ pub async fn lookup_open(
     let tree = tree.read().await;
     let opens = tree.opens.read().await;
     opens.get(&file_id).cloned()
+}
+
+/// Closes the open or pipe `file_id` of `tree`, as a CLOSE does, without a
+/// response.
+pub async fn discard_open(tree: &Arc<RwLock<TreeConnect>>, file_id: FileId) {
+    let tree = tree.read().await;
+    let removed = tree.opens.write().await.remove(&file_id);
+    if let Some(open) = removed {
+        drop(tree);
+        close_open(&open, false).await;
+    } else {
+        pipes(&tree).remove(&file_id);
+    }
 }
 
 /// True if a READ or WRITE on `dialect` may carry `channel`. Every

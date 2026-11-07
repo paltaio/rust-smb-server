@@ -17,6 +17,9 @@ pub const FILE_MODE: u32 = 0o100_644;
 /// The mode directories report.
 pub const DIR_MODE: u32 = 0o040_755;
 
+/// The four times of an entry no one set times on.
+const DEFAULT_TIMES: [u64; 4] = [0x01D9_0000_0000_0000; 4];
+
 /// In-memory backend for unit tests. Files and directories are keyed by
 /// backslash-joined path. Clones share the same files. Files and
 /// directories have named streams, unless made with
@@ -308,6 +311,34 @@ impl MemFsBackend {
     /// The contents of the file `path`.
     pub fn contents(&self, path: &str) -> Option<Vec<u8>> {
         self.inner.lock().unwrap().files.get(path).cloned()
+    }
+
+    /// The contents of the named stream `name` of `path`.
+    pub fn stream_contents(&self, path: &str, name: &str) -> Option<Vec<u8>> {
+        let g = self.inner.lock().unwrap();
+        g.streams_of(path)
+            .iter()
+            .find(|s| s.name == name)
+            .map(|s| s.data.clone())
+    }
+
+    /// Gives the entry `path` the creation time `creation` and the last
+    /// write time `write`.
+    pub fn with_times(self, path: &str, creation: u64, write: u64) -> Self {
+        {
+            let mut g = self.inner.lock().unwrap();
+            let stored = g.times.entry(path.to_string()).or_insert(DEFAULT_TIMES);
+            stored[0] = creation;
+            stored[2] = write;
+        }
+        self
+    }
+
+    /// The creation and last write time of `path`.
+    pub fn times(&self, path: &str) -> (u64, u64) {
+        let g = self.inner.lock().unwrap();
+        let [creation, _, write, _] = g.times.get(path).copied().unwrap_or(DEFAULT_TIMES);
+        (creation, write)
     }
 }
 
@@ -697,11 +728,7 @@ impl Handle for MemHandle {
             last_access_time,
             last_write_time,
             change_time,
-        ] = g
-            .times
-            .get(&key)
-            .copied()
-            .unwrap_or([0x01D9_0000_0000_0000; 4]);
+        ] = g.times.get(&key).copied().unwrap_or(DEFAULT_TIMES);
         Ok(FileInfo {
             name,
             end_of_file: size,
@@ -722,7 +749,7 @@ impl Handle for MemHandle {
     async fn set_times(&self, times: FileTimes) -> SmbResult<()> {
         let mut g = self.inner.lock().unwrap();
         let key = self.path(&g)?;
-        let stored = g.times.entry(key).or_insert([0x01D9_0000_0000_0000; 4]);
+        let stored = g.times.entry(key).or_insert(DEFAULT_TIMES);
         let wanted = [
             times.creation_time,
             times.last_access_time,

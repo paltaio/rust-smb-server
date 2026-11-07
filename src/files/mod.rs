@@ -26,7 +26,10 @@ pub(crate) use lease::{Granted, LeaseId, LeaseRequest, LeaseState, LeaseVersion,
 #[cfg(test)]
 pub(crate) use leases::LEASE_BREAK_TIMEOUT;
 pub(crate) use leases::{AfterSend, BreakWait, LeaseRef, LeaseTable, MAX_BREAK_WAIT};
-pub(crate) use table::{FileRef, FileTable, OpenRequest, Refused, Sharing};
+pub(crate) use table::{
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileRef, FileTable, OpenRequest, Refused,
+    Sharing,
+};
 #[cfg(test)]
 pub(crate) use watch::MAX_WATCHES_PER_CONNECTION;
 pub(crate) use watch::{

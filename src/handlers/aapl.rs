@@ -13,7 +13,8 @@ use crate::conn::state::Connection;
 use crate::error::SmbError;
 use crate::info_class::FinderData;
 use crate::proto::messages::aapl::{
-    AAPL_CASE_SENSITIVE, AAPL_SERVER_CAPS, AAPL_SUPPORTS_READ_DIR_ATTR, AAPL_UNIX_BASED,
+    AAPL_CASE_SENSITIVE, AAPL_SERVER_CAPS, AAPL_SUPPORTS_OSX_COPYFILE, AAPL_SUPPORTS_READ_DIR_ATTR,
+    AAPL_UNIX_BASED,
 };
 use crate::proto::messages::{AaplQuery, AaplReply, CreateContext};
 use crate::server::ShareBindings;
@@ -48,18 +49,24 @@ const S_IFDIR: u32 = 0o040_000;
 /// streams, and from then on with every reply on `conn` that carries
 /// server caps: the client keeps the caps of the last such reply for its
 /// session and reads FileIdBothDirectoryInformation on every share by
-/// them.
+/// them. OSX_COPYFILE goes the same way on a share with named streams that
+/// allows server-side copies, when `copyfile` is set.
 pub(super) fn reply(
     conn: &Connection,
     share: &ShareBindings,
     query: &AaplQuery,
     model: &str,
+    copyfile: bool,
 ) -> CreateContext {
     let mut server_caps = SERVER_CAPS;
     if query.bitmap & AAPL_SERVER_CAPS != 0 {
         let grant = query.client_caps & AAPL_SUPPORTS_READ_DIR_ATTR != 0 && share.named_streams;
         if conn.aapl_read_dir_attr.fetch_or(grant, Ordering::AcqRel) || grant {
             server_caps |= AAPL_SUPPORTS_READ_DIR_ATTR;
+        }
+        let grant = copyfile && share.server_side_copy && share.named_streams;
+        if conn.aapl_copyfile.fetch_or(grant, Ordering::AcqRel) || grant {
+            server_caps |= AAPL_SUPPORTS_OSX_COPYFILE;
         }
     }
     let volume_caps = if share.backend.capabilities().case_sensitive {

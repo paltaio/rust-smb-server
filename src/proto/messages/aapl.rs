@@ -17,6 +17,9 @@ pub const AAPL_MODEL_INFO: u64 = 0x04;
 /// Client and server caps: directory listings carry Finder data
 /// (READ_DIR_ATTR).
 pub const AAPL_SUPPORTS_READ_DIR_ATTR: u64 = 0x01;
+/// Client and server caps: a zero-chunk FSCTL_SRV_COPYCHUNK copies a whole
+/// file with its named streams (OSX_COPYFILE).
+pub const AAPL_SUPPORTS_OSX_COPYFILE: u64 = 0x02;
 /// Server caps: the server runs on a Unix system.
 pub const AAPL_UNIX_BASED: u64 = 0x04;
 

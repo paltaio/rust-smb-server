@@ -2,6 +2,9 @@
 //! copy requests FSCTL_SRV_COPYCHUNK and FSCTL_SRV_COPYCHUNK_WRITE (MS-SMB2
 //! 3.3.5.15.6). A copy reads the open a resume key names and writes the
 //! open the request is on, chunk by chunk, before it answers.
+//!
+//! A request without chunks from a connection offered Apple's whole-file
+//! copy copies the file and its named streams, and answers when it is done.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -10,21 +13,24 @@ use tokio::sync::{RwLock, RwLockReadGuard};
 
 use crate::access_mask::{FILE_APPEND_DATA, FILE_READ_DATA, FILE_WRITE_DATA};
 use crate::backend::{Handle, ShareBackend};
-use crate::conn::state::{Connection, Open};
+use crate::conn::state::{Connection, Open, TreeConnect};
 use crate::dispatch::HandlerResponse;
 use crate::error::SmbError;
 use crate::files::{FileRef, Trigger};
+use crate::handlers::Outcome;
 use crate::handlers::create::WRITE_THROUGH_OPTIONS;
 use crate::handlers::ioctl::response;
 use crate::handlers::shared::{lookup_session, restore_fixed_times};
 use crate::ntstatus;
+use crate::proto::header::Smb2Header;
 use crate::proto::messages::copychunk::{
     Chunk, CopychunkRequest, CopychunkResponse, RESUME_KEY_LEN, ResumeKeyResponse, resume_key,
     resume_key_file_id,
 };
 use crate::proto::messages::{FileId, Fsctl, IoctlRequest};
 use crate::server::{ServerState, ShareBindings};
-use crate::stream::stream_error;
+
+mod whole_file;
 
 /// How a copy request ended short of its last chunk: the status, and the
 /// bytes of the chunk it stopped in that were written.
@@ -45,25 +51,40 @@ impl Failure {
     }
 }
 
-/// The status of a copy request on a share that does not serve copies.
-/// After STATUS_NOT_SUPPORTED on a named stream macOS keeps an extended
-/// attribute in a `._` file instead.
-fn refusal(on_stream: bool) -> u32 {
-    if on_stream {
-        ntstatus::STATUS_INVALID_DEVICE_REQUEST
-    } else {
-        ntstatus::STATUS_NOT_SUPPORTED
+/// The answer to a copy request on a share that does not serve copies. A
+/// request on a named stream (`on_stream`) gets
+/// STATUS_INVALID_DEVICE_REQUEST, because after STATUS_NOT_SUPPORTED macOS
+/// keeps an extended attribute in a `._` file instead. A whole-file copy
+/// request (`whole_file`) on a file gets STATUS_ACCESS_DENIED.
+fn refused(whole_file: bool, on_stream: bool) -> Outcome {
+    let status = match (whole_file, on_stream) {
+        (_, true) => ntstatus::STATUS_INVALID_DEVICE_REQUEST,
+        (true, false) => ntstatus::STATUS_ACCESS_DENIED,
+        (false, false) => ntstatus::STATUS_NOT_SUPPORTED,
+    };
+    Outcome::Done(HandlerResponse::err(status))
+}
+
+/// The status a copy request answers for a step that failed with `status`.
+/// A request on a named stream (`on_stream`) never answers
+/// STATUS_NOT_SUPPORTED, and no copy answers STATUS_INVALID_PARAMETER with a
+/// body, which a client reads as the limits.
+fn reply_status(status: u32, on_stream: bool) -> u32 {
+    match status {
+        ntstatus::STATUS_INVALID_PARAMETER => ntstatus::STATUS_INVALID_DEVICE_REQUEST,
+        ntstatus::STATUS_NOT_SUPPORTED if on_stream => ntstatus::STATUS_ACCESS_DENIED,
+        status => status,
     }
 }
 
 /// An IOCTL response with `status` that carries a SRV_COPYCHUNK_RESPONSE.
 fn copy_response(
-    req: &IoctlRequest,
+    ctl_code: u32,
     file_id: FileId,
     status: u32,
     counts: CopychunkResponse,
 ) -> HandlerResponse {
-    let mut answer = response(req.ctl_code, file_id, counts.encode());
+    let mut answer = response(ctl_code, file_id, counts.encode());
     answer.status = status;
     answer
 }
@@ -107,68 +128,132 @@ impl<'a> Guards<'a> {
     fn target(&self) -> &Open {
         self.target.as_deref().unwrap_or(&self.source)
     }
+
+    /// The two sides of a copy from the source to the target, which is on
+    /// `share`. Fails with the status a request on a closed open gets when
+    /// one of them has no handle.
+    fn ends<'s>(&'s self, share: &'s ShareBindings) -> Result<Ends<'s>, u32> {
+        let (source, target) = (self.source(), self.target());
+        let (Some(source_handle), Some(source_file)) =
+            (source.handle.as_deref(), source.file.as_ref())
+        else {
+            return Err(ntstatus::STATUS_OBJECT_NAME_NOT_FOUND);
+        };
+        let (Some(target_handle), Some(target_file)) =
+            (target.handle.as_deref(), target.file.as_ref())
+        else {
+            return Err(ntstatus::STATUS_FILE_CLOSED);
+        };
+        Ok(Ends {
+            source: source_handle,
+            source_file,
+            target: target_handle,
+            target_file,
+            backend: share.backend.as_ref(),
+            on_stream: target.on_stream,
+        })
+    }
 }
 
-/// Answers a request of one of the three FSCTLs on `target`, an open of
-/// the file share `share`.
+/// A request of one of the three FSCTLs, as the IOCTL handler read it.
+pub(super) struct Call<'a> {
+    pub hdr: &'a Smb2Header,
+    pub req: &'a IoctlRequest,
+    pub input: &'a [u8],
+    /// Bytes of the request frame a request that goes asynchronous keeps
+    /// until it completes.
+    pub retained: usize,
+}
+
+/// An open of a copy, with the share and the tree it is on.
+struct Side {
+    tree_id: u32,
+    share: Arc<ShareBindings>,
+    open: Arc<RwLock<Open>>,
+}
+
+/// Answers FSCTL_SRV_REQUEST_RESUME_KEY, FSCTL_SRV_COPYCHUNK or
+/// FSCTL_SRV_COPYCHUNK_WRITE on `target`, an open of a file share on `tree`.
 pub(super) async fn handle(
     server: &Arc<ServerState>,
     conn: &Arc<Connection>,
-    session_id: u64,
-    share: &Arc<ShareBindings>,
+    call: &Call<'_>,
+    tree: &Arc<RwLock<TreeConnect>>,
     target: &Arc<RwLock<Open>>,
-    req: &IoctlRequest,
-    input: &[u8],
-) -> HandlerResponse {
+) -> Outcome {
+    let Call {
+        hdr, req, input, ..
+    } = *call;
+    let (tree_id, share) = {
+        let tree = tree.read().await;
+        (tree.id, Arc::clone(&tree.share))
+    };
     let open = target.read().await;
     let (file_id, on_stream) = (open.file_id, open.on_stream);
-    if !share.server_side_copy {
-        return HandlerResponse::err(refusal(on_stream));
-    }
     if req.fsctl() == Fsctl::SrvRequestResumeKey {
-        return request_resume_key(server, req, &open);
+        if !share.server_side_copy {
+            return refused(false, on_stream);
+        }
+        return Outcome::Done(request_resume_key(server, req, &open));
     }
     drop(open);
 
     let parsed = CopychunkRequest::parse(input);
+    let whole_file = conn.aapl_copyfile.load(Ordering::Acquire)
+        && parsed
+            .as_ref()
+            .is_ok_and(|request| request.chunks.is_empty());
+    if !share.server_side_copy {
+        return refused(whole_file, on_stream);
+    }
     let key = match &parsed {
         Ok(request) => Some(request.source_key),
         Err(over) => over.source_key,
     };
-    let mut source = None;
-    if let Some(key) = key {
-        let Some(found) = find_source(server, conn, session_id, &key).await else {
-            return HandlerResponse::err(ntstatus::STATUS_OBJECT_NAME_NOT_FOUND);
-        };
-        source = Some(found);
-    }
-    if let Some((source_share, _)) = &source
-        && !source_share.server_side_copy
+    let source = match key {
+        Some(key) => match find_source(server, conn, hdr.session_id, &key).await {
+            Some(found) => Some(found),
+            None => {
+                return Outcome::Done(HandlerResponse::err(ntstatus::STATUS_OBJECT_NAME_NOT_FOUND));
+            }
+        },
+        None => None,
+    };
+    if let Some(source) = &source
+        && !source.share.server_side_copy
     {
-        return HandlerResponse::err(refusal(on_stream));
+        return refused(whole_file, on_stream);
     }
     if req.max_output_response < CopychunkResponse::LEN as u32 {
-        return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
+        return Outcome::Done(HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER));
     }
-    let (Ok(request), Some((_, source))) = (parsed, source) else {
-        return copy_response(
-            req,
+    let (Ok(request), Some(source)) = (parsed, source) else {
+        return Outcome::Done(copy_response(
+            req.ctl_code,
             file_id,
             ntstatus::STATUS_INVALID_PARAMETER,
             CopychunkResponse::LIMITS,
-        );
+        ));
     };
     if request.chunks.is_empty() {
-        return copy_response(
-            req,
+        if whole_file {
+            let target = Side {
+                tree_id,
+                share,
+                open: Arc::clone(target),
+            };
+            return whole_file::start(server, conn, call, request.source_key, source, target).await;
+        }
+        return Outcome::Done(copy_response(
+            req.ctl_code,
             file_id,
             ntstatus::STATUS_SUCCESS,
             CopychunkResponse::ZERO,
-        );
+        ));
     }
 
-    let guards = Guards::take(&source, target).await;
-    copy(share, &guards, req, &request.chunks).await
+    let guards = Guards::take(&source.open, target).await;
+    Outcome::Done(copy(&share, &guards, req, &request.chunks).await)
 }
 
 /// MS-SMB2 3.3.5.15.5: the key names the open it is asked on, and holds the
@@ -189,14 +274,14 @@ fn request_resume_key(server: &ServerState, req: &IoctlRequest, open: &Open) -> 
 }
 
 /// The open `key` names among the opens of the session `session_id`, on
-/// any of its trees, and the share it is on. A key made for another
-/// server, another session, or an open that is closed names nothing.
+/// any of its trees, with its share. A key made for another server,
+/// another session, or an open that is closed names nothing.
 async fn find_source(
     server: &ServerState,
     conn: &Arc<Connection>,
     session_id: u64,
     key: &[u8; RESUME_KEY_LEN],
-) -> Option<(Arc<ShareBindings>, Arc<RwLock<Open>>)> {
+) -> Option<Side> {
     let file_id = resume_key_file_id(key, &server.resume_tag)?;
     let session = lookup_session(conn, session_id).await.ok()?;
     let trees: Vec<_> = session
@@ -211,10 +296,25 @@ async fn find_source(
     for tree in trees {
         let tree = tree.read().await;
         if let Some(open) = tree.opens.read().await.get(&file_id) {
-            return Some((Arc::clone(&tree.share), Arc::clone(open)));
+            return Some(Side {
+                tree_id: tree.id,
+                share: Arc::clone(&tree.share),
+                open: Arc::clone(open),
+            });
         }
     }
     None
+}
+
+/// Whether `source` and `target` may take part in the copy FSCTL `code`:
+/// files, the source open for reading and the target for writing, and for
+/// FSCTL_SRV_COPYCHUNK the target also open for reading.
+fn permitted(code: Fsctl, source: &Open, target: &Open) -> bool {
+    !(source.is_directory
+        || target.is_directory
+        || source.granted_access & FILE_READ_DATA == 0
+        || target.granted_access & (FILE_WRITE_DATA | FILE_APPEND_DATA) == 0
+        || (code == Fsctl::SrvCopychunk && target.granted_access & FILE_READ_DATA == 0))
 }
 
 /// Copies `chunks` from the source to the target in order and answers with
@@ -226,83 +326,65 @@ async fn copy(
     chunks: &[Chunk],
 ) -> HandlerResponse {
     let (source, target) = (guards.source(), guards.target());
-    if source.is_directory
-        || target.is_directory
-        || source.granted_access & FILE_READ_DATA == 0
-        || target.granted_access & (FILE_WRITE_DATA | FILE_APPEND_DATA) == 0
-        || (req.fsctl() == Fsctl::SrvCopychunk && target.granted_access & FILE_READ_DATA == 0)
-    {
+    if !permitted(req.fsctl(), source, target) {
         return HandlerResponse::err(ntstatus::STATUS_ACCESS_DENIED);
     }
-    let (Some(source_handle), Some(source_file)) = (source.handle.as_deref(), source.file.as_ref())
-    else {
-        return HandlerResponse::err(ntstatus::STATUS_OBJECT_NAME_NOT_FOUND);
-    };
-    let (Some(target_handle), Some(target_file)) = (target.handle.as_deref(), target.file.as_ref())
-    else {
-        return HandlerResponse::err(ntstatus::STATUS_FILE_CLOSED);
-    };
-    let ends = Ends {
-        source: source_handle,
-        source_file,
-        target: target_handle,
-        target_file,
-        backend: share.backend.as_ref(),
-        on_stream: target.on_stream,
+    let ends = match guards.ends(share) {
+        Ok(ends) => ends,
+        Err(status) => return HandlerResponse::err(status),
     };
 
     if chunks.iter().any(|chunk| ends.check_locks(chunk).is_err()) {
         return copy_response(
-            req,
+            req.ctl_code,
             target.file_id,
             ntstatus::STATUS_FILE_LOCK_CONFLICT,
             CopychunkResponse::ZERO,
         );
     }
-    target_file.break_leases(Trigger::Write);
 
-    let mut copied = 0u32;
-    let mut bytes = 0u32;
-    let mut failure = None;
-    for chunk in chunks {
-        match ends.copy_chunk(chunk).await {
-            Ok(()) => {
-                copied += 1;
-                bytes += chunk.length;
-            }
-            Err(f) => {
-                failure = Some(f);
-                break;
-            }
-        }
-    }
-    let partial = failure.map_or(0, |f| f.partial);
-    let written = bytes + partial;
-    if written > 0 {
-        target.wrote.store(true, Ordering::Release);
-    }
-    // Breaks a lease granted while the copy ran.
-    target_file.break_leases(Trigger::Write);
-    let mut status = failure.map_or(ntstatus::STATUS_SUCCESS, |f| f.status);
+    let run = ends.copy_chunks(target, chunks).await;
+    let mut status = run.failure.map_or(ntstatus::STATUS_SUCCESS, |f| f.status);
     if status == ntstatus::STATUS_SUCCESS
-        && target.create_options & WRITE_THROUGH_OPTIONS != 0
-        && let Err(e) = target_handle.flush().await
+        && let Err(e) = ends.flush_write_through(target).await
     {
         status = ends.status_of(e);
     }
-    if written > 0 {
+    if run.written() > 0 {
         restore_fixed_times(target).await;
     }
     copy_response(
-        req,
+        req.ctl_code,
         target.file_id,
         status,
         CopychunkResponse {
-            chunks_written: copied,
-            chunk_bytes_written: partial,
-            total_bytes_written: written,
+            chunks_written: run.chunks,
+            chunk_bytes_written: run.partial(),
+            total_bytes_written: run.written(),
         },
     )
+}
+
+/// How far a run of chunks got.
+struct Run {
+    /// Chunks copied whole.
+    chunks: u32,
+    /// Bytes of those chunks.
+    bytes: u32,
+    /// How it ended short of its last chunk.
+    failure: Option<Failure>,
+}
+
+impl Run {
+    /// Bytes of the chunk it stopped in that were written.
+    fn partial(&self) -> u32 {
+        self.failure.map_or(0, |f| f.partial)
+    }
+
+    /// Bytes written, including those written of the chunk it stopped in.
+    fn written(&self) -> u32 {
+        self.bytes + self.partial()
+    }
 }
 
 /// The two sides of a copy.
@@ -318,20 +400,9 @@ struct Ends<'a> {
 }
 
 impl Ends<'_> {
-    /// The status for a backend error. A request on a named stream never
-    /// answers STATUS_NOT_SUPPORTED, and no copy answers
-    /// STATUS_INVALID_PARAMETER with a body, which a client reads as the
-    /// limits.
+    /// The status for a backend error, as [`reply_status`] gives it.
     fn status_of(&self, error: SmbError) -> u32 {
-        let error = if self.on_stream {
-            stream_error(error)
-        } else {
-            error
-        };
-        match error.to_nt_status() {
-            ntstatus::STATUS_INVALID_PARAMETER => ntstatus::STATUS_INVALID_DEVICE_REQUEST,
-            status => status,
-        }
+        reply_status(error.to_nt_status(), self.on_stream)
     }
 
     /// A failure after `written` bytes of its chunk, caused by `error`.
@@ -347,6 +418,56 @@ impl Ends<'_> {
         self.source_file
             .check_io(chunk.source_offset, length, false)?;
         self.target_file.check_io(chunk.target_offset, length, true)
+    }
+
+    /// Runs `change`, which writes the target, between two breaks of the
+    /// leases on it. The second break catches a lease granted while `change`
+    /// ran.
+    async fn breaking_leases<T>(&self, change: impl Future<Output = T>) -> T {
+        self.target_file.break_leases(Trigger::Write);
+        let result = change.await;
+        self.target_file.break_leases(Trigger::Write);
+        result
+    }
+
+    /// Flushes the target when its open `target` asked for write-through.
+    async fn flush_write_through(&self, target: &Open) -> Result<(), SmbError> {
+        if target.create_options & WRITE_THROUGH_OPTIONS == 0 {
+            return Ok(());
+        }
+        self.target.flush().await
+    }
+
+    /// Copies `chunks` in order up to the first that fails. The leases on
+    /// the target break before the first chunk and again after the last,
+    /// and the open `target` is marked written once any byte is written.
+    async fn copy_chunks(&self, target: &Open, chunks: &[Chunk]) -> Run {
+        let run = self
+            .breaking_leases(async {
+                let mut run = Run {
+                    chunks: 0,
+                    bytes: 0,
+                    failure: None,
+                };
+                for chunk in chunks {
+                    match self.copy_chunk(chunk).await {
+                        Ok(()) => {
+                            run.chunks += 1;
+                            run.bytes += chunk.length;
+                        }
+                        Err(failure) => {
+                            run.failure = Some(failure);
+                            break;
+                        }
+                    }
+                }
+                run
+            })
+            .await;
+        if run.written() > 0 {
+            target.wrote.store(true, Ordering::Release);
+        }
+        run
     }
 
     /// Copies one chunk. The source range has to lie inside the source;

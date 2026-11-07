@@ -198,6 +198,8 @@ pub struct ServerConfig {
     /// The model string of `AAPL` replies; `None` when the server ignores
     /// the `AAPL` create context.
     pub(crate) apple_model: Option<String>,
+    /// `AAPL` replies offer OSX_COPYFILE.
+    pub(crate) apple_copyfile: bool,
     /// The server is announced on the local network while it serves.
     #[cfg(feature = "discovery")]
     pub(crate) discovery: Option<crate::discovery::Settings>,

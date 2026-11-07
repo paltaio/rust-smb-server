@@ -7,10 +7,12 @@ use std::sync::Arc;
 
 use crate::proto::header::{SMB2_HEADER_LEN, Smb2Header};
 use crate::proto::messages::{Dialect, FileId, Fsctl, IoctlRequest, IoctlResponse};
+use tokio::sync::RwLock;
 use tracing::warn;
 
-use crate::conn::state::Connection;
+use crate::conn::state::{Connection, Open, TreeConnect};
 use crate::dispatch::HandlerResponse;
+use crate::handlers::Outcome;
 use crate::handlers::copy;
 use crate::handlers::negotiate::{select_dialect, server_capabilities, server_security_mode};
 use crate::handlers::shared::{lookup_open, lookup_session_tree};
@@ -32,29 +34,59 @@ pub async fn handle(
     conn: &Arc<Connection>,
     hdr: &Smb2Header,
     body: &[u8],
-) -> HandlerResponse {
-    let tree = match lookup_session_tree(conn, hdr).await {
-        Ok(t) => t,
-        Err(status) => return HandlerResponse::err(status),
+    retained: usize,
+) -> Outcome {
+    let (tree, req, open, input) = match check(conn, hdr, body).await {
+        Ok(checked) => checked,
+        Err(status) => return Outcome::Done(HandlerResponse::err(status)),
     };
-    let req = match IoctlRequest::parse(body) {
-        Ok(r) => r,
-        Err(_) => return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER),
-    };
+    if matches!(
+        req.fsctl(),
+        Fsctl::SrvRequestResumeKey | Fsctl::SrvCopychunk | Fsctl::SrvCopychunkWrite
+    ) && let Some(open) = &open
+    {
+        let call = copy::Call {
+            hdr,
+            req: &req,
+            input,
+            retained,
+        };
+        return copy::handle(server, conn, &call, &tree, open).await;
+    }
+    Outcome::Done(answer(server, conn, &req, open, input).await)
+}
+
+/// Runs the checks every IOCTL gets (MS-SMB2 3.3.5.15). Returns the tree, the
+/// request, the open it names (`None` for an FSCTL that names none), and the
+/// input buffer.
+async fn check<'a>(
+    conn: &Arc<Connection>,
+    hdr: &Smb2Header,
+    body: &'a [u8],
+) -> Result<
+    (
+        Arc<RwLock<TreeConnect>>,
+        IoctlRequest,
+        Option<Arc<RwLock<Open>>>,
+        &'a [u8],
+    ),
+    u32,
+> {
+    let tree = lookup_session_tree(conn, hdr).await?;
+    let req = IoctlRequest::parse(body).map_err(|_| ntstatus::STATUS_INVALID_PARAMETER)?;
     if req.flags != IoctlRequest::FLAG_IS_FSCTL {
-        return HandlerResponse::err(ntstatus::STATUS_NOT_SUPPORTED);
+        return Err(ntstatus::STATUS_NOT_SUPPORTED);
     }
 
-    let fsctl = req.fsctl();
-    let open = if takes_no_file(fsctl) {
+    let open = if takes_no_file(req.fsctl()) {
         if req.file_id != FileId::any() {
-            return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
+            return Err(ntstatus::STATUS_INVALID_PARAMETER);
         }
         None
     } else {
         match lookup_open(&tree, req.file_id).await {
             Some(open) => Some(open),
-            None => return HandlerResponse::err(ntstatus::STATUS_FILE_CLOSED),
+            None => return Err(ntstatus::STATUS_FILE_CLOSED),
         }
     };
 
@@ -63,23 +95,21 @@ pub async fn handle(
         || req.max_input_response > max_transact
         || req.max_output_response > max_transact
     {
-        return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
+        return Err(ntstatus::STATUS_INVALID_PARAMETER);
     }
-    let Some(input) = input_buffer(&req, body) else {
-        return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
-    };
+    let input = input_buffer(&req, body).ok_or(ntstatus::STATUS_INVALID_PARAMETER)?;
+    Ok((tree, req, open, input))
+}
 
-    if matches!(
-        fsctl,
-        Fsctl::SrvRequestResumeKey | Fsctl::SrvCopychunk | Fsctl::SrvCopychunkWrite
-    ) && let Some(open) = &open
-    {
-        let share = Arc::clone(&tree.read().await.share);
-        return copy::handle(server, conn, hdr.session_id, &share, open, &req, input).await;
-    }
-
-    match fsctl {
-        Fsctl::ValidateNegotiateInfo => validate_negotiate_info(server, conn, &req, input).await,
+async fn answer(
+    server: &Arc<ServerState>,
+    conn: &Arc<Connection>,
+    req: &IoctlRequest,
+    open: Option<Arc<RwLock<Open>>>,
+    input: &[u8],
+) -> HandlerResponse {
+    match req.fsctl() {
+        Fsctl::ValidateNegotiateInfo => validate_negotiate_info(server, conn, req, input).await,
         Fsctl::SrvEnumerateSnapshots => {
             if req.max_output_response < 16 {
                 return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
@@ -241,12 +271,11 @@ impl ValidateNegotiateRequest {
 mod tests {
     use super::*;
     use crate::builder::Access;
-    use crate::conn::state::{Session, TreeConnect};
+    use crate::conn::state::Session;
     use crate::handlers::negotiate::ClientNegotiate;
     use crate::proto::auth::ntlm::Identity;
     use crate::proto::header::{Command, HeaderTail};
     use crate::server::ShareBindings;
-    use tokio::sync::RwLock;
 
     const GUID: [u8; 16] = [0xCD; 16];
     const DIALECTS: [u16; 2] = [0x0300, 0x0302];
@@ -277,6 +306,17 @@ mod tests {
             .await
             .insert(7, Arc::new(RwLock::new(session)));
         (server, conn)
+    }
+
+    async fn answer_of(
+        server: &Arc<ServerState>,
+        conn: &Arc<Connection>,
+        body: &[u8],
+    ) -> HandlerResponse {
+        match handle(server, conn, &header(), body, 0).await {
+            Outcome::Done(response) => response,
+            Outcome::Pending(_) => panic!("the request waits"),
+        }
     }
 
     fn header() -> Smb2Header {
@@ -335,14 +375,14 @@ mod tests {
         for (caps, guid, mode, dialects, max) in cases {
             let (server, conn) = connection(Dialect::Smb302).await;
             let body = validate_body(caps, guid, mode, dialects, max);
-            let resp = handle(&server, &conn, &header(), &body).await;
+            let resp = answer_of(&server, &conn, &body).await;
             assert_ne!(resp.status, ntstatus::STATUS_SUCCESS);
             assert!(conn.disconnect_requested(), "{caps:x} {mode} {dialects:?}");
         }
 
         let (server, conn) = connection(Dialect::Smb302).await;
         let body = validate_body(0x44, GUID, 0x0001, &DIALECTS, 24);
-        let resp = handle(&server, &conn, &header(), &body).await;
+        let resp = answer_of(&server, &conn, &body).await;
         assert_eq!(resp.status, ntstatus::STATUS_SUCCESS);
         assert!(!conn.disconnect_requested());
     }
@@ -358,7 +398,7 @@ mod tests {
             .unwrap()
             .dialects = dialects.to_vec();
         let body = validate_body(0x44, GUID, 0x0001, &dialects, 24);
-        handle(&server, &conn, &header(), &body).await;
+        answer_of(&server, &conn, &body).await;
         assert!(conn.disconnect_requested());
     }
 }

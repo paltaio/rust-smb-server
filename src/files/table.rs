@@ -1450,11 +1450,16 @@ impl FileRef {
             .any(|e| e.id != self.id && same_stream(e.stream.as_ref(), stream))
     }
 
+    /// Whether this open and `other` are on the same file of one share,
+    /// whatever their streams.
+    pub(crate) fn same_file_as(&self, other: &FileRef) -> bool {
+        Arc::ptr_eq(&self.node, &other.node)
+    }
+
     /// Whether this open and `other` are on the same data: the same stream
     /// of the same file on one share.
     pub(crate) fn same_data_as(&self, other: &FileRef) -> bool {
-        Arc::ptr_eq(&self.node, &other.node)
-            && same_stream(self.stream().as_ref(), other.stream().as_ref())
+        self.same_file_as(other) && same_stream(self.stream().as_ref(), other.stream().as_ref())
     }
 
     /// Whether this open, moved onto the default stream, passes the
@@ -2028,6 +2033,30 @@ mod tests {
             open(&s, "other-link", FILE_READ_DATA, ALL).err(),
             Some(ntstatus::STATUS_SHARING_VIOLATION)
         );
+    }
+
+    #[test]
+    fn same_file_ignores_streams_and_same_data_does_not() {
+        let s = share();
+        let sharing = Sharing {
+            access: FILE_READ_DATA,
+            share: ALL,
+        };
+        let stream = OpenRequest {
+            sharing,
+            stream: Some("s".parse().unwrap()),
+            ..OpenRequest::default()
+        };
+        let file = open(&s, "f", FILE_READ_DATA, ALL).unwrap();
+        let (on_stream, _) = FileRef::register(&s, &info(7), &p("f"), stream).unwrap();
+        let (other, _) = FileRef::register(&s, &info(8), &p("g"), sharing.into()).unwrap();
+        assert!(file.same_file_as(&on_stream));
+        assert!(!file.same_data_as(&on_stream));
+        assert!(!file.same_file_as(&other));
+        assert!(!file.same_data_as(&other));
+        for f in [file, on_stream, other] {
+            assert!(f.release(false).is_none());
+        }
     }
 
     #[test]

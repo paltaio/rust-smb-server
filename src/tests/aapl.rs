@@ -33,15 +33,18 @@ const FILE_DIRECTORY_FILE: u32 = 0x1;
 const CLIENT: Uuid = Uuid::from_bytes([0xC1; 16]);
 
 /// A server query for every part from a client with every extension.
-const QUERY: [u8; 24] = [
+pub(super) const QUERY: [u8; 24] = [
     0x01, 0, 0, 0, 0, 0, 0, 0, //
     0x07, 0, 0, 0, 0, 0, 0, 0, //
     0x3F, 0, 0, 0, 0, 0, 0, 0,
 ];
 
-/// READ_DIR_ATTR, which shares with named streams get, and UNIX_BASED on
-/// Unix hosts.
-const SERVER_CAPS: u64 = if cfg!(unix) { 0x05 } else { 0x01 };
+const READ_DIR_ATTR: u64 = 0x01;
+pub(super) const OSX_COPYFILE: u64 = 0x02;
+
+/// READ_DIR_ATTR, which shares with named streams get, OSX_COPYFILE, which
+/// those that also copy get, and UNIX_BASED on Unix hosts.
+const SERVER_CAPS: u64 = if cfg!(unix) { 0x07 } else { 0x03 };
 
 /// Memory backend whose names are case-sensitive.
 struct CaseSensitive(MemFsBackend);
@@ -662,7 +665,7 @@ async fn listings_without_read_dir_attr_are_plain() {
     let (_, contexts) = mount(&state, &mut peer, &query).await;
     assert_eq!(
         aapl_reply(&contexts),
-        Some(&reply(SERVER_CAPS & !1, 0, "smb-server")[..])
+        Some(&reply(SERVER_CAPS & !READ_DIR_ATTR, 0, "smb-server")[..])
     );
     assert!(plain(list(&state, &mut peer, 1, ID_BOTH).await));
     // Nor does one whose query asks for no server caps.
@@ -673,7 +676,7 @@ async fn listings_without_read_dir_attr_are_plain() {
 }
 
 #[tokio::test]
-async fn read_dir_attr_once_granted_stays_for_every_share() {
+async fn aapl_caps_once_granted_stay_for_every_share() {
     let state = SmbServer::builder()
         .listen("127.0.0.1:0".parse().unwrap())
         .share(Share::new("home", files()).public())
@@ -682,33 +685,27 @@ async fn read_dir_attr_once_granted_stays_for_every_share() {
         .expect("build")
         .state();
     let mut peer = Peer::new(&state, false).await;
-    let bare = state.find_share("bare").await.expect("share");
-    let session = peer.conn.sessions.read().await[&1].clone();
-    session.read().await.trees.write().await.insert(
-        2,
-        Arc::new(RwLock::new(TreeConnect::new(2, bare, Access::Read))),
-    );
-    let mount_bare = async |peer: &mut Peer| {
-        let (_, mut msg) = peer.message(Command::Create, &mount_body(&QUERY));
-        msg[36..40].copy_from_slice(&2u32.to_le_bytes());
-        let response = peer.dispatch(&state, &msg).await.expect("a response");
-        let (_, _, contexts) = created(&response);
-        contexts
-    };
+    connect_tree_two(&state, &peer, "bare", Access::Read).await;
     // Before a grant, the share without streams gets none.
-    let contexts = mount_bare(&mut peer).await;
+    let contexts = mount_tree_two(&state, &mut peer).await;
     assert_eq!(
         aapl_reply(&contexts),
-        Some(&reply(SERVER_CAPS & !1, 0, "smb-server")[..])
+        Some(
+            &reply(
+                SERVER_CAPS & !(READ_DIR_ATTR | OSX_COPYFILE),
+                0,
+                "smb-server"
+            )[..]
+        )
     );
     assert_eq!(
         entry(&list(&state, &mut peer, 2, ID_BOTH).await, "f.txt").short,
         [0, 0]
     );
     mount(&state, &mut peer, &QUERY).await;
-    // After it, that share gets READ_DIR_ATTR too and lists Finder data
-    // without its streams, with the read-only tree's access.
-    let contexts = mount_bare(&mut peer).await;
+    // After it, that share gets READ_DIR_ATTR and OSX_COPYFILE too and lists
+    // Finder data without its streams, with the read-only tree's access.
+    let contexts = mount_tree_two(&state, &mut peer).await;
     assert_eq!(
         aapl_reply(&contexts),
         Some(&reply(SERVER_CAPS, 0, "smb-server")[..])
@@ -729,6 +726,69 @@ async fn read_dir_attr_once_granted_stays_for_every_share() {
     mount(&state, &mut peer, &query).await;
     let listed = list(&state, &mut peer, 1, ID_BOTH).await;
     assert_eq!(entry(&listed, "f.txt").short, [24, 0]);
+}
+
+/// Connects tree 2 of the session of `peer` to the share `name`.
+async fn connect_tree_two(state: &Arc<ServerState>, peer: &Peer, name: &str, access: Access) {
+    let share = state.find_share(name).await.expect("share");
+    let session = peer.conn.sessions.read().await[&1].clone();
+    session
+        .read()
+        .await
+        .trees
+        .write()
+        .await
+        .insert(2, Arc::new(RwLock::new(TreeConnect::new(2, share, access))));
+}
+
+/// The response contexts of a mount of tree 2 with [`QUERY`].
+async fn mount_tree_two(state: &Arc<ServerState>, peer: &mut Peer) -> Vec<CreateContext> {
+    let (_, mut msg) = peer.message(Command::Create, &mount_body(&QUERY));
+    msg[36..40].copy_from_slice(&2u32.to_le_bytes());
+    let response = peer.dispatch(state, &msg).await.expect("a response");
+    let (_, _, contexts) = created(&response);
+    contexts
+}
+
+/// The server caps of the `AAPL` reply among `contexts`.
+pub(super) fn server_caps(contexts: &[CreateContext]) -> u64 {
+    let data = aapl_reply(contexts).expect("an AAPL reply");
+    u64::from_le_bytes(data[16..24].try_into().unwrap())
+}
+
+/// The server caps a client on a connection of its own gets in the reply
+/// to a mount of the share `name`.
+async fn caps_on_mounting(state: &Arc<ServerState>, name: &str) -> u64 {
+    let mut peer = Peer::new(state, false).await;
+    connect_tree_two(state, &peer, name, Access::ReadWrite).await;
+    server_caps(&mount_tree_two(state, &mut peer).await)
+}
+
+#[tokio::test]
+async fn osx_copyfile_is_offered_only_on_a_share_that_copies() {
+    let state = SmbServer::builder()
+        .listen("127.0.0.1:0".parse().unwrap())
+        .share(Share::new("home", files()).public())
+        .share(
+            Share::new("nocopy", files())
+                .public()
+                .server_side_copy(false),
+        )
+        .build()
+        .expect("build")
+        .state();
+    assert_eq!(caps_on_mounting(&state, "home").await, SERVER_CAPS);
+    assert_eq!(caps_on_mounting(&state, "nocopy").await & OSX_COPYFILE, 0);
+}
+
+#[tokio::test]
+async fn with_apple_copyfile_off_the_reply_leaves_osx_copyfile_out() {
+    let builder = SmbServer::builder().apple_copyfile(false);
+    let state = server_with(builder, files());
+    assert_eq!(
+        caps_on_mounting(&state, "home").await,
+        SERVER_CAPS & !OSX_COPYFILE
+    );
 }
 
 #[tokio::test]

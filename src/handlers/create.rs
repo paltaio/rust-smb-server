@@ -15,6 +15,7 @@ use crate::proto::messages::{
     DurableReconnectV2, DurableRequest, DurableRequestV2, DurableResponse, DurableResponseV2,
     FileId, LeaseContext, OplockLevel,
 };
+use tokio::sync::RwLock;
 use tokio::time::Instant;
 use tracing::{debug, warn};
 use uuid::Uuid;
@@ -28,19 +29,20 @@ use crate::backend::{
     FILE_ATTRIBUTE_NOT_CONTENT_INDEXED, FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_SYSTEM, FileInfo,
     FileTimes, Handle, OpenAction, OpenIntent, OpenOptions, VALID_SET_ATTRIBUTES,
 };
-use crate::conn::pending::{Stop, stopped};
+use crate::conn::pending::{Stop, StopReceiver, stopped};
 use crate::conn::state::{Connection, Open};
 use crate::dispatch::HandlerResponse;
 use crate::ea::{self, Ea};
 use crate::error::SmbError;
 use crate::files::{
-    BreakWait, CONTENT_CHANGED, Change, Closing, Durability, FileRef, Granted, LeaseId, LeaseRef,
-    LeaseRequest, LeaseState, LeaseVersion, MAX_BREAK_WAIT, OpenRequest, OpenSlot, Refused,
-    STREAM_BASE_CHANGED, STREAM_CHANGED, Sharing, Trigger, finish_close, v2_timeout,
+    AfterSend, BreakWait, CONTENT_CHANGED, Change, Closing, Durability, FILE_SHARE_DELETE,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, FileRef, Granted, LeaseId, LeaseRef, LeaseRequest,
+    LeaseState, LeaseVersion, MAX_BREAK_WAIT, OpenRequest, OpenSlot, Refused, STREAM_BASE_CHANGED,
+    STREAM_CHANGED, Sharing, Trigger, finish_close, v2_timeout,
 };
 use crate::handlers::aapl;
 use crate::handlers::reconnect::{self, Reconnect};
-use crate::handlers::shared::{lookup_session, lookup_session_tree};
+use crate::handlers::shared::{lookup_session, lookup_session_tree, lookup_tree};
 use crate::handlers::{Outcome, Pending};
 use crate::info_class::VOLUME_SERIAL_NUMBER;
 use crate::ntstatus;
@@ -121,6 +123,7 @@ const GRANTABLE_LEASE: LeaseState = LeaseState::RWH;
 
 /// Create contexts of a request that the response answers (MS-SMB2
 /// 3.3.5.9.5, 3.3.5.9.9) or that fail it. Other contexts are ignored.
+#[derive(Default)]
 pub(super) struct ContextQueries {
     /// QUERY_MAXIMAL_ACCESS, with its timestamp if it has one.
     maximal_access: Option<Option<u64>>,
@@ -137,8 +140,9 @@ pub(super) struct ContextQueries {
 }
 
 /// The durable handle a CREATE asks for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum DurableAsk {
+    #[default]
     None,
     /// DHnQ (MS-SMB2 3.3.5.9.6).
     V1,
@@ -603,6 +607,46 @@ impl CreateArgs {
             owner,
         }))
     }
+
+    /// The CREATE of a stream a server-side copy opens.
+    fn for_copy(stream: &CopyStream) -> Self {
+        let (intent, create_disposition, open_access) = if stream.write {
+            (OpenIntent::OpenOrCreate, FILE_OPEN_IF, FILE_WRITE_DATA)
+        } else {
+            (OpenIntent::Open, FILE_OPEN, FILE_READ_DATA)
+        };
+        Self {
+            path: stream.path.clone(),
+            stream: Some(stream.name.clone()),
+            intent,
+            options: 0,
+            create_disposition,
+            open_access,
+            maximal: 0,
+            delete_on_close: false,
+            new_attributes: 0,
+            eas: Ok(Vec::new()),
+            stream_exta: false,
+            no_ea_knowledge: false,
+            opts: OpenOptions {
+                read: !stream.write,
+                write: stream.write,
+                write_attributes: false,
+                intent,
+                directory: false,
+                non_directory: false,
+                delete_on_close: false,
+            },
+            sharing: Sharing {
+                access: open_access,
+                share: FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            },
+            queries: ContextQueries::default(),
+            lease: None,
+            aapl: None,
+            owner: None,
+        }
+    }
 }
 
 /// Where an attempt to open stands.
@@ -697,9 +741,95 @@ impl Stage {
 
 /// How an attempt ended.
 enum Step {
-    Done(HandlerResponse),
+    /// The open is in its tree.
+    Opened(Box<Opened>),
+    Failed(u32),
     /// A lease break has to complete first.
     Wait(BreakWait, Stage),
+}
+
+/// An open an attempt made, and what the CREATE response reports of it.
+struct Opened {
+    open: Arc<RwLock<Open>>,
+    file_id: FileId,
+    share: Arc<ShareBindings>,
+    info: FileInfo,
+    action: OpenAction,
+    granted: Option<Granted>,
+    durability: Option<Durability>,
+    volume_serial: u32,
+    after_send: Option<AfterSend>,
+}
+
+impl Opened {
+    /// The CREATE response for `args`, made on `conn`.
+    fn respond(
+        self,
+        server: &ServerState,
+        conn: &Connection,
+        args: &CreateArgs,
+    ) -> HandlerResponse {
+        let Self {
+            file_id,
+            share,
+            info,
+            action,
+            granted,
+            durability,
+            volume_serial,
+            after_send,
+            ..
+        } = self;
+        let create_action = match action {
+            OpenAction::Opened => FILE_OPENED,
+            OpenAction::Created => FILE_CREATED,
+            OpenAction::Overwritten if args.create_disposition == FILE_SUPERSEDE => FILE_SUPERSEDED,
+            OpenAction::Overwritten => FILE_OVERWRITTEN,
+        };
+        let mut answers = args.queries.answer(&info, args.maximal, volume_serial);
+        if let (Some(query), Some(model)) = (&args.aapl, &server.config.apple_model) {
+            answers.insert(
+                0,
+                aapl::reply(conn, &share, query, model, server.config.apple_copyfile),
+            );
+        }
+        if let Some(granted) = &granted {
+            answers.push(lease_response(granted));
+        }
+        if let Some(durability) = durability {
+            debug!(
+                id = file_id.persistent,
+                timeout = ?durability.timeout,
+                v2 = durability.create_guid.is_some(),
+                "durable open granted"
+            );
+            answers.push(match durability.create_guid {
+                None => CreateContext {
+                    name: CreateContext::NAME_DHNQ.to_vec(),
+                    data: DurableResponse.encode(),
+                },
+                Some(_) => CreateContext {
+                    name: CreateContext::NAME_DH2Q.to_vec(),
+                    data: DurableResponseV2 {
+                        timeout_ms: u32::try_from(durability.timeout.as_millis())
+                            .unwrap_or(u32::MAX),
+                        flags: 0,
+                    }
+                    .encode(),
+                },
+            });
+        }
+        let shown = match args.stream {
+            Some(_) => data_stream_info(info),
+            None => info,
+        };
+        let buf = encode_response(&shown, file_id, granted.is_some(), create_action, &answers);
+        let mut response = HandlerResponse::ok(buf);
+        if let Some(guard) = after_send {
+            response.after_send.push(guard);
+        }
+        response
+    }
 }
 
 pub async fn handle(
@@ -709,6 +839,9 @@ pub async fn handle(
     body: &[u8],
     retained: usize,
 ) -> Outcome {
+    let Some(place) = Place::of(hdr) else {
+        return Outcome::Done(HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER));
+    };
     let args = match CreateArgs::parse(server, conn, hdr, body).await {
         Ok(Request::Open(args)) => args,
         Ok(Request::Reconnect(r)) => {
@@ -731,8 +864,9 @@ pub async fn handle(
             return Outcome::Done(HandlerResponse::err(ntstatus::STATUS_DUPLICATE_OBJECTID));
         }
     }
-    let (wait, stage) = match attempt(server, conn, hdr, &args, Stage::Start).await {
-        Step::Done(response) => return Outcome::Done(response),
+    let (wait, stage) = match attempt(server, conn, place, &args, Stage::Start).await {
+        Step::Opened(opened) => return Outcome::Done(opened.respond(server, conn, &args)),
+        Step::Failed(status) => return Outcome::Done(HandlerResponse::err(status)),
         Step::Wait(wait, stage) => (wait, stage),
     };
     // MS-SMB2 3.3.4.2: past its limits the connection gets no more
@@ -744,39 +878,11 @@ pub async fn handle(
             ntstatus::STATUS_INSUFFICIENT_RESOURCES,
         ));
     };
-    let (server, conn, hdr) = (Arc::clone(server), Arc::clone(conn), *hdr);
-    // The wait ends when the breaks complete, which their acknowledgment
-    // timers bound. A wait that runs out with nothing changed on the file,
-    // or one that outlasts [`MAX_BREAK_WAIT`], fails the CREATE as a sharing
-    // violation.
+    let (server, conn) = (Arc::clone(server), Arc::clone(conn));
     let work = async move {
-        let give_up = Instant::now() + MAX_BREAK_WAIT;
-        let mut wait = wait;
-        let mut stage = stage;
-        loop {
-            let changed = tokio::select! {
-                biased;
-                why = stopped(&mut stop) => {
-                    if why == Stop::Cancelled {
-                        stage.release().await;
-                        return HandlerResponse::err(ntstatus::STATUS_CANCELLED);
-                    }
-                    true
-                }
-                changed = wait.changed() => changed,
-                () = tokio::time::sleep_until(give_up) => false,
-            };
-            match attempt(&server, &conn, &hdr, &args, stage).await {
-                Step::Done(response) => return response,
-                Step::Wait(_, left) if !changed => {
-                    left.release().await;
-                    return HandlerResponse::err(ntstatus::STATUS_SHARING_VIOLATION);
-                }
-                Step::Wait(next, left) => {
-                    wait = next;
-                    stage = left;
-                }
-            }
+        match wait_for_open(&server, &conn, place, &args, wait, stage, &mut stop).await {
+            Ok(opened) => opened.respond(&server, &conn, &args),
+            Err(status) => HandlerResponse::err(status),
         }
     };
     Outcome::Pending(Pending {
@@ -785,17 +891,114 @@ pub async fn handle(
     })
 }
 
+/// Tries the open again each time a lease break it waits for makes
+/// progress. The wait ends when the breaks complete, which their
+/// acknowledgment timers bound. A wait that runs out with nothing changed
+/// on the file, or one that outlasts [`MAX_BREAK_WAIT`], fails the open as a
+/// sharing violation.
+async fn wait_for_open(
+    server: &Arc<ServerState>,
+    conn: &Arc<Connection>,
+    place: Place,
+    args: &CreateArgs,
+    mut wait: BreakWait,
+    mut stage: Stage,
+    stop: &mut StopReceiver,
+) -> Result<Box<Opened>, u32> {
+    let give_up = Instant::now() + MAX_BREAK_WAIT;
+    loop {
+        let changed = tokio::select! {
+            biased;
+            why = stopped(stop) => {
+                if why == Stop::Cancelled {
+                    stage.release().await;
+                    return Err(ntstatus::STATUS_CANCELLED);
+                }
+                true
+            }
+            changed = wait.changed() => changed,
+            () = tokio::time::sleep_until(give_up) => false,
+        };
+        match attempt(server, conn, place, args, stage).await {
+            Step::Opened(opened) => return Ok(opened),
+            Step::Failed(status) => return Err(status),
+            Step::Wait(_, left) if !changed => {
+                left.release().await;
+                return Err(ntstatus::STATUS_SHARING_VIOLATION);
+            }
+            Step::Wait(next, left) => {
+                wait = next;
+                stage = left;
+            }
+        }
+    }
+}
+
+/// The session and tree a CREATE is made on.
+#[derive(Clone, Copy)]
+struct Place {
+    session_id: u64,
+    tree_id: u32,
+}
+
+impl Place {
+    /// The place a request names; `None` for a header that names no tree.
+    fn of(hdr: &Smb2Header) -> Option<Self> {
+        Some(Self {
+            session_id: hdr.session_id,
+            tree_id: hdr.tree_id()?,
+        })
+    }
+}
+
+/// A named stream a server-side copy opens: the stream `name` of the file at
+/// `path`, on the tree `tree_id` of the session `session_id`.
+pub(super) struct CopyStream {
+    pub session_id: u64,
+    pub tree_id: u32,
+    pub path: SmbPath,
+    pub name: StreamName,
+    /// Opened for writing, and created when it is missing; otherwise opened
+    /// for reading. An existing stream keeps its data.
+    pub write: bool,
+}
+
+/// Opens a stream for a server-side copy as a CREATE would: the same
+/// sharing checks and lease breaks, and the same changes reported. The open
+/// is in its tree like any other, holds no lease, and shares everything.
+/// Returns its FileId and the open; closing it is up to the caller.
+pub(super) async fn open_copy_stream(
+    server: &Arc<ServerState>,
+    conn: &Arc<Connection>,
+    stream: &CopyStream,
+    stop: &mut StopReceiver,
+) -> Result<(FileId, Arc<RwLock<Open>>), u32> {
+    let args = CreateArgs::for_copy(stream);
+    let place = Place {
+        session_id: stream.session_id,
+        tree_id: stream.tree_id,
+    };
+    let opened = match attempt(server, conn, place, &args, Stage::Start).await {
+        Step::Opened(opened) => opened,
+        Step::Failed(status) => return Err(status),
+        Step::Wait(wait, stage) => {
+            wait_for_open(server, conn, place, &args, wait, stage, stop).await?
+        }
+    };
+    Ok((opened.file_id, opened.open))
+}
+
 /// One try at opening the file. Runs the session and tree checks again, so
 /// a CREATE that waited fails once its session or tree is gone.
 async fn attempt(
     server: &Arc<ServerState>,
     conn: &Arc<Connection>,
-    hdr: &Smb2Header,
+    place: Place,
     args: &CreateArgs,
     stage: Stage,
 ) -> Step {
-    let fail = |status| Step::Done(HandlerResponse::err(status));
-    let tree_arc = match lookup_session_tree(conn, hdr).await {
+    let fail = Step::Failed;
+    let tree_arc = match lookup_tree(conn, place.session_id, place.tree_id).await {
         Ok(t) => t,
         Err(s) => {
             stage.release().await;
@@ -1189,55 +1392,21 @@ async fn attempt(
         resized: AtomicBool::new(stream.is_some() && action == OpenAction::Overwritten),
         moved_data: false,
     };
-    let open_arc = Arc::new(tokio::sync::RwLock::new(open));
-    tree.opens.get_mut().insert(file_id, open_arc);
+    let open_arc = Arc::new(RwLock::new(open));
+    tree.opens.get_mut().insert(file_id, Arc::clone(&open_arc));
     drop(tree);
 
-    let create_action = match action {
-        OpenAction::Opened => FILE_OPENED,
-        OpenAction::Created => FILE_CREATED,
-        OpenAction::Overwritten if args.create_disposition == FILE_SUPERSEDE => FILE_SUPERSEDED,
-        OpenAction::Overwritten => FILE_OVERWRITTEN,
-    };
-    let mut answers = args.queries.answer(&info, args.maximal, volume_serial);
-    if let (Some(query), Some(model)) = (&args.aapl, &server.config.apple_model) {
-        answers.insert(0, aapl::reply(conn, &share, query, model));
-    }
-    if let Some(granted) = &granted {
-        answers.push(lease_response(granted));
-    }
-    if let Some(durability) = durability {
-        debug!(
-            id = file_id.persistent,
-            timeout = ?durability.timeout,
-            v2 = durability.create_guid.is_some(),
-            "durable open granted"
-        );
-        answers.push(match durability.create_guid {
-            None => CreateContext {
-                name: CreateContext::NAME_DHNQ.to_vec(),
-                data: DurableResponse.encode(),
-            },
-            Some(_) => CreateContext {
-                name: CreateContext::NAME_DH2Q.to_vec(),
-                data: DurableResponseV2 {
-                    timeout_ms: u32::try_from(durability.timeout.as_millis()).unwrap_or(u32::MAX),
-                    flags: 0,
-                }
-                .encode(),
-            },
-        });
-    }
-    let shown = match stream {
-        Some(_) => data_stream_info(info),
-        None => info,
-    };
-    let buf = encode_response(&shown, file_id, granted.is_some(), create_action, &answers);
-    let mut response = HandlerResponse::ok(buf);
-    if let Some(guard) = after_send {
-        response.after_send.push(Box::new(guard));
-    }
-    Step::Done(response)
+    Step::Opened(Box::new(Opened {
+        open: open_arc,
+        file_id,
+        share,
+        info,
+        action,
+        granted,
+        durability,
+        volume_serial,
+        after_send: after_send.map(|guard| Box::new(guard) as AfterSend),
+    }))
 }
 
 /// Opens `path`, or its named stream `stream`, on the backend with `opts`
