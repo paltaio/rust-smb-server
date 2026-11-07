@@ -2159,3 +2159,133 @@ async fn a_backend_that_copied_part_of_a_chunk_before_the_write_failed_is_counte
     assert_eq!(watcher.events(w).await, [(MODIFIED, "t".to_string())]);
     assert_eq!(spy.copy_calls(), [(0, 0, 1000)]);
 }
+
+// ---------------------------------------------------------------------------
+// Files on the host
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "localfs")]
+mod local {
+    use std::path::Path;
+
+    use super::*;
+    use crate::fs::LocalFsBackend;
+
+    fn share(name: &str, dir: &Path) -> Share {
+        Share::new(name, LocalFsBackend::new(dir).unwrap()).public()
+    }
+
+    #[tokio::test]
+    async fn a_file_is_copied_chunk_by_chunk_within_its_share() {
+        let td = tempfile::tempdir().unwrap();
+        let data = pattern(2 * MIB as usize + 12_345, 0x21);
+        std::fs::write(td.path().join("s"), &data).unwrap();
+        std::fs::write(td.path().join("t"), []).unwrap();
+        let state = server_on(vec![share("home", td.path())]);
+        let mut c = Client::new(&state).await;
+        let source = c.open(Create::new("s")).await;
+        let target = c.open(Create::new("t")).await;
+        let key = c.key(source).await;
+        let mib = u64::from(MIB);
+        let chunks = [(0, 0, MIB), (mib, mib, MIB), (2 * mib, 2 * mib, 12_345)];
+        assert_eq!(
+            c.copy(target, &key, &chunks).await,
+            (OK, Some([3, 0, 2 * MIB + 12_345]))
+        );
+        assert_eq!(std::fs::read(td.path().join("t")).unwrap(), data);
+    }
+
+    #[tokio::test]
+    async fn one_file_through_two_shares_copies_as_if_moved_through_a_buffer() {
+        let td = tempfile::tempdir().unwrap();
+        let data = pattern(10_000, 0x23);
+        std::fs::write(td.path().join("f"), &data).unwrap();
+        let state = server_on(vec![share("home", td.path()), share("other", td.path())]);
+        let mut c = Client::new(&state)
+            .await
+            .with_other_share(Access::ReadWrite)
+            .await;
+        let source = c.open(Create::new("f")).await;
+        let target = c.open_at(OTHER, Create::new("f")).await;
+        let key = c.key(source).await;
+
+        let mut expected = data.clone();
+        expected.resize(2048 + 8192, 0);
+        expected.copy_within(0..8192, 2048);
+        assert_eq!(
+            c.copy_at(OTHER, COPYCHUNK, target, &key, &[(0, 2048, 8192)])
+                .await,
+            (OK, Some([1, 0, 8192]))
+        );
+        assert_eq!(std::fs::read(td.path().join("f")).unwrap(), expected);
+
+        expected.copy_within(4096..8096, 1000);
+        assert_eq!(
+            c.copy_at(OTHER, COPYCHUNK, target, &key, &[(4096, 1000, 4000)])
+                .await,
+            (OK, Some([1, 0, 4000]))
+        );
+        assert_eq!(std::fs::read(td.path().join("f")).unwrap(), expected);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_copy_between_two_filesystems_keeps_every_byte() {
+        let Some((build, shm)) = crate::tests::filesystems::pair() else {
+            return;
+        };
+        let data = pattern(MIB as usize + 451_424, 0x24);
+        std::fs::write(build.path().join("s"), &data).unwrap();
+        std::fs::write(shm.path().join("t"), []).unwrap();
+        let state = server_on(vec![
+            share("home", build.path()),
+            share("other", shm.path()),
+        ]);
+        let mut c = Client::new(&state)
+            .await
+            .with_other_share(Access::ReadWrite)
+            .await;
+        let source = c.open(Create::new("s")).await;
+        let target = c.open_at(OTHER, Create::new("t")).await;
+        let key = c.key(source).await;
+        let chunks = [(0, 0, MIB), (u64::from(MIB), u64::from(MIB), 451_424)];
+        assert_eq!(
+            c.copy_at(OTHER, COPYCHUNK, target, &key, &chunks).await,
+            (OK, Some([2, 0, MIB + 451_424]))
+        );
+        assert_eq!(std::fs::read(shm.path().join("t")).unwrap(), data);
+    }
+
+    #[tokio::test]
+    async fn a_named_stream_is_copied_from_and_to_a_file() {
+        let exe = std::env::current_exe().unwrap();
+        let td = tempfile::tempdir_in(exe.parent().unwrap()).unwrap();
+        let backend = LocalFsBackend::new(td.path()).unwrap();
+        if !backend.capabilities().named_streams {
+            eprintln!("skipping: no named streams on {}", td.path().display());
+            return;
+        }
+        std::fs::write(td.path().join("f"), b"file data").unwrap();
+        std::fs::write(td.path().join("g"), []).unwrap();
+        std::fs::write(td.path().join("h"), []).unwrap();
+        let state = server_on(vec![Share::new("home", backend).public()]);
+        let mut c = Client::new(&state).await;
+        let file = c.open(Create::new("f")).await;
+        let stream = c.open(Create::new("g:s").disposition(FILE_CREATE)).await;
+        let key = c.key(file).await;
+        assert_eq!(
+            c.copy(stream, &key, &[(0, 0, 9)]).await,
+            (OK, Some([1, 0, 9]))
+        );
+        assert_eq!(c.read(stream, 0, 100).await, b"file data");
+        assert!(std::fs::read(td.path().join("g")).unwrap().is_empty());
+
+        let key = c.key(stream).await;
+        let target = c.open(Create::new("h")).await;
+        assert_eq!(
+            c.copy(target, &key, &[(0, 0, 9)]).await,
+            (OK, Some([1, 0, 9]))
+        );
+        assert_eq!(std::fs::read(td.path().join("h")).unwrap(), b"file data");
+    }
+}

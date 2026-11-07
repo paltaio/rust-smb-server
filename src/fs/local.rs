@@ -749,6 +749,77 @@ fn write_at(file: &std::fs::File, data: &[u8], offset: u64) -> io::Result<usize>
     }
 }
 
+/// `handle` as a handle of this backend, `None` for any other.
+#[cfg(target_os = "linux")]
+fn local_handle(handle: &dyn Handle) -> Option<&LocalHandle> {
+    handle.as_any()?.downcast_ref()
+}
+
+/// Copies `len` bytes at `src_offset` of `src` to `dst_offset` of `dst` with
+/// copy_file_range(2) until they are copied or `src` ends. Returns the
+/// bytes copied and the error that ended the copy early, if any.
+///
+/// Overlapping ranges of one file fail with EINVAL before anything is
+/// copied. The kernel checks the overlap after it cuts the range at the end
+/// of `src`, so a range cut short can pass its check.
+#[cfg(target_os = "linux")]
+fn copy_file_range_loop(
+    src: &std::fs::File,
+    mut src_offset: u64,
+    dst: &std::fs::File,
+    mut dst_offset: u64,
+    len: u64,
+) -> (u64, Option<rustix::io::Errno>) {
+    use rustix::io::Errno;
+
+    let overlap =
+        src_offset.saturating_add(len) > dst_offset && dst_offset.saturating_add(len) > src_offset;
+    // If the files cannot be compared, they count as the same file.
+    if overlap && same_file(src, dst).unwrap_or(true) {
+        return (0, Some(Errno::INVAL));
+    }
+    let mut copied = 0;
+    while copied < len {
+        let want = usize::try_from(len - copied).unwrap_or(usize::MAX);
+        match rustix::fs::copy_file_range(
+            src,
+            Some(&mut src_offset),
+            dst,
+            Some(&mut dst_offset),
+            want,
+        ) {
+            Ok(0) => break,
+            Ok(n) => copied += n as u64,
+            Err(Errno::INTR) => {}
+            Err(errno) => return (copied, Some(errno)),
+        }
+    }
+    (copied, None)
+}
+
+/// True if `a` and `b` are open on one file.
+#[cfg(target_os = "linux")]
+fn same_file(a: &std::fs::File, b: &std::fs::File) -> io::Result<bool> {
+    let key = |file| Metadata::from_file(file).map(|md| file_key(&md));
+    Ok(key(a)? == key(b)?)
+}
+
+/// The error of a copy_file_range(2) call that copied nothing. A copy the
+/// kernel cannot make between these files is left to reads and writes.
+#[cfg(target_os = "linux")]
+fn copy_error(errno: rustix::io::Errno) -> SmbError {
+    use rustix::io::Errno;
+    match errno {
+        Errno::XDEV
+        | Errno::OPNOTSUPP
+        | Errno::NOSYS
+        | Errno::INVAL
+        | Errno::PERM
+        | Errno::BADF => SmbError::NotSupported,
+        errno => io_to_smb(errno.into()),
+    }
+}
+
 /// Host identity of a file: device and inode number on Unix, volume serial
 /// number and file index on Windows. `None` if `md` does not carry it.
 pub(super) fn file_key(md: &Metadata) -> Option<(u64, u64)> {
@@ -1949,6 +2020,41 @@ impl ShareBackend for LocalFsBackend {
             .map_err(io_to_smb)
     }
 
+    #[cfg(target_os = "linux")]
+    async fn copy_range(
+        &self,
+        src: &dyn Handle,
+        src_offset: u64,
+        dst: &dyn Handle,
+        dst_offset: u64,
+        len: u64,
+    ) -> SmbResult<u64> {
+        let (
+            Some(LocalHandle::File { file: src, .. }),
+            Some(LocalHandle::File {
+                file: dst,
+                read_only,
+                ..
+            }),
+        ) = (local_handle(src), local_handle(dst))
+        else {
+            return Err(SmbError::NotSupported);
+        };
+        if *read_only {
+            return Err(SmbError::AccessDenied);
+        }
+        let (src, dst) = (Arc::clone(src), Arc::clone(dst));
+        let (copied, stopped) =
+            spawn_blocking(move || copy_file_range_loop(&src, src_offset, &dst, dst_offset, len))
+                .await
+                .map_err(join_to_io)
+                .map_err(io_to_smb)?;
+        match stopped {
+            Some(errno) if copied == 0 => Err(copy_error(errno)),
+            _ => Ok(copied),
+        }
+    }
+
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     async fn open_stream(
         &self,
@@ -2572,6 +2678,10 @@ impl Handle for LocalHandle {
             .map_err(join_to_io)
             .map_err(io_to_smb)
     }
+
+    fn as_any(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
+        Some(self)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2635,6 +2745,18 @@ pub(super) mod tests {
             non_directory: false,
             delete_on_close: false,
         }
+    }
+
+    /// Opens the existing file `name` of `backend` for reading and writing.
+    #[cfg(any(target_os = "linux", windows))]
+    async fn open(backend: &LocalFsBackend, name: &str) -> Box<dyn Handle> {
+        backend.open(&p(name), opts_open_rw()).await.unwrap().0
+    }
+
+    /// Opens the existing file `name` of `backend` for reading.
+    #[cfg(any(target_os = "linux", windows))]
+    async fn open_ro(backend: &LocalFsBackend, name: &str) -> Box<dyn Handle> {
+        backend.open(&p(name), opts_open_ro()).await.unwrap().0
     }
 
     #[tokio::test]
@@ -3537,6 +3659,189 @@ pub(super) mod tests {
             let (file, _) = backend.open(&p("f"), opts).await.unwrap();
             file.close().await.unwrap();
             drop(holder);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    mod copy_range {
+        use super::*;
+        use rustix::io::Errno;
+
+        fn data(len: usize) -> Vec<u8> {
+            (0..len)
+                .map(|i| (i.wrapping_mul(31) ^ (i >> 8)) as u8)
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn copies_a_range_between_files() {
+            let td = tempdir().unwrap();
+            let bytes = data(300_000);
+            std::fs::write(td.path().join("s"), &bytes).unwrap();
+            std::fs::write(td.path().join("t"), [7u8; 10]).unwrap();
+            let backend = LocalFsBackend::new(td.path()).unwrap();
+            let (s, t) = (open(&backend, "s").await, open(&backend, "t").await);
+            let copied = backend.copy_range(&*s, 1000, &*t, 4, 250_000).await;
+            assert_eq!(copied.unwrap(), 250_000);
+            let mut expected = vec![7u8; 4];
+            expected.extend_from_slice(&bytes[1000..251_000]);
+            assert_eq!(std::fs::read(td.path().join("t")).unwrap(), expected);
+        }
+
+        #[tokio::test]
+        async fn stops_at_the_end_of_the_source() {
+            let td = tempdir().unwrap();
+            let bytes = data(5000);
+            std::fs::write(td.path().join("s"), &bytes).unwrap();
+            std::fs::write(td.path().join("t"), []).unwrap();
+            let backend = LocalFsBackend::new(td.path()).unwrap();
+            let (s, t) = (open(&backend, "s").await, open(&backend, "t").await);
+            let copied = backend.copy_range(&*s, 1000, &*t, 0, 10_000).await;
+            assert_eq!(copied.unwrap(), 4000);
+            assert_eq!(std::fs::read(td.path().join("t")).unwrap(), bytes[1000..]);
+            assert_eq!(backend.copy_range(&*s, 6000, &*t, 0, 10).await.unwrap(), 0);
+        }
+
+        #[tokio::test]
+        async fn a_target_past_its_end_gets_a_gap_of_zeros() {
+            let td = tempdir().unwrap();
+            let bytes = data(1000);
+            std::fs::write(td.path().join("s"), &bytes).unwrap();
+            std::fs::write(td.path().join("t"), [7u8; 10]).unwrap();
+            let backend = LocalFsBackend::new(td.path()).unwrap();
+            let (s, t) = (open(&backend, "s").await, open(&backend, "t").await);
+            assert_eq!(
+                backend.copy_range(&*s, 0, &*t, 5000, 1000).await.unwrap(),
+                1000
+            );
+            let mut expected = vec![7u8; 10];
+            expected.resize(5000, 0);
+            expected.extend_from_slice(&bytes);
+            assert_eq!(std::fs::read(td.path().join("t")).unwrap(), expected);
+        }
+
+        #[tokio::test]
+        async fn overlapping_ranges_of_one_file_are_left_to_the_server() {
+            let td = tempdir().unwrap();
+            let bytes = data(10_000);
+            std::fs::write(td.path().join("f"), &bytes).unwrap();
+            let short = data(3000);
+            std::fs::write(td.path().join("short"), &short).unwrap();
+            let (a, b) = (
+                LocalFsBackend::new(td.path()).unwrap(),
+                LocalFsBackend::new(td.path()).unwrap(),
+            );
+            let (f, g) = (open(&a, "f").await, open(&b, "f").await);
+            for (from, to) in [(0, 2048), (2048, 0), (0, 0)] {
+                let copied = a.copy_range(&*f, from, &*g, to, 8192).await;
+                assert!(matches!(copied, Err(SmbError::NotSupported)), "{from} {to}");
+                assert_eq!(std::fs::read(td.path().join("f")).unwrap(), bytes);
+            }
+
+            // The kernel cuts this range at the end of the file, and the
+            // part left does not overlap.
+            let (s, r) = (open(&a, "short").await, open(&b, "short").await);
+            let copied = a.copy_range(&*s, 0, &*r, 3500, 4096).await;
+            assert!(matches!(copied, Err(SmbError::NotSupported)));
+            assert_eq!(std::fs::read(td.path().join("short")).unwrap(), short);
+        }
+
+        #[tokio::test]
+        async fn a_range_of_one_file_that_does_not_overlap_its_target_is_copied() {
+            let td = tempdir().unwrap();
+            let bytes = data(10_000);
+            std::fs::write(td.path().join("f"), &bytes).unwrap();
+            let (a, b) = (
+                LocalFsBackend::new(td.path()).unwrap(),
+                LocalFsBackend::new(td.path()).unwrap(),
+            );
+            let (f, g) = (open(&a, "f").await, open(&b, "f").await);
+            assert_eq!(a.copy_range(&*f, 0, &*g, 20_000, 1000).await.unwrap(), 1000);
+            let mut expected = bytes.clone();
+            expected.resize(20_000, 0);
+            expected.extend_from_slice(&bytes[..1000]);
+            assert_eq!(std::fs::read(td.path().join("f")).unwrap(), expected);
+        }
+
+        /// Some kernels copy across filesystems; others refuse.
+        #[tokio::test]
+        async fn a_copy_across_filesystems_is_made_whole_or_left_to_the_server() {
+            let Some((build, shm)) = crate::tests::filesystems::pair() else {
+                return;
+            };
+            let bytes = data(100_000);
+            std::fs::write(build.path().join("s"), &bytes).unwrap();
+            std::fs::write(shm.path().join("t"), []).unwrap();
+            let (from, to) = (
+                LocalFsBackend::new(build.path()).unwrap(),
+                LocalFsBackend::new(shm.path()).unwrap(),
+            );
+            let (s, t) = (open(&from, "s").await, open(&to, "t").await);
+            match to.copy_range(&*s, 0, &*t, 0, 100_000).await {
+                Err(SmbError::NotSupported) => {
+                    assert!(std::fs::read(shm.path().join("t")).unwrap().is_empty());
+                }
+                Ok(copied) => {
+                    assert_eq!(copied, 100_000);
+                    assert_eq!(std::fs::read(shm.path().join("t")).unwrap(), bytes);
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn a_handle_of_a_read_only_backend_is_not_copied_to() {
+            let td = tempdir().unwrap();
+            std::fs::write(td.path().join("s"), data(100)).unwrap();
+            std::fs::write(td.path().join("t"), []).unwrap();
+            let backend = LocalFsBackend::new(td.path()).unwrap().read_only();
+            let (s, t) = (open_ro(&backend, "s").await, open_ro(&backend, "t").await);
+            let copied = backend.copy_range(&*s, 0, &*t, 0, 100).await;
+            assert!(matches!(copied, Err(SmbError::AccessDenied)));
+            assert!(std::fs::read(td.path().join("t")).unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn handles_that_are_not_files_of_this_backend_are_left_to_the_server() {
+            use crate::tests::memfs::MemFsBackend;
+
+            let td = tempdir().unwrap();
+            std::fs::write(td.path().join("f"), data(100)).unwrap();
+            let backend = LocalFsBackend::new(td.path()).unwrap();
+            let file = open(&backend, "f").await;
+            let dir = backend
+                .open(&SmbPath::root(), opts_open_dir())
+                .await
+                .unwrap()
+                .0;
+            let memory = MemFsBackend::new().with_file("m", b"data");
+            let foreign = memory.open(&p("m"), opts_open_rw()).await.unwrap().0;
+            for (src, dst) in [
+                (&dir, &file),
+                (&file, &dir),
+                (&foreign, &file),
+                (&file, &foreign),
+            ] {
+                let copied = backend.copy_range(&**src, 0, &**dst, 0, 10).await;
+                assert!(matches!(copied, Err(SmbError::NotSupported)));
+            }
+        }
+
+        #[test]
+        fn copy_errors_without_a_kernel_path_are_not_supported() {
+            for errno in [
+                Errno::XDEV,
+                Errno::OPNOTSUPP,
+                Errno::NOSYS,
+                Errno::INVAL,
+                Errno::PERM,
+                Errno::BADF,
+            ] {
+                assert!(
+                    matches!(copy_error(errno), SmbError::NotSupported),
+                    "{errno}"
+                );
+            }
         }
     }
 }

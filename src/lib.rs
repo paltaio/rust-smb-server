@@ -406,6 +406,8 @@ mod tests {
     mod durable;
     mod dynamic_config;
     mod eas;
+    #[cfg(all(target_os = "linux", feature = "localfs"))]
+    pub(crate) mod filesystems;
     pub(crate) mod memfs;
     mod notify;
     pub(crate) mod peer;
