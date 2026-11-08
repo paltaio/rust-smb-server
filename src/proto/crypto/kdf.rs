@@ -7,8 +7,8 @@
 //! ```
 //!
 //! Convention in this crate:
-//! * Callers pass `label` and `context` *already including* a trailing `\x00`.
-//! * The KDF then **also** emits a single `0x00` separator between `label`
+//! * Callers pass `label` and `context` already including a trailing `\x00`.
+//! * The KDF then also emits a single `0x00` separator between `label`
 //!   and `context`, so the wire-level input has two consecutive NULs at that
 //!   boundary.
 

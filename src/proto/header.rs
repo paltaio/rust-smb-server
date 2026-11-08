@@ -9,8 +9,8 @@
 //!
 //! The two forms differ only in the 8 bytes at 0x20..0x28:
 //!
-//! * **Sync**:  `Reserved` (u32) + `TreeId` (u32).
-//! * **Async**: `AsyncId` (u64).
+//! * Sync:  `Reserved` (u32) + `TreeId` (u32).
+//! * Async: `AsyncId` (u64).
 //!
 //! Bytes 0x08..0x0C hold `Status` on responses and `ChannelSequence` +
 //! `Reserved` on 3.x requests; both are kept as one u32 named
@@ -137,7 +137,7 @@ impl HeaderTail {
 /// |  16    |   4  | Flags |
 /// |  20    |   4  | NextCommand |
 /// |  24    |   8  | MessageId |
-/// |  32    |   8  | Reserved/TreeId (sync) **or** AsyncId (async) |
+/// |  32    |   8  | Reserved/TreeId (sync) or AsyncId (async) |
 /// |  40    |   8  | SessionId |
 /// |  48    |  16  | Signature |
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

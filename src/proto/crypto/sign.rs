@@ -1,15 +1,15 @@
 //! SMB2/3 message signing per MS-SMB2 §3.1.4.1.
 //!
 //! Two algorithms are supported:
-//! 1. **HMAC-SHA-256** for SMB 2.0.2 / 2.1.
-//! 2. **AES-CMAC** for SMB 3.0+.
+//! 1. HMAC-SHA-256 for SMB 2.0.2 / 2.1.
+//! 2. AES-CMAC for SMB 3.0+.
 //!
 //! Both produce a 16-byte signature that lives at bytes 48..64 of the SMB2
 //! header (the `Signature` field, MS-SMB2 §2.2.1.2).
 //!
 //! Algorithm:
 //! 1. Zero out bytes 48..64 of the message.
-//! 2. Compute MAC over the **entire** message (header + body).
+//! 2. Compute MAC over the entire message (header + body).
 //! 3. Place the first 16 bytes of MAC at bytes 48..64.
 
 use aes::Aes128;
@@ -70,7 +70,7 @@ fn compute_mac_zeroed_signature(msg: &[u8], key: &[u8; 16], algo: SigningAlgo) -
 /// Compute and embed a signature in `msg`. Mutates `msg` in place.
 ///
 /// The caller is responsible for setting the SMB2 SIGNED flag (`0x00000008`)
-/// on the header *before* calling - it is part of the bytes that get MAC'd.
+/// on the header before calling - it is part of the bytes that get MAC'd.
 ///
 /// Errors if `msg` is too short to contain an SMB2 header (< 64 bytes).
 pub fn sign(msg: &mut [u8], key: &[u8; 16], algo: SigningAlgo) -> ProtoResult<()> {
@@ -86,7 +86,7 @@ pub fn sign(msg: &mut [u8], key: &[u8; 16], algo: SigningAlgo) -> ProtoResult<()
     Ok(())
 }
 
-/// Verify the signature in `msg`. Does **not** modify `msg`.
+/// Verify the signature in `msg`. Does not modify `msg`.
 ///
 /// Uses constant-time comparison. Returns `Ok(())` if the embedded signature
 /// matches the freshly computed MAC.

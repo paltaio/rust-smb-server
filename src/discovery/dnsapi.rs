@@ -338,7 +338,7 @@ impl Registration {
         }
     }
 
-    /// Takes note that the DNS client is done with the request.
+    /// Marks the request as finished by the DNS client.
     fn finish(&mut self) {
         if let Some(request) = &mut self.lent.0 {
             request.finished = true;

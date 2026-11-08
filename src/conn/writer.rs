@@ -23,8 +23,8 @@ pub const QUEUED_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 /// separate from the response limits.
 pub const QUEUED_NOTICE_BYTES: usize = 1024 * 1024;
 
-/// One message to send: the final SMB2 header and body, *with signing
-/// already applied if required*, and its share of the queue limits.
+/// One message to send: the final SMB2 header and body, with signing
+/// already applied if required, and its share of the queue limits.
 pub struct FramePayload {
     bytes: Vec<u8>,
     _budget: Option<OwnedSemaphorePermit>,

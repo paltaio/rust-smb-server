@@ -3,7 +3,7 @@
 //! ## Data buffer offsets
 //!
 //! Both the READ request `ReadChannelInfoOffset` and the READ response
-//! `DataOffset` are measured from the **start of the SMB2 header**, not from
+//! `DataOffset` are measured from the start of the SMB2 header, not from
 //! the start of this structure (MS-SMB2 §2.2.20 explicitly: "DataOffset (1
 //! byte): The offset, in bytes, from the beginning of the SMB2 header to the
 //! data being read"). A response sets

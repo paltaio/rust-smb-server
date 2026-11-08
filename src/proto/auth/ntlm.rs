@@ -8,7 +8,7 @@
 //! * §3.4.4 Message Integrity Code (MIC)
 //! * §4.2.4 Known-answer test vectors
 //!
-//! This module implements the **server side only**. We parse incoming
+//! This module implements the server side only. We parse incoming
 //! `NEGOTIATE_MESSAGE` (Type 1) and `AUTHENTICATE_MESSAGE` (Type 3) blobs,
 //! produce the `CHALLENGE_MESSAGE` (Type 2) reply, and validate the client's
 //! NT response to derive a session key.
@@ -161,7 +161,7 @@ pub fn nt_hash(password: &str) -> [u8; 16] {
 
 /// `NTOWFv2(password, user, domain) = HMAC_MD5(NT_hash(password), UTF-16LE(UPPER(user) || domain))`.
 ///
-/// The user name is uppercased; the domain is **not** (per MS-NLMP §3.4 NTOWFv2).
+/// The user name is uppercased; the domain is not (per MS-NLMP §3.4 NTOWFv2).
 pub fn ntowf_v2(nt_hash_bytes: &[u8; 16], user: &str, domain: &str) -> [u8; 16] {
     let mut mac = HmacMd5::new_from_slice(nt_hash_bytes).expect("HMAC accepts any key length");
     mac.update(&utf16le(&user.to_uppercase()));

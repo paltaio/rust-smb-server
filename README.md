@@ -44,6 +44,8 @@ SMB_DISCOVERY=1 SMB_LISTEN='[::]:4445' cargo run -p minimal-smb-example --featur
 
 `SMB_STREAMS=0` turns named streams off on the example's shares.
 
+`SMB_COPY=0` turns server-side copy off on the example's shares.
+
 ## Embed
 
 ```rust
@@ -175,6 +177,20 @@ macOS clients put Apple's `AAPL` create context in the first CREATE on a share t
 A share whose backend stores extended attributes serves them, and reports FILE_SUPPORTS_EXTENDED_ATTRIBUTES, unless `.extended_attributes(false)` on the `Share` turns them off. Linux clients read and set them as `user.*` attributes on a cifs mount.
 
 On Linux, `LocalFsBackend` keeps them in extended attributes named `user.<name>`, the layout Samba uses, when the share root's filesystem stores user extended attributes. On Windows it keeps them in NTFS extended attributes. Shares on macOS hosts have none; every extended attribute there is a named stream. On Linux, these attributes of the server and of Samba are hidden from clients, and a set of one of their names fails with STATUS_ACCESS_DENIED: `user.DosStream.*`, `user.smb-server.*`, `user.DOSATTRIB`, `user.SAMBA_PAI`, `user.SAMBA_STREAMS`, `user.SmbReparse` and `user.org.netatalk.Metadata`. A set that does not fit in the room the filesystem gives a file's extended attributes fails with STATUS_EA_TOO_LARGE. A set on a read-only file fails with STATUS_ACCESS_DENIED unless the server runs as a user that can write any file regardless of its mode, such as root.
+
+## Server-side copy
+
+Windows Explorer, `cp` on a Linux cifs mount and the macOS Finder ask the server to copy the data of a file. COPYCHUNK and COPYCHUNK_WRITE copy ranges within a share or between two shares of one session, and FSCTL_DUPLICATE_EXTENTS_TO_FILE clones a range on a share whose backend can share blocks between files. On a share with named streams, macOS clients are offered a whole-file copy: one request copies a file with its last write and creation times, and with its named streams when both shares have them. `.server_side_copy(false)` on the `Share` turns all of this off there, and clients then copy the data themselves. `apple_copyfile(false)` on the builder turns off the whole-file copy only.
+
+With `LocalFsBackend`:
+
+- On Linux, copies between files go through `copy_file_range(2)`, and copies to or from a named stream go by reads and writes on the server. The kernel shares the blocks of the range where the filesystem can, and copies inside the kernel otherwise. A copy it refuses goes by reads and writes on the server.
+- On Linux, a share whose root is on a filesystem that clones ranges, such as Btrfs or XFS with reflinks, also serves FSCTL_DUPLICATE_EXTENTS_TO_FILE and reports FILE_SUPPORTS_BLOCK_REFCOUNTING. A share root the server cannot create files in reports no cloning.
+- On Linux, the target of a whole-file copy keeps its own creation time.
+- On Windows, copies go by reads and writes on the server, and FSCTL_DUPLICATE_EXTENTS_TO_FILE clones ranges on a volume that reports block cloning, as ReFS does.
+- On macOS, copies go by reads and writes on the server.
+
+A `.read_only()` backend reports no cloning.
 
 ## Share listing
 

@@ -5,7 +5,7 @@
 //! * [`header`]  - SMB2 64-byte fixed header.
 //! * [`messages`] - Per-command request/response structs.
 //! * [`auth`]    - NTLMv2 server-side authentication and minimal SPNEGO.
-//! * [`crypto`]  - Signing, key derivation, pre-auth integrity.
+//! * [`crypto`]  - Signing, encryption, key derivation, pre-auth integrity.
 //! * [`error`]   - Protocol-layer error type.
 
 pub mod auth;

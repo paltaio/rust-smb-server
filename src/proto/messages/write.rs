@@ -2,7 +2,7 @@
 //!
 //! ## Data buffer offsets
 //!
-//! `DataOffset` is from the **start of the SMB2 header**, not from the start
+//! `DataOffset` is from the start of the SMB2 header, not from the start
 //! of this structure (MS-SMB2 §2.2.21). The canonical layout puts the data
 //! immediately after the fixed 48-byte prefix, giving 64 + 48 = 112 = 0x70.
 

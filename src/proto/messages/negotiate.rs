@@ -53,7 +53,7 @@ impl Dialect {
 /// `negotiate_context_offset`.
 ///
 /// `negotiate_context_list` is not read here: its offset is relative to the
-/// *start of the SMB2 header*, not to this body. Resolve it against the full
+/// start of the SMB2 header, not to this body. Resolve it against the full
 /// packet and decode the contexts with [`NegotiateContext::parse_list`].
 #[binrw]
 #[brw(little)]
@@ -91,7 +91,7 @@ impl NegotiateRequest {
 ///
 /// The trailing `security_buffer` and (3.1.1) `negotiate_context_list` are
 /// referenced by absolute offsets from the start of the SMB2 header. This
-/// struct holds the *fixed* portion and a `security_buffer` read immediately
+/// struct holds the fixed portion and a `security_buffer` read immediately
 /// after it. For 3.1.1, set `negotiate_context_offset_or_reserved2` to the
 /// 8-aligned offset after the security buffer, write this struct with
 /// [`NegotiateResponse::write_to`], then pad and append the

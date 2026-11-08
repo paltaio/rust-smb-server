@@ -418,8 +418,8 @@ unsafe impl Send for Record {}
 struct DeviceInfo(Option<Record>);
 
 impl DeviceInfo {
-    /// Takes note that `record` failed, and returns whether it was the
-    /// record in place.
+    /// Forgets `record` if it is the record in place, and returns whether it
+    /// was.
     fn failed(&mut self, record: Record) -> bool {
         let current = self.0 == Some(record);
         if current {

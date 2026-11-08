@@ -2,7 +2,7 @@
 //!
 //! `create_contexts` is a chained sequence of `SMB2_CREATE_CONTEXT` records
 //! (MS-SMB2 §2.2.13.2). Each record has `Next` (offset to the next entry,
-//! relative to the start of *this* entry; 0 marks the last), a name + data
+//! relative to the start of this entry; 0 marks the last), a name + data
 //! pair, and 8-byte alignment.
 
 use binrw::{BinRead, BinWrite, binrw};
@@ -156,7 +156,7 @@ impl CreateResponse {
 /// Generic SMB2_CREATE_CONTEXT envelope.
 ///
 /// Per MS-SMB2 §2.2.13.2 each entry has:
-/// * `Next` - offset (bytes) from the start of *this* entry to the start of
+/// * `Next` - offset (bytes) from the start of this entry to the start of
 ///   the next entry in the chain, or 0 for the last entry.
 /// * `NameOffset`/`NameLength` - name (typically a 4-byte ASCII tag) at an
 ///   offset relative to the entry start.
