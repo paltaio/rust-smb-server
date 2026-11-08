@@ -51,7 +51,7 @@ async fn message_ids_outside_the_window_close_the_connection() {
 }
 
 #[tokio::test]
-async fn grants_stay_between_one_and_the_server_maximum() {
+async fn grants_start_at_one_and_top_out_at_8192() {
     let (addr, handle) = start_server(SmbServer::builder()).await;
     let mut s = connect(addr).await;
     let mut hdr = build_header(Command::Negotiate, 0, 0, 0);
@@ -69,7 +69,7 @@ async fn grants_stay_between_one_and_the_server_maximum() {
     );
     assert_eq!(echo(&mut s, 2, 0).await, 1);
     let granted = echo(&mut s, 3, u16::MAX).await;
-    assert!((1..=512).contains(&granted), "granted {granted}");
+    assert_eq!(granted, 8192);
     handle.abort();
 }
 

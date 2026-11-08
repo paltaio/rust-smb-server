@@ -17,7 +17,7 @@ use crate::proto::messages::{
 };
 use crate::server::ServerState;
 use crate::tests::memfs::MemFsBackend;
-use crate::tests::peer::{KEY, Peer, header, status};
+use crate::tests::peer::{KEY, Peer, START_CREDITS, header, status};
 use crate::{Share, SmbServer};
 
 const LEASE_KEY: [u8; 16] = [0xA1; 16];
@@ -224,6 +224,23 @@ async fn an_interim_response_grants_credits_and_is_never_signed() {
     assert_ne!(hdr.credit_request_response, 0);
     // An ERROR body with no data.
     assert_eq!(interim.len(), SMB2_HEADER_LEN + 8);
+}
+
+#[tokio::test]
+async fn credits_last_for_many_requests_after_one_that_keeps_waiting() {
+    let state = server().await;
+    let (_holder, _held, mut waiter, _) = waiting_create(&state, false).await;
+    // Some clients send no MessageId more than their credits past their
+    // oldest unanswered request.
+    let oldest = 1;
+    let mut credits = u64::from(START_CREDITS);
+    waiter.credit_request = 256;
+    for sent in 0..2048 {
+        let (mid, reply) = waiter.request(&state, Command::Echo, &[4, 0, 0, 0]).await;
+        assert!(mid - oldest <= credits, "out of credits after {sent}");
+        credits = credits - 1 + u64::from(header(&reply).credit_request_response);
+    }
+    assert_eq!(waiter.conn.pending.len(), 1);
 }
 
 #[tokio::test]

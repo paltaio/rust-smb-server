@@ -127,8 +127,8 @@ impl ReplyCtx {
 
     /// The response `resp` in `form`. Credits go with the interim response
     /// of an asynchronous request, so its final response grants none
-    /// (MS-SMB2 3.3.4.1.2, 3.3.4.4); an interim response is never signed
-    /// (MS-SMB2 3.3.4.2).
+    /// (MS-SMB2 3.3.4.1.2, 3.3.4.3, 3.3.4.4); an interim response is never
+    /// signed (MS-SMB2 3.3.4.2).
     async fn build(
         &self,
         conn: &Arc<Connection>,

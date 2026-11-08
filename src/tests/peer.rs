@@ -19,12 +19,17 @@ use crate::server::{ServerState, ShareBindings};
 /// Signing key of the signed sessions.
 pub(crate) const KEY: [u8; 16] = [0x5A; 16];
 
+/// Credits a peer holds before it sends its first request.
+pub(crate) const START_CREDITS: u16 = 64;
+
 /// One connection with session 1 on tree 1, of `home` unless made with
 /// [`Peer::on_ipc`], and the queue its unsolicited messages and late
 /// responses go to.
 pub(crate) struct Peer {
     pub(crate) conn: Arc<Connection>,
     pub(crate) rx: ResponseReceiver,
+    /// Credits each request asks for.
+    pub(crate) credit_request: u16,
     next_mid: u64,
     signed: bool,
 }
@@ -62,7 +67,7 @@ impl Peer {
         {
             let mut credits = conn.credits.lock().expect("credits");
             assert!(credits.consume(0, 1));
-            credits.grant(64, false);
+            credits.grant(START_CREDITS, false);
         }
         let identity = if signed {
             Identity::User {
@@ -88,6 +93,7 @@ impl Peer {
         Self {
             conn,
             rx,
+            credit_request: 1,
             next_mid: 1,
             signed,
         }
@@ -110,7 +116,7 @@ impl Peer {
         let hdr = Smb2Header {
             credit_charge: 1,
             command,
-            credit_request_response: 1,
+            credit_request_response: self.credit_request,
             flags: if self.signed { SMB2_FLAGS_SIGNED } else { 0 },
             message_id: mid,
             tail: HeaderTail::sync(1),

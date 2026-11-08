@@ -3,12 +3,16 @@
 
 use std::collections::VecDeque;
 
-/// Most credits a client holds at once.
-pub const MAX_CREDITS: u64 = 512;
+/// Most credits a client holds at once. Some clients stop sending once a
+/// MessageId is more than their credit count past their oldest unanswered
+/// request, so this also bounds the requests that can follow one that takes a
+/// long time to answer.
+pub const MAX_CREDITS: u64 = 8192;
 
 /// The MessageIds a client may use: each id from `low` up to
-/// `low + received.len()` that has not been received yet. A new connection
-/// may use only id 0.
+/// `low + received.len()` that has not been received yet, with `received`
+/// holding at most `2 * MAX_CREDITS` entries. A new connection may use only
+/// id 0.
 pub struct CreditWindow {
     low: u64,
     /// Whether `low + i` has been received. The front entry is always
@@ -161,6 +165,7 @@ mod tests {
             w.grant(64, false);
         }
         assert_eq!(next, 2 * MAX_CREDITS + 1);
+        assert!(w.received.len() as u64 <= 2 * MAX_CREDITS);
         assert!(w.consume(1, 1));
         assert!(w.grant(64, false) > 0);
     }
