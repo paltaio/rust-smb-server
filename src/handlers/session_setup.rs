@@ -8,6 +8,8 @@ use crate::proto::auth::ntlm::{
     AuthOutcome, Direction, Identity, NTLMSSP_SIGNATURE, NtlmAuthenticate, NtlmMac, NtlmServer,
     NtlmTargetInfo, UserCreds,
 };
+#[cfg(feature = "krb5")]
+use crate::proto::auth::spnego::OID_KRB5;
 use crate::proto::auth::spnego::{
     NegState, NegTokenInit, OID_NTLMSSP, decode_init_token, decode_resp_token, encode_resp_token,
 };
@@ -128,6 +130,16 @@ pub async fn handle(
 
     let opening = match token {
         Token::Raw { msg_type: 1, ntlm } => Opening::Raw(ntlm),
+        // Kerberos is offered first in the server's mechanism list, so a domain client sends an
+        // AP-REQ already wrapped in SPNEGO and the exchange ends in this one round. It is checked
+        // before the NTLM opening because there is no second message to fall back into: the ticket
+        // is either good now or never.
+        #[cfg(feature = "krb5")]
+        Token::Init(init)
+            if server.kerberos.is_some() && init.mech_types.iter().any(|mech| mech == OID_KRB5) =>
+        {
+            return accept_kerberos(server, conn, &req, sid, &init).await;
+        }
         Token::Init(init) => Opening::Spnego(init),
         Token::Raw { ntlm, .. } => {
             return continue_or_reject(server, conn, &req, sid, ntlm, None).await;
@@ -157,6 +169,176 @@ pub async fn handle(
         return HandlerResponse::err(ntstatus::STATUS_USER_SESSION_DELETED);
     }
     begin_exchange(server, conn, sid, opening).await
+}
+
+/// Accepts a Kerberos AP-REQ and establishes the session, in one round.
+///
+/// Mirrors the session construction `continue_exchange` does after NTLM succeeds, because the shape
+/// of a session does not depend on how the client proved who it is: the key, the signing policy, the
+/// cipher and the flags are the same either way. What it does not mirror is the message exchange -
+/// there is no challenge, so a failure here is final and a success needs no second round trip.
+#[cfg(feature = "krb5")]
+async fn accept_kerberos(
+    server: &Arc<ServerState>,
+    conn: &Arc<Connection>,
+    req: &SessionSetupRequest,
+    sid: u64,
+    init: &NegTokenInit,
+) -> HandlerResponse {
+    let Some(acceptor) = server.kerberos.as_ref() else {
+        // Unreachable: the caller checked. Refusing beats panicking, and the status says what a
+        // client can act on.
+        return HandlerResponse::err(ntstatus::STATUS_NOT_SUPPORTED);
+    };
+
+    // The AP-REQ travels as the mechanism token of the first SPNEGO message.
+    let Some(ap_req) = init.mech_token.as_deref() else {
+        info!("kerberos offered without a ticket");
+        return HandlerResponse::err(ntstatus::STATUS_LOGON_FAILURE);
+    };
+
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        let mut head = String::with_capacity(48);
+        for byte in ap_req.iter().take(24) {
+            use std::fmt::Write as _;
+            write!(&mut head, "{byte:02x}").expect("writing to String cannot fail");
+        }
+        tracing::debug!(len = ap_req.len(), head = %head, "kerberos ticket bytes");
+    }
+
+    let identity = match acceptor.accept(ap_req) {
+        Ok(identity) => identity,
+        Err(error) => {
+            // The reason is logged, never returned: an attacker learns from the difference between
+            // "no such principal" and "bad key", and a client learns nothing it can use.
+            info!(reason = %error, "kerberos ticket refused");
+            let peer = conn.peer_addr.map(|a| a.ip());
+            server.auth.record_failure("", peer);
+            return HandlerResponse::err(ntstatus::STATUS_LOGON_FAILURE);
+        }
+    };
+
+    // A realm is not a share ACL: the identity is the user, and what it may reach is decided by the
+    // share and the session, exactly as for an NTLM logon of the same name.
+    let smb_identity = Identity::User {
+        user: identity.user.clone(),
+        domain: identity.realm.clone(),
+    };
+
+    let new_sid = if sid == 0 {
+        if session_limit_reached(server, &*conn.sessions.read().await) {
+            warn!("session limit reached on connection");
+            return HandlerResponse::err(ntstatus::STATUS_INSUFFICIENT_RESOURCES);
+        }
+        server.auth.alloc_session_id()
+    } else {
+        sid
+    };
+
+    // Reauthentication keeps the session and its trees, for the same user only (MS-SMB2 3.3.5.5.2).
+    let existing = conn.sessions.read().await.get(&new_sid).cloned();
+    if let Some(existing) = &existing
+        && !same_user(&existing.read().await.identity, &smb_identity)
+    {
+        info!(%identity.realm, "kerberos reauthentication as another user refused");
+        return HandlerResponse::err(ntstatus::STATUS_ACCESS_DENIED);
+    }
+
+    let dialect = *conn.dialect.read().await;
+    let Some(dialect) = dialect else {
+        return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
+    };
+
+    let session_base_key = identity.session_key;
+    let cipher = *conn.cipher.read().await;
+    let encrypt_data = server.auth.settings.encrypt_data && cipher.is_some();
+    let session_flags = if encrypt_data {
+        SessionSetupResponse::FLAG_ENCRYPT_DATA
+    } else {
+        0
+    };
+
+    // The reply carries the AP-REP when the client asked for mutual authentication: Windows always
+    // does, and a client that asked and got none refuses the session even though the ticket was good.
+    let response_token = encode_resp_token(
+        NegState::AcceptCompleted,
+        Some(OID_KRB5),
+        identity.ap_rep.as_deref(),
+        None,
+    );
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        let mut head = String::with_capacity(96);
+        for byte in response_token.iter().take(48) {
+            use std::fmt::Write as _;
+            write!(&mut head, "{byte:02x}").expect("writing to String cannot fail");
+        }
+        tracing::debug!(len = response_token.len(), head = %head, "kerberos reply bytes");
+    }
+
+    let body_out =
+        build_session_setup_response(ntstatus::STATUS_SUCCESS, &response_token, session_flags);
+
+    let mut response = HandlerResponse {
+        body: body_out,
+        status: ntstatus::STATUS_SUCCESS,
+        override_tree_id: None,
+        override_session_id: Some(new_sid),
+        skip_signing: false,
+        take_preauth_snapshot_for_session: None,
+        after_send: Vec::new(),
+    };
+
+    if existing.is_some() {
+        info!("session reauthenticated by kerberos");
+        return response;
+    }
+
+    let signing_key = signing_key(dialect, &session_base_key);
+    let signing_required = signing_required(server, conn, req, &smb_identity);
+    let mut session = Session::new(
+        smb_identity.clone(),
+        session_base_key,
+        signing_key,
+        signing_required,
+        None,
+    );
+    session.encrypt_data = encrypt_data;
+    // SMB 3.1.1 keys come from the preauth hash, once it is known.
+    if dialect != Dialect::Smb311
+        && let Some(cipher) = cipher
+    {
+        session.cipher = Some(Arc::new(SessionCipher::derive(
+            cipher,
+            &session_base_key,
+            None,
+        )));
+    }
+
+    let session_arc = Arc::new(tokio::sync::RwLock::new(session));
+    {
+        let mut sessions = conn.sessions.write().await;
+        if session_limit_reached(server, &sessions) {
+            warn!("session limit reached on connection");
+            return HandlerResponse::err(ntstatus::STATUS_INSUFFICIENT_RESOURCES);
+        }
+        sessions.insert(new_sid, session_arc);
+    }
+
+    if req.previous_session_id != 0 && req.previous_session_id != new_sid {
+        close_previous_session(server, req.previous_session_id, &smb_identity).await;
+    }
+    if dialect == Dialect::Smb311 {
+        response.take_preauth_snapshot_for_session = Some(new_sid);
+    }
+
+    server.auth.record_success(&identity.user);
+    info!(
+        user = %identity.user,
+        realm = %identity.realm,
+        mutual = identity.ap_rep.is_some(),
+        "session established by kerberos"
+    );
+    response
 }
 
 /// A token that continues the exchange of `sid`.

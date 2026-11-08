@@ -51,8 +51,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!(?listen, ?root, "starting example smb server");
 
-    let builder = SmbServer::builder()
-        .listen(listen)
+    let builder = SmbServer::builder().listen(listen);
+
+    // Kerberos, when a keytab is named: the same shares then serve a domain client by ticket, and a
+    // workgroup client by password. `SMB_KEYTAB` is the path; absent means NTLM only.
+    #[cfg(feature = "krb5")]
+    let builder = match std::env::var("SMB_KEYTAB") {
+        Ok(path) => {
+            tracing::info!(%path, "kerberos enabled from keytab");
+            builder.keytab(path)
+        }
+        Err(_) => builder,
+    };
+
+    let builder = builder
         .user("alice", password.as_str())
         .user("bob", password.as_str())
         .share(

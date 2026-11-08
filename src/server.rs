@@ -331,6 +331,13 @@ pub struct ServerState {
     /// Signing policy, session and tree limits, and the logon throttle.
     pub auth: crate::auth_policy::AuthPolicy,
 
+    /// The Kerberos acceptor, when a keytab was configured.
+    ///
+    /// `None` is "this server does not do Kerberos", which is a different statement from "the keytab
+    /// failed to load" - the second is an error at start, not a silent fallback to NTLM.
+    #[cfg(feature = "krb5")]
+    pub kerberos: Option<std::sync::Arc<crate::proto::auth::kerberos::KerberosAcceptor>>,
+
     /// Opens one connection may hold at once. CREATE past it fails with
     /// STATUS_INSUFFICIENT_RESOURCES.
     pub max_opens_per_connection: std::sync::atomic::AtomicUsize,
@@ -357,6 +364,8 @@ impl ServerState {
             shutdown: Arc::new(Notify::new()),
             shutting_down: Arc::new(AtomicBool::new(false)),
             auth: crate::auth_policy::AuthPolicy::default(),
+            #[cfg(feature = "krb5")]
+            kerberos: None,
             max_opens_per_connection: std::sync::atomic::AtomicUsize::new(
                 crate::files::DEFAULT_MAX_OPENS_PER_CONNECTION,
             ),
@@ -391,6 +400,15 @@ impl ServerState {
     /// Find a share by case-insensitive name.
     pub async fn find_share(&self, name: &str) -> Option<Arc<ShareBindings>> {
         self.shares.find(name).await
+    }
+
+    /// Installs the Kerberos acceptor.
+    ///
+    /// Set once, before `serve()`: an acceptor installed halfway through a run would leave sessions
+    /// authenticated by one realm beside sessions that could not have been.
+    #[cfg(feature = "krb5")]
+    pub fn set_kerberos(&mut self, acceptor: crate::proto::auth::kerberos::KerberosAcceptor) {
+        self.kerberos = Some(std::sync::Arc::new(acceptor));
     }
 
     /// Look up a user's NT hash by name.

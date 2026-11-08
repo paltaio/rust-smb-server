@@ -69,6 +69,9 @@ aes-gcm.workspace = true
 ccm.workspace = true
 socket2 = "0.6"
 if-addrs = { version = "0.15", optional = true, features = ["link-local"] }
+# Kerberos accept side, in pure Rust: no libgssapi, no Heimdal, no C. The GSS-API framing, the token
+# ids, the AP-REP envelope and the PAC all come from here rather than from this crate.
+krb5 = { version = "1.0", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 cap-primitives = { workspace = true, optional = true }
@@ -88,6 +91,9 @@ zbus = { version = "6.2", default-features = false, features = ["tokio"], option
 [features]
 default = ["localfs"]
 localfs = ["dep:cap-std", "dep:cap-primitives", "dep:rustix", "dep:windows-sys"]
+# Kerberos authentication in SESSION_SETUP. Off by default: a server that accepts a keytab has
+# another credential to protect, and most deployments of this crate are anonymous file shares.
+krb5 = ["dep:krb5"]
 discovery = [
     "dep:mdns-sd",
     "dep:zbus",

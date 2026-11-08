@@ -13,3 +13,4 @@ uuid.workspace = true
 
 [features]
 discovery = ["smb-server/discovery"]
+krb5 = ["smb-server/krb5"]

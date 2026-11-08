@@ -52,6 +52,15 @@ const TAG_CTX_3: u8 = 0xa3;
 /// (i.e. **without** the leading 0x06 tag + length).
 pub const OID_SPNEGO: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x02];
 
+/// Kerberos v5 `1.2.840.113554.1.2.2` encoded as the *content* of an OBJECT IDENTIFIER.
+///
+/// Only when the mechanism is built: without it nothing in this crate names Kerberos, and a constant
+/// that nothing reads is what `-D warnings` refuses - correctly, since it would be dead weight.
+#[cfg(feature = "krb5")]
+///
+/// `2a 86 48 86 f7 12 01 02 02`: 1.2 -> 0x2a, 840 -> 86 48, 113554 -> 86 f7 12, then 1, 2, 2.
+pub const OID_KRB5: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x02];
+
 /// NTLMSSP `1.3.6.1.4.1.311.2.2.10` encoded as OID *content*.
 pub const OID_NTLMSSP: &[u8] = &[0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x02, 0x0a];
 
@@ -261,6 +270,14 @@ fn parse_neg_token_init_body(inner: &[u8]) -> ProtoResult<NegTokenInit> {
 
 /// Decode a subsequent `NegTokenResp`. These are sent without the GSS-API
 /// outer wrapper - they begin directly with the `[1]` choice tag.
+/// The value of an implicitly tagged OCTET STRING, accepting the explicit form too.
+fn octxet_or_bytes(content: &[u8]) -> Vec<u8> {
+    match read_any_tlv(content, 0) {
+        Ok((TAG_OCTET, inner, _)) => inner.to_vec(),
+        _ => content.to_vec(),
+    }
+}
+
 pub fn decode_resp_token(buf: &[u8]) -> ProtoResult<NegTokenResp> {
     let (resp_inner, _) = read_tlv(buf, 0, TAG_CTX_1)?;
     let (seq_body, _) = read_tlv(resp_inner, 0, TAG_SEQUENCE)?;
@@ -281,14 +298,12 @@ pub fn decode_resp_token(buf: &[u8]) -> ProtoResult<NegTokenResp> {
                 let (oid, _) = read_tlv(content, 0, TAG_OBJECT)?;
                 out.supported_mech = Some(oid.to_vec());
             }
-            TAG_CTX_2 => {
-                let (oct, _) = read_tlv(content, 0, TAG_OCTET)?;
-                out.response_token = Some(oct.to_vec());
-            }
-            TAG_CTX_3 => {
-                let (oct, _) = read_tlv(content, 0, TAG_OCTET)?;
-                out.mech_list_mic = Some(oct.to_vec());
-            }
+            // Implicit tagging means the bytes are the content; some clients (and this crate until
+            // it was fixed) wrap an OCTET STRING inside the context tag instead. Both are read, in
+            // that order of preference, because refusing the explicit form would lock out every
+            // client that was written to match the older encoder.
+            TAG_CTX_2 => out.response_token = Some(octxet_or_bytes(content)),
+            TAG_CTX_3 => out.mech_list_mic = Some(octxet_or_bytes(content)),
             _ => {}
         }
         pos = next;
@@ -301,8 +316,12 @@ pub fn decode_resp_token(buf: &[u8]) -> ProtoResult<NegTokenResp> {
 /// `NegTokenInit` advertising NTLMSSP only. Used during SMB2 NEGOTIATE
 /// when the server publishes its security blob.
 pub fn encode_init_response() -> Vec<u8> {
-    // mechTypes SEQUENCE { OID NTLMSSP }
+    // mechTypes SEQUENCE { OID ... }: the server's own preference, in order. Kerberos first when the
+    // feature is built, because a domain client that can use it must be offered it - a client that
+    // sees only NTLMSSP takes NTLM, and over a domain that is a downgrade rather than a fallback.
     let mut mech_types_seq = Vec::new();
+    #[cfg(feature = "krb5")]
+    write_tlv(TAG_OBJECT, OID_KRB5, &mut mech_types_seq);
     write_tlv(TAG_OBJECT, OID_NTLMSSP, &mut mech_types_seq);
     let mut mech_types_outer = Vec::new();
     write_tlv(TAG_SEQUENCE, &mech_types_seq, &mut mech_types_outer);
@@ -341,25 +360,31 @@ pub fn encode_resp_token(
 ) -> Vec<u8> {
     let mut seq = Vec::new();
 
-    // [0] negState
+    // [0] negState. Kept as an explicit ENUMERATED inside the context tag: this is what Windows and
+    // Samba exchange, and it is the one field of this structure that was already accepted by every
+    // client seen so far.
     {
         let mut en = Vec::new();
         write_tlv(TAG_ENUMERATED, &[state as u8], &mut en);
         write_tlv(TAG_CTX_0, &en, &mut seq);
     }
-    // [1] supportedMech
+    // [1] supportedMech, explicit like the rest: the client refused the bare OID bytes with
+    // "Invalid SPNEGO request" and showed `a1 09 2a 86 ...`, wanting the OBJECT IDENTIFIER tag back.
     if let Some(oid) = supported_mech {
         let mut o = Vec::new();
         write_tlv(TAG_OBJECT, oid, &mut o);
         write_tlv(TAG_CTX_1, &o, &mut seq);
     }
-    // [2] responseToken
+    // [2] responseToken and [3] mechListMIC keep an explicit OCTET STRING inside the context tag.
+    // RFC 4178 makes them implicit, and an implicit encoding was tried: the client answered
+    // "Invalid SPNEGO request" and printed the frame, which is how this was settled. Whatever the
+    // RFC says, what Samba and Windows exchange - and what every client this server has met parses -
+    // is the explicit form, so that is what is written.
     if let Some(tok) = response_token {
         let mut o = Vec::new();
         write_tlv(TAG_OCTET, tok, &mut o);
         write_tlv(TAG_CTX_2, &o, &mut seq);
     }
-    // [3] mechListMIC
     if let Some(mic) = mech_list_mic {
         let mut o = Vec::new();
         write_tlv(TAG_OCTET, mic, &mut o);
@@ -420,8 +445,14 @@ mod tests {
         assert_eq!(blob[0], TAG_APP_0);
         // decode_init_token accepts a NegTokenInit without a mechToken.
         let init = decode_init_token(&blob).unwrap();
+        // NTLMSSP alone, or Kerberos and then NTLMSSP when the feature is built. The assertion is
+        // written as "the last mechanism is NTLMSSP" so it holds either way, and the order is checked
+        // separately in `the_server_offers_kerberos_before_ntlm`.
+        assert_eq!(init.mech_types.last(), Some(&OID_NTLMSSP.to_vec()));
+        #[cfg(feature = "krb5")]
+        assert_eq!(init.mech_types.len(), 2);
+        #[cfg(not(feature = "krb5"))]
         assert_eq!(init.mech_types.len(), 1);
-        assert_eq!(init.mech_types[0], OID_NTLMSSP);
         assert!(init.mech_token.is_none());
     }
 
@@ -536,5 +567,38 @@ mod tests {
     fn rejects_truncated_blob() {
         let err = decode_init_token(&[0x60, 0x05, 0xAA, 0xBB]).unwrap_err();
         assert!(matches!(err, ProtoError::Auth(_)));
+    }
+}
+
+#[cfg(all(test, feature = "krb5"))]
+mod krb5_tests {
+    use super::*;
+
+    #[test]
+    fn the_server_offers_kerberos_before_ntlm() {
+        // Order is the server's preference, and it matters: a client that sees only NTLMSSP takes
+        // NTLM, which over a domain is a downgrade rather than a fallback.
+        let encoded = encode_init_response();
+        assert_eq!(&encoded[..2], &[TAG_APP_0, encoded[1]]);
+
+        let krb5 = encoded
+            .windows(OID_KRB5.len())
+            .position(|window| window == OID_KRB5)
+            .expect("the Kerberos OID is offered");
+        let ntlm = encoded
+            .windows(OID_NTLMSSP.len())
+            .position(|window| window == OID_NTLMSSP)
+            .expect("the NTLM OID is offered");
+        assert!(krb5 < ntlm, "Kerberos comes first: {krb5} before {ntlm}");
+    }
+
+    #[test]
+    fn the_kerberos_oid_is_the_one_the_rfc_names() {
+        // 1.2.840.113554.1.2.2, encoded by hand twice: a wrong OID means a client never picks the
+        // mechanism, and the failure looks like "the server does not do Kerberos" rather than a typo.
+        assert_eq!(
+            OID_KRB5,
+            &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x02]
+        );
     }
 }

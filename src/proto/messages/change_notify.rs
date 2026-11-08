@@ -251,7 +251,13 @@ mod tests {
     fn responses_without_entries_are_8_bytes() {
         let empty = ChangeNotifyResponse::encode(&[]);
         assert_eq!(empty, [9, 0, 0x48, 0, 0, 0, 0, 0]);
-        assert_eq!(ChangeNotifyResponse::parse(&empty).unwrap().buffer, []);
+        // `Vec::new()` rather than `[]`: with `serde_json` in the build (the `krb5` feature pulls it
+        // in through `rskrb5`) an empty array literal has two candidate element types and inference
+        // fails. Naming the type is the fix; the assertion is the same one.
+        assert_eq!(
+            ChangeNotifyResponse::parse(&empty).unwrap().buffer,
+            Vec::<u8>::new()
+        );
         let full = ChangeNotifyResponse::encode(&[1, 2, 3]);
         let parsed = ChangeNotifyResponse::parse(&full).unwrap();
         assert_eq!(parsed.output_buffer_length, 3);

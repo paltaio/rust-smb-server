@@ -268,6 +268,8 @@ pub enum BuildError {
     InvalidShareName(String),
     #[error("remark of share `{0}` must hold no NUL and at most 1024 UTF-16 code units")]
     InvalidShareRemark(String),
+    #[error("the Kerberos keytab cannot be used: {0}")]
+    Keytab(String),
     #[error("`{setting}` must be {expected}")]
     OutOfRange {
         setting: &'static str,
@@ -341,6 +343,30 @@ pub struct SmbServerBuilder {
     apple_model: String,
     #[cfg(feature = "discovery")]
     discovery: Option<crate::discovery::Discovery>,
+    /// Keytab bytes, when Kerberos is configured.
+    ///
+    /// Bytes rather than a path: the builder consumes the keytab once at build time, and holding a
+    /// path would mean a server whose credentials can change under it between start and first logon.
+    /// The keytab to read, when Kerberos is configured.
+    ///
+    /// A path, loaded once in `build()`: a missing or unreadable keytab fails the start rather than
+    /// becoming an acceptor that refuses every ticket, and a server whose credentials are read once
+    /// cannot have them swapped under it.
+    #[cfg(feature = "krb5")]
+    keytab: Option<std::path::PathBuf>,
+}
+
+#[cfg(feature = "krb5")]
+impl SmbServerBuilder {
+    /// Enables Kerberos authentication from a keytab file.
+    ///
+    /// The file is read here and not at first logon: a missing or unreadable keytab must fail the
+    /// start, because a server that answers NEGOTIATE with Kerberos in its mechanism list and then
+    /// cannot accept a ticket is a server that fails every domain client silently.
+    pub fn keytab(mut self, path: impl AsRef<std::path::Path>) -> Self {
+        self.keytab = Some(path.as_ref().to_path_buf());
+        self
+    }
 }
 
 impl Default for SmbServerBuilder {
@@ -365,6 +391,8 @@ impl SmbServerBuilder {
             max_opens_per_connection: crate::files::DEFAULT_MAX_OPENS_PER_CONNECTION,
             max_locks_per_open: crate::files::DEFAULT_MAX_LOCKS_PER_OPEN,
             share_listing: true,
+            #[cfg(feature = "krb5")]
+            keytab: None,
             apple_extensions: true,
             apple_model: DEFAULT_APPLE_MODEL.to_string(),
             #[cfg(feature = "discovery")]
@@ -738,6 +766,30 @@ impl SmbServerBuilder {
 
         let state = ServerState::new(cfg, users, share_bindings);
         let state = state.with_auth(self.auth);
+
+        // A keytab that was configured but cannot be used fails the build: a server that answers
+        // NEGOTIATE advertising Kerberos and then refuses every ticket is worse than one that never
+        // started, because the client reports an access failure rather than a configuration error.
+        //
+        // The `mut` lives inside the block on purpose: with the feature off there is nothing to
+        // install, and an outer `let mut` that is never written is what `-D warnings` refuses.
+        #[cfg(feature = "krb5")]
+        let state = {
+            let mut state = state;
+            if let Some(path) = self.keytab {
+                let acceptor = crate::proto::auth::kerberos::KerberosAcceptor::from_keytab(&path)
+                    .map_err(|error| {
+                    BuildError::Keytab(format!("{}: {error}", path.display()))
+                })?;
+                tracing::info!(
+                    principals = ?acceptor.principals(),
+                    "kerberos acceptor installed"
+                );
+                state.set_kerberos(acceptor);
+            }
+            state
+        };
+
         state
             .max_opens_per_connection
             .store(self.max_opens_per_connection, Ordering::Relaxed);
