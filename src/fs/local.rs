@@ -71,6 +71,10 @@ use crate::wildcard::Pattern;
 /// server cannot create files in, or one on a filesystem without unnamed
 /// temporary files, reports none. A read-only backend reports none.
 ///
+/// On Windows, it reports `block_cloning` when the volume of the share root
+/// reports FILE_SUPPORTS_BLOCK_REFCOUNTING, which ReFS does. A clone of a
+/// sparse file makes the target sparse first.
+///
 /// On Linux, a file's or directory's named streams are its extended
 /// attributes named `user.DosStream.<name>:$DATA`, each holding the
 /// stream's data followed by one NUL byte. A share moves between this
@@ -234,7 +238,9 @@ impl LocalFsBackend {
         let eas = false;
         #[cfg(target_os = "linux")]
         let block_cloning = super::reflink::supported(&root);
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(windows)]
+        let block_cloning = super::windows_clone::supported(&root);
+        #[cfg(not(any(target_os = "linux", windows)))]
         let block_cloning = false;
         #[cfg(target_os = "linux")]
         let store = streams
@@ -764,9 +770,37 @@ fn write_at(file: &std::fs::File, data: &[u8], offset: u64) -> io::Result<usize>
 }
 
 /// `handle` as a handle of this backend, `None` for any other.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 fn local_handle(handle: &dyn Handle) -> Option<&LocalHandle> {
     handle.as_any()?.downcast_ref()
+}
+
+/// The files behind the handles of a copy or a clone, the source first. A
+/// directory, or a destination another backend gave, is not supported; a
+/// source no `LocalFsBackend` gave is on another device; a destination of a
+/// read-only backend is refused.
+#[cfg(any(target_os = "linux", windows))]
+fn local_files(
+    src: &dyn Handle,
+    dst: &dyn Handle,
+) -> SmbResult<(Arc<std::fs::File>, Arc<std::fs::File>)> {
+    let Some(LocalHandle::File {
+        file: dst,
+        read_only,
+        ..
+    }) = local_handle(dst)
+    else {
+        return Err(SmbError::NotSupported);
+    };
+    let src = match local_handle(src) {
+        Some(LocalHandle::File { file, .. }) => file,
+        Some(LocalHandle::Dir { .. }) => return Err(SmbError::NotSupported),
+        None => return Err(SmbError::NotSameDevice),
+    };
+    if *read_only {
+        return Err(SmbError::AccessDenied);
+    }
+    Ok((Arc::clone(src), Arc::clone(dst)))
 }
 
 /// Copies `len` bytes at `src_offset` of `src` to `dst_offset` of `dst` with
@@ -2057,21 +2091,7 @@ impl ShareBackend for LocalFsBackend {
         dst_offset: u64,
         len: u64,
     ) -> SmbResult<u64> {
-        let (
-            Some(LocalHandle::File { file: src, .. }),
-            Some(LocalHandle::File {
-                file: dst,
-                read_only,
-                ..
-            }),
-        ) = (local_handle(src), local_handle(dst))
-        else {
-            return Err(SmbError::NotSupported);
-        };
-        if *read_only {
-            return Err(SmbError::AccessDenied);
-        }
-        let (src, dst) = (Arc::clone(src), Arc::clone(dst));
+        let (src, dst) = local_files(src, dst)?;
         let (copied, stopped) =
             spawn_blocking(move || copy_file_range_loop(&src, src_offset, &dst, dst_offset, len))
                 .await
@@ -2092,32 +2112,37 @@ impl ShareBackend for LocalFsBackend {
         dst_offset: u64,
         len: u64,
     ) -> SmbResult<()> {
-        let Some(LocalHandle::File {
-            file: dst,
-            read_only,
-            ..
-        }) = local_handle(dst)
-        else {
-            return Err(SmbError::NotSupported);
-        };
-        let src = match local_handle(src) {
-            Some(LocalHandle::File { file, .. }) => file,
-            Some(LocalHandle::Dir { .. }) => return Err(SmbError::NotSupported),
-            None => return Err(SmbError::NotSameDevice),
-        };
-        if *read_only {
-            return Err(SmbError::AccessDenied);
-        }
+        let (src, dst) = local_files(src, dst)?;
         // FICLONERANGE reads a length of 0 as "to the end of the source".
         if len == 0 {
             return Ok(());
         }
-        let (src, dst) = (Arc::clone(src), Arc::clone(dst));
         spawn_blocking(move || super::reflink::clone_range(&src, src_offset, &dst, dst_offset, len))
             .await
             .map_err(join_to_io)
             .map_err(io_to_smb)?
             .map_err(clone_error)
+    }
+
+    #[cfg(windows)]
+    async fn clone_range(
+        &self,
+        src: &dyn Handle,
+        src_offset: u64,
+        dst: &dyn Handle,
+        dst_offset: u64,
+        len: u64,
+    ) -> SmbResult<()> {
+        let (src, dst) = local_files(src, dst)?;
+        if len == 0 {
+            return Ok(());
+        }
+        spawn_blocking(move || {
+            super::windows_clone::clone_range(&src, src_offset, &dst, dst_offset, len)
+        })
+        .await
+        .map_err(join_to_io)
+        .map_err(io_to_smb)?
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
@@ -3452,7 +3477,7 @@ pub(super) mod tests {
         let info = backend.volume_info().await.unwrap();
         let st = rustix::fs::statvfs(td.path()).unwrap();
         assert_eq!(info.total_allocation_units, st.f_blocks);
-        let unit = u64::from(info.sectors_per_allocation_unit) * u64::from(info.bytes_per_sector);
+        let unit = info.allocation_unit();
         assert_eq!(unit, st.f_frsize);
         // Free space moves with other activity on the volume.
         let free_bytes = info.actual_available_allocation_units * unit;
@@ -3745,18 +3770,13 @@ pub(super) mod tests {
     #[cfg(target_os = "linux")]
     mod copy_range {
         use super::*;
+        use crate::tests::data::pattern;
         use rustix::io::Errno;
-
-        fn data(len: usize) -> Vec<u8> {
-            (0..len)
-                .map(|i| (i.wrapping_mul(31) ^ (i >> 8)) as u8)
-                .collect()
-        }
 
         #[tokio::test]
         async fn copies_a_range_between_files() {
             let td = tempdir().unwrap();
-            let bytes = data(300_000);
+            let bytes = pattern(300_000, 0);
             std::fs::write(td.path().join("s"), &bytes).unwrap();
             std::fs::write(td.path().join("t"), [7u8; 10]).unwrap();
             let backend = LocalFsBackend::new(td.path()).unwrap();
@@ -3771,7 +3791,7 @@ pub(super) mod tests {
         #[tokio::test]
         async fn stops_at_the_end_of_the_source() {
             let td = tempdir().unwrap();
-            let bytes = data(5000);
+            let bytes = pattern(5000, 0);
             std::fs::write(td.path().join("s"), &bytes).unwrap();
             std::fs::write(td.path().join("t"), []).unwrap();
             let backend = LocalFsBackend::new(td.path()).unwrap();
@@ -3785,7 +3805,7 @@ pub(super) mod tests {
         #[tokio::test]
         async fn a_target_past_its_end_gets_a_gap_of_zeros() {
             let td = tempdir().unwrap();
-            let bytes = data(1000);
+            let bytes = pattern(1000, 0);
             std::fs::write(td.path().join("s"), &bytes).unwrap();
             std::fs::write(td.path().join("t"), [7u8; 10]).unwrap();
             let backend = LocalFsBackend::new(td.path()).unwrap();
@@ -3803,9 +3823,9 @@ pub(super) mod tests {
         #[tokio::test]
         async fn overlapping_ranges_of_one_file_are_left_to_the_server() {
             let td = tempdir().unwrap();
-            let bytes = data(10_000);
+            let bytes = pattern(10_000, 0);
             std::fs::write(td.path().join("f"), &bytes).unwrap();
-            let short = data(3000);
+            let short = pattern(3000, 0);
             std::fs::write(td.path().join("short"), &short).unwrap();
             let (a, b) = (
                 LocalFsBackend::new(td.path()).unwrap(),
@@ -3829,7 +3849,7 @@ pub(super) mod tests {
         #[tokio::test]
         async fn a_range_of_one_file_that_does_not_overlap_its_target_is_copied() {
             let td = tempdir().unwrap();
-            let bytes = data(10_000);
+            let bytes = pattern(10_000, 0);
             std::fs::write(td.path().join("f"), &bytes).unwrap();
             let (a, b) = (
                 LocalFsBackend::new(td.path()).unwrap(),
@@ -3849,7 +3869,7 @@ pub(super) mod tests {
             let Some((build, shm)) = crate::tests::filesystems::pair() else {
                 return;
             };
-            let bytes = data(100_000);
+            let bytes = pattern(100_000, 0);
             std::fs::write(build.path().join("s"), &bytes).unwrap();
             std::fs::write(shm.path().join("t"), []).unwrap();
             let (from, to) = (
@@ -3872,7 +3892,7 @@ pub(super) mod tests {
         #[tokio::test]
         async fn a_handle_of_a_read_only_backend_is_not_copied_to() {
             let td = tempdir().unwrap();
-            std::fs::write(td.path().join("s"), data(100)).unwrap();
+            std::fs::write(td.path().join("s"), pattern(100, 0)).unwrap();
             std::fs::write(td.path().join("t"), []).unwrap();
             let backend = LocalFsBackend::new(td.path()).unwrap().read_only();
             let (s, t) = (open_ro(&backend, "s").await, open_ro(&backend, "t").await);
@@ -3883,28 +3903,19 @@ pub(super) mod tests {
 
         #[tokio::test]
         async fn handles_that_are_not_files_of_this_backend_are_left_to_the_server() {
-            use crate::tests::memfs::MemFsBackend;
-
             let td = tempdir().unwrap();
-            std::fs::write(td.path().join("f"), data(100)).unwrap();
+            std::fs::write(td.path().join("f"), pattern(100, 0)).unwrap();
             let backend = LocalFsBackend::new(td.path()).unwrap();
             let file = open(&backend, "f").await;
-            let dir = backend
-                .open(&SmbPath::root(), opts_open_dir())
-                .await
-                .unwrap()
-                .0;
-            let memory = MemFsBackend::new().with_file("m", b"data");
-            let foreign = memory.open(&p("m"), opts_open_rw()).await.unwrap().0;
-            for (src, dst) in [
-                (&dir, &file),
-                (&file, &dir),
-                (&foreign, &file),
-                (&file, &foreign),
-            ] {
-                let copied = backend.copy_range(&**src, 0, &**dst, 0, 10).await;
-                assert!(matches!(copied, Err(SmbError::NotSupported)));
-            }
+            let (dir, foreign) = dir_and_foreign(&backend).await;
+            let copied = backend.copy_range(&*dir, 0, &*file, 0, 10).await;
+            assert!(matches!(copied, Err(SmbError::NotSupported)), "{copied:?}");
+            let copied = backend.copy_range(&*file, 0, &*dir, 0, 10).await;
+            assert!(matches!(copied, Err(SmbError::NotSupported)), "{copied:?}");
+            let copied = backend.copy_range(&*foreign, 0, &*file, 0, 10).await;
+            assert!(matches!(copied, Err(SmbError::NotSameDevice)), "{copied:?}");
+            let copied = backend.copy_range(&*file, 0, &*foreign, 0, 10).await;
+            assert!(matches!(copied, Err(SmbError::NotSupported)), "{copied:?}");
         }
 
         #[test]
@@ -3925,39 +3936,40 @@ pub(super) mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     mod clone_range {
         use super::*;
-        use rustix::io::Errno;
-
-        const EXT4_MAGIC: i128 = 0xEF53;
-        const TMPFS_MAGIC: i128 = 0x0102_1994;
-
-        fn data(len: usize) -> Vec<u8> {
-            (0..len)
-                .map(|i| (i.wrapping_mul(31) ^ (i >> 8)) as u8)
-                .collect()
-        }
+        use crate::tests::data::{allocation_unit, pattern};
 
         /// Whether the filesystem of `dir` is one that cannot clone.
+        #[cfg(target_os = "linux")]
         fn cannot_clone(dir: &Path) -> bool {
+            const EXT4_MAGIC: i128 = 0xEF53;
+            const TMPFS_MAGIC: i128 = 0x0102_1994;
+
             let magic = i128::from(rustix::fs::statfs(dir).unwrap().f_type);
             matches!(magic, EXT4_MAGIC | TMPFS_MAGIC)
         }
 
-        /// Bytes in an allocation unit of the volume of `backend`.
-        async fn unit(backend: &LocalFsBackend) -> usize {
-            let info = backend.volume_info().await.unwrap();
-            (u64::from(info.sectors_per_allocation_unit) * u64::from(info.bytes_per_sector))
-                as usize
+        /// The name of the file system of the volume of `dir`.
+        #[cfg(windows)]
+        fn file_system(dir: &Path) -> String {
+            let dir = Dir::open_ambient_dir(dir, ambient_authority()).unwrap();
+            volume::volume_of(&dir).unwrap().1
+        }
+
+        /// Whether the filesystem of `dir` is one that cannot clone.
+        #[cfg(windows)]
+        fn cannot_clone(dir: &Path) -> bool {
+            file_system(dir).eq_ignore_ascii_case("NTFS")
         }
 
         #[tokio::test]
         async fn clones_a_range_where_the_filesystem_can_and_says_so_where_it_cannot() {
             let td = tempdir().unwrap();
             let backend = LocalFsBackend::new(td.path()).unwrap();
-            let unit = unit(&backend).await;
-            let bytes = data(4 * unit);
+            let unit = allocation_unit(&backend).await as usize;
+            let bytes = pattern(4 * unit, 0);
             std::fs::write(td.path().join("s"), &bytes).unwrap();
             std::fs::write(td.path().join("t"), vec![0; 4 * unit]).unwrap();
             let (s, t) = (open(&backend, "s").await, open(&backend, "t").await);
@@ -3976,6 +3988,7 @@ pub(super) mod tests {
             }
         }
 
+        #[cfg(target_os = "linux")]
         #[tokio::test]
         async fn an_unaligned_length_is_cloned_only_when_it_ends_both_files() {
             let td = tempdir().unwrap();
@@ -3984,9 +3997,9 @@ pub(super) mod tests {
                 eprintln!("skipping: {} does not clone", td.path().display());
                 return;
             }
-            let unit = unit(&backend).await;
+            let unit = allocation_unit(&backend).await as usize;
             let size = 3 * unit + 1000;
-            std::fs::write(td.path().join("s"), data(size)).unwrap();
+            std::fs::write(td.path().join("s"), pattern(size, 0)).unwrap();
             std::fs::write(td.path().join("same"), vec![0; size]).unwrap();
             std::fs::write(td.path().join("longer"), vec![0; 4 * unit]).unwrap();
             let s = open(&backend, "s").await;
@@ -4001,9 +4014,13 @@ pub(super) mod tests {
                 .clone_range(&*s, 0, &*same, 0, size as u64)
                 .await
                 .unwrap();
-            assert_eq!(std::fs::read(td.path().join("same")).unwrap(), data(size));
+            assert_eq!(
+                std::fs::read(td.path().join("same")).unwrap(),
+                pattern(size, 0)
+            );
         }
 
+        #[cfg(target_os = "linux")]
         #[tokio::test]
         async fn a_filesystem_that_cannot_clone_reports_no_block_cloning() {
             let Some((build, shm)) = crate::tests::filesystems::pair() else {
@@ -4022,7 +4039,7 @@ pub(super) mod tests {
         #[tokio::test]
         async fn a_clone_of_no_bytes_changes_nothing() {
             let td = tempdir().unwrap();
-            std::fs::write(td.path().join("s"), data(8192)).unwrap();
+            std::fs::write(td.path().join("s"), pattern(8192, 0)).unwrap();
             std::fs::write(td.path().join("t"), [0u8; 8192]).unwrap();
             let backend = LocalFsBackend::new(td.path()).unwrap();
             let (s, t) = (open(&backend, "s").await, open(&backend, "t").await);
@@ -4030,12 +4047,13 @@ pub(super) mod tests {
             assert_eq!(std::fs::read(td.path().join("t")).unwrap(), [0; 8192]);
         }
 
+        #[cfg(target_os = "linux")]
         #[tokio::test]
         async fn a_clone_across_filesystems_is_refused_with_nothing_changed() {
             let Some((build, shm)) = crate::tests::filesystems::pair() else {
                 return;
             };
-            std::fs::write(build.path().join("s"), data(8192)).unwrap();
+            std::fs::write(build.path().join("s"), pattern(8192, 0)).unwrap();
             std::fs::write(shm.path().join("t"), [0u8; 8192]).unwrap();
             let (from, to) = (
                 LocalFsBackend::new(build.path()).unwrap(),
@@ -4050,7 +4068,7 @@ pub(super) mod tests {
         #[tokio::test]
         async fn a_read_only_backend_reports_no_block_cloning_and_does_not_clone() {
             let td = tempdir().unwrap();
-            std::fs::write(td.path().join("s"), data(8192)).unwrap();
+            std::fs::write(td.path().join("s"), pattern(8192, 0)).unwrap();
             std::fs::write(td.path().join("t"), [0u8; 8192]).unwrap();
             let backend = LocalFsBackend::new(td.path()).unwrap().read_only();
             assert!(!backend.capabilities().block_cloning);
@@ -4062,7 +4080,7 @@ pub(super) mod tests {
         #[tokio::test]
         async fn handles_that_are_not_files_of_this_backend_are_not_cloned() {
             let td = tempdir().unwrap();
-            std::fs::write(td.path().join("f"), data(8192)).unwrap();
+            std::fs::write(td.path().join("f"), pattern(8192, 0)).unwrap();
             let backend = LocalFsBackend::new(td.path()).unwrap();
             let file = open(&backend, "f").await;
             let (dir, foreign) = dir_and_foreign(&backend).await;
@@ -4074,8 +4092,24 @@ pub(super) mod tests {
             }
         }
 
+        #[cfg(windows)]
+        #[tokio::test]
+        async fn block_cloning_follows_the_file_system_of_the_share_root() {
+            let td = tempdir().unwrap();
+            let backend = LocalFsBackend::new(td.path()).unwrap();
+            let cloning = backend.capabilities().block_cloning;
+            match file_system(td.path()).to_ascii_uppercase().as_str() {
+                "NTFS" => assert!(!cloning),
+                "REFS" => assert!(cloning),
+                other => eprintln!("skipping: {} is on {other}", td.path().display()),
+            }
+        }
+
+        #[cfg(target_os = "linux")]
         #[test]
         fn clone_errors_are_told_apart() {
+            use rustix::io::Errno;
+
             assert!(matches!(
                 clone_error(Errno::INVAL),
                 SmbError::InvalidParameter

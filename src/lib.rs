@@ -401,6 +401,7 @@ mod tests {
     mod aapl;
     mod async_requests;
     mod copy;
+    pub(crate) mod data;
     #[cfg(feature = "discovery")]
     mod discovery;
     mod durable;

@@ -41,6 +41,7 @@ use crate::proto::messages::{
 use crate::server::{ServerState, ShareBindings};
 use crate::stream::{StreamInfo, StreamName};
 use crate::tests::aapl;
+use crate::tests::data::pattern;
 use crate::tests::memfs::MemFsBackend;
 use crate::tests::peer::{Peer, header, status};
 use crate::{Access, Share, SmbServer};
@@ -117,13 +118,6 @@ const SECOND: At = At {
     session: 2,
     tree: 1,
 };
-
-/// `len` bytes that tell their position, and `seed`.
-fn pattern(len: usize, seed: u8) -> Vec<u8> {
-    (0..len)
-        .map(|i| (i as u8).wrapping_mul(31).wrapping_add((i >> 8) as u8) ^ seed)
-        .collect()
-}
 
 /// A CREATE request, opening an existing file for reading and writing and
 /// sharing everything unless set otherwise.

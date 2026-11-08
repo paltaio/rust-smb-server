@@ -2,6 +2,8 @@
 //! space, serial number and the case rule of name lookups.
 
 use std::io;
+#[cfg(windows)]
+use std::os::windows::io::AsHandle;
 
 use cap_std::fs::Dir;
 
@@ -45,7 +47,13 @@ pub(super) fn volume_info(dir: &Dir, root_dev: Option<u64>) -> io::Result<Volume
 /// Size and identity of the volume holding `dir`.
 #[cfg(windows)]
 pub(super) fn volume_info(dir: &Dir, _root_dev: Option<u64>) -> io::Result<VolumeInfo> {
-    use std::os::windows::io::{AsHandle as _, AsRawHandle as _};
+    volume_info_of(dir)
+}
+
+/// Size and identity of the volume `file` is open on.
+#[cfg(windows)]
+pub(super) fn volume_info_of(file: &impl AsHandle) -> io::Result<VolumeInfo> {
+    use std::os::windows::io::AsRawHandle as _;
     use windows_sys::Wdk::Storage::FileSystem::{
         FileFsFullSizeInformation, NtQueryVolumeInformationFile,
     };
@@ -63,10 +71,10 @@ pub(super) fn volume_info(dir: &Dir, _root_dev: Option<u64>) -> io::Result<Volum
         bytes_per_sector: u32,
     }
 
-    let handle = dir.as_handle().as_raw_handle();
+    let handle = file.as_handle().as_raw_handle();
     let mut serial = 0u32;
     let mut max_component = 0u32;
-    // SAFETY: `handle` stays open while `dir` is borrowed, and every non-null
+    // SAFETY: `handle` stays open while `file` is borrowed, and every non-null
     // pointer refers to a live local.
     let ok = unsafe {
         GetVolumeInformationByHandleW(
@@ -113,6 +121,34 @@ pub(super) fn volume_info(dir: &Dir, _root_dev: Option<u64>) -> io::Result<Volum
         label: None,
         max_name_length: max_component.clamp(1, MAX_NAME_LENGTH),
     })
+}
+
+/// The file system flags and name of the volume `file` is open on.
+#[cfg(windows)]
+pub(super) fn volume_of(file: &impl AsHandle) -> Option<(u32, String)> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::GetVolumeInformationByHandleW;
+
+    let handle = file.as_handle().as_raw_handle();
+    let mut flags = 0u32;
+    let mut name = [0u16; 64];
+    // SAFETY: `handle` stays open while `file` is borrowed, `flags` is a live
+    // local and `name` a live buffer of the length passed; the other buffers
+    // are null with size 0.
+    let ok = unsafe {
+        GetVolumeInformationByHandleW(
+            handle,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut flags,
+            name.as_mut_ptr(),
+            name.len() as u32,
+        )
+    };
+    let len = name.iter().position(|&u| u == 0).unwrap_or(name.len());
+    (ok != 0).then(|| (flags, String::from_utf16_lossy(&name[..len])))
 }
 
 /// Whether names in `dir` are looked up case-sensitively. On Linux, FAT

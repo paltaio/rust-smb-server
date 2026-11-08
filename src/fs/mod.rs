@@ -14,6 +14,8 @@ mod reflink;
 #[cfg(target_os = "linux")]
 mod streams;
 #[cfg(windows)]
+mod windows_clone;
+#[cfg(windows)]
 mod windows_eas;
 #[cfg(windows)]
 mod windows_streams;

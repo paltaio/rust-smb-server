@@ -35,8 +35,8 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_DISPOSITION_INFO, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES,
     FILE_READ_DATA, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
     FILE_STANDARD_INFO, FILE_WRITE_ATTRIBUTES, FileAttributeTagInfo, FileDispositionInfo,
-    FileRenameInfo, FileStandardInfo, GetFileInformationByHandleEx, GetVolumeInformationByHandleW,
-    SYNCHRONIZE, SetFileInformationByHandle,
+    FileRenameInfo, FileStandardInfo, GetFileInformationByHandleEx, SYNCHRONIZE,
+    SetFileInformationByHandle,
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
@@ -44,6 +44,7 @@ use super::local::{
     file_index, file_info_from_metadata, file_key, host_file_times, io_to_smb, join_to_io,
     link_count, set_host_attributes,
 };
+use super::volume::volume_of;
 use crate::backend::{DirEntry, FileInfo, FileTimes, Handle, OpenAction, OpenIntent, OpenOptions};
 use crate::error::{SmbError, SmbResult};
 use crate::path::is_valid_component;
@@ -66,10 +67,10 @@ const STATUS_END_OF_FILE: NTSTATUS = 0xC000_0011_u32 as NTSTATUS;
 const STATUS_INFO_LENGTH_MISMATCH: NTSTATUS = 0xC000_0004_u32 as NTSTATUS;
 const STATUS_BUFFER_TOO_SMALL: NTSTATUS = 0xC000_0023_u32 as NTSTATUS;
 
-const ERROR_INVALID_FUNCTION: i32 = 1;
+pub(super) const ERROR_INVALID_FUNCTION: i32 = 1;
 const ERROR_SHARING_VIOLATION: i32 = 32;
-const ERROR_NOT_SUPPORTED: i32 = 50;
-const ERROR_INVALID_PARAMETER: i32 = 87;
+pub(super) const ERROR_NOT_SUPPORTED: i32 = 50;
+pub(super) const ERROR_INVALID_PARAMETER: i32 = 87;
 const ERROR_FILE_SYSTEM_LIMITATION: i32 = 665;
 
 /// Most named streams one file has. Past it, the rest are not listed, and
@@ -112,7 +113,7 @@ fn to_smb(e: io::Error) -> SmbError {
 
 /// The error for a request the volume or the stream's state refuses,
 /// which STATUS_INVALID_PARAMETER answers.
-fn refused() -> io::Error {
+pub(super) fn refused() -> io::Error {
     io::Error::from_raw_os_error(ERROR_INVALID_PARAMETER)
 }
 
@@ -123,33 +124,9 @@ pub(super) struct Volume {
     pub refs: bool,
 }
 
-/// The file system flags and name of the volume `handle` is on.
-fn volume_of(handle: HANDLE) -> Option<(u32, String)> {
-    let mut flags = 0u32;
-    let mut name = [0u16; 64];
-    // SAFETY: `handle` is open for the call, `flags` is a live local and
-    // `name` a live buffer of the length passed; the other buffers are
-    // null with size 0.
-    let ok = unsafe {
-        GetVolumeInformationByHandleW(
-            handle,
-            std::ptr::null_mut(),
-            0,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            &mut flags,
-            name.as_mut_ptr(),
-            name.len() as u32,
-        )
-    };
-    let len = name.iter().position(|&u| u == 0).unwrap_or(name.len());
-    (ok != 0).then(|| (flags, String::from_utf16_lossy(&name[..len])))
-}
-
 /// The named streams of the volume of `root`, `None` when it has none.
 pub(super) fn volume(root: &Dir) -> Option<Volume> {
-    use std::os::windows::io::AsHandle as _;
-    let (flags, name) = volume_of(root.as_handle().as_raw_handle() as HANDLE)?;
+    let (flags, name) = volume_of(root)?;
     (flags & FILE_NAMED_STREAMS != 0).then(|| Volume {
         refs: name.eq_ignore_ascii_case("ReFS"),
     })
@@ -386,7 +363,7 @@ pub(super) fn list(file: &File) -> io::Result<Vec<StreamInfo>> {
             // A volume without named streams, such as FAT, refuses the
             // query with STATUS_INVALID_PARAMETER.
             status => {
-                return match volume_of(file.as_raw_handle() as HANDLE) {
+                return match volume_of(file) {
                     Some((flags, _)) if flags & FILE_NAMED_STREAMS == 0 => Ok(Vec::new()),
                     _ => Err(nt_error(status)),
                 };

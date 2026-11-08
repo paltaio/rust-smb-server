@@ -101,9 +101,7 @@ impl Ends<'_> {
             ..
         } = *request;
         let volume = self.backend.volume_info().await.map_err(clone_status)?;
-        let cluster = (u64::from(volume.sectors_per_allocation_unit)
-            * u64::from(volume.bytes_per_sector))
-        .max(1);
+        let cluster = volume.allocation_unit();
         if [source_offset, target_offset, byte_count]
             .iter()
             .any(|field| !field.is_multiple_of(cluster))

@@ -984,18 +984,13 @@ async fn set_sparse_is_not_served_on_the_other_shares() {
 mod local {
     use super::*;
     use crate::fs::LocalFsBackend;
-
-    /// Bytes in an allocation unit of the volume of `backend`.
-    async fn unit(backend: &LocalFsBackend) -> u64 {
-        let info = backend.volume_info().await.unwrap();
-        u64::from(info.sectors_per_allocation_unit) * u64::from(info.bytes_per_sector)
-    }
+    use crate::tests::data::allocation_unit;
 
     #[tokio::test]
     async fn a_clone_works_where_the_share_says_it_does_and_is_refused_elsewhere() {
         let td = tempfile::tempdir().unwrap();
         let backend = LocalFsBackend::new(td.path()).unwrap();
-        let unit = unit(&backend).await;
+        let unit = allocation_unit(&backend).await;
         let len = 4 * unit as usize;
         let data = pattern(len, 0x51);
         std::fs::write(td.path().join("s"), &data).unwrap();
@@ -1030,7 +1025,7 @@ mod local {
     async fn a_source_that_ends_inside_its_last_unit_is_cloned_to_a_target_of_its_size_only() {
         let td = tempfile::tempdir().unwrap();
         let backend = LocalFsBackend::new(td.path()).unwrap();
-        let unit = unit(&backend).await;
+        let unit = allocation_unit(&backend).await;
         let size = 3 * unit as usize + 1000;
         let data = pattern(size, 0x52);
         std::fs::write(td.path().join("s"), &data).unwrap();

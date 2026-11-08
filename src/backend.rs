@@ -826,6 +826,13 @@ pub struct VolumeInfo {
     pub max_name_length: u32,
 }
 
+impl VolumeInfo {
+    /// Bytes in one allocation unit, at least 1.
+    pub(crate) fn allocation_unit(&self) -> u64 {
+        (u64::from(self.sectors_per_allocation_unit) * u64::from(self.bytes_per_sector)).max(1)
+    }
+}
+
 impl Default for VolumeInfo {
     /// A 4 PiB volume with 2 PiB free, in 4 KiB allocation units.
     fn default() -> Self {
