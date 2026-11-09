@@ -1,6 +1,6 @@
 [package]
 name = "smb-server"
-version = "0.9.1"
+version = "0.10.0"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
@@ -18,14 +18,14 @@ members = [
 ]
 
 [workspace.package]
-version = "0.9.1"
+version = "0.10.0"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
 repository = "https://github.com/paltaio/rust-smb-server"
 
 [workspace.dependencies]
-smb-server = { path = ".", version = "0.9.1" }
+smb-server = { path = ".", version = "0.10.0" }
 
 tokio = { version = "1.40", features = ["full"] }
 binrw = "0.15"
