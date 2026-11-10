@@ -1,0 +1,12 @@
+[book]
+title = "smb-server"
+language = "en"
+src = "src"
+
+[output.html]
+default-theme = "light"
+preferred-dark-theme = "coal"
+git-repository-url = "https://github.com/paltaio/rust-smb-server"
+
+[output.html.playground]
+runnable = false
