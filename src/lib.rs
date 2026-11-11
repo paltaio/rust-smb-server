@@ -446,6 +446,8 @@ mod tests {
     mod notify;
     pub(crate) mod peer;
     mod pipes;
+    #[cfg(feature = "s3")]
+    mod s3;
     mod stream_leases;
     mod streams;
 }

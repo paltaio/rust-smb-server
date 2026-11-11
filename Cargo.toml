@@ -88,6 +88,7 @@ zbus = { version = "6.2", default-features = false, features = ["tokio"], option
 [features]
 default = ["localfs"]
 localfs = ["dep:cap-std", "dep:cap-primitives", "dep:rustix", "dep:windows-sys"]
+s3 = []
 discovery = [
     "dep:mdns-sd",
     "dep:zbus",
