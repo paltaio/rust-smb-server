@@ -427,6 +427,8 @@ pub mod ntstatus;
 mod path;
 mod proto;
 mod rpc;
+#[cfg(feature = "s3")]
+mod s3;
 mod server;
 mod stream;
 #[cfg(test)]

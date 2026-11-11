@@ -69,6 +69,15 @@ aes-gcm.workspace = true
 ccm.workspace = true
 socket2 = "0.6"
 if-addrs = { version = "0.15", optional = true, features = ["link-local"] }
+quick-xml = { version = "0.42", optional = true }
+hyper = { version = "1.12", default-features = false, features = ["client", "http1"], optional = true }
+hyper-util = { version = "0.1", default-features = false, features = ["client-legacy", "http1", "tokio"], optional = true }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "tls12", "ring"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+rustls-native-certs = { version = "0.8", optional = true }
+http = { version = "1.5", optional = true }
+http-body-util = { version = "0.1", optional = true }
+tower-service = { version = "0.3", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 cap-primitives = { workspace = true, optional = true }
@@ -77,7 +86,6 @@ windows-sys = { version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_Fil
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["fs"], optional = true }
 libc = "0.2.173"
-quick-xml = { version = "0.42", optional = true }
 
 [target.'cfg(all(unix, not(target_vendor = "apple")))'.dependencies]
 mdns-sd = { version = "0.21.6", optional = true }
@@ -88,7 +96,17 @@ zbus = { version = "6.2", default-features = false, features = ["tokio"], option
 [features]
 default = ["localfs"]
 localfs = ["dep:cap-std", "dep:cap-primitives", "dep:rustix", "dep:windows-sys"]
-s3 = []
+s3 = [
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:hyper-rustls",
+    "dep:rustls",
+    "dep:rustls-native-certs",
+    "dep:http",
+    "dep:http-body-util",
+    "dep:tower-service",
+    "dep:quick-xml",
+]
 discovery = [
     "dep:mdns-sd",
     "dep:zbus",

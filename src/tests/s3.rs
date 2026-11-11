@@ -1,3 +1,4 @@
-//! A local Versity Gateway for tests that need an S3 endpoint.
+//! Tests that need an S3 endpoint, served by a local Versity Gateway.
 
 mod gateway;
+mod transport;

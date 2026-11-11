@@ -56,23 +56,17 @@ jobs:
       - name: clippy (no default features)
         run: cargo clippy --workspace --all-targets --no-default-features -- -D warnings
 
+      - name: clippy (s3)
+        run: cargo clippy --workspace --all-targets --no-default-features --features s3 -- -D warnings
+
   test:
-    name: test (${{ matrix.os }})
-    env:
-      VERSITYGW_VERSION: v1.11.0
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: ubuntu-latest
-            versitygw_asset: versitygw_v1.11.0_Linux_x86_64.tar.gz
-            versitygw_sha256: 1f075c9dc92fef232f5b3c7465711ddc5e1b062b2b6df4a3bd246a4be5b35b52
-          - os: windows-latest
-            versitygw_asset: versitygw_v1.11.0_Windows_x86_64.zip
-            versitygw_sha256: 2c647cf9ed07ba9d35fdfbb38bb139bc8fde15dc0c94775cacfdf8ba4fdaf33a
-          - os: macos-latest
-            versitygw_asset: versitygw_v1.11.0_Darwin_arm64.tar.gz
-            versitygw_sha256: 678555913e0eb574f38d1daef36fcc584392e9ae2bb966ee6d3d6bbab1e14c31
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -81,32 +75,7 @@ jobs:
         with:
           toolchain: '1.95'
 
-      - name: install versitygw
-        shell: bash
-        env:
-          ASSET: ${{ matrix.versitygw_asset }}
-          SHA256: ${{ matrix.versitygw_sha256 }}
-        run: |
-          mkdir -p "$RUNNER_TEMP/versitygw"
-          cd "$RUNNER_TEMP/versitygw"
-          curl -sSfL --retry 3 --retry-all-errors -o "$ASSET" "https://github.com/versity/versitygw/releases/download/$VERSITYGW_VERSION/$ASSET"
-          if command -v sha256sum >/dev/null; then
-            sum="$(sha256sum "$ASSET")"
-          else
-            sum="$(shasum -a 256 "$ASSET")"
-          fi
-          [ "${sum%% *}" = "$SHA256" ] || { echo "sha256 mismatch for $ASSET"; exit 1; }
-          case "$ASSET" in
-            *.zip) unzip -q "$ASSET" ;;
-            *) tar -xzf "$ASSET" ;;
-          esac
-          name="${ASSET%.tar.gz}"
-          bin="$PWD/${name%.zip}/versitygw"
-          "$bin" --version
-          if [ "$RUNNER_OS" = Windows ]; then
-            bin="$(cygpath -w "$bin.exe")"
-          fi
-          echo "SMB_TEST_VERSITYGW=$bin" >> "$GITHUB_ENV"
+      - uses: ./.github/actions/install-versitygw
 
       - name: cargo test
         run: cargo test --workspace --all-features
@@ -134,6 +103,11 @@ jobs:
         with:
           toolchain: '1.95'
           targets: i686-unknown-linux-gnu
+
+      - name: install gcc-multilib
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-multilib
 
       - name: cargo check (i686)
         run: cargo check --workspace --all-targets --all-features --target i686-unknown-linux-gnu

@@ -27,6 +27,8 @@ jobs:
             exit 1
           fi
 
+      - uses: ./.github/actions/install-versitygw
+
       - name: cargo test
         run: cargo test --workspace --all-features
 

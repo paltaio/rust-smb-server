@@ -1,0 +1,50 @@
+name: install versitygw
+description: Downloads the Versity Gateway release for the runner, checks its SHA-256 and sets SMB_TEST_VERSITYGW to the binary.
+
+runs:
+  using: composite
+  steps:
+    - name: install versitygw
+      shell: bash
+      env:
+        VERSITYGW_VERSION: v1.11.0
+      run: |
+        case "$RUNNER_OS-$RUNNER_ARCH" in
+          Linux-X64)
+            asset=Linux_x86_64.tar.gz
+            sha256=1f075c9dc92fef232f5b3c7465711ddc5e1b062b2b6df4a3bd246a4be5b35b52
+            ;;
+          Windows-X64)
+            asset=Windows_x86_64.zip
+            sha256=2c647cf9ed07ba9d35fdfbb38bb139bc8fde15dc0c94775cacfdf8ba4fdaf33a
+            ;;
+          macOS-ARM64)
+            asset=Darwin_arm64.tar.gz
+            sha256=678555913e0eb574f38d1daef36fcc584392e9ae2bb966ee6d3d6bbab1e14c31
+            ;;
+          *)
+            echo "no versitygw release is pinned for $RUNNER_OS-$RUNNER_ARCH" >&2
+            exit 1
+            ;;
+        esac
+        file="versitygw_${VERSITYGW_VERSION}_${asset}"
+        mkdir -p "$RUNNER_TEMP/versitygw"
+        cd "$RUNNER_TEMP/versitygw"
+        curl -sSfL --retry 3 --retry-all-errors -o "$file" "https://github.com/versity/versitygw/releases/download/$VERSITYGW_VERSION/$file"
+        if command -v sha256sum >/dev/null; then
+          sum="$(sha256sum "$file")"
+        else
+          sum="$(shasum -a 256 "$file")"
+        fi
+        [ "${sum%% *}" = "$sha256" ] || { echo "sha256 mismatch for $file"; exit 1; }
+        case "$file" in
+          *.zip) unzip -q "$file" ;;
+          *) tar -xzf "$file" ;;
+        esac
+        name="${file%.tar.gz}"
+        bin="$PWD/${name%.zip}/versitygw"
+        "$bin" --version
+        if [ "$RUNNER_OS" = Windows ]; then
+          bin="$(cygpath -w "$bin.exe")"
+        fi
+        echo "SMB_TEST_VERSITYGW=$bin" >> "$GITHUB_ENV"

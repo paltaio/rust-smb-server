@@ -45,7 +45,6 @@ static GATEWAY: OnceLock<Result<Gateway, String>> = OnceLock::new();
 /// A running gateway and its generated credentials.
 pub(crate) struct Gateway {
     /// Address the gateway listens on; its endpoint is `http://` and this.
-    #[expect(dead_code, reason = "used by the S3 backend tests")]
     pub(crate) addr: SocketAddr,
     #[expect(dead_code, reason = "used by the S3 backend tests")]
     pub(crate) access_key: String,
