@@ -474,6 +474,8 @@ pub use files::{
 pub use fs::LocalFsBackend;
 pub use path::SmbPath;
 pub use proto::auth::ntlm::Identity;
+#[cfg(feature = "s3")]
+pub use s3::{S3Backend, S3BackendBuilder, S3Error};
 pub use server::{ConfigError, ConfigHandle, ShareMode, ShutdownHandle, SmbServer};
 pub use stream::{StreamInfo, StreamName};
 

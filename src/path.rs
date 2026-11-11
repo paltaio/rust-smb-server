@@ -183,10 +183,6 @@ const MAX_PATH_UNITS: usize = 32_760;
 
 /// True if `name` is one filename component that `SmbPath` accepts, so a
 /// client that sees it in a listing can open it.
-#[cfg_attr(
-    not(feature = "localfs"),
-    allow(dead_code, reason = "used by LocalFsBackend")
-)]
 pub(crate) fn is_valid_component(name: &str) -> bool {
     !name.is_empty()
         && name != "."

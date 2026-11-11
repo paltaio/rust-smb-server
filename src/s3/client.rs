@@ -319,6 +319,7 @@ pub(crate) struct ListRequest<'a> {
 
 /// The metadata a copy gives the new object.
 #[derive(Debug, Clone, Copy)]
+#[cfg_attr(not(test), expect(dead_code, reason = "used by tests only"))]
 pub(crate) enum CopyMetadata<'a> {
     /// The metadata of the source, in the storage class given.
     Copy { storage_class: Option<&'a str> },
@@ -452,7 +453,10 @@ impl S3Client {
         })
         .await
     }
+}
 
+#[cfg_attr(not(test), expect(dead_code, reason = "called by tests only"))]
+impl S3Client {
     /// PutObject. Returns the ETag of the new object.
     ///
     /// Every attempt sends `payload` from its start. A file that no longer
@@ -708,7 +712,9 @@ impl S3Client {
         })
         .await
     }
+}
 
+impl S3Client {
     fn call(&self, method: Method, key: Option<&str>, params: &[(&str, &str)]) -> Call {
         Call {
             method,

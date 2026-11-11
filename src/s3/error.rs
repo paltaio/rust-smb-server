@@ -22,31 +22,37 @@ const MAX_FIELD_LEN: usize = 128;
 /// credentials, signatures or the body of a response.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
-pub(crate) enum S3Error {
+pub enum S3Error {
     /// The store answered with an error status, or with an error document
     /// under a success status.
+    #[non_exhaustive]
     Status {
+        /// The HTTP status of the answer.
         status: u16,
+        /// The S3 error code, when the answer has one.
         code: Option<String>,
+        /// The request id the store gave the call, when it did.
         request_id: Option<String>,
     },
     /// No answer: the connection, the TLS handshake, the request or the
     /// response body failed.
     Transport(Arc<dyn Error + Send + Sync>),
-    /// Nothing was sent or received within the idle limit.
+    /// Nothing was sent or received for 60 seconds.
     TimedOut,
     /// The deadline of the call passed.
     DeadlineExceeded,
     /// The call was stopped. No attempt began after the stop.
+    #[doc(hidden)]
     Stopped,
     /// The data to send is not the data its hash covers: the file changed
     /// after it was hashed.
+    #[doc(hidden)]
     SourceChanged,
     /// The data to send could not be read from its file.
     SourceRead(Arc<io::Error>),
     /// The answer breaks what the call expects of it.
     InvalidResponse(&'static str),
-    /// The call was given an argument it cannot send.
+    /// A setting or argument cannot be used. The text names it.
     InvalidArgument(&'static str),
 }
 
@@ -105,12 +111,14 @@ impl S3Error {
     /// Whether the data sent was not the data the request was signed for: the
     /// file changed after it was hashed, or the store found the body to differ
     /// from the hash.
+    #[cfg_attr(not(test), expect(dead_code, reason = "called by tests only"))]
     pub(crate) fn is_source_changed(&self) -> bool {
         matches!(self, S3Error::SourceChanged)
             || matches!(self.code(), Some("XAmzContentSHA256Mismatch" | "BadDigest"))
     }
 
     /// Whether the call ended because it was stopped.
+    #[cfg_attr(not(test), expect(dead_code, reason = "called by tests only"))]
     pub(crate) fn is_stopped(&self) -> bool {
         matches!(self, S3Error::Stopped)
     }
@@ -169,7 +177,9 @@ impl S3Error {
     /// The error a share request fails with, chosen by the code of the store's
     /// answer and by its status when it has no code. Logs a refused access at
     /// warn level, with the code only, and a clock the store rejects at error
-    /// level.
+    /// level. An answer that matches none of the specific errors becomes `Io`
+    /// and is logged at warn level with its status, code, request id and
+    /// causes.
     pub(crate) fn into_smb_error(self) -> SmbError {
         let (status, code) = (self.http_status(), self.code());
         match (status, code) {
@@ -191,7 +201,16 @@ impl S3Error {
             (_, Some("ExistingObjectIsDirectory")) => SmbError::Exists,
             (_, Some("KeyTooLongError")) => SmbError::NameInvalid,
             (_, Some("EntityTooLarge")) => SmbError::DiskFull,
-            _ => SmbError::Io(io::Error::other(self)),
+            _ => {
+                warn!(
+                    status,
+                    code,
+                    request_id = self.request_id(),
+                    cause = self.causes(),
+                    "the store request failed"
+                );
+                SmbError::Io(io::Error::other(self))
+            }
         }
     }
 }
@@ -225,7 +244,7 @@ impl fmt::Display for S3Error {
                 Ok(())
             }
             S3Error::Transport(_) => f.write_str("the request failed in transit"),
-            S3Error::TimedOut => f.write_str("no data moved within the idle limit"),
+            S3Error::TimedOut => f.write_str("no data moved for 60 seconds"),
             S3Error::DeadlineExceeded => f.write_str("the deadline passed"),
             S3Error::Stopped => f.write_str("the call was stopped"),
             S3Error::SourceChanged => f.write_str("the data to upload changed after it was hashed"),

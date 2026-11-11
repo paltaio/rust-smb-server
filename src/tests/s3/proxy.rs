@@ -49,6 +49,9 @@ pub(super) struct Reply {
     status: u16,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
+    /// The `Content-Length` to send when it is not the length of the body, as
+    /// for the answer to a HEAD.
+    declared_length: Option<usize>,
 }
 
 impl Reply {
@@ -57,7 +60,14 @@ impl Reply {
             status,
             headers: Vec::new(),
             body: body.into(),
+            declared_length: None,
         }
+    }
+
+    /// Sends `length` as the `Content-Length`.
+    pub(super) fn declaring(mut self, length: usize) -> Self {
+        self.declared_length = Some(length);
+        self
     }
 
     pub(super) fn header(mut self, name: &str, value: &str) -> Self {
@@ -84,7 +94,7 @@ impl Reply {
         out.extend_from_slice(
             format!(
                 "Content-Length: {}\r\nConnection: close\r\n\r\n",
-                self.body.len()
+                self.declared_length.unwrap_or(self.body.len())
             )
             .as_bytes(),
         );

@@ -36,6 +36,7 @@ impl Stop {
 
     /// Ends the calls: no attempt begins from now on, and a wait before the
     /// next attempt ends at once. An attempt under way runs to its end.
+    #[cfg_attr(not(test), expect(dead_code, reason = "called by tests only"))]
     pub(crate) fn stop(&self) {
         self.0.send_replace(true);
     }
@@ -62,22 +63,29 @@ pub(crate) enum Retry {
     Background { stop: Stop },
 }
 
+/// The instant `timeout` from now. A `timeout` too long for the clock gives a
+/// deadline decades away.
+pub(crate) fn deadline_after(timeout: Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_add(timeout).unwrap_or(now + FAR_FUTURE)
+}
+
 impl Retry {
-    /// A foreground call that has `timeout` from now. A `timeout` too long
-    /// for the clock gives a deadline decades away.
+    /// A foreground call that has `timeout` from now.
     pub(crate) fn within(timeout: Duration) -> Self {
-        let now = Instant::now();
         Retry::Foreground {
-            deadline: now.checked_add(timeout).unwrap_or(now + FAR_FUTURE),
+            deadline: deadline_after(timeout),
         }
     }
 
     /// A background call nothing stops.
+    #[cfg_attr(not(test), expect(dead_code, reason = "called by tests only"))]
     pub(crate) fn background() -> Self {
         Retry::Background { stop: Stop::new() }
     }
 
     /// A background call that ends when `stop` is called.
+    #[cfg_attr(not(test), expect(dead_code, reason = "called by tests only"))]
     pub(crate) fn until(stop: &Stop) -> Self {
         Retry::Background { stop: stop.clone() }
     }
