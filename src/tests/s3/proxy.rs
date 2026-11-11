@@ -41,6 +41,9 @@ pub(super) enum Fault {
     Stall,
     /// Waits until the `Notify` is notified, then passes the request on as usual.
     Hold(Arc<Notify>),
+    /// Waits until the `Notify` is notified, then answers with this response.
+    /// The gateway never sees the request.
+    HoldReply(Arc<Notify>, Reply),
 }
 
 /// A canned response.
@@ -317,6 +320,10 @@ async fn serve(state: &State, mut client: TcpStream) -> io::Result<()> {
             client
                 .write_all(&pass(state.upstream, &head, &body).await?)
                 .await?
+        }
+        Some(Fault::HoldReply(gate, reply)) => {
+            gate.notified().await;
+            client.write_all(&reply.to_bytes()).await?;
         }
         None => {
             client

@@ -16,6 +16,7 @@ use super::cache::MetaCache;
 use super::client::S3Client;
 use super::handle::S3Handle;
 use super::lookup::Found;
+use super::readahead::ReadAhead;
 use super::retry::Retry;
 
 /// Serves the objects of an S3 bucket as files and directories.
@@ -42,6 +43,16 @@ use super::retry::Retry;
 /// [`metadata_ttl`](crate::S3BackendBuilder::metadata_ttl). Clones share the
 /// connection pool and that cache.
 ///
+/// A read of a file requests the chunks of
+/// [`read_chunk`](crate::S3BackendBuilder::read_chunk) bytes that hold its
+/// bytes, and keeps them for later reads while a handle that reads their
+/// version is open. A chunk not kept is requested for the ETag the file last
+/// saw. If the object has another ETag by then, the read looks the object up
+/// again and reads that version, and the file reports that version's size and
+/// times from then on. An object without an ETag is read as asked for, with
+/// no chunks, and a read fails once the answer has an ETag, or a size or
+/// modification time that differs from what the file was opened with.
+///
 /// Build one with [`S3Backend::builder`].
 #[derive(Clone)]
 pub struct S3Backend {
@@ -61,6 +72,10 @@ pub(super) struct Shared {
     /// The time of the share root and of directories without a marker.
     pub(super) built: SystemTime,
     pub(super) cache: Mutex<MetaCache>,
+    /// The size of the requests that read file data.
+    pub(super) read_chunk: u64,
+    /// The chunks read requests brought, shared by every handle.
+    pub(super) ahead: Arc<ReadAhead>,
 }
 
 impl Shared {
@@ -89,6 +104,22 @@ impl S3Backend {
     /// Empties the listing cache and bounds it to `rows` rows.
     pub(crate) fn limit_listing_rows(&self, rows: usize) {
         self.shared.cache().limit_rows(rows);
+    }
+
+    /// Drops the chunks kept for reads and bounds them to `per_version` for
+    /// one version of an object and `bytes` in all.
+    pub(crate) fn limit_read_chunks(&self, per_version: usize, bytes: usize) {
+        self.shared.ahead.limit(per_version, bytes);
+    }
+
+    /// The bytes of chunks kept for reads.
+    pub(crate) fn read_chunk_bytes(&self) -> usize {
+        self.shared.ahead.held()
+    }
+
+    /// The reads that wait for a chunk another read is fetching.
+    pub(crate) fn read_chunk_waiters(&self) -> usize {
+        self.shared.ahead.waiting()
     }
 }
 

@@ -9,7 +9,7 @@ use tokio::task::JoinSet;
 
 use super::fixture::{TestBucket, foreground, user_metadata};
 use super::gateway::REGION;
-use super::proxy::{Fault, Proxy, Reply};
+use super::proxy::{Fault, Proxy, Reply, Seen};
 use crate::backend::FILE_ATTRIBUTE_DIRECTORY;
 use crate::ntstatus;
 use crate::proto::header::{Command, SMB2_HEADER_LEN};
@@ -219,9 +219,14 @@ pub(super) fn listings(proxy: &Proxy) -> usize {
     proxy.count(|seen| seen.method == "GET" && seen.has_param("delimiter"))
 }
 
+/// Whether `seen` is a read of object data: a GET that is not a listing.
+pub(super) fn is_data_read(seen: &Seen) -> bool {
+    seen.method == "GET" && !seen.has_param("list-type")
+}
+
 /// Reads of object data.
 pub(super) fn reads(proxy: &Proxy) -> usize {
-    proxy.count(|seen| seen.method == "GET" && !seen.has_param("list-type"))
+    proxy.count(is_data_read)
 }
 
 /// Every request the proxy has seen.

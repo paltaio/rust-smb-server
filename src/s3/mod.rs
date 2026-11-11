@@ -14,6 +14,8 @@ mod lookup;
 mod meta;
 pub(crate) mod object;
 pub(crate) mod payload;
+mod read;
+mod readahead;
 pub(crate) mod retry;
 pub(crate) mod sigv4;
 pub(crate) mod transport;

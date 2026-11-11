@@ -9,6 +9,7 @@ use super::cache::MetaCache;
 use super::client::{ListRequest, Location, S3Client, Settings};
 use super::error::S3Error;
 use super::keys::{MAX_KEY_LEN, dir_prefix};
+use super::readahead::{MAX_CHUNK, MIN_CHUNK, ReadAhead};
 use super::retry::Retry;
 use super::sigv4::Credentials;
 
@@ -16,6 +17,7 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_METADATA_TTL: Duration = Duration::from_secs(30);
 const DEFAULT_LISTING_METADATA_MAX: usize = 1000;
 const DEFAULT_UPLOAD_CONCURRENCY: usize = 4;
+const DEFAULT_READ_CHUNK: u32 = 8 << 20;
 
 /// Settings of an [`S3Backend`], set through the methods below and applied by
 /// [`build`](S3BackendBuilder::build).
@@ -32,6 +34,7 @@ pub struct S3BackendBuilder {
     metadata_ttl: Duration,
     listing_metadata_max: usize,
     upload_concurrency: usize,
+    read_chunk: u32,
 }
 
 impl fmt::Debug for S3BackendBuilder {
@@ -80,6 +83,7 @@ impl S3Backend {
             metadata_ttl: DEFAULT_METADATA_TTL,
             listing_metadata_max: DEFAULT_LISTING_METADATA_MAX,
             upload_concurrency: DEFAULT_UPLOAD_CONCURRENCY,
+            read_chunk: DEFAULT_READ_CHUNK,
         }
     }
 }
@@ -189,6 +193,19 @@ impl S3BackendBuilder {
         self
     }
 
+    /// Sets the size of the chunks that reads of objects with an ETag
+    /// request, from 64 KiB to 32 MiB. Chunks are counted from the start of
+    /// the object, and a read requests those that hold its bytes. A read of an
+    /// object without an ETag requests the bytes it asks for. The backend
+    /// keeps chunks for later reads while a handle that reads their version of
+    /// the object is open: up to 4 chunks of each version, and 128 MiB of
+    /// chunks over all versions. The default is 8 MiB.
+    #[must_use]
+    pub fn read_chunk(mut self, bytes: u32) -> Self {
+        self.read_chunk = bytes;
+        self
+    }
+
     /// Checks the settings and the bucket, and returns the backend.
     ///
     /// # Errors
@@ -235,6 +252,8 @@ impl S3BackendBuilder {
                 head_concurrency: head_concurrency(self.upload_concurrency),
                 built: SystemTime::now(),
                 cache: Mutex::new(MetaCache::new(self.metadata_ttl)),
+                read_chunk: u64::from(self.read_chunk),
+                ahead: Arc::new(ReadAhead::new()),
             }),
         })
     }
@@ -258,6 +277,11 @@ impl S3BackendBuilder {
         }
         if self.upload_concurrency == 0 {
             return Err(S3Error::InvalidArgument("the upload concurrency is zero"));
+        }
+        if !(MIN_CHUNK..=MAX_CHUNK).contains(&self.read_chunk) {
+            return Err(S3Error::InvalidArgument(
+                "the read chunk is not between 64 KiB and 32 MiB",
+            ));
         }
         if self
             .prefix
@@ -390,6 +414,19 @@ mod tests {
                 .check()
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn the_read_chunk_is_between_64_kib_and_32_mib() {
+        for bytes in [0, 1, MIN_CHUNK - 1, MAX_CHUNK + 1, u32::MAX] {
+            assert!(
+                refusal(builder().read_chunk(bytes)).contains("read chunk"),
+                "{bytes}"
+            );
+        }
+        for bytes in [MIN_CHUNK, DEFAULT_READ_CHUNK, MAX_CHUNK] {
+            assert!(builder().read_chunk(bytes).check().is_ok(), "{bytes}");
+        }
     }
 
     #[test]

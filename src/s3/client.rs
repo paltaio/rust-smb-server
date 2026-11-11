@@ -9,7 +9,7 @@ use bytes::{Bytes, BytesMut};
 use http::header::{CONTENT_LENGTH, CONTENT_RANGE, ETAG, HOST, IF_MATCH, RANGE};
 use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, Uri};
 use http_body_util::BodyExt as _;
-use hyper::body::Incoming;
+use hyper::body::{Body as _, Incoming, SizeHint};
 use md5::{Digest as _, Md5};
 
 use super::encode::{Query, base64, uri_encode};
@@ -832,6 +832,15 @@ fn check_part_number(part_number: u32) -> Result<String, S3Error> {
     Ok(part_number.to_string())
 }
 
+/// The room to reserve for object data of which at most `max` bytes are read:
+/// the length the response declares, or `max`. Growing the buffer as data
+/// arrives could leave up to twice the bytes allocated.
+fn object_capacity(hint: &SizeHint, max: usize) -> usize {
+    hint.exact()
+        .and_then(|len| usize::try_from(len).ok())
+        .map_or(max, |len| len.min(max))
+}
+
 /// Reads the body of a response within `limit`. Every chunk counts as
 /// activity of the request, and a body that stalls fails the read.
 async fn read_body(
@@ -844,7 +853,11 @@ async fn read_body(
         BodyLimit::Capped(max) => (max, false),
         BodyLimit::Prefix(max) => (max, true),
     };
-    let mut data = BytesMut::new();
+    let mut data = BytesMut::with_capacity(if truncate {
+        object_capacity(&body.size_hint(), max)
+    } else {
+        0
+    });
     while let Some(frame) = activity
         .watch(idle, body.frame())
         .await
@@ -1219,5 +1232,18 @@ mod tests {
             .await
             .unwrap();
         assert!(failed.is_empty());
+    }
+
+    #[test]
+    fn object_data_reserves_the_declared_length_up_to_the_range() {
+        assert_eq!(object_capacity(&SizeHint::with_exact(10), 100), 10);
+        assert_eq!(object_capacity(&SizeHint::with_exact(100), 100), 100);
+        assert_eq!(object_capacity(&SizeHint::with_exact(1000), 100), 100);
+        assert_eq!(object_capacity(&SizeHint::with_exact(u64::MAX), 100), 100);
+        assert_eq!(object_capacity(&SizeHint::new(), 100), 100);
+        let mut unsure = SizeHint::new();
+        unsure.set_lower(5);
+        unsure.set_upper(50);
+        assert_eq!(object_capacity(&unsure, 100), 100);
     }
 }

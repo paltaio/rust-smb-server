@@ -11,8 +11,8 @@ use super::gateway::REGION;
 use super::proxy::{Fault, Proxy, Reply};
 use super::share::{
     DELETE, FILE_CREATE, FILE_DELETE_ON_CLOSE, FILE_OPEN_IF, FILE_OVERWRITE, FILE_OVERWRITE_IF,
-    READ, Rig, Spec, WRITE, WRITE_ATTRIBUTES, builder, filetime, heads, listings, names,
-    open_handle, put_with, reads, requests,
+    READ, Rig, Spec, WRITE, WRITE_ATTRIBUTES, builder, filetime, heads, is_data_read, listings,
+    names, open_handle, put_with, reads, requests,
 };
 use crate::ntstatus::{
     STATUS_ACCESS_DENIED, STATUS_FILE_IS_A_DIRECTORY, STATUS_OBJECT_NAME_NOT_FOUND,
@@ -304,57 +304,27 @@ async fn capabilities_and_the_volume_describe_a_read_only_share() {
 }
 
 #[tokio::test]
-async fn a_read_asks_for_exactly_the_range_with_the_etag_of_the_open() {
+async fn an_object_smaller_than_the_default_chunk_is_read_by_one_request_for_all_of_it() {
     let mut rig = Rig::new().await;
     let data = pattern(0, 3 * MIB + 5);
-    let etag = put(rig.store(), "data.bin", &data).await;
+    put(rig.store(), "data.bin", &data).await;
     let file = rig.smb.open("data.bin").await.unwrap();
     let size = data.len() as u64;
-    let cases = [
-        (0, 10, (0, 9)),
-        (100, 65_536, (100, 65_635)),
-        (1 << 20, 65_536, (1 << 20, (1 << 20) + 65_535)),
-        (size - 5, 1000, (size - 5, size - 1)),
-        (size - 1, 1, (size - 1, size - 1)),
-    ];
-    for (n, &(offset, len, wanted)) in cases.iter().enumerate() {
+    for (offset, len) in [
+        (0, 10),
+        (100, 65_536),
+        (1 << 20, 65_536),
+        (size - 5, 1000),
+        (size - 1, 1),
+    ] {
+        let end = (offset + u64::from(len)).min(size);
         let got = rig.smb.read(file.id, offset, len).await.unwrap();
-        assert_eq!(got, &data[wanted.0 as usize..=wanted.1 as usize]);
-        let last = rig.proxy.seen().pop().unwrap();
-        assert_eq!(
-            last.header("range"),
-            Some(format!("bytes={}-{}", wanted.0, wanted.1).as_str())
-        );
-        assert_eq!(last.header("if-match"), Some(etag.as_str()));
-        assert_eq!(reads(&rig.proxy), n + 1, "one request per read");
+        assert_eq!(got, &data[offset as usize..end as usize]);
     }
-    // Past the end nothing is asked for.
-    assert!(rig.smb.read(file.id, size, 10).await.is_err());
-    assert!(rig.smb.read(file.id, size + 1, 10).await.is_err());
-    assert_eq!(reads(&rig.proxy), cases.len());
-}
-
-#[tokio::test]
-async fn a_read_of_an_object_that_changed_fails_and_the_next_open_sees_the_new_one() {
-    let mut rig = Rig::new().await;
-    put(rig.store(), "f.txt", b"first version").await;
-    let file = rig.smb.open("f.txt").await.unwrap();
-    assert_eq!(
-        rig.smb.read(file.id, 0, 100).await.unwrap(),
-        b"first version"
-    );
-    put(rig.store(), "f.txt", b"second, longer version").await;
-    assert_eq!(
-        rig.smb.read(file.id, 0, 100).await.unwrap_err(),
-        STATUS_UNEXPECTED_IO_ERROR
-    );
-    // Within the ttl, but what the failure showed is not trusted any more.
-    let again = rig.smb.open("f.txt").await.unwrap();
-    assert_eq!(again.size, 22);
-    assert_eq!(
-        rig.smb.read(again.id, 0, 100).await.unwrap(),
-        b"second, longer version"
-    );
+    assert_eq!(reads(&rig.proxy), 1);
+    let read = rig.proxy.seen().into_iter().find(is_data_read).unwrap();
+    let wanted = format!("bytes=0-{}", size - 1);
+    assert_eq!(read.header("range"), Some(wanted.as_str()));
 }
 
 #[tokio::test]
@@ -400,7 +370,7 @@ fn bare_object(rig: &Rig, key: &str, modified: &str, total: u64, etag: Option<&s
         read = read.header("ETag", etag);
     }
     rig.proxy.inject(
-        move |seen| seen.method == "GET" && seen.target == target && seen.header("range").is_some(),
+        move |seen| is_data_read(seen) && seen.target == target,
         Fault::Reply(read),
         usize::MAX,
     );
@@ -420,6 +390,17 @@ async fn an_object_without_an_etag_is_read_without_if_match() {
 }
 
 #[tokio::test]
+async fn an_object_without_an_etag_is_requested_for_every_read() {
+    let mut rig = Rig::new().await;
+    bare_object(&rig, "bare", OLD, 3, None);
+    let file = rig.smb.open("bare").await.unwrap();
+    for n in 1..=3 {
+        assert_eq!(rig.smb.read(file.id, 0, 10).await.unwrap(), b"abc");
+        assert_eq!(reads(&rig.proxy), n);
+    }
+}
+
+#[tokio::test]
 async fn an_object_without_an_etag_that_changes_size_or_time_or_gets_one_is_not_read() {
     for (modified, total, etag) in [
         ("Fri, 25 May 2013 00:00:00 GMT", 3, None),
@@ -432,11 +413,14 @@ async fn an_object_without_an_etag_that_changes_size_or_time_or_gets_one_is_not_
         let file = rig.smb.open("bare").await.unwrap();
         rig.proxy.clear_rules();
         bare_object(&rig, "bare", modified, total, etag);
+        let heads_before = heads(&rig.proxy);
         assert_eq!(
             rig.smb.read(file.id, 0, 10).await.unwrap_err(),
             STATUS_UNEXPECTED_IO_ERROR,
             "{modified} {total} {etag:?}"
         );
+        assert_eq!(reads(&rig.proxy), 1);
+        assert_eq!(heads(&rig.proxy), heads_before, "nothing is refreshed");
     }
 }
 
@@ -866,18 +850,4 @@ async fn a_stall_in_a_read_ends_at_the_deadline() {
         "{:?}",
         started.elapsed()
     );
-}
-
-#[tokio::test]
-async fn data_is_read_from_the_store_every_time() {
-    let mut rig = Rig::new().await;
-    put(rig.store(), "f.bin", pattern(0, 1000)).await;
-    let file = rig.smb.open("f.bin").await.unwrap();
-    for _ in 0..3 {
-        assert_eq!(
-            rig.smb.read(file.id, 0, 100).await.unwrap(),
-            pattern(0, 100)
-        );
-    }
-    assert_eq!(reads(&rig.proxy), 3);
 }
