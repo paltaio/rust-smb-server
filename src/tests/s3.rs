@@ -9,6 +9,8 @@ mod lookups;
 mod proxy;
 mod readonly;
 mod reads;
+mod recovery;
 mod share;
 mod transport;
 mod wire;
+mod writes;

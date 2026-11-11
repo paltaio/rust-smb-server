@@ -13,10 +13,12 @@ use super::cache::Known;
 use super::client::ListRequest;
 use super::error::S3Error;
 use super::keys::{
-    DirListing, ListingBuilder, MAX_KEY_LEN, Row, RowKind, child_key, dir_prefix, path_key,
+    DirListing, ListingBuilder, MAX_KEY_LEN, Row, RowKind, child_key, dir_prefix, last_name,
+    path_key,
 };
 use super::meta;
 use super::object::ObjectHead;
+use super::overlay::Held;
 use super::retry::Retry;
 
 /// A directory found in the store.
@@ -75,10 +77,96 @@ impl Shared {
         self.cache().forget_file(key, dir);
     }
 
-    /// Resolves `path`. Fails with `NotFound` when the directory it is in
-    /// exists and holds no such name, and with `PathNotFound` when that
-    /// directory does not exist or is an object.
+    /// Resolves `path`, as far as the bucket and the cache tell. Fails with
+    /// `NotFound` when the directory it is in exists and holds no such name,
+    /// and with `PathNotFound` when that directory does not exist or is an
+    /// object. An object whose key is to be deleted does not resolve, and a
+    /// directory that only entries of the overlay below it imply does.
     pub(super) async fn lookup(&self, path: &SmbPath, retry: &Retry) -> SmbResult<Found> {
+        match self.resolve(path, retry).await {
+            Ok(found) => self.visible(found),
+            Err(e @ (SmbError::NotFound | SmbError::PathNotFound)) => {
+                let key = path_key(&self.prefix, path.components())?;
+                if let Some(found) = self.implied(&key) {
+                    return Ok(found);
+                }
+                // A directory that only the overlay has holds names the
+                // bucket does not know.
+                let parent = path.parent().filter(|parent| !parent.is_root());
+                let in_overlay = parent
+                    .and_then(|parent| path_key(&self.prefix, parent.components()).ok())
+                    .is_some_and(|parent| {
+                        self.overlay
+                            .peek(&parent)
+                            .is_some_and(|entry| entry.is_dir())
+                            || self.overlay.spelling(&parent).is_some()
+                    });
+                Err(if in_overlay { SmbError::NotFound } else { e })
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// A hold on the entry of the overlay that `path` names: one that holds
+    /// changes, else one for what the bucket has there.
+    pub(super) async fn locate(self: &Arc<Self>, path: &SmbPath, retry: &Retry) -> SmbResult<Held> {
+        let key = path_key(&self.prefix, path.components())?;
+        if let Some(held) = self.overlay.take_pending(&key) {
+            return Ok(held);
+        }
+        let found = self.lookup(path, retry).await?;
+        Ok(self.overlay.take_found(found, &self.ahead))
+    }
+
+    /// The directory `path` is in, as the bucket spells it. Fails with
+    /// `PathNotFound` if it is not a directory.
+    pub(super) async fn parent_dir(&self, path: &SmbPath, retry: &Retry) -> SmbResult<DirRef> {
+        let parent = path.parent().filter(|parent| !parent.is_root());
+        let Some(parent) = parent else {
+            return Ok(self.root());
+        };
+        let key = path_key(&self.prefix, parent.components())?;
+        if let Some(entry) = self.overlay.peek(&key) {
+            if !entry.is_dir() {
+                return Err(SmbError::PathNotFound);
+            }
+            return Ok(entry.state().dir_ref());
+        }
+        match self.lookup(&parent, retry).await {
+            Ok(Found::Dir(dir)) => Ok(dir),
+            Ok(Found::File(_)) | Err(SmbError::NotFound) => Err(SmbError::PathNotFound),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The directory `key` names if entries of the overlay below it imply it.
+    fn implied(&self, key: &str) -> Option<Found> {
+        self.overlay.spelling(key).map(|key| {
+            Found::Dir(DirRef {
+                name: last_name(&key).to_owned(),
+                key,
+                marker: None,
+            })
+        })
+    }
+
+    /// `found`, unless the overlay has the key of the object to delete. An
+    /// object that entries of the overlay are below is the directory they
+    /// imply.
+    fn visible(&self, found: Found) -> SmbResult<Found> {
+        let Found::File(file) = &found else {
+            return Ok(found);
+        };
+        if let Some(dir) = self.implied(&file.key) {
+            return Ok(dir);
+        }
+        if self.overlay.tombstoned(&file.key) {
+            return Err(SmbError::NotFound);
+        }
+        Ok(found)
+    }
+
+    async fn resolve(&self, path: &SmbPath, retry: &Retry) -> SmbResult<Found> {
         let components = path.components();
         let Some((name, parents)) = components.split_last() else {
             return Ok(Found::Dir(self.root()));
@@ -118,13 +206,19 @@ impl Shared {
         if !is_valid_component(name) {
             return Err(SmbError::NotFound);
         }
-        if let Some(found) = self.exact(&dir.key, name, retry).await? {
-            return Ok(found);
-        }
-        if self.case_insensitive {
+        let found = if let Some(found) = self.exact(&dir.key, name, retry).await? {
+            Ok(found)
+        } else if self.case_insensitive {
             self.fold_in(&dir.key, name, retry).await
         } else {
             Err(SmbError::NotFound)
+        };
+        match found {
+            Ok(found) => self.visible(found),
+            Err(SmbError::NotFound) => self
+                .implied(&child_key(&dir.key, name)?)
+                .ok_or(SmbError::NotFound),
+            Err(e) => Err(e),
         }
     }
 

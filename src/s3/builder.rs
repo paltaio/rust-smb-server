@@ -1,14 +1,22 @@
 //! The settings of an [`S3Backend`] and the check that the bucket is there.
 
 use std::fmt;
+use std::io;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
+use tracing::info;
+
 use super::backend::{S3Backend, Shared};
 use super::cache::MetaCache;
+use super::cachedir::{CacheDir, Recovered, cache_error, identity};
 use super::client::{ListRequest, Location, S3Client, Settings};
+use super::entry::{Entry, Own};
 use super::error::S3Error;
 use super::keys::{MAX_KEY_LEN, dir_prefix};
+use super::meta::same_times;
+use super::overlay::Overlay;
 use super::readahead::{MAX_CHUNK, MIN_CHUNK, ReadAhead};
 use super::retry::Retry;
 use super::sigv4::Credentials;
@@ -28,6 +36,7 @@ pub struct S3BackendBuilder {
     credentials: Option<Credentials>,
     prefix: String,
     path_style: Option<bool>,
+    cache_dir: Option<PathBuf>,
     read_only: bool,
     case_insensitive: bool,
     request_timeout: Duration,
@@ -77,6 +86,7 @@ impl S3Backend {
             credentials: None,
             prefix: String::new(),
             path_style: None,
+            cache_dir: None,
             read_only: false,
             case_insensitive: true,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
@@ -140,8 +150,22 @@ impl S3BackendBuilder {
         self
     }
 
-    /// Refuses every change to the share. [`build`](Self::build) fails
-    /// without it.
+    /// Keeps what clients change in `dir`. The backend makes `dir` if it is
+    /// missing and locks it until the backend is dropped. The directory must
+    /// belong to this endpoint, bucket, prefix and
+    /// [case setting](Self::case_insensitive), and be on storage that
+    /// survives a restart: what it holds is not in the bucket.
+    ///
+    /// Required unless the backend is [`read_only`](Self::read_only), and
+    /// refused with it.
+    #[must_use]
+    pub fn cache_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.cache_dir = Some(dir.into());
+        self
+    }
+
+    /// Refuses every change to the share. The backend then needs no
+    /// [`cache_dir`](Self::cache_dir), and one is refused.
     #[must_use]
     pub fn read_only(mut self) -> Self {
         self.read_only = true;
@@ -150,7 +174,8 @@ impl S3BackendBuilder {
 
     /// Sets whether names match without regard to case. On by default: a name
     /// that no key spells exactly opens the first key that differs only in
-    /// case. Off, every name is exactly a key.
+    /// case. Off, every name is exactly a key. A
+    /// [cache directory](Self::cache_dir) is used with one setting only.
     #[must_use]
     pub fn case_insensitive(mut self, case_insensitive: bool) -> Self {
         self.case_insensitive = case_insensitive;
@@ -210,13 +235,43 @@ impl S3BackendBuilder {
     ///
     /// # Errors
     ///
-    /// Fails for settings that cannot be used, for a platform without root
-    /// certificates, and when one request for the keys below the prefix
-    /// fails: the store answers with an error, as for a bucket that does not
-    /// exist or credentials it refuses, or does not answer, as for an
-    /// unreachable endpoint or a timeout.
+    /// Fails for settings that cannot be used and for a platform without root
+    /// certificates.
+    ///
+    /// Fails for a cache directory that cannot be used, is locked by another
+    /// backend, belongs to another endpoint, bucket, prefix or case setting,
+    /// or has files and no identity.
+    ///
+    /// Fails when one request for the keys below the prefix fails: the store
+    /// answers with an error, as for a bucket that does not exist or
+    /// credentials it refuses, or does not answer, as for an unreachable
+    /// endpoint or a timeout. The request runs before the cache directory is
+    /// read back.
+    ///
+    /// Files flushed through an earlier backend come back into the share with
+    /// their recorded times and attributes. A file comes back as of its last
+    /// flush: one made and never flushed is gone, and an object changed and
+    /// never flushed reads as the bucket has it. A file in the cache
+    /// directory that cannot be read back moves to its `conflicts` directory,
+    /// with an error in the log.
     pub async fn build(self) -> Result<S3Backend, S3Error> {
         let credentials = self.check()?;
+        let local = match &self.cache_dir {
+            None => None,
+            Some(dir) => {
+                let dir = dir.clone();
+                let who = identity(
+                    &origin(&self.endpoint),
+                    &self.bucket,
+                    &self.prefix,
+                    self.case_insensitive,
+                );
+                let opened = tokio::task::spawn_blocking(move || CacheDir::open(&dir, &who))
+                    .await
+                    .map_err(|e| cache_error(io::Error::other(e)))??;
+                Some(Arc::new(opened))
+            }
+        };
         let mut settings = Settings::new(
             Location {
                 endpoint: self.endpoint,
@@ -242,6 +297,34 @@ impl S3BackendBuilder {
             .list_objects(&request, Retry::within(self.request_timeout))
             .await?;
 
+        let recovered = match &local {
+            None => Recovered::default(),
+            Some(local) => {
+                let local = Arc::clone(local);
+                let (prefix, fold) = (self.prefix.clone(), self.case_insensitive);
+                tokio::task::spawn_blocking(move || local.recover(&prefix, fold))
+                    .await
+                    .map_err(|e| cache_error(io::Error::other(e)))?
+                    .map_err(cache_error)?
+            }
+        };
+
+        let built = SystemTime::now();
+        let ahead = Arc::new(ReadAhead::new());
+        let overlay = Overlay::new(self.case_insensitive);
+        let entries = recovered
+            .entries
+            .into_iter()
+            .map(|(record, file)| Entry::recovered(record, file, &ahead))
+            .collect();
+        let restored = overlay.install(entries, recovered.tombstones);
+        if restored > 0 {
+            info!(
+                entries = restored,
+                "entries restored from the cache directory"
+            );
+        }
+
         Ok(S3Backend {
             shared: Arc::new(Shared {
                 client,
@@ -250,10 +333,17 @@ impl S3BackendBuilder {
                 request_timeout: self.request_timeout,
                 listing_metadata_max: self.listing_metadata_max,
                 head_concurrency: head_concurrency(self.upload_concurrency),
-                built: SystemTime::now(),
+                built,
                 cache: Mutex::new(MetaCache::new(self.metadata_ttl)),
                 read_chunk: u64::from(self.read_chunk),
-                ahead: Arc::new(ReadAhead::new()),
+                ahead,
+                read_only: self.read_only,
+                overlay,
+                local,
+                root_own: Mutex::new(Own {
+                    times: same_times(built),
+                    attributes: 0,
+                }),
             }),
         })
     }
@@ -297,10 +387,18 @@ impl S3BackendBuilder {
                 "the prefix is too long to leave room for a name",
             ));
         }
-        if !self.read_only {
-            return Err(S3Error::InvalidArgument(
-                "the backend serves a read-only share; call read_only()",
-            ));
+        match (self.read_only, &self.cache_dir) {
+            (false, None) => {
+                return Err(S3Error::InvalidArgument(
+                    "the cache directory is not set; call cache_dir() or read_only()",
+                ));
+            }
+            (true, Some(_)) => {
+                return Err(S3Error::InvalidArgument(
+                    "a read-only backend has no use for a cache directory",
+                ));
+            }
+            _ => {}
         }
         Ok(credentials.clone())
     }
@@ -430,10 +528,19 @@ mod tests {
     }
 
     #[test]
-    fn a_backend_that_is_not_read_only_is_refused_by_name() {
+    fn a_writable_backend_needs_a_cache_directory_and_a_read_only_one_refuses_it() {
         let writable = S3Backend::builder("http://127.0.0.1:1", "r", "b").credentials("a", "s");
         let why = refusal(writable);
+        assert!(why.contains("cache_dir()"), "{why}");
         assert!(why.contains("read_only()"), "{why}");
+
+        let both = builder().cache_dir("cache");
+        assert!(refusal(both).contains("read-only"));
+
+        let writable = S3Backend::builder("http://127.0.0.1:1", "r", "b")
+            .credentials("a", "s")
+            .cache_dir("cache");
+        assert!(writable.check().is_ok());
     }
 
     #[test]

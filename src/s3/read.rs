@@ -1,107 +1,198 @@
 //! Reads of file data.
 
+use std::fs::File;
 use std::io;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::ops::Range;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use tokio::sync::oneshot;
 use tokio::time::timeout_at;
 use tracing::debug;
 
-use crate::backend::FileInfo;
 use crate::error::{SmbError, SmbResult};
 
 use super::backend::Shared;
+use super::data::{disk_error, read_full_at};
+use super::entry::{Base, Entry};
 use super::error::S3Error;
-use super::lookup::FileRef;
-use super::meta;
 use super::object::{ByteRange, ObjectHead};
-use super::readahead::{Claim, Outcome, Pin, ReadAhead, Version, assemble, extent, span};
+use super::readahead::{Claim, Outcome, ReadAhead, Version, assemble, extent, span};
 use super::retry::Retry;
 
-/// A file as opened: its key, and the object its reads go to.
-pub(super) struct OpenFile {
-    key: String,
-    name: String,
-    current: Mutex<Current>,
+/// What a read of an entry is made of.
+enum Plan {
+    /// Nothing: the read is of no bytes or past the end.
+    Empty,
+    /// The object of the base, which the entry has no local data over.
+    Base { key: String, head: Arc<ObjectHead> },
+    /// Pieces of local data and of the base, in order.
+    Local {
+        file: Arc<File>,
+        base: Option<(String, Arc<ObjectHead>)>,
+        pieces: Vec<(Range<u64>, bool)>,
+    },
 }
 
-struct Current {
-    /// The object as opened, or as a read found it after it changed.
-    head: Arc<ObjectHead>,
-    /// The pin that keeps the chunks of `head`, if it has an ETag.
-    pin: Option<Pin>,
-}
-
-impl OpenFile {
-    pub(super) fn new(ahead: &Arc<ReadAhead>, file: FileRef) -> Self {
-        let pin = Version::of(&file.key, &file.head).map(|version| ahead.pin(version));
-        OpenFile {
-            key: file.key,
-            name: file.name,
-            current: Mutex::new(Current {
-                head: file.head,
-                pin,
-            }),
+impl Entry {
+    fn plan(&self, offset: u64, len: u32) -> Plan {
+        let state = self.state();
+        let size = state.size();
+        if len == 0 || offset >= size {
+            return Plan::Empty;
+        }
+        let base = state
+            .base
+            .as_ref()
+            .map(|base| (base.key.clone(), Arc::clone(&base.head)));
+        match state.local() {
+            None => match base {
+                Some((key, head)) => Plan::Base { key, head },
+                None => Plan::Empty,
+            },
+            Some(local) => {
+                let end = offset.saturating_add(u64::from(len)).min(local.len);
+                Plan::Local {
+                    file: Arc::clone(&local.file),
+                    base,
+                    pieces: local.present.segments(offset..end),
+                }
+            }
         }
     }
 
-    fn current(&self) -> MutexGuard<'_, Current> {
-        self.current.lock().unwrap_or_else(PoisonError::into_inner)
+    /// Reads from `head` from now on, if the entry has no local data.
+    fn follow_head(&self, ahead: &Arc<ReadAhead>, head: Arc<ObjectHead>) {
+        let mut state = self.state();
+        if state.local().is_some() {
+            return;
+        }
+        if let Some(base) = state.base.take() {
+            // The new pin is taken before the old one ends, so a version
+            // that stays is never unpinned and the chunks other reads have
+            // in flight for it are still kept.
+            state.base = Some(Base::new(ahead, base.key, head, true));
+        }
     }
 
-    fn head(&self) -> Arc<ObjectHead> {
-        Arc::clone(&self.current().head)
-    }
-
-    /// Reads from `head` from now on.
-    fn set_head(&self, ahead: &Arc<ReadAhead>, head: Arc<ObjectHead>) {
-        let mut current = self.current();
-        // The new pin is taken before the old one ends, so a version that
-        // stays is never unpinned and the chunks other reads have in flight
-        // for it are still kept.
-        current.pin = Version::of(&self.key, &head).map(|version| ahead.pin(version));
-        current.head = head;
-    }
-
-    pub(super) fn info(&self) -> FileInfo {
-        meta::file_info(&self.name, &self.head())
-    }
-
-    /// Reads up to `len` bytes at `offset`. A read of an object with an ETag
-    /// that finds the object changed or gone drops the chunks kept of it, asks
-    /// the store for the object as it is, and reads again from that, once.
+    /// Reads up to `len` bytes at `offset`. The bytes of local data come from
+    /// its file, and the others from the object of the base, all of one
+    /// version.
+    ///
+    /// A read of an entry without local data that finds its object changed or
+    /// gone drops the chunks kept of it, asks the store for the object as it
+    /// is, and reads again from that, once. With local data, the base
+    /// changing fails the read: the bytes of the entry are not those of the
+    /// new object.
     pub(super) async fn read(&self, shared: &Shared, offset: u64, len: u32) -> SmbResult<Bytes> {
         let retry = shared.retry();
         let mut refreshed = false;
         loop {
-            let head = self.head();
-            let Some(version) = Version::of(&self.key, &head) else {
-                return shared
-                    .read_unversioned(&self.key, &head, offset, len, &retry)
-                    .await;
+            let (key, head) = match self.plan(offset, len) {
+                Plan::Empty => return Ok(Bytes::new()),
+                Plan::Local { file, base, pieces } => {
+                    return self.read_local(shared, &file, base, &pieces, &retry).await;
+                }
+                Plan::Base { key, head } => (key, head),
             };
-            let error = match shared.read_chunked(&version, offset, len, &retry).await {
-                Ok(data) => return Ok(data),
-                Err(error) => error,
+            let error = match shared.fetch_version(&key, &head, offset, len, &retry).await {
+                Fetched::Data(data) => return Ok(data),
+                Fetched::Failed(e) => return Err(e),
+                Fetched::Changed(error) => error,
             };
-            if !is_changed(&error) {
-                return Err(error.into_smb_error());
-            }
-            shared.ahead.drop_version(&version);
             if refreshed {
-                shared.forget_file(&self.key);
+                shared.forget_file(&key);
                 return Err(error.into_smb_error());
             }
             debug!("an object changed after it was opened");
             let head = shared
-                .refresh(&self.key, &retry)
+                .refresh(&key, &retry)
                 .await
                 .map_err(S3Error::into_smb_error)?;
-            self.set_head(&shared.ahead, head);
+            self.follow_head(&shared.ahead, head);
             refreshed = true;
         }
     }
+
+    async fn read_local(
+        &self,
+        shared: &Shared,
+        file: &Arc<File>,
+        base: Option<(String, Arc<ObjectHead>)>,
+        pieces: &[(Range<u64>, bool)],
+        retry: &Retry,
+    ) -> SmbResult<Bytes> {
+        let from_file: Vec<Range<u64>> = pieces
+            .iter()
+            .filter(|(_, present)| *present)
+            .map(|(range, _)| range.clone())
+            .collect();
+        let mut present = if from_file.is_empty() {
+            Vec::new()
+        } else {
+            let file = Arc::clone(file);
+            tokio::task::spawn_blocking(move || {
+                from_file
+                    .into_iter()
+                    .map(|range| {
+                        let mut bytes = vec![0; (range.end - range.start) as usize];
+                        read_full_at(&file, &mut bytes, range.start).map(|()| bytes)
+                    })
+                    .collect::<io::Result<Vec<Vec<u8>>>>()
+            })
+            .await
+            .map_err(|e| SmbError::Io(io::Error::other(e)))?
+            .map_err(disk_error)?
+        }
+        .into_iter();
+
+        let total: u64 = pieces
+            .iter()
+            .map(|(range, _)| range.end - range.start)
+            .sum();
+        let mut out = Vec::with_capacity(usize::try_from(total).unwrap_or_default());
+        for (range, is_present) in pieces {
+            if *is_present {
+                out.extend_from_slice(&present.next().unwrap_or_default());
+                continue;
+            }
+            let Some((key, head)) = &base else {
+                // No object lies under the missing bytes.
+                out.resize(out.len() + (range.end - range.start) as usize, 0);
+                continue;
+            };
+            let len =
+                u32::try_from(range.end - range.start).map_err(|_| SmbError::InvalidParameter)?;
+            match shared
+                .fetch_version(key, head, range.start, len, retry)
+                .await
+            {
+                Fetched::Data(data) => {
+                    out.extend_from_slice(&data);
+                    // The object may end before the entry does.
+                    out.resize(out.len() + (len as usize).saturating_sub(data.len()), 0);
+                }
+                Fetched::Failed(e) => return Err(e),
+                Fetched::Changed(_) => {
+                    debug!("the object under an entry changed after it was opened");
+                    shared.forget_file(key);
+                    return Err(SmbError::Io(io::Error::other(
+                        "the object changed after it was opened",
+                    )));
+                }
+            }
+        }
+        Ok(Bytes::from(out))
+    }
+}
+
+/// How a read of one version of an object ended.
+enum Fetched {
+    Data(Bytes),
+    /// The object is not that version any more: it has another ETag or is
+    /// gone. The chunks kept of the version are dropped.
+    Changed(S3Error),
+    Failed(SmbError),
 }
 
 /// Whether `error` says the object is not the version that was read: another
@@ -116,6 +207,33 @@ fn changed() -> S3Error {
 }
 
 impl Shared {
+    /// Up to `len` bytes at `offset` of the version of the object at `key`
+    /// that `head` describes. A read of an object without an ETag that finds
+    /// it changed ends as `Failed`, not `Changed`.
+    async fn fetch_version(
+        &self,
+        key: &str,
+        head: &ObjectHead,
+        offset: u64,
+        len: u32,
+        retry: &Retry,
+    ) -> Fetched {
+        let Some(version) = Version::of(key, head) else {
+            return match self.read_unversioned(key, head, offset, len, retry).await {
+                Ok(data) => Fetched::Data(data),
+                Err(e) => Fetched::Failed(e),
+            };
+        };
+        match self.read_chunked(&version, offset, len, retry).await {
+            Ok(data) => Fetched::Data(data),
+            Err(error) if is_changed(&error) => {
+                self.ahead.drop_version(&version);
+                Fetched::Changed(error)
+            }
+            Err(error) => Fetched::Failed(error.into_smb_error()),
+        }
+    }
+
     /// The bytes `offset..offset + len` of the object at `version`, as far as
     /// it reaches. They come from its chunks. Each chunk not kept is requested
     /// with an `If-Match` for the ETag, and an object with another one fails

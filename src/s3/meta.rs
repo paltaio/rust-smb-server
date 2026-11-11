@@ -1,10 +1,11 @@
 //! The times and attributes stored with an object, and the `FileInfo` they
 //! make.
 
+use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::backend::{FILE_ATTRIBUTE_READONLY, FileInfo, VALID_SET_ATTRIBUTES};
-use crate::utils::system_time_to_filetime;
+use crate::utils::{FILETIME_OFFSET, system_time_to_filetime};
 
 use super::keys::FileStamp;
 use super::object::ObjectHead;
@@ -18,6 +19,8 @@ const SOURCE_MILLIS: &str = "src_last_modified_millis";
 
 /// Allocation sizes are multiples of this.
 const ALLOCATION_UNIT: u64 = 4096;
+
+const TICKS_PER_SECOND: u128 = 10_000_000;
 
 /// The four times of an entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,13 +62,53 @@ fn times(head: &ObjectHead) -> Times {
 
 /// The attributes stored with an object: READONLY and the flags a client can
 /// set. DIRECTORY is never stored.
-fn attributes(head: &ObjectHead) -> u32 {
+pub(super) fn attributes(head: &ObjectHead) -> u32 {
     head.metadata
         .user
         .get(ATTRIBUTES)
         .and_then(|text| parse_attributes(text))
         .unwrap_or(0)
         & VALID_SET_ATTRIBUTES
+}
+
+/// The four times of the object `head` describes as FILETIME ticks: creation,
+/// access, write and change.
+pub(super) fn head_times(head: &ObjectHead) -> [u64; 4] {
+    let times = times(head);
+    [times.created, times.accessed, times.written, times.changed].map(system_time_to_filetime)
+}
+
+/// All four times at `time`, as FILETIME ticks.
+pub(super) fn same_times(time: SystemTime) -> [u64; 4] {
+    [system_time_to_filetime(time); 4]
+}
+
+/// A FILETIME count of 100 ns ticks since 1601 as Unix seconds with nine
+/// fraction digits, as `parse_seconds` reads them.
+fn format_filetime(ticks: u64) -> String {
+    let since_epoch = i128::from(ticks) - i128::from(FILETIME_OFFSET);
+    let ticks = since_epoch.unsigned_abs();
+    format!(
+        "{}{}.{:09}",
+        if since_epoch < 0 { "-" } else { "" },
+        ticks / TICKS_PER_SECOND,
+        ticks % TICKS_PER_SECOND * 100
+    )
+}
+
+/// The user metadata that stores `times` (FILETIME ticks) and `attributes`.
+pub(super) fn stored_metadata(times: [u64; 4], attributes: u32) -> BTreeMap<String, String> {
+    let [created, accessed, written, changed] = times;
+    [
+        (BTIME, format_filetime(created)),
+        (ATIME, format_filetime(accessed)),
+        (MTIME, format_filetime(written)),
+        (CTIME, format_filetime(changed)),
+        (ATTRIBUTES, format!("{attributes:x}")),
+    ]
+    .into_iter()
+    .map(|(name, value)| (name.to_owned(), value))
+    .collect()
 }
 
 /// Unix seconds with an optional fraction, as in `1700000000.123456789`.
@@ -119,6 +162,25 @@ fn parse_attributes(text: &str) -> Option<u32> {
 }
 
 fn info(name: &str, is_directory: bool, size: u64, times: Times, attributes: u32) -> FileInfo {
+    let ticks = [times.created, times.accessed, times.written, times.changed];
+    entry_info(
+        name,
+        is_directory,
+        size,
+        ticks.map(system_time_to_filetime),
+        attributes,
+    )
+}
+
+/// The `FileInfo` of a file or directory with these times as FILETIME ticks
+/// (creation, access, write, change) and these attributes.
+pub(super) fn entry_info(
+    name: &str,
+    is_directory: bool,
+    size: u64,
+    times: [u64; 4],
+    attributes: u32,
+) -> FileInfo {
     let mut info = FileInfo::new(name);
     if !is_directory {
         info.end_of_file = size;
@@ -126,13 +188,15 @@ fn info(name: &str, is_directory: bool, size: u64, times: Times, attributes: u32
             .checked_next_multiple_of(ALLOCATION_UNIT)
             .unwrap_or(size);
     }
-    info.creation_time = system_time_to_filetime(times.created);
-    info.last_access_time = system_time_to_filetime(times.accessed);
-    info.last_write_time = system_time_to_filetime(times.written);
-    info.change_time = system_time_to_filetime(times.changed);
+    [
+        info.creation_time,
+        info.last_access_time,
+        info.last_write_time,
+        info.change_time,
+    ] = times;
     info.is_directory = is_directory;
     info.read_only = attributes & FILE_ATTRIBUTE_READONLY != 0;
-    info.file_attributes = attributes;
+    info.file_attributes = attributes & VALID_SET_ATTRIBUTES;
     info
 }
 
@@ -332,6 +396,31 @@ mod tests {
         assert_eq!(info.unix_mode, None);
         assert_eq!(info.ea_size, 0);
         assert_eq!(info.attributes(), 0x21);
+    }
+
+    #[test]
+    fn ticks_become_unix_seconds_with_nine_digits() {
+        let at = |secs: u64, ticks: u64| FILETIME_OFFSET + secs * TICKS + ticks;
+        assert_eq!(
+            format_filetime(at(1_700_000_000, 1_234_567)),
+            "1700000000.123456700"
+        );
+        assert_eq!(format_filetime(FILETIME_OFFSET), "0.000000000");
+        assert_eq!(format_filetime(FILETIME_OFFSET - 5), "-0.000000500");
+        assert_eq!(
+            format_filetime(FILETIME_OFFSET - 30 * TICKS - 1),
+            "-30.000000100"
+        );
+        assert_eq!(format_filetime(0), "-11644473600.000000000");
+    }
+
+    #[test]
+    fn the_largest_ticks_format_without_overflow() {
+        assert_eq!(format_filetime(u64::MAX), "1833029933770.955161500");
+        let stored = stored_metadata([u64::MAX, 0, i64::MAX as u64, 1], 0);
+        assert_eq!(stored["btime"], "1833029933770.955161500");
+        assert_eq!(stored["atime"], "-11644473600.000000000");
+        assert_eq!(stored["mtime"], "910692730085.477580700");
     }
 
     #[test]

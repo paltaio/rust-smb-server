@@ -2,7 +2,9 @@
 //! dispatcher.
 
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use tokio::task::JoinSet;
@@ -14,8 +16,8 @@ use crate::backend::FILE_ATTRIBUTE_DIRECTORY;
 use crate::ntstatus;
 use crate::proto::header::{Command, SMB2_HEADER_LEN};
 use crate::proto::messages::{
-    CloseRequest, CreateRequest, CreateResponse, FileId, QueryDirectoryRequest,
-    QueryDirectoryResponse, ReadRequest, ReadResponse, SetInfoRequest,
+    CloseRequest, CreateRequest, CreateResponse, FileId, FlushRequest, QueryDirectoryRequest,
+    QueryDirectoryResponse, ReadRequest, ReadResponse, SetInfoRequest, WriteRequest, WriteResponse,
 };
 use crate::s3::client::S3Client;
 use crate::s3::encode::uri_encode;
@@ -49,6 +51,18 @@ pub(super) fn builder(bucket: &TestBucket, addr: SocketAddr) -> S3BackendBuilder
     S3Backend::builder(format!("http://{addr}"), REGION, &bucket.name)
         .credentials(&bucket.gateway.access_key, &bucket.gateway.secret_key)
         .read_only()
+}
+
+/// Settings for a backend of `bucket` that keeps its changes in `cache`,
+/// reached at `addr`.
+pub(super) fn writable_builder(
+    bucket: &TestBucket,
+    addr: SocketAddr,
+    cache: &Path,
+) -> S3BackendBuilder {
+    S3Backend::builder(format!("http://{addr}"), REGION, &bucket.name)
+        .credentials(&bucket.gateway.access_key, &bucket.gateway.secret_key)
+        .cache_dir(cache)
 }
 
 /// A read-only backend of `bucket`, reached directly.
@@ -102,6 +116,8 @@ pub(super) struct Rig {
     pub(super) proxy: Proxy,
     pub(super) backend: S3Backend,
     pub(super) smb: Smb,
+    /// The cache directory of a writable backend.
+    pub(super) cache: Option<tempfile::TempDir>,
 }
 
 impl Rig {
@@ -123,7 +139,78 @@ impl Rig {
             proxy,
             backend,
             smb,
+            cache: None,
         }
+    }
+
+    /// A rig whose backend keeps its changes in a cache directory.
+    pub(super) async fn writable() -> Self {
+        Self::writable_with(|builder| builder).await
+    }
+
+    /// [`writable`](Self::writable) with the settings `configure` makes.
+    pub(super) async fn writable_with(
+        configure: impl FnOnce(S3BackendBuilder) -> S3BackendBuilder,
+    ) -> Self {
+        let bucket = TestBucket::new().await;
+        let proxy = Proxy::start(bucket.gateway.addr).await;
+        Rig::start(bucket, proxy, tempfile::tempdir().unwrap(), configure).await
+    }
+
+    /// The cache directory.
+    pub(super) fn cache_dir(&self) -> &Path {
+        self.cache.as_ref().expect("a writable rig").path()
+    }
+
+    /// Ends the backend and builds another on the same cache directory,
+    /// as after a restart.
+    pub(super) async fn restart(self) -> Self {
+        self.restart_with(|builder| builder).await
+    }
+
+    /// [`restart`](Self::restart) with the settings `configure` makes.
+    pub(super) async fn restart_with(
+        self,
+        configure: impl FnOnce(S3BackendBuilder) -> S3BackendBuilder,
+    ) -> Self {
+        let (bucket, proxy, cache) = self.stop().await;
+        Rig::start(bucket, proxy, cache, configure).await
+    }
+
+    /// A rig for a bucket and a cache directory that exist already.
+    pub(super) async fn start(
+        bucket: TestBucket,
+        proxy: Proxy,
+        cache: tempfile::TempDir,
+        configure: impl FnOnce(S3BackendBuilder) -> S3BackendBuilder,
+    ) -> Self {
+        let backend = configure(writable_builder(&bucket, proxy.addr, cache.path()))
+            .build()
+            .await
+            .unwrap();
+        let smb = Smb::new(backend.clone()).await;
+        Rig {
+            bucket,
+            proxy,
+            backend,
+            smb,
+            cache: Some(cache),
+        }
+    }
+
+    /// Ends the backend, which releases the cache directory.
+    pub(super) async fn stop(self) -> (TestBucket, Proxy, tempfile::TempDir) {
+        let Rig {
+            bucket,
+            proxy,
+            backend,
+            mut smb,
+            cache,
+        } = self;
+        smb.close_all().await;
+        drop(smb);
+        drop(backend);
+        (bucket, proxy, cache.expect("a writable rig"))
     }
 
     /// The bucket, for putting objects in it without the backend knowing.
@@ -232,6 +319,37 @@ pub(super) fn reads(proxy: &Proxy) -> usize {
 /// Every request the proxy has seen.
 pub(super) fn requests(proxy: &Proxy) -> usize {
     proxy.seen().len()
+}
+
+/// Waits until `ready` holds. Panics with `what` if it does not within about
+/// 5 s.
+pub(super) async fn wait_until(what: &str, ready: impl Fn() -> bool) {
+    wait_until_async(what, async || ready()).await;
+}
+
+/// [`wait_until`] for a condition that needs an await to check.
+pub(super) async fn wait_until_async(what: &str, ready: impl AsyncFn() -> bool) {
+    for _ in 0..500 {
+        if ready().await {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("{what}");
+}
+
+/// Waits until the proxy has seen at least `count` requests that `matches`.
+/// Panics if that takes more than about 5 s.
+pub(super) async fn wait_for_requests(
+    proxy: &Proxy,
+    count: usize,
+    matches: impl Fn(&Seen) -> bool,
+) {
+    wait_until(
+        &format!("the proxy saw fewer than {count} requests"),
+        || proxy.count(&matches) >= count,
+    )
+    .await;
 }
 
 /// What a CREATE answered.
@@ -343,6 +461,8 @@ impl Spec {
 pub(super) struct Smb {
     peer: Peer,
     state: Arc<ServerState>,
+    /// The opens that are not closed.
+    opened: Vec<FileId>,
 }
 
 impl Smb {
@@ -356,6 +476,14 @@ impl Smb {
         Smb {
             peer: Peer::new(&state, false).await,
             state,
+            opened: Vec::new(),
+        }
+    }
+
+    /// Closes every open that is left, as a connection that ends does.
+    pub(super) async fn close_all(&mut self) {
+        for id in std::mem::take(&mut self.opened) {
+            self.close(id).await;
         }
     }
 
@@ -369,6 +497,7 @@ impl Smb {
         match self.send(Command::Create, &spec.body(name)).await {
             (0, body) => {
                 let reply = CreateResponse::parse(&body).expect("create response");
+                self.opened.push(reply.file_id);
                 Ok(Opened {
                     id: reply.file_id,
                     action: reply.create_action,
@@ -408,6 +537,7 @@ impl Smb {
         .write_to(&mut body)
         .expect("close");
         assert_eq!(self.send(Command::Close, &body).await.0, 0);
+        self.opened.retain(|open| *open != id);
     }
 
     /// Reads up to `len` bytes at `offset`. An empty read at or past the
@@ -525,6 +655,57 @@ impl Smb {
                 at += next;
             }
         }
+    }
+
+    /// Writes `data` at `offset` of the open `id`. Returns the count written.
+    pub(super) async fn write(&mut self, id: FileId, offset: u64, data: &[u8]) -> Result<u32, u32> {
+        let mut body = Vec::new();
+        WriteRequest {
+            structure_size: 49,
+            data_offset: WriteRequest::STANDARD_DATA_OFFSET,
+            length: data.len() as u32,
+            offset,
+            file_id: id,
+            channel: 0,
+            remaining_bytes: 0,
+            write_channel_info_offset: 0,
+            write_channel_info_length: 0,
+            flags: 0,
+            data: data.to_vec(),
+        }
+        .write_to(&mut body)
+        .expect("write");
+        match self.send(Command::Write, &body).await {
+            (0, body) => Ok(WriteResponse::parse(&body).expect("write response").count),
+            (status, _) => Err(status),
+        }
+    }
+
+    /// Flushes the open `id`. Returns the status.
+    pub(super) async fn flush(&mut self, id: FileId) -> u32 {
+        let mut body = Vec::new();
+        FlushRequest::new(id.persistent, id.volatile)
+            .write_to(&mut body)
+            .expect("flush");
+        self.send(Command::Flush, &body).await.0
+    }
+
+    /// Sets the length of the open `id`. Returns the status.
+    pub(super) async fn set_size(&mut self, id: FileId, len: u64) -> u32 {
+        self.set_info(id, 20, len.to_le_bytes().to_vec()).await
+    }
+
+    /// Sets the creation, access, write and change time of the open `id`, as
+    /// FileBasicInformation takes them (0 leaves a time alone), and its
+    /// attributes (0 leaves them alone). Returns the status.
+    pub(super) async fn set_basic(&mut self, id: FileId, times: [i64; 4], attributes: u32) -> u32 {
+        let mut buffer = Vec::new();
+        for time in times {
+            buffer.extend_from_slice(&time.to_le_bytes());
+        }
+        buffer.extend_from_slice(&attributes.to_le_bytes());
+        buffer.extend_from_slice(&[0; 4]);
+        self.set_info(id, 4, buffer).await
     }
 
     /// Renames the open `id` to `to`. Returns the status.

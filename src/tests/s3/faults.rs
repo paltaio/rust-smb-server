@@ -13,6 +13,7 @@ use super::fixture::{
     overwrite, pattern, put, range,
 };
 use super::proxy::{Fault, Proxy, Reply, Seen};
+use super::share::{wait_for_requests, wait_until};
 use crate::s3::client::{CopyMetadata, ListRequest, MAX_BODY, Settings};
 use crate::s3::error::S3Error;
 use crate::s3::object::Metadata;
@@ -75,28 +76,6 @@ async fn pending_upload(bucket: &TestBucket, key: &str) -> (String, Vec<Complete
 
 fn completes(seen: &Seen) -> bool {
     seen.method == "POST" && seen.has_param("uploadId")
-}
-
-/// Waits until `ready` holds. Panics with `what` if it does not within about
-/// 5 s.
-async fn wait_until(what: &str, ready: impl Fn() -> bool) {
-    for _ in 0..500 {
-        if ready() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!("{what}");
-}
-
-/// Waits until the proxy has seen at least `count` requests that `matches`.
-/// Panics if that takes more than about 5 s.
-async fn wait_for_requests(proxy: &Proxy, count: usize, matches: impl Fn(&Seen) -> bool) {
-    wait_until(
-        &format!("the proxy saw fewer than {count} requests"),
-        || proxy.count(&matches) >= count,
-    )
-    .await;
 }
 
 #[tokio::test]

@@ -422,6 +422,8 @@ mod files;
 #[cfg(feature = "localfs")]
 mod fs;
 mod handlers;
+#[cfg(any(feature = "localfs", feature = "s3"))]
+mod host;
 pub(crate) mod info_class;
 pub mod ntstatus;
 mod path;

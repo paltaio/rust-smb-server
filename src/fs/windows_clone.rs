@@ -5,7 +5,6 @@
 //! ReFS clones ranges whose offsets and length are multiples of the cluster
 //! size, under 4 GiB to a call; a range goes in pieces of at most 1 GiB.
 
-use std::ffi::c_void;
 use std::fs::File;
 use std::io;
 use std::os::windows::fs::MetadataExt as _;
@@ -13,19 +12,16 @@ use std::os::windows::io::AsRawHandle as _;
 
 use cap_std::fs::{Dir, Metadata};
 use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_SPARSE_FILE;
-use windows_sys::Win32::System::IO::DeviceIoControl;
-use windows_sys::Win32::System::Ioctl::{
-    DUPLICATE_EXTENTS_DATA, FILE_SET_SPARSE_BUFFER, FSCTL_DUPLICATE_EXTENTS_TO_FILE,
-    FSCTL_SET_SPARSE,
-};
+use windows_sys::Win32::System::Ioctl::{DUPLICATE_EXTENTS_DATA, FSCTL_DUPLICATE_EXTENTS_TO_FILE};
 use windows_sys::Win32::System::SystemServices::FILE_SUPPORTS_BLOCK_REFCOUNTING;
 
 use super::local::{file_key, io_to_smb};
-use super::volume::{volume_info_of, volume_of};
+use super::volume::volume_of;
 use super::windows_streams::{
     ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED, refused,
 };
 use crate::error::{SmbError, SmbResult};
+use crate::host::{control, set_sparse, volume_info_of};
 
 /// Most bytes of one call.
 const PIECE: u64 = 1 << 30;
@@ -150,39 +146,6 @@ fn same_volume(a: &File, b: &File) -> io::Result<bool> {
 /// True if `file` has the sparse attribute.
 fn is_sparse(file: &File) -> io::Result<bool> {
     Ok(file.metadata()?.file_attributes() & FILE_ATTRIBUTE_SPARSE_FILE != 0)
-}
-
-/// Sets or clears the sparse attribute of `file`.
-fn set_sparse(file: &File, sparse: bool) -> io::Result<()> {
-    control(
-        file,
-        FSCTL_SET_SPARSE,
-        &FILE_SET_SPARSE_BUFFER { SetSparse: sparse },
-    )
-}
-
-/// Sends the control code `code` with `input` to the file `file` is open on.
-fn control<T>(file: &File, code: u32, input: &T) -> io::Result<()> {
-    let mut returned = 0u32;
-    // SAFETY: the handle stays open for the call, `input` is a live value of
-    // the size passed, `returned` is a live local, and there is no output
-    // buffer and no OVERLAPPED, as the handle is synchronous.
-    let ok = unsafe {
-        DeviceIoControl(
-            file.as_raw_handle(),
-            code,
-            std::ptr::from_ref(input).cast::<c_void>(),
-            size_of::<T>() as u32,
-            std::ptr::null_mut(),
-            0,
-            &mut returned,
-            std::ptr::null_mut(),
-        )
-    };
-    if ok == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
 }
 
 /// The error of a clone call: a volume or file that cannot clone is not

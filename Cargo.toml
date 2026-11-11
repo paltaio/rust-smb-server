@@ -106,6 +106,8 @@ s3 = [
     "dep:http-body-util",
     "dep:tower-service",
     "dep:quick-xml",
+    "dep:rustix",
+    "dep:windows-sys",
 ]
 discovery = [
     "dep:mdns-sd",

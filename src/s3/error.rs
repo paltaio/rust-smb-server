@@ -15,7 +15,7 @@ pub(crate) type BoxError = Box<dyn Error + Send + Sync>;
 /// Longest error code or request id kept from a response.
 const MAX_FIELD_LEN: usize = 128;
 
-/// Why an S3 call failed.
+/// Why an S3 call, or the cache directory of the backend, failed.
 ///
 /// The text of an error and its `Debug` output carry the HTTP status, the
 /// error code and the request id of the store's answer. They never carry
@@ -54,6 +54,8 @@ pub enum S3Error {
     InvalidResponse(&'static str),
     /// A setting or argument cannot be used. The text names it.
     InvalidArgument(&'static str),
+    /// The cache directory could not be read or written.
+    Cache(Arc<io::Error>),
 }
 
 impl S3Error {
@@ -152,7 +154,8 @@ impl S3Error {
             | S3Error::SourceChanged
             | S3Error::SourceRead(_)
             | S3Error::InvalidResponse(_)
-            | S3Error::InvalidArgument(_) => false,
+            | S3Error::InvalidArgument(_)
+            | S3Error::Cache(_) => false,
         }
     }
 
@@ -251,6 +254,7 @@ impl fmt::Display for S3Error {
             S3Error::SourceRead(_) => f.write_str("the data to upload could not be read"),
             S3Error::InvalidResponse(what) => write!(f, "invalid response: {what}"),
             S3Error::InvalidArgument(what) => write!(f, "invalid argument: {what}"),
+            S3Error::Cache(_) => f.write_str("the cache directory could not be used"),
         }
     }
 }
@@ -259,7 +263,7 @@ impl Error for S3Error {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             S3Error::Transport(source) => Some(source.as_ref()),
-            S3Error::SourceRead(source) => Some(source.as_ref()),
+            S3Error::SourceRead(source) | S3Error::Cache(source) => Some(source.as_ref()),
             _ => None,
         }
     }
@@ -389,6 +393,7 @@ mod tests {
             S3Error::SourceRead(Arc::new(io::Error::other("x"))),
             S3Error::InvalidResponse("x"),
             S3Error::InvalidArgument("x"),
+            S3Error::Cache(Arc::new(io::Error::other("x"))),
         ] {
             assert!(!permanent.is_transient(), "{permanent:?}");
         }

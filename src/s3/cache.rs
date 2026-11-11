@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::time::Instant;
 
-use super::keys::{DirListing, FileStamp};
+use super::keys::{DirListing, FileStamp, Row};
 use super::object::ObjectHead;
 
 /// Most keys the cache remembers a lookup of.
@@ -193,6 +193,16 @@ impl MetaCache {
         fresh(ttl, slot.at, now).then(|| Arc::clone(&slot.value))
     }
 
+    /// Adds `row` to the cached listing of the directory `dir`, if there is
+    /// one. The listing keeps its age.
+    pub(super) fn add_row(&mut self, dir: &str, row: Row) {
+        let Some(slot) = self.listings.get(dir) else {
+            return;
+        };
+        let (at, listing) = (slot.at, Arc::new(slot.value.with_row(row)));
+        self.put_listing(dir, listing, at);
+    }
+
     pub(super) fn put_listing(&mut self, dir: &str, listing: Arc<DirListing>, now: Instant) {
         let weight = listing.rows.len().max(1);
         self.listings.insert(
@@ -252,6 +262,23 @@ mod tests {
 
     fn is_file(known: Option<Known>) -> bool {
         matches!(known, Some(Known::File(_)))
+    }
+
+    #[test]
+    fn a_row_added_to_a_cached_listing_keeps_the_age_of_the_listing() {
+        let ttl = Duration::from_secs(10);
+        let mut cache = MetaCache::new(ttl);
+        let start = Instant::now();
+        cache.put_listing("d", listing(2), start);
+        let row = Row {
+            name: "new".to_owned(),
+            kind: RowKind::Dir,
+        };
+        cache.add_row("d", row.clone());
+        cache.add_row("absent", row);
+        assert_eq!(cache.listing("d", start).unwrap().rows.len(), 3);
+        assert!(cache.listing("absent", start).is_none());
+        assert!(cache.listing("d", start + ttl).is_none());
     }
 
     #[test]

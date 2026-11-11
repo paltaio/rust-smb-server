@@ -1,21 +1,23 @@
 //! The backend: a bucket served as a share.
 
 use std::fmt;
+use std::io;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 
 use crate::backend::{
-    BackendCapabilities, Handle, OpenAction, OpenIntent, OpenOptions, ShareBackend,
+    BackendCapabilities, Handle, OpenAction, OpenIntent, OpenOptions, ShareBackend, VolumeInfo,
 };
 use crate::error::{SmbError, SmbResult};
 use crate::path::SmbPath;
 
 use super::cache::MetaCache;
+use super::cachedir::CacheDir;
 use super::client::S3Client;
-use super::handle::S3Handle;
-use super::lookup::Found;
+use super::entry::Own;
+use super::overlay::Overlay;
 use super::readahead::ReadAhead;
 use super::retry::Retry;
 
@@ -53,6 +55,21 @@ use super::retry::Retry;
 /// no chunks, and a read fails once the answer has an ETag, or a size or
 /// modification time that differs from what the file was opened with.
 ///
+/// A writable backend keeps what clients change in its cache directory: the
+/// bytes written to a file, and the times and attributes set on files and
+/// directories. Bytes written and size changes reach the disk when a client
+/// flushes the file, and closing does not flush: after a restart a file has
+/// what its last flush recorded. A truncate below the length last flushed is
+/// recorded at once. Times and attributes reach the disk at once, except
+/// those of a file the backend holds bytes of, which reach it at the next
+/// flush. The share root keeps its times and attributes in memory. A read
+/// returns the bytes written and gets the rest from the store; it fails when
+/// it needs bytes of the store and the object under the file changed since
+/// the file was opened. What the backend holds shows in lookups and listings
+/// at once. A directory made through the share has its marker object put in
+/// the store before the open returns. Deletes and renames are refused, and
+/// the bytes of files are not put in the store.
+///
 /// Build one with [`S3Backend::builder`].
 #[derive(Clone)]
 pub struct S3Backend {
@@ -76,6 +93,15 @@ pub(super) struct Shared {
     pub(super) read_chunk: u64,
     /// The chunks read requests brought, shared by every handle.
     pub(super) ahead: Arc<ReadAhead>,
+    pub(super) read_only: bool,
+    /// What the backend holds for the paths that differ from the bucket, or
+    /// may.
+    pub(super) overlay: Arc<Overlay>,
+    /// The cache directory of a writable backend.
+    pub(super) local: Option<Arc<CacheDir>>,
+    /// The times and attributes of the share root, which the backend keeps
+    /// in memory.
+    pub(super) root_own: Mutex<Own>,
 }
 
 impl Shared {
@@ -87,6 +113,17 @@ impl Shared {
     /// The cache. Never held across an await.
     pub(super) fn cache(&self) -> MutexGuard<'_, MetaCache> {
         self.cache.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The cache directory. A backend that is read-only has none, and
+    /// changes fail as refused.
+    pub(super) fn local(&self) -> SmbResult<&CacheDir> {
+        self.local.as_deref().ok_or(SmbError::AccessDenied)
+    }
+
+    /// The times and attributes of the share root.
+    pub(super) fn root_own(&self) -> MutexGuard<'_, Own> {
+        self.root_own.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -121,10 +158,60 @@ impl S3Backend {
     pub(crate) fn read_chunk_waiters(&self) -> usize {
         self.shared.ahead.waiting()
     }
+
+    /// The files and directories the overlay holds.
+    pub(crate) fn overlay_len(&self) -> usize {
+        self.shared.overlay.len()
+    }
+
+    /// What tests make the cache directory do.
+    pub(crate) fn hooks(&self) -> &super::cachedir::Hooks {
+        &self
+            .shared
+            .local
+            .as_ref()
+            .expect("a writable backend")
+            .hooks
+    }
+
+    /// Holds the `io` lock of the entry the overlay has for `key` until the
+    /// returned value is dropped.
+    pub(crate) fn hold_io(&self, key: &str) -> Option<IoHold> {
+        let entry = self.shared.overlay.peek(key)?;
+        let (locked, wait) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            let _io = entry.lock_io();
+            let _ = locked.send(());
+            let _ = released.recv();
+        });
+        wait.recv().ok()?;
+        Some(IoHold {
+            release: Some(release),
+            thread: Some(thread),
+        })
+    }
+}
+
+/// A hold on the `io` lock of an entry.
+#[cfg(test)]
+pub(crate) struct IoHold {
+    release: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(test)]
+impl Drop for IoHold {
+    fn drop(&mut self) {
+        self.release.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 /// Whether an open with `opts` may change the share.
-fn changes(opts: &OpenOptions) -> bool {
+pub(super) fn changes(opts: &OpenOptions) -> bool {
     opts.write || opts.write_attributes || opts.delete_on_close || opts.intent != OpenIntent::Open
 }
 
@@ -135,19 +222,7 @@ impl ShareBackend for S3Backend {
         path: &SmbPath,
         opts: OpenOptions,
     ) -> SmbResult<(Box<dyn Handle>, OpenAction)> {
-        if changes(&opts) {
-            return Err(SmbError::AccessDenied);
-        }
-        let found = self.shared.lookup(path, &self.shared.retry()).await?;
-        match &found {
-            Found::Dir(_) if opts.non_directory => return Err(SmbError::IsDirectory),
-            Found::File(_) if opts.directory => return Err(SmbError::NotADirectory),
-            _ => {}
-        }
-        Ok((
-            Box::new(S3Handle::new(Arc::clone(&self.shared), found)),
-            OpenAction::Opened,
-        ))
+        self.shared.open(path, opts).await
     }
 
     async fn unlink(&self, _path: &SmbPath) -> SmbResult<()> {
@@ -165,9 +240,19 @@ impl ShareBackend for S3Backend {
 
     fn capabilities(&self) -> BackendCapabilities {
         BackendCapabilities {
-            is_read_only: true,
+            is_read_only: self.shared.read_only,
             case_sensitive: !self.shared.case_insensitive,
             ..BackendCapabilities::default()
         }
+    }
+
+    async fn volume_info(&self) -> SmbResult<VolumeInfo> {
+        let Some(local) = self.shared.local.clone() else {
+            return Ok(VolumeInfo::default());
+        };
+        tokio::task::spawn_blocking(move || local.volume_info())
+            .await
+            .map_err(|e| SmbError::Io(io::Error::other(e)))?
+            .map_err(SmbError::Io)
     }
 }

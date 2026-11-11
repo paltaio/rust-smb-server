@@ -31,6 +31,11 @@ pub(super) fn child_key(dir: &str, name: &str) -> SmbResult<String> {
     Ok(key)
 }
 
+/// The last name of `key`.
+pub(super) fn last_name(key: &str) -> &str {
+    key.rsplit_once('/').map_or(key, |(_, name)| name)
+}
+
 /// The prefix of the keys below the directory with key `dir`, which is also
 /// the key of its marker object. Empty for the root of a share without a
 /// prefix, which has no marker.
@@ -39,6 +44,16 @@ pub(super) fn dir_prefix(dir: &str) -> String {
         String::new()
     } else {
         format!("{dir}/")
+    }
+}
+
+/// `text`, a key or a name, as names are compared: lowercased when `fold` is
+/// set, which is when names match without regard to case.
+pub(super) fn slot(text: &str, fold: bool) -> String {
+    if fold {
+        text.to_lowercase()
+    } else {
+        text.to_owned()
     }
 }
 
@@ -89,6 +104,19 @@ pub(super) struct DirListing {
 }
 
 impl DirListing {
+    /// The listing with `row` added, in place of a row of the same name.
+    pub(super) fn with_row(&self, row: Row) -> DirListing {
+        let mut rows: Vec<Row> = self
+            .rows
+            .iter()
+            .filter(|held| held.name != row.name)
+            .cloned()
+            .collect();
+        rows.push(row);
+        rows.sort_by(by_key);
+        DirListing { rows }
+    }
+
     /// The row named exactly `name`.
     pub(super) fn find_exact(&self, name: &str) -> Option<&Row> {
         self.rows.iter().find(|row| row.name == name)
@@ -265,6 +293,20 @@ mod tests {
     }
 
     #[test]
+    fn the_name_of_a_key_is_its_last_component() {
+        assert_eq!(last_name("a/b/c.txt"), "c.txt");
+        assert_eq!(last_name("c.txt"), "c.txt");
+        assert_eq!(last_name(""), "");
+    }
+
+    #[test]
+    fn names_are_compared_as_lowercase_only_when_case_is_ignored() {
+        assert_eq!(slot("Dir/\u{c9}COLE.TXT", true), "dir/\u{e9}cole.txt");
+        assert_eq!(slot("Dir/\u{c9}COLE.TXT", false), "Dir/\u{c9}COLE.TXT");
+        assert_eq!(slot("A\u{3a3}/B", true), slot("a\u{3c2}/b", true));
+    }
+
+    #[test]
     fn a_key_over_the_limit_is_an_invalid_name() {
         // Four names and three separators take 803 bytes.
         let mut components = vec!["x".repeat(200); 4];
@@ -318,6 +360,34 @@ mod tests {
         assert_eq!(stamp.size, 7);
         assert_eq!(stamp.etag, "\"e\"");
         assert_eq!(stamp.last_modified, UNIX_EPOCH + Duration::from_secs(1_000));
+    }
+
+    #[test]
+    fn a_row_added_takes_its_place_in_key_order_and_replaces_one_of_its_name() {
+        let base = listing("", &[page(&["a0", "a.txt"], &["b/"])]);
+        let row = |name: &str, is_dir: bool| Row {
+            name: name.to_owned(),
+            kind: if is_dir {
+                RowKind::Dir
+            } else {
+                RowKind::File(FileStamp {
+                    size: 1,
+                    etag: String::new(),
+                    last_modified: UNIX_EPOCH,
+                })
+            },
+        };
+        let added = base.with_row(row("a", true));
+        assert_eq!(
+            names(&added),
+            [("a.txt", false), ("a", true), ("a0", false), ("b", true)]
+        );
+        let replaced = added.with_row(row("b", false));
+        assert_eq!(
+            names(&replaced),
+            [("a.txt", false), ("a", true), ("a0", false), ("b", false)]
+        );
+        assert_eq!(names(&base).len(), 3, "the original is not changed");
     }
 
     #[test]

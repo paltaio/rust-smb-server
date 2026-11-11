@@ -9,12 +9,14 @@ use tracing::debug;
 
 use crate::backend::DirEntry;
 use crate::error::{SmbError, SmbResult};
+use crate::path::is_valid_component;
 use crate::wildcard::Pattern;
 
 use super::backend::Shared;
 use super::cache::Known;
 use super::keys::{Row, RowKind, dir_prefix, join_key};
 use super::lookup::DirRef;
+use super::merge::{Direct, Picked, Source, merge};
 use super::meta;
 use super::object::ObjectHead;
 use super::retry::{Retry, deadline_after};
@@ -32,7 +34,8 @@ struct Fetch {
     is_dir: bool,
 }
 
-/// The entries of `dir` that match `pattern`.
+/// The entries of `dir` that match `pattern`: those of its listing in the
+/// bucket, less the keys to delete, and the overlay's entries in their place.
 pub(super) async fn list_entries(
     shared: &Arc<Shared>,
     dir: &DirRef,
@@ -42,36 +45,90 @@ pub(super) async fn list_entries(
     let retry = Retry::Foreground { deadline };
     let pattern = pattern.filter(|p| !matches!(*p, "" | "*" | "*.*"));
     if let Some(name) = pattern.filter(|p| !has_wildcard(p)) {
-        return match shared.lookup_in(dir, name, &retry).await {
-            Ok(found) => Ok(vec![DirEntry {
-                info: found.info(shared),
-            }]),
-            Err(SmbError::NotFound | SmbError::PathNotFound) => Ok(Vec::new()),
-            Err(e) => Err(e),
-        };
+        return single(shared, dir, name, &retry).await;
     }
 
     let listing = shared.listing(&dir.key, &retry).await?;
-    let matcher = pattern.map(|p| Pattern::new(p, shared.case_insensitive));
+    let below = shared.overlay.below(&dir.key);
+    let direct: Vec<Direct> = below
+        .direct
+        .iter()
+        .map(|entry| Direct {
+            name: entry.state().name().to_owned(),
+            is_dir: entry.is_dir(),
+        })
+        .collect();
     let rows: Vec<&Row> = listing
         .rows
         .iter()
-        .filter(|row| matcher.as_ref().is_none_or(|m| m.matches(&row.name)))
+        .filter(|row| !shared.hidden(&dir.key, row))
         .collect();
-    let heads = row_heads(shared, &dir.key, &rows, deadline).await;
-    Ok(rows
+    let matcher = pattern.map(|p| Pattern::new(p, shared.case_insensitive));
+    let picked: Vec<Picked> = merge(&rows, &direct, &below.implied, shared.case_insensitive)
         .into_iter()
-        .zip(heads)
-        .map(|(row, head)| DirEntry {
-            info: match (&row.kind, head) {
-                (RowKind::File(_), Some(head)) => meta::file_info(&row.name, &head),
-                (RowKind::File(stamp), None) => meta::stamp_info(&row.name, stamp),
-                (RowKind::Dir, marker) => {
-                    meta::dir_info(&row.name, marker.as_deref(), shared.built)
-                }
-            },
+        .filter(|picked| matcher.as_ref().is_none_or(|m| m.matches(&picked.name)))
+        .collect();
+
+    let from_store: Vec<&Row> = picked
+        .iter()
+        .filter_map(|picked| match picked.source {
+            Source::Row(at) => Some(rows[at]),
+            _ => None,
         })
-        .collect())
+        .collect();
+    let mut heads = row_heads(shared, &dir.key, &from_store, deadline)
+        .await
+        .into_iter();
+    let mut entries = Vec::with_capacity(picked.len());
+    for picked in picked {
+        let info = match picked.source {
+            Source::Row(at) => {
+                let head = heads.next().flatten();
+                let row = rows[at];
+                match (&row.kind, head) {
+                    (RowKind::File(_), Some(head)) => meta::file_info(&row.name, &head),
+                    (RowKind::File(stamp), None) => meta::stamp_info(&row.name, stamp),
+                    (RowKind::Dir, marker) => {
+                        meta::dir_info(&row.name, marker.as_deref(), shared.built)
+                    }
+                }
+            }
+            Source::Entry(at) => below.direct[at].info(shared.built),
+            Source::Implied(_) => meta::dir_info(&picked.name, None, shared.built),
+        };
+        entries.push(DirEntry { info });
+    }
+    Ok(entries)
+}
+
+/// The entry of `dir` named `name`, which has no wildcard.
+async fn single(
+    shared: &Arc<Shared>,
+    dir: &DirRef,
+    name: &str,
+    retry: &Retry,
+) -> SmbResult<Vec<DirEntry>> {
+    if is_valid_component(name)
+        && let Some(entry) = shared.overlay.peek(&join_key(&dir.key, name))
+    {
+        return Ok(vec![DirEntry {
+            info: entry.info(shared.built),
+        }]);
+    }
+    match shared.lookup_in(dir, name, retry).await {
+        Ok(found) => Ok(vec![DirEntry {
+            info: found.info(shared),
+        }]),
+        Err(SmbError::NotFound | SmbError::PathNotFound) => Ok(Vec::new()),
+        Err(e) => Err(e),
+    }
+}
+
+impl Shared {
+    /// Whether the overlay has the key of the object of `row` to delete.
+    fn hidden(&self, dir: &str, row: &Row) -> bool {
+        matches!(row.kind, RowKind::File(_)) && self.overlay.tombstoned(&join_key(dir, &row.name))
+    }
 }
 
 /// The description of the object, or the marker of the directory, of each
