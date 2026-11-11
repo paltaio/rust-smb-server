@@ -455,7 +455,6 @@ impl S3Client {
     }
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "called by tests only"))]
 impl S3Client {
     /// PutObject. Returns the ETag of the new object.
     ///
@@ -481,6 +480,7 @@ impl S3Client {
     }
 
     /// CopyObject from `source` to `key`, in this bucket.
+    #[cfg_attr(not(test), expect(dead_code, reason = "called by tests only"))]
     pub(crate) async fn copy_object(
         &self,
         source: &str,
@@ -554,6 +554,7 @@ impl S3Client {
     }
 
     /// UploadPartCopy of `range` of `source`.
+    #[cfg_attr(not(test), expect(dead_code, reason = "called by tests only"))]
     pub(crate) async fn upload_part_copy(
         &self,
         key: &str,
@@ -666,6 +667,7 @@ impl S3Client {
     /// DeleteObject. A key that does not exist is deleted: the store says so
     /// with status 404 and no body, or with the code `NoSuchKey`. Any other 404,
     /// such as a missing bucket or the page of a proxy, is an error.
+    #[cfg_attr(not(test), expect(dead_code, reason = "called by tests only"))]
     pub(crate) async fn delete_object(&self, key: &str, retry: Retry) -> Result<(), S3Error> {
         let call = self.object_call(Method::DELETE, key, &[])?;
         self.run(retry, &call, BodyLimit::Capped(MAX_BODY), |reply| {

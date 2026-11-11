@@ -356,7 +356,7 @@ async fn wait(done: oneshot::Receiver<Outcome>, retry: &Retry) -> Result<Option<
 
 /// Whether the object a GET returned is the one that was opened, going by its
 /// size, modification time and ETag.
-fn same_version(got: &ObjectHead, opened: &ObjectHead) -> bool {
+pub(super) fn same_version(got: &ObjectHead, opened: &ObjectHead) -> bool {
     got.size == opened.size && got.last_modified == opened.last_modified && got.etag == opened.etag
 }
 

@@ -769,9 +769,9 @@ async fn a_directory_the_store_already_has_as_a_directory_counts_as_made() {
     );
     let dir = rig.smb.create("dup", create_dir()).await.unwrap();
     assert_eq!(dir.action, 2);
-    let records = records(&rig);
-    assert_eq!(records.len(), 1);
-    assert!(!records[0].marker_pending);
+    assert!(records(&rig).is_empty(), "the skipped marker counts as put");
+    rig.smb.close(dir.id).await;
+    assert_eq!(rig.backend.overlay_len(), 0);
 }
 
 #[tokio::test]

@@ -17,6 +17,8 @@ use super::cache::MetaCache;
 use super::cachedir::CacheDir;
 use super::client::S3Client;
 use super::entry::Own;
+use super::error::S3Error;
+use super::jobs::{Guard, Jobs};
 use super::overlay::Overlay;
 use super::readahead::ReadAhead;
 use super::retry::Retry;
@@ -58,22 +60,65 @@ use super::retry::Retry;
 /// A writable backend keeps what clients change in its cache directory: the
 /// bytes written to a file, and the times and attributes set on files and
 /// directories. Bytes written and size changes reach the disk when a client
-/// flushes the file, and closing does not flush: after a restart a file has
-/// what its last flush recorded. A truncate below the length last flushed is
-/// recorded at once. Times and attributes reach the disk at once, except
-/// those of a file the backend holds bytes of, which reach it at the next
-/// flush. The share root keeps its times and attributes in memory. A read
+/// flushes the file or when the backend starts to store it; closing does not
+/// flush. After a restart a file has what was last recorded: one made and
+/// never recorded is gone, and an object changed and never recorded reads as
+/// the bucket has it. A truncate below the length last recorded is recorded
+/// at once. Times and attributes reach the disk at once, except those of a
+/// file the backend holds bytes of, which reach it at the next flush or when
+/// the backend starts to store the file. The share root keeps its times and
+/// attributes in memory. A read
 /// returns the bytes written and gets the rest from the store; it fails when
 /// it needs bytes of the store and the object under the file changed since
 /// the file was opened. What the backend holds shows in lookups and listings
 /// at once. A directory made through the share has its marker object put in
-/// the store before the open returns. Deletes and renames are refused, and
-/// the bytes of files are not put in the store.
+/// the store before the open returns. Deletes and renames are refused.
+///
+/// A file the backend holds bytes of is stored in the bucket in the
+/// background, [`upload_delay`](crate::S3BackendBuilder::upload_delay) after
+/// its last change, open or not. A file of up to
+/// [`part_size`](crate::S3BackendBuilder::part_size) bytes goes up in one
+/// request, a larger one as a multipart upload. The object gets the times and
+/// attributes of the file and keeps the other metadata it had. A file that has
+/// not changed since it was stored loses the bytes the backend held, and is
+/// read from the bucket. After a change to a file, the upload under way
+/// starts no more requests, a multipart upload is aborted, and a request
+/// already sent may still store the earlier content. Another upload starts
+/// after the delay. Times and attributes set on a file the backend holds no
+/// bytes of, or on a directory that has no marker object to put, stay in the
+/// cache directory and are not stored in the bucket.
+///
+/// Before it stores a file that was changed in part, the backend reads the
+/// rest of its bytes from the object. If the object has changed or is gone by
+/// then, the file moves to the `conflicts` directory of the cache directory
+/// with an error in the log, and the bucket keeps what it has. If the move
+/// fails, the file stays and shows in [`failures`](S3Backend::failures). A
+/// file whose bytes are all local replaces the object with no check of what
+/// the bucket holds.
+///
+/// An upload fails for good when the store refuses a request in a way trying
+/// again cannot fix, or when the cache directory cannot be read or written.
+/// It is logged, shows in [`failures`](S3Backend::failures), and is tried
+/// again when the next backend is built on the cache directory. That backend
+/// stores the files and directory markers an earlier one left without waiting
+/// for the upload delay, and aborts the multipart uploads the earlier one left
+/// running. A bucket should have a lifecycle rule that aborts incomplete
+/// multipart uploads. [`sync`](S3Backend::sync) waits until the files the
+/// backend holds bytes of, and the directory markers it has not put, are
+/// stored.
+///
+/// Dropping the last clone ends the uploads. The cache directory stays locked
+/// until the handles opened through the backend are closed and the requests
+/// in flight have ended. A change made through a handle after the last clone
+/// is dropped is not stored by this backend; the next backend built on the
+/// cache directory stores what the directory records.
 ///
 /// Build one with [`S3Backend::builder`].
 #[derive(Clone)]
 pub struct S3Backend {
     pub(super) shared: Arc<Shared>,
+    /// Ends the worker when the last clone is dropped.
+    pub(super) _worker: Arc<Guard>,
 }
 
 pub(super) struct Shared {
@@ -102,6 +147,8 @@ pub(super) struct Shared {
     /// The times and attributes of the share root, which the backend keeps
     /// in memory.
     pub(super) root_own: Mutex<Own>,
+    /// What the background jobs run with.
+    pub(super) jobs: Arc<Jobs>,
 }
 
 impl Shared {
@@ -124,6 +171,38 @@ impl Shared {
     /// The times and attributes of the share root.
     pub(super) fn root_own(&self) -> MutexGuard<'_, Own> {
         self.root_own.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl S3Backend {
+    /// Waits until the files the backend holds bytes of, and the directories
+    /// whose marker objects it has not put, are stored in the bucket. Only
+    /// what the backend holds when the call begins counts. A file that keeps
+    /// changing delays the call, as it delays its upload. The call waits as
+    /// long as the uploads take, through failures that trying again may fix
+    /// and through a full disk of the cache directory.
+    ///
+    /// # Errors
+    ///
+    /// Fails with the error of one of those files or directories whose upload
+    /// failed for good, or whose changes moved to the `conflicts` directory of
+    /// the cache directory because the object changed or is gone in the
+    /// bucket. Fails with [`S3Error::Stopped`] if the background worker has
+    /// ended.
+    pub async fn sync(&self) -> Result<(), S3Error> {
+        self.shared.sync().await
+    }
+
+    /// The paths whose upload failed for good, with the error of each. A path
+    /// has `/` between its names and no `/` before the first.
+    ///
+    /// A file or directory on the list keeps what the backend holds for it,
+    /// which clients still see. It gets no other upload until the next backend
+    /// is built on the cache directory, which tries it again. A file that
+    /// moved to the `conflicts` directory is not on the list.
+    #[must_use]
+    pub fn failures(&self) -> Vec<(String, S3Error)> {
+        self.shared.overlay.failures(&self.shared.prefix)
     }
 }
 
@@ -174,6 +253,43 @@ impl S3Backend {
             .hooks
     }
 
+    /// Keeps the worker from starting jobs, or lets it start them again.
+    pub(crate) fn hold_uploads(&self, held: bool) {
+        self.shared
+            .jobs
+            .held
+            .store(held, std::sync::atomic::Ordering::SeqCst);
+        self.shared.overlay.queue().wake();
+    }
+
+    /// Makes the next job that has hashed a file wait: it notifies the first
+    /// `Notify`, and goes on when the second is notified.
+    pub(crate) fn pause_after_hash(&self) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        gates(&self.shared.jobs.pause)
+    }
+
+    /// Makes the next job whose request has stored a file wait, as
+    /// [`pause_after_hash`](Self::pause_after_hash) does. If the backend is
+    /// dropped meanwhile, the job ends without noting what it stored.
+    pub(crate) fn pause_after_store(&self) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        gates(&self.shared.jobs.pause_stored)
+    }
+
+    /// Whether the worker has ended, which it does after the last clone of
+    /// the backend is dropped.
+    pub(crate) fn worker_exited(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.shared.jobs.exited.subscribe()
+    }
+
+    /// Makes the worker panic.
+    pub(crate) fn panic_worker(&self) {
+        self.shared
+            .jobs
+            .panic_worker
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.shared.overlay.queue().wake();
+    }
+
     /// Holds the `io` lock of the entry the overlay has for `key` until the
     /// returned value is dropped.
     pub(crate) fn hold_io(&self, key: &str) -> Option<IoHold> {
@@ -191,6 +307,19 @@ impl S3Backend {
             thread: Some(thread),
         })
     }
+}
+
+/// Puts up new gates in `slot`.
+#[cfg(test)]
+fn gates(
+    slot: &Mutex<Option<super::jobs::Gates>>,
+) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+    let gates = (
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(tokio::sync::Notify::new()),
+    );
+    *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(gates.clone());
+    gates
 }
 
 /// A hold on the `io` lock of an entry.

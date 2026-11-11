@@ -12,5 +12,6 @@ mod reads;
 mod recovery;
 mod share;
 mod transport;
+mod uploads;
 mod wire;
 mod writes;

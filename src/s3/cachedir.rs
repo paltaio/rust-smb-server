@@ -19,7 +19,7 @@ use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use tracing::{debug, error};
 
@@ -53,13 +53,21 @@ pub(crate) struct Hooks {
     pub(crate) data_writes: AtomicUsize,
     /// Calls of `sync_data_dir`.
     pub(crate) data_dir_syncs: AtomicUsize,
+    /// A failed move of a data file to `conflicts/` leaves the file where it
+    /// was.
+    pub(crate) data_moves: AtomicUsize,
+    /// The failures injected are those of a full disk.
+    pub(crate) disk_full: AtomicBool,
 }
 
 #[cfg(test)]
 impl Hooks {
-    fn take(counter: &AtomicUsize) -> io::Result<()> {
+    fn take(&self, counter: &AtomicUsize) -> io::Result<()> {
         let left = counter.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
         match left {
+            Ok(_) if self.disk_full.load(Ordering::SeqCst) => {
+                Err(io::ErrorKind::StorageFull.into())
+            }
             Ok(_) => Err(io::Error::other("injected failure")),
             Err(_) => Ok(()),
         }
@@ -220,7 +228,7 @@ impl CacheDir {
     /// Writes all of `bytes` at `offset` of a data file.
     pub(crate) fn write_data(&self, file: &File, bytes: &[u8], offset: u64) -> io::Result<()> {
         #[cfg(test)]
-        if let Err(e) = Hooks::take(&self.hooks.data_writes) {
+        if let Err(e) = self.hooks.take(&self.hooks.data_writes) {
             data::write_all_at(file, &bytes[..bytes.len() / 2], offset)?;
             return Err(e);
         }
@@ -240,15 +248,41 @@ impl CacheDir {
     /// one, never a partial write.
     pub(crate) fn write_record(&self, id: &RecordId, text: &str) -> io::Result<()> {
         #[cfg(test)]
-        Hooks::take(&self.hooks.record_writes)?;
+        self.hooks.take(&self.hooks.record_writes)?;
         self.write_file(id.as_str(), self.record_path(id), text)
     }
 
     pub(crate) fn remove_record(&self, id: &RecordId) -> io::Result<()> {
         #[cfg(test)]
-        Hooks::take(&self.hooks.record_removals)?;
+        self.hooks.take(&self.hooks.record_removals)?;
         ignore_missing(fs::remove_file(self.record_path(id)))?;
         sync_dir(&self.root.join("records"))
+    }
+
+    /// Moves the data file of entry `id` to `target`. A file that is not
+    /// there is left out.
+    fn move_data(&self, id: &RecordId, target: &Path) -> io::Result<()> {
+        #[cfg(test)]
+        self.hooks.take(&self.hooks.data_moves)?;
+        ignore_missing(fs::rename(self.data_path(id), target))
+    }
+
+    /// Moves the data file and then the record of entry `id` to `conflicts/`,
+    /// under a new id, syncing `conflicts/` in between. A file that is not
+    /// there is left out. If the data file cannot be moved, both stay where
+    /// they are.
+    pub(crate) fn keep_conflict(&self, id: &RecordId) -> io::Result<RecordId> {
+        let fresh = new_id()?;
+        let conflicts = self.root.join("conflicts");
+        self.move_data(id, &conflicts.join(format!("{fresh}.data")))?;
+        sync_dir(&conflicts)?;
+        ignore_missing(fs::rename(
+            self.record_path(id),
+            conflicts.join(format!("{fresh}.record")),
+        ))?;
+        sync_dir(&self.root.join("records"))?;
+        sync_dir(&conflicts)?;
+        Ok(fresh)
     }
 
     /// The size and free space of the volume of the directory.
@@ -286,7 +320,7 @@ impl CacheDir {
         let mut tombstones = Vec::new();
         for name in names {
             let Some(id) = name.to_str().and_then(RecordId::parse) else {
-                self.quarantine(&name, None, "the file name is not a record id");
+                self.quarantine(&name, None, "the file name is not a record id", &mut live);
                 continue;
             };
             let decoded = match read_capped(&self.record_path(&id)) {
@@ -296,20 +330,30 @@ impl CacheDir {
             let record = match decoded {
                 Ok(record) if *record.id() == id => record,
                 Ok(_) => {
-                    self.quarantine(&name, Some(&id), "the record has another id");
+                    self.quarantine(&name, Some(&id), "the record has another id", &mut live);
                     continue;
                 }
                 Err(why) => {
-                    self.quarantine(&name, Some(&id), &why);
+                    self.quarantine(&name, Some(&id), &why, &mut live);
                     continue;
                 }
             };
             match record {
                 Record::Tombstone(tombstone) => {
                     if !tombstone.keys.iter().all(|key| key.starts_with(&inside)) {
-                        self.quarantine(&name, Some(&id), "the key is outside the prefix");
+                        self.quarantine(
+                            &name,
+                            Some(&id),
+                            "the key is outside the prefix",
+                            &mut live,
+                        );
                     } else if tombstone.keys.iter().any(|key| dead_keys.contains(key)) {
-                        self.quarantine(&name, Some(&id), "another record has the same key");
+                        self.quarantine(
+                            &name,
+                            Some(&id),
+                            "another record has the same key",
+                            &mut live,
+                        );
                     } else {
                         dead_keys.extend(tombstone.keys.iter().cloned());
                         tombstones.push(tombstone);
@@ -322,7 +366,7 @@ impl CacheDir {
                         }
                         recovered.entries.push((*entry, data));
                     }
-                    Err(why) => self.quarantine(&name, Some(&id), &why),
+                    Err(why) => self.quarantine(&name, Some(&id), &why, &mut live),
                 },
             }
         }
@@ -404,21 +448,42 @@ impl CacheDir {
         Ok(data)
     }
 
-    /// Moves the record `name` and the data file of `data_id` to
-    /// `conflicts/`.
-    fn quarantine(&self, name: &OsStr, data_id: Option<&RecordId>, why: &str) {
+    /// Moves the data file of `data_id` and then the record `name` to
+    /// `conflicts/`. If the data file cannot be moved, the record stays in
+    /// `records/` for this build, and `data_id` is added to `live` so the
+    /// data file is kept.
+    fn quarantine(
+        &self,
+        name: &OsStr,
+        data_id: Option<&RecordId>,
+        why: &str,
+        live: &mut HashSet<RecordId>,
+    ) {
         let Ok(fresh) = new_id() else {
+            live.extend(data_id.cloned());
             error!(record = ?name, reason = why, "a record in the cache directory is unusable");
             return;
         };
         let conflicts = self.root.join("conflicts");
+        if let Some(id) = data_id {
+            let data = self
+                .move_data(id, &conflicts.join(format!("{fresh}.data")))
+                .and_then(|()| sync_dir(&conflicts));
+            if let Err(e) = data {
+                live.insert(id.clone());
+                error!(
+                    record = ?name,
+                    reason = why,
+                    error = %e,
+                    "a record in the cache directory is unusable and its data file could not be moved; both stay where they are"
+                );
+                return;
+            }
+        }
         let moved = fs::rename(
             self.root.join("records").join(name),
             conflicts.join(format!("{fresh}.record")),
         );
-        if let Some(id) = data_id {
-            let _ = fs::rename(self.data_path(id), conflicts.join(format!("{fresh}.data")));
-        }
         match moved {
             Ok(()) => error!(
                 record = ?name,
@@ -926,5 +991,92 @@ mod tests {
         assert_eq!(recovered.entries.len(), 1);
         assert!(recovered.tombstones.is_empty());
         assert_eq!(conflicts(temp.path()).len(), 3);
+    }
+
+    #[test]
+    fn a_conflict_takes_the_data_file_and_the_record_under_one_new_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = CacheDir::open(temp.path(), &who()).unwrap();
+        let held = entry("held", Some(4));
+        store(&dir, &held, Some(b"data"));
+        let bare = entry("bare", None);
+        store(&dir, &bare, None);
+
+        let fresh = dir.keep_conflict(&held.id).unwrap();
+        assert_eq!(
+            conflicts(temp.path()),
+            [format!("{fresh}.data"), format!("{fresh}.record")]
+        );
+        let kept = temp.path().join("conflicts").join(format!("{fresh}.data"));
+        assert_eq!(fs::read(kept).unwrap(), b"data");
+        assert_eq!(names(&temp.path().join("records")), [bare.id.to_string()]);
+        assert!(names(&temp.path().join("data")).is_empty());
+
+        let other = dir.keep_conflict(&bare.id).unwrap();
+        assert!(conflicts(temp.path()).contains(&format!("{other}.record")));
+        assert!(!conflicts(temp.path()).contains(&format!("{other}.data")));
+        assert!(names(&temp.path().join("records")).is_empty());
+    }
+
+    #[test]
+    fn a_conflict_whose_data_file_cannot_be_moved_leaves_both_files_in_place() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = CacheDir::open(temp.path(), &who()).unwrap();
+        let held = entry("held", Some(4));
+        store(&dir, &held, Some(b"data"));
+
+        dir.hooks.data_moves.store(1, Ordering::SeqCst);
+        assert!(dir.keep_conflict(&held.id).is_err());
+        assert_eq!(names(&temp.path().join("records")), [held.id.to_string()]);
+        assert_eq!(names(&temp.path().join("data")), [held.id.to_string()]);
+        assert!(conflicts(temp.path()).is_empty());
+
+        dir.keep_conflict(&held.id).unwrap();
+        assert_eq!(conflicts(temp.path()).len(), 2);
+    }
+
+    #[test]
+    fn a_record_whose_data_file_cannot_be_moved_stays_with_it_until_the_next_build() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = CacheDir::open(temp.path(), &who()).unwrap();
+        let short = entry("short", Some(10));
+        store(&dir, &short, Some(b"abc"));
+
+        dir.hooks.data_moves.store(1, Ordering::SeqCst);
+        assert!(dir.recover("pre/fix", false).unwrap().entries.is_empty());
+        assert_eq!(names(&temp.path().join("records")), [short.id.to_string()]);
+        assert_eq!(names(&temp.path().join("data")), [short.id.to_string()]);
+        assert!(conflicts(temp.path()).is_empty());
+
+        assert!(dir.recover("pre/fix", false).unwrap().entries.is_empty());
+        assert!(names(&temp.path().join("records")).is_empty());
+        assert!(names(&temp.path().join("data")).is_empty());
+        let moved = conflicts(temp.path());
+        assert_eq!(moved.len(), 2, "{moved:?}");
+        let data = moved.iter().find(|n| n.ends_with(".data")).unwrap();
+        assert_eq!(
+            fs::read(temp.path().join("conflicts").join(data)).unwrap(),
+            b"abc"
+        );
+    }
+
+    #[test]
+    fn a_crash_between_the_two_moves_of_a_conflict_keeps_the_data_in_conflicts() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = CacheDir::open(temp.path(), &who()).unwrap();
+        let held = entry("held", Some(4));
+        store(&dir, &held, Some(b"data"));
+        let moved = temp
+            .path()
+            .join("conflicts")
+            .join(format!("{}.data", new_id().unwrap()));
+        fs::rename(dir.data_path(&held.id), &moved).unwrap();
+
+        assert!(dir.recover("pre/fix", false).unwrap().entries.is_empty());
+        assert_eq!(fs::read(&moved).unwrap(), b"data");
+        assert!(names(&temp.path().join("records")).is_empty());
+        let found = conflicts(temp.path());
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert_eq!(found.iter().filter(|n| n.ends_with(".record")).count(), 1);
     }
 }

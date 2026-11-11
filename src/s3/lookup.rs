@@ -77,6 +77,21 @@ impl Shared {
         self.cache().forget_file(key, dir);
     }
 
+    /// Makes what is cached of the object at `key` `known`, and puts `kind`
+    /// as its row in the cached listing of its directory.
+    pub(super) fn remember(&self, key: &str, known: Known, kind: RowKind) {
+        let dir = key.rsplit_once('/').map_or("", |(dir, _)| dir);
+        let mut cache = self.cache();
+        cache.put_known(key, known, Instant::now());
+        cache.add_row(
+            dir,
+            Row {
+                name: last_name(key).to_owned(),
+                kind,
+            },
+        );
+    }
+
     /// Resolves `path`, as far as the bucket and the cache tell. Fails with
     /// `NotFound` when the directory it is in exists and holds no such name,
     /// and with `PathNotFound` when that directory does not exist or is an

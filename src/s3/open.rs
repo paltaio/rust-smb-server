@@ -2,12 +2,9 @@
 
 use std::io;
 use std::sync::Arc;
-use std::time::SystemTime;
 
-use bytes::Bytes;
 use tokio::task::spawn_blocking;
-use tokio::time::Instant;
-use tracing::{debug, warn};
+use tracing::warn;
 
 use crate::backend::{FILE_ATTRIBUTE_READONLY, Handle, OpenAction, OpenIntent, OpenOptions};
 use crate::error::{SmbError, SmbResult};
@@ -15,16 +12,13 @@ use crate::path::SmbPath;
 use crate::utils::now_filetime;
 
 use super::backend::{Shared, changes};
-use super::cache::Known;
 use super::cachedir::new_id;
 use super::change;
 use super::data::disk_error;
 use super::entry::Entry;
 use super::handle::S3Handle;
-use super::keys::{Row, RowKind, child_key, dir_prefix, last_name};
-use super::lookup::DirRef;
+use super::keys::child_key;
 use super::meta;
-use super::object::{Metadata, ObjectHead};
 use super::overlay::Held;
 use super::retry::Retry;
 
@@ -33,9 +27,6 @@ use super::retry::Retry;
 const ATTEMPTS: usize = 4;
 
 type Opened = (Box<dyn Handle>, OpenAction);
-
-/// The content type of the marker object of a directory.
-const MARKER_TYPE: &str = "application/x-directory";
 
 impl Shared {
     pub(super) async fn open(
@@ -111,7 +102,7 @@ impl Shared {
         let key = child_key(&parent.key, name)?;
         let now = now_filetime();
         let held = if opts.directory {
-            self.create_dir(&parent, key, now, retry).await?
+            self.create_dir(key, now, retry).await?
         } else {
             self.create_file(key, now).await?
         };
@@ -142,12 +133,11 @@ impl Shared {
         .map_err(|e| SmbError::Io(io::Error::other(e)))?
     }
 
-    /// Makes the directory `key` in `parent`: its entry and record, then its
-    /// marker object, before the open answers. The work runs as a task of its
-    /// own, so an open that is dropped does not leave it half done.
+    /// Makes the directory `key`: its entry and record, then its marker
+    /// object, before the open answers. The work runs as a task of its own, so
+    /// an open that is dropped does not leave it half done.
     async fn create_dir(
         self: &Arc<Self>,
-        parent: &DirRef,
         key: String,
         now: u64,
         retry: &Retry,
@@ -156,9 +146,8 @@ impl Shared {
             return Ok(None);
         };
         let task = tokio::spawn({
-            let (shared, held) = (Arc::clone(self), held.another());
-            let (parent, retry) = (parent.key.clone(), retry.clone());
-            async move { shared.put_marker(&held, &parent, retry).await }
+            let (shared, held, retry) = (Arc::clone(self), held.another(), retry.clone());
+            async move { shared.put_marker(&held, retry).await }
         });
         match task.await {
             Ok(Ok(())) => Ok(Some(held)),
@@ -172,45 +161,26 @@ impl Shared {
     /// because the directory is there already counts as put. If the record or
     /// the marker fails, the open fails and the record is removed; a record
     /// that cannot be removed stays, with a warning in the log.
-    async fn put_marker(
-        self: &Arc<Self>,
-        held: &Held,
-        parent: &str,
-        retry: Retry,
-    ) -> SmbResult<()> {
+    async fn put_marker(self: &Arc<Self>, held: &Held, retry: Retry) -> SmbResult<()> {
         let (key, metadata, generation) = {
             let state = held.entry.state();
             let own = state.own_or_base(self.built);
-            let metadata = Metadata {
-                user: meta::stored_metadata(own.times, own.attributes),
-                content_type: Some(MARKER_TYPE.to_owned()),
-                ..Metadata::default()
-            };
+            let metadata = meta::marker_metadata(own.times, own.attributes);
             (state.key.clone(), metadata, state.generation)
         };
-        let marker = dir_prefix(&key);
         let put = async {
             change::record(self, held).await?;
-            match self
-                .client
-                .put_object(&marker, Bytes::new(), &metadata, retry)
+            change::store_marker(self, &key, metadata, retry)
                 .await
-            {
-                Ok(etag) => Ok(Some(etag)),
-                Err(e) if e.code() == Some("ExistingObjectIsDirectory") => {
-                    debug!("the store has a directory where a marker was to go");
-                    Ok(None)
-                }
-                Err(e) => {
+                .map_err(|e| {
                     if !matches!(e.http_status(), Some(400..=499)) {
                         self.forget_file(&key);
                     }
-                    Err(e.into_smb_error())
-                }
-            }
+                    e.into_smb_error()
+                })
         };
-        let etag = match put.await {
-            Ok(etag) => etag,
+        let head = match put.await {
+            Ok(head) => head,
             Err(e) => {
                 if let Err(abandoned) = change::abandon(self, held).await {
                     warn!(error = %abandoned, "the record of a directory that was not made is still there");
@@ -218,27 +188,7 @@ impl Shared {
                 return Err(e);
             }
         };
-
-        let head = etag.map(|etag| {
-            Arc::new(ObjectHead {
-                size: 0,
-                etag,
-                last_modified: SystemTime::now(),
-                metadata,
-            })
-        });
-        {
-            let mut cache = self.cache();
-            cache.put_known(&key, Known::Dir(head.clone()), Instant::now());
-            cache.add_row(
-                parent,
-                Row {
-                    name: last_name(&key).to_owned(),
-                    kind: RowKind::Dir,
-                },
-            );
-        }
-        if let Err(e) = change::marker_put(self, held, generation, &marker, head).await {
+        if let Err(e) = change::marker_put(self, held, generation, &key, head).await {
             warn!(error = %e, "the record of a new directory was not updated");
         }
         Ok(())

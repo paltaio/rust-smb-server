@@ -54,7 +54,8 @@ pub(super) fn builder(bucket: &TestBucket, addr: SocketAddr) -> S3BackendBuilder
 }
 
 /// Settings for a backend of `bucket` that keeps its changes in `cache`,
-/// reached at `addr`.
+/// reached at `addr`. Its worker starts no job until a test calls
+/// `hold_uploads(false)` on it.
 pub(super) fn writable_builder(
     bucket: &TestBucket,
     addr: SocketAddr,
@@ -63,6 +64,7 @@ pub(super) fn writable_builder(
     S3Backend::builder(format!("http://{addr}"), REGION, &bucket.name)
         .credentials(&bucket.gateway.access_key, &bucket.gateway.secret_key)
         .cache_dir(cache)
+        .held_uploads(true)
 }
 
 /// A read-only backend of `bucket`, reached directly.
@@ -209,7 +211,12 @@ impl Rig {
         } = self;
         smb.close_all().await;
         drop(smb);
+        let mut exited = backend.worker_exited();
         drop(backend);
+        tokio::time::timeout(Duration::from_secs(10), exited.wait_for(|exited| *exited))
+            .await
+            .expect("the worker ends once the backend is dropped")
+            .expect("the worker reports its end");
         (bucket, proxy, cache.expect("a writable rig"))
     }
 

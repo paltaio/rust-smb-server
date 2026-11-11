@@ -58,7 +58,6 @@ impl Payload {
     /// they do not hash to `sha256`, the request fails with
     /// [`S3Error::SourceChanged`] before it sends the last piece, and the
     /// store keeps nothing.
-    #[cfg_attr(not(test), expect(dead_code, reason = "called by tests only"))]
     pub(crate) fn file(
         file: Arc<File>,
         offset: u64,

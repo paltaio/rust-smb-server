@@ -113,14 +113,12 @@ impl S3Error {
     /// Whether the data sent was not the data the request was signed for: the
     /// file changed after it was hashed, or the store found the body to differ
     /// from the hash.
-    #[cfg_attr(not(test), expect(dead_code, reason = "called by tests only"))]
     pub(crate) fn is_source_changed(&self) -> bool {
         matches!(self, S3Error::SourceChanged)
             || matches!(self.code(), Some("XAmzContentSHA256Mismatch" | "BadDigest"))
     }
 
     /// Whether the call ended because it was stopped.
-    #[cfg_attr(not(test), expect(dead_code, reason = "called by tests only"))]
     pub(crate) fn is_stopped(&self) -> bool {
         matches!(self, S3Error::Stopped)
     }

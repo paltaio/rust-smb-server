@@ -9,23 +9,28 @@
 use std::fs::File;
 use std::io;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::SystemTime;
 
 use tokio::task::spawn_blocking;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::backend::{FileTimes, VALID_SET_ATTRIBUTES};
 use crate::error::{SmbError, SmbResult};
 use crate::utils::now_filetime;
 
 use super::backend::Shared;
+use super::cache::Known;
 use super::cachedir::CacheDir;
 use super::data::disk_error;
 use super::entry::{Base, Entry, Local, Own, Sealed, State};
-use super::object::ObjectHead;
+use super::error::S3Error;
+use super::keys::{RowKind, dir_prefix};
+use super::object::{Metadata, ObjectHead};
 use super::overlay::Held;
+use super::payload::Payload;
 use super::ranges::RangeSet;
 use super::record::{EntryRecord, LocalRecord, RecordId};
+use super::retry::Retry;
 
 /// Runs `work` on a blocking thread, for `held`: the entry stays in the
 /// overlay until it is done, even if the request that asked for it is
@@ -97,7 +102,7 @@ fn write_data(shared: &Shared, entry: &Entry, offset: u64, data: &[u8]) -> SmbRe
         // Part of the bytes may be in the file. The next flush has to sync
         // them, and a file the write made longer is cut back.
         let mut state = entry.state();
-        state.generation += 1;
+        state.bump();
         let len = state.local().map(|local| local.len);
         drop(state);
         if let Some(len) = len.filter(|&len| end > len) {
@@ -115,7 +120,6 @@ fn write_data(shared: &Shared, entry: &Entry, offset: u64, data: &[u8]) -> SmbRe
             local.len = local.len.max(end);
         }
         state.wrote(shared.built, now);
-        state.changed = Instant::now();
     })
 }
 
@@ -259,16 +263,24 @@ pub(super) async fn flush(shared: &Arc<Shared>, held: &Held) -> SmbResult<()> {
     if held.entry.state().local().is_none() {
         return Ok(());
     }
-    blocking(shared, held, seal).await
+    blocking(shared, held, |shared, entry| seal(shared, entry, false)).await
 }
 
 /// Writes the record of the entry once the data it claims is on disk. The
 /// record says what the entry held when this started, so it never claims a
 /// byte the data file did not have by then. The first record of an entry
 /// also syncs, on Unix hosts, the directory of the data files.
-fn seal(shared: &Shared, entry: &Entry) -> SmbResult<()> {
-    let cache = shared.local()?;
+///
+/// A record sealed at the current generation is not written again unless
+/// `force`.
+pub(super) fn seal(shared: &Shared, entry: &Entry, force: bool) -> SmbResult<()> {
     let _seal = entry.lock_seal();
+    seal_held(shared, entry, force)
+}
+
+/// [`seal`] for a caller that holds the `seal` lock of the entry.
+pub(super) fn seal_held(shared: &Shared, entry: &Entry, force: bool) -> SmbResult<()> {
+    let cache = shared.local()?;
     let (file, record, first) = {
         let mut state = entry.state();
         state.attached()?;
@@ -277,7 +289,7 @@ fn seal(shared: &Shared, entry: &Entry) -> SmbResult<()> {
         };
         let file = Arc::clone(&local.file);
         let sealed = state.sealed();
-        if sealed.is_some_and(|sealed| sealed.generation == state.generation) {
+        if !force && sealed.is_some_and(|sealed| sealed.generation == state.generation) {
             return Ok(());
         }
         let record =
@@ -301,28 +313,59 @@ fn seal(shared: &Shared, entry: &Entry) -> SmbResult<()> {
 
 /// Writes the record of the entry as it is now.
 pub(super) async fn record(shared: &Arc<Shared>, held: &Held) -> SmbResult<()> {
-    blocking(shared, held, |shared, entry| {
-        let cache = shared.local()?;
-        let _seal = entry.lock_seal();
-        let record = {
-            let mut state = entry.state();
-            state.attached()?;
-            Entry::record(&mut state, &shared.prefix, shared.built).map_err(SmbError::Io)?
-        };
-        write_record(cache, &record)?;
-        commit(cache, entry, Some(&record.id), |state| {
-            state.recorded = true
-        })
-    })
-    .await
+    blocking(shared, held, record_now).await
 }
 
-/// Notes that the marker object of the new directory is in the bucket, as
-/// `head` describes it, or that the store has the directory without one. If
-/// nothing about the directory changed since `generation`, the marker carries
-/// its times and the directory has nothing left to keep: its record is
-/// removed.
-/// Otherwise its record is rewritten.
+/// Writes the record of the entry as it is now, on the calling thread.
+pub(super) fn record_now(shared: &Shared, entry: &Entry) -> SmbResult<()> {
+    let cache = shared.local()?;
+    let _seal = entry.lock_seal();
+    let record = {
+        let mut state = entry.state();
+        state.attached()?;
+        Entry::record(&mut state, &shared.prefix, shared.built).map_err(SmbError::Io)?
+    };
+    write_record(cache, &record)?;
+    commit(cache, entry, Some(&record.id), |state| {
+        state.recorded = true
+    })
+}
+
+/// Puts the marker object of the directory `key` with `metadata`, and makes
+/// the metadata cache hold the directory. A marker the store refuses because
+/// the directory is there already counts as put, and the answer is `None`.
+pub(super) async fn store_marker(
+    shared: &Shared,
+    key: &str,
+    metadata: Metadata,
+    retry: Retry,
+) -> Result<Option<Arc<ObjectHead>>, S3Error> {
+    let put = shared
+        .client
+        .put_object(&dir_prefix(key), Payload::empty(), &metadata, retry)
+        .await;
+    let head = match put {
+        Ok(etag) => Some(Arc::new(ObjectHead {
+            size: 0,
+            etag,
+            last_modified: SystemTime::now(),
+            metadata,
+        })),
+        Err(e) if e.code() == Some("ExistingObjectIsDirectory") => {
+            debug!(key, "the store has a directory where a marker was to go");
+            None
+        }
+        Err(e) => return Err(e),
+    };
+    shared.remember(key, Known::Dir(head.clone()), RowKind::Dir);
+    Ok(head)
+}
+
+/// Notes that the marker object of the new directory `key` is in the bucket,
+/// as `head` describes it, or that the store has the directory without one.
+/// If nothing about the directory changed since `generation`, the directory
+/// has nothing left to keep: its record is removed and its own times are
+/// dropped. Otherwise its record is rewritten.
 ///
 /// A directory changes only through the `seal` lock, which is held here, so
 /// the generation cannot move while this runs.
@@ -330,17 +373,17 @@ pub(super) async fn marker_put(
     shared: &Arc<Shared>,
     held: &Held,
     generation: u64,
-    marker: &str,
+    key: &str,
     head: Option<Arc<ObjectHead>>,
 ) -> SmbResult<()> {
-    let marker = marker.to_owned();
+    let marker = dir_prefix(key);
     blocking(shared, held, move |shared, entry| {
         let cache = shared.local()?;
         let _seal = entry.lock_seal();
         let id = {
             let state = entry.state();
             state.attached()?;
-            (head.is_some() && state.generation == generation)
+            (state.generation == generation)
                 .then(|| state.id.clone())
                 .flatten()
         };
@@ -353,6 +396,7 @@ pub(super) async fn marker_put(
         });
         let record = {
             let mut state = entry.state();
+            state.creating = false;
             state.set_marker_pending(false);
             state.may_exist = true;
             state.base = head.map(|head| Base::new(&shared.ahead, marker, head, false));
@@ -382,6 +426,7 @@ pub(super) async fn abandon(shared: &Arc<Shared>, held: &Held) -> SmbResult<()> 
             cache.remove_record(&id).map_err(disk_error)?;
         }
         let mut state = entry.state();
+        state.creating = false;
         state.set_marker_pending(false);
         state.own = None;
         state.recorded = false;
@@ -454,7 +499,7 @@ fn change_own(shared: &Shared, entry: &Entry, change: impl FnOnce(&mut Own)) -> 
         }
         if state.local().is_some() {
             state.own = Some(own);
-            state.generation += 1;
+            state.bump();
             return Ok(());
         }
         let mut record =
@@ -468,7 +513,7 @@ fn change_own(shared: &Shared, entry: &Entry, change: impl FnOnce(&mut Own)) -> 
     write_record(cache, &record)?;
     commit(cache, entry, Some(&record.id), |state| {
         state.own = Some(own);
-        state.generation += 1;
+        state.bump();
         state.recorded = true;
     })
 }

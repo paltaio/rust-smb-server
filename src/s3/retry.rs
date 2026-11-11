@@ -36,7 +36,6 @@ impl Stop {
 
     /// Ends the calls: no attempt begins from now on, and a wait before the
     /// next attempt ends at once. An attempt under way runs to its end.
-    #[cfg_attr(not(test), expect(dead_code, reason = "called by tests only"))]
     pub(crate) fn stop(&self) {
         self.0.send_replace(true);
     }
@@ -45,7 +44,7 @@ impl Stop {
         *self.0.borrow()
     }
 
-    async fn stopped(&self) {
+    pub(crate) async fn stopped(&self) {
         let mut state = self.0.subscribe();
         // The sender lives in `self`, so the wait ends only with the signal.
         let _ = state.wait_for(|stopped| *stopped).await;
@@ -85,7 +84,6 @@ impl Retry {
     }
 
     /// A background call that ends when `stop` is called.
-    #[cfg_attr(not(test), expect(dead_code, reason = "called by tests only"))]
     pub(crate) fn until(stop: &Stop) -> Self {
         Retry::Background { stop: stop.clone() }
     }

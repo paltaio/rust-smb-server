@@ -9,13 +9,16 @@
 use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use super::entry::Entry;
+use super::entry::{Entry, State};
+use super::error::S3Error;
 use super::keys::{dir_prefix, slot};
 use super::lookup::Found;
+use super::queue::Queue;
 use super::readahead::ReadAhead;
 use super::record::TombstoneRecord;
+use super::retry::Stop;
 
 #[derive(Default)]
 struct Index {
@@ -36,7 +39,21 @@ pub(super) struct Below {
 
 pub(super) struct Overlay {
     fold: bool,
+    /// How long an entry rests after its last change before a job may start.
+    delay: Duration,
+    /// The entries that wait for a job.
+    queue: Queue<Arc<Entry>>,
     index: Mutex<Index>,
+}
+
+/// What the worker finds when it takes an entry off the queue.
+pub(super) enum Claim {
+    /// The entry has a job to run, with the signal that stops it.
+    Run(Held, Stop),
+    /// The entry waits for a later time.
+    Later(Arc<Entry>, Instant),
+    /// The entry has no job to run.
+    Skip,
 }
 
 /// A hold on an entry. The entry stays in the overlay while a hold is on it,
@@ -65,12 +82,101 @@ impl Drop for Held {
 
 impl Overlay {
     /// An overlay whose names match without regard to case when
-    /// `case_insensitive`.
-    pub(super) fn new(case_insensitive: bool) -> Arc<Overlay> {
+    /// `case_insensitive`, and whose entries wait `delay` after their last
+    /// change for a job.
+    pub(super) fn new(case_insensitive: bool, delay: Duration) -> Arc<Overlay> {
         Arc::new(Overlay {
             fold: case_insensitive,
+            delay,
+            queue: Queue::new(),
             index: Mutex::new(Index::default()),
         })
+    }
+
+    /// The entries that wait for a job.
+    pub(super) fn queue(&self) -> &Queue<Arc<Entry>> {
+        &self.queue
+    }
+
+    /// Queues `entry`, whose state is `state`, for a job if it has one to run
+    /// and is not queued.
+    fn schedule(&self, entry: &Arc<Entry>, state: &mut State) {
+        if state.queued {
+            return;
+        }
+        if let Some(due) = state.job_due(self.delay) {
+            state.queued = true;
+            self.queue.push(Arc::clone(entry), due);
+        }
+    }
+
+    /// Takes `entry` off the queue: a hold on it and the signal that stops
+    /// its job if a job may run at `now`. Jobs of one entry never overlap.
+    pub(super) fn claim(self: &Arc<Self>, entry: Arc<Entry>, now: Instant) -> Claim {
+        let mut state = entry.state();
+        state.queued = false;
+        match state.job_due(self.delay) {
+            None => Claim::Skip,
+            Some(due) if due > now => {
+                state.queued = true;
+                drop(state);
+                Claim::Later(entry, due)
+            }
+            Some(_) => {
+                let stop = Stop::new();
+                state.job = Some(stop.clone());
+                state.eager = false;
+                state.handles += 1;
+                drop(state);
+                Claim::Run(self.held(entry), stop)
+            }
+        }
+    }
+
+    /// Takes `entry` out of the overlay. It takes no more changes.
+    pub(super) fn evict(&self, entry: &Arc<Entry>) {
+        let mut index = self.lock();
+        let slot = self.slot(&entry.state().key);
+        if index
+            .entries
+            .get(&slot)
+            .is_some_and(|held| Arc::ptr_eq(held, entry))
+        {
+            index.entries.remove(&slot);
+        }
+        entry.state().detached = true;
+    }
+
+    /// The entries that hold something for a job to store, each with its
+    /// generation now. A directory whose open is still putting its marker is
+    /// left out: the open has not answered.
+    pub(super) fn work(&self) -> Vec<(Arc<Entry>, u64)> {
+        let index = self.lock();
+        index
+            .entries
+            .values()
+            .filter_map(|entry| {
+                let state = entry.state();
+                (state.has_work() && !state.creating).then(|| (Arc::clone(entry), state.generation))
+            })
+            .collect()
+    }
+
+    /// The paths whose jobs failed for good, with the errors, in the order of
+    /// the names. `prefix` is the key of the share root.
+    pub(super) fn failures(&self, prefix: &str) -> Vec<(String, S3Error)> {
+        let index = self.lock();
+        index
+            .entries
+            .values()
+            .filter_map(|entry| {
+                let state = entry.state();
+                state
+                    .failure
+                    .clone()
+                    .map(|failure| (state.path(prefix), failure))
+            })
+            .collect()
     }
 
     fn lock(&self) -> MutexGuard<'_, Index> {
@@ -169,17 +275,19 @@ impl Overlay {
             let mut state = entry.state();
             state.handles = 1;
             state.may_exist |= index.tombstones.contains(&slot);
+            self.schedule(&entry, &mut state);
         }
         index.entries.insert(slot, Arc::clone(&entry));
         Some(self.held(entry))
     }
 
-    /// Ends one hold on `entry`.
+    /// Ends one hold on `entry`, and queues the entry for a job if it has one
+    /// to run. Every change to an entry holds it for its task, so the end of
+    /// that hold is where a change reaches the queue.
     fn release(&self, entry: &Arc<Entry>) {
         let mut index = self.lock();
         let mut state = entry.state();
         state.handles = state.handles.saturating_sub(1);
-        state.changed = Instant::now();
         if state.handles == 0 && !state.pending() {
             let slot = self.slot(&state.key);
             drop(state);
@@ -190,7 +298,9 @@ impl Overlay {
             {
                 index.entries.remove(&slot);
             }
+            return;
         }
+        self.schedule(entry, &mut state);
     }
 
     /// The spelling of the directory `key` in the keys of the entries below
@@ -271,6 +381,7 @@ impl Overlay {
         let count = entries.len();
         for entry in entries {
             let slot = self.slot(&entry.state().key);
+            self.schedule(&entry, &mut entry.state());
             let taken = index.entries.insert(slot, entry);
             debug_assert!(taken.is_none(), "two recovered entries have one name");
         }
@@ -296,6 +407,10 @@ mod tests {
     use crate::s3::lookup::DirRef;
     use crate::s3::record::RecordId;
 
+    fn test_overlay(fold: bool) -> Arc<Overlay> {
+        Overlay::new(fold, Duration::from_secs(5))
+    }
+
     fn plain(key: &str) -> Arc<Entry> {
         Entry::from_state(State::new(key.to_owned(), false))
     }
@@ -310,6 +425,19 @@ mod tests {
         entry
     }
 
+    /// A file with local data, which a job has to store.
+    fn stored_later(overlay: &Arc<Overlay>, key: &str) -> Held {
+        let id = RecordId::parse(&"b".repeat(32)).unwrap();
+        let file = tempfile::tempfile().unwrap();
+        overlay
+            .insert_new(Entry::created_file(key.to_owned(), id, 1, file))
+            .unwrap()
+    }
+
+    fn queued(overlay: &Overlay) -> usize {
+        overlay.queue().len()
+    }
+
     fn keys(entries: &[Arc<Entry>]) -> Vec<String> {
         let mut keys: Vec<String> = entries.iter().map(|e| e.state().key.clone()).collect();
         keys.sort();
@@ -318,7 +446,7 @@ mod tests {
 
     #[test]
     fn two_inserts_of_one_name_never_both_succeed() {
-        let overlay = Overlay::new(false);
+        let overlay = test_overlay(false);
         let first = overlay.insert_new(plain("a"));
         assert!(first.is_some());
         assert!(overlay.insert_new(plain("a")).is_none());
@@ -329,7 +457,7 @@ mod tests {
 
     #[test]
     fn names_that_differ_in_case_are_one_name_when_case_is_ignored() {
-        let overlay = Overlay::new(true);
+        let overlay = test_overlay(true);
         let held = overlay.insert_new(kept("Dir/File.TXT")).unwrap();
         assert!(overlay.insert_new(plain("dir/file.txt")).is_none());
         let found = overlay.take_pending("DIR/FILE.txt").unwrap();
@@ -340,7 +468,7 @@ mod tests {
 
     #[test]
     fn names_that_differ_in_case_are_two_names_when_case_counts() {
-        let overlay = Overlay::new(false);
+        let overlay = test_overlay(false);
         let _held = overlay.insert_new(kept("a")).unwrap();
         assert!(overlay.peek("A").is_none());
         assert!(overlay.peek("a").is_some());
@@ -348,7 +476,7 @@ mod tests {
 
     #[test]
     fn the_last_release_drops_an_entry_with_nothing_to_keep() {
-        let overlay = Overlay::new(false);
+        let overlay = test_overlay(false);
         let first = overlay.insert_new(plain("f")).unwrap();
         let second = first.another();
         assert_eq!(first.entry.state().handles, 2);
@@ -361,7 +489,7 @@ mod tests {
 
     #[test]
     fn an_entry_with_something_to_keep_stays_after_its_last_release() {
-        let overlay = Overlay::new(false);
+        let overlay = test_overlay(false);
         drop(overlay.insert_new(kept("f")).unwrap());
         assert_eq!(overlay.len(), 1);
         let held = overlay.take_pending("f").unwrap();
@@ -373,7 +501,7 @@ mod tests {
 
     #[test]
     fn entries_with_nothing_to_keep_do_not_count_as_below_a_directory() {
-        let overlay = Overlay::new(false);
+        let overlay = test_overlay(false);
         let _held = overlay.insert_new(plain("d/f")).unwrap();
         assert_eq!(overlay.spelling("d"), None);
         let _kept = overlay.insert_new(kept("d/g")).unwrap();
@@ -382,26 +510,26 @@ mod tests {
 
     #[test]
     fn an_entry_with_nothing_to_keep_is_not_taken_as_pending() {
-        let overlay = Overlay::new(false);
+        let overlay = test_overlay(false);
         let held = overlay.insert_new(plain("f")).unwrap();
         assert!(overlay.take_pending("f").is_none());
         drop(held);
     }
 
     #[test]
-    fn a_release_changes_the_time_of_the_last_change() {
-        let overlay = Overlay::new(false);
+    fn a_release_leaves_the_time_of_the_last_change() {
+        let overlay = test_overlay(false);
         let held = overlay.insert_new(kept("f")).unwrap();
         let entry = Arc::clone(&held.entry);
         let before = entry.state().changed;
         std::thread::sleep(std::time::Duration::from_millis(2));
         drop(held);
-        assert!(entry.state().changed > before);
+        assert_eq!(entry.state().changed, before);
     }
 
     #[test]
     fn a_release_of_an_entry_another_took_the_place_of_leaves_that_one() {
-        let overlay = Overlay::new(false);
+        let overlay = test_overlay(false);
         let old = overlay.insert_new(plain("f")).unwrap();
         overlay.lock().entries.clear();
         let new = overlay.insert_new(plain("f")).unwrap();
@@ -413,7 +541,7 @@ mod tests {
 
     #[test]
     fn entries_below_a_directory_are_direct_or_imply_a_directory() {
-        let overlay = Overlay::new(false);
+        let overlay = test_overlay(false);
         let entries = vec![
             kept("p/a.txt"),
             kept("p/sub/b.txt"),
@@ -447,7 +575,7 @@ mod tests {
 
     #[test]
     fn a_directory_is_spelled_as_the_entries_below_it_spell_it() {
-        let overlay = Overlay::new(true);
+        let overlay = test_overlay(true);
         overlay.install(vec![kept("Up/Down/c.txt"), dir("Up")], Vec::new());
         assert_eq!(overlay.spelling("up").as_deref(), Some("Up"));
         assert_eq!(overlay.spelling("UP/down").as_deref(), Some("Up/Down"));
@@ -460,7 +588,7 @@ mod tests {
 
     #[test]
     fn implied_names_that_differ_in_case_count_once() {
-        let overlay = Overlay::new(true);
+        let overlay = test_overlay(true);
         overlay.install(vec![kept("p/Sub/a"), kept("p/sub/b")], Vec::new());
         let below = overlay.below("p");
         assert_eq!(below.implied.len(), 1);
@@ -475,12 +603,12 @@ mod tests {
 
     #[test]
     fn tombstones_are_found_by_key_as_the_names_compare() {
-        let overlay = Overlay::new(true);
+        let overlay = test_overlay(true);
         overlay.install(Vec::new(), vec![tombstone(&["Gone/x", "other"])]);
         assert!(overlay.tombstoned("gone/X"));
         assert!(overlay.tombstoned("OTHER"));
         assert!(!overlay.tombstoned("gone"));
-        let exact = Overlay::new(false);
+        let exact = test_overlay(false);
         exact.install(Vec::new(), vec![tombstone(&["Gone/x"])]);
         assert!(exact.tombstoned("Gone/x"));
         assert!(!exact.tombstoned("gone/x"));
@@ -488,7 +616,7 @@ mod tests {
 
     #[test]
     fn a_new_entry_at_a_key_to_delete_may_exist_in_the_bucket() {
-        let overlay = Overlay::new(false);
+        let overlay = test_overlay(false);
         overlay.install(Vec::new(), vec![tombstone(&["gone"])]);
         let over = overlay.insert_new(plain("gone")).unwrap();
         assert!(over.entry.state().may_exist);
@@ -498,7 +626,7 @@ mod tests {
 
     #[test]
     fn an_entry_that_a_lookup_of_another_kind_replaces_is_detached_while_held() {
-        let overlay = Overlay::new(false);
+        let overlay = test_overlay(false);
         let held = overlay.insert_new(plain("x")).unwrap();
         let ahead = Arc::new(ReadAhead::new());
         let dir = Found::Dir(DirRef {
@@ -513,5 +641,108 @@ mod tests {
         assert!(!new.entry.state().detached);
         drop(held);
         assert_eq!(overlay.len(), 1);
+    }
+
+    #[test]
+    fn an_entry_with_local_data_is_queued_when_it_is_made_and_a_directory_being_made_is_not() {
+        let overlay = test_overlay(false);
+        let _file = stored_later(&overlay, "f");
+        assert_eq!(queued(&overlay), 1);
+        let _dir = overlay.insert_new(dir("d")).unwrap();
+        assert_eq!(queued(&overlay), 1, "its open puts the marker");
+        let _plain = overlay.insert_new(plain("p")).unwrap();
+        assert_eq!(queued(&overlay), 1);
+    }
+
+    #[test]
+    fn a_job_starts_only_when_its_time_has_come_and_jobs_of_one_entry_never_overlap() {
+        let overlay = test_overlay(false);
+        let held = stored_later(&overlay, "f");
+        let entry = Arc::clone(&held.entry);
+        let first = overlay
+            .queue()
+            .pop_due(Instant::now() + Duration::from_secs(60));
+        assert!(Arc::ptr_eq(first.as_ref().unwrap(), &entry));
+
+        let now = Instant::now();
+        let Claim::Later(back, due) = overlay.claim(Arc::clone(&entry), now) else {
+            panic!("expected Later");
+        };
+        assert!(due > now);
+        assert!(entry.state().queued);
+        overlay.queue().push(back, due);
+
+        let later = now + Duration::from_secs(60);
+        let Some(next) = overlay.queue().pop_due(later) else {
+            panic!("expected the entry in the queue");
+        };
+        let Claim::Run(job, stop) = overlay.claim(next, later) else {
+            panic!("expected Run");
+        };
+        assert!(entry.state().job.is_some());
+        assert_eq!(entry.state().handles, 2);
+        assert!(!stop.is_stopped());
+        assert!(matches!(
+            overlay.claim(Arc::clone(&entry), later),
+            Claim::Skip
+        ));
+        entry.state().bump();
+        assert!(stop.is_stopped(), "a change stops the job");
+
+        // The job ends: the entry waits its turn again.
+        entry.state().job = None;
+        drop(job);
+        assert_eq!(queued(&overlay), 1);
+        drop(held);
+    }
+
+    #[test]
+    fn an_entry_that_failed_or_left_is_not_claimed() {
+        let overlay = test_overlay(false);
+        let failed = stored_later(&overlay, "a");
+        failed.entry.state().failure = Some(S3Error::Stopped);
+        let gone = stored_later(&overlay, "b");
+        overlay.evict(&gone.entry);
+        assert!(gone.entry.state().detached);
+        let later = Instant::now() + Duration::from_secs(60);
+        while let Some(entry) = overlay.queue().pop_due(later) {
+            assert!(matches!(overlay.claim(entry, later), Claim::Skip));
+        }
+        assert_eq!(overlay.len(), 1);
+        assert_eq!(overlay.failures("").len(), 1);
+        assert_eq!(overlay.work().len(), 1, "an entry that left holds nothing");
+    }
+
+    #[test]
+    fn entries_that_came_back_from_disk_are_due_at_once_oldest_first() {
+        let overlay = test_overlay(false);
+        let make = |key: &str| {
+            let mut state = State::new(key.to_owned(), false);
+            state.set_local(crate::s3::entry::Local {
+                file: Arc::new(tempfile::tempfile().unwrap()),
+                len: 0,
+                present: crate::s3::ranges::RangeSet::new(),
+            });
+            state.eager = true;
+            state.recorded = true;
+            Entry::from_state(state)
+        };
+        overlay.install(vec![make("one"), make("two"), make("three")], Vec::new());
+        let now = Instant::now() + Duration::from_millis(1);
+        let order: Vec<String> = std::iter::from_fn(|| overlay.queue().pop_due(now))
+            .map(|entry| entry.state().key.clone())
+            .collect();
+        assert_eq!(order, ["one", "two", "three"]);
+    }
+
+    #[test]
+    fn work_gives_each_entry_with_something_to_store_and_its_generation() {
+        let overlay = test_overlay(false);
+        let held = stored_later(&overlay, "f");
+        let work = overlay.work();
+        assert_eq!(work.len(), 1);
+        let generation = work[0].1;
+        held.entry.state().bump();
+        assert_eq!(overlay.work()[0].1, generation + 1);
     }
 }

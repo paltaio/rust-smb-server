@@ -14,9 +14,11 @@ use super::cachedir::{CacheDir, Recovered, cache_error, identity};
 use super::client::{ListRequest, Location, S3Client, Settings};
 use super::entry::{Entry, Own};
 use super::error::S3Error;
+use super::jobs::{Guard, Jobs};
 use super::keys::{MAX_KEY_LEN, dir_prefix};
 use super::meta::same_times;
 use super::overlay::Overlay;
+use super::parts::{MAX_PART_SIZE, MIN_PART_SIZE};
 use super::readahead::{MAX_CHUNK, MIN_CHUNK, ReadAhead};
 use super::retry::Retry;
 use super::sigv4::Credentials;
@@ -24,6 +26,8 @@ use super::sigv4::Credentials;
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_METADATA_TTL: Duration = Duration::from_secs(30);
 const DEFAULT_LISTING_METADATA_MAX: usize = 1000;
+const DEFAULT_UPLOAD_DELAY: Duration = Duration::from_secs(5);
+const DEFAULT_PART_SIZE: u64 = 16 << 20;
 const DEFAULT_UPLOAD_CONCURRENCY: usize = 4;
 const DEFAULT_READ_CHUNK: u32 = 8 << 20;
 
@@ -42,8 +46,13 @@ pub struct S3BackendBuilder {
     request_timeout: Duration,
     metadata_ttl: Duration,
     listing_metadata_max: usize,
+    upload_delay: Duration,
+    part_size: u64,
     upload_concurrency: usize,
     read_chunk: u32,
+    /// Keeps the worker from starting jobs until a test lets it.
+    #[cfg(test)]
+    held_uploads: bool,
 }
 
 impl fmt::Debug for S3BackendBuilder {
@@ -92,8 +101,12 @@ impl S3Backend {
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             metadata_ttl: DEFAULT_METADATA_TTL,
             listing_metadata_max: DEFAULT_LISTING_METADATA_MAX,
+            upload_delay: DEFAULT_UPLOAD_DELAY,
+            part_size: DEFAULT_PART_SIZE,
             upload_concurrency: DEFAULT_UPLOAD_CONCURRENCY,
             read_chunk: DEFAULT_READ_CHUNK,
+            #[cfg(test)]
+            held_uploads: false,
         }
     }
 }
@@ -151,8 +164,9 @@ impl S3BackendBuilder {
     }
 
     /// Keeps what clients change in `dir`. The backend makes `dir` if it is
-    /// missing and locks it until the backend is dropped. The directory must
-    /// belong to this endpoint, bucket, prefix and
+    /// missing and locks it until every clone of the backend is dropped, the
+    /// handles opened through it are closed and the requests in flight have
+    /// ended. The directory must belong to this endpoint, bucket, prefix and
     /// [case setting](Self::case_insensitive), and be on storage that
     /// survives a restart: what it holds is not in the bucket.
     ///
@@ -210,8 +224,32 @@ impl S3BackendBuilder {
         self
     }
 
-    /// Sets only how many HEAD requests a listing keeps in flight: four times
-    /// this value, at most 64. The default is 4.
+    /// Sets how long a file rests after its last change before the backend
+    /// stores it in the bucket. A file that is open and left alone is stored
+    /// too. Opening a file without overwriting it, or closing it, is not a
+    /// change. A change to a file that is being stored stops the upload, and
+    /// the file rests this long again. Times and attributes set on a file the
+    /// backend holds no bytes of, or on a directory that has no marker object
+    /// to put, are not stored in the bucket. The default is 5 seconds.
+    #[must_use]
+    pub fn upload_delay(mut self, delay: Duration) -> Self {
+        self.upload_delay = delay;
+        self
+    }
+
+    /// Sets the size of the parts of a multipart upload, from 5 MiB to 5 GiB.
+    /// A file of up to this many bytes is stored with one request; a larger
+    /// one is stored in parts of this size. A file that would take more than
+    /// 10,000 parts is stored in larger parts. The default is 16 MiB.
+    #[must_use]
+    pub fn part_size(mut self, bytes: u64) -> Self {
+        self.part_size = bytes;
+        self
+    }
+
+    /// Sets how many uploads run at once, and how many parts of a multipart
+    /// upload are in flight at once for each. A listing keeps four times this
+    /// many HEAD requests in flight, at most 64. The default is 4.
     #[must_use]
     pub fn upload_concurrency(mut self, concurrency: usize) -> Self {
         self.upload_concurrency = concurrency;
@@ -228,6 +266,15 @@ impl S3BackendBuilder {
     #[must_use]
     pub fn read_chunk(mut self, bytes: u32) -> Self {
         self.read_chunk = bytes;
+        self
+    }
+
+    /// Keeps the backend from starting uploads until
+    /// [`hold_uploads`](S3Backend::hold_uploads) lets it.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn held_uploads(mut self, held: bool) -> Self {
+        self.held_uploads = held;
         self
     }
 
@@ -248,10 +295,12 @@ impl S3BackendBuilder {
     /// endpoint or a timeout. The request runs before the cache directory is
     /// read back.
     ///
-    /// Files flushed through an earlier backend come back into the share with
-    /// their recorded times and attributes. A file comes back as of its last
-    /// flush: one made and never flushed is gone, and an object changed and
-    /// never flushed reads as the bucket has it. A file in the cache
+    /// Files an earlier backend recorded come back into the share with their
+    /// times and attributes. The backend stores them, and the directory
+    /// markers an earlier one left, without waiting for the upload delay,
+    /// including those whose upload failed. A file comes back as last
+    /// recorded: one made and never recorded is gone, and an object changed
+    /// and never recorded reads as the bucket has it. A file in the cache
     /// directory that cannot be read back moves to its `conflicts` directory,
     /// with an error in the log.
     pub async fn build(self) -> Result<S3Backend, S3Error> {
@@ -311,7 +360,7 @@ impl S3BackendBuilder {
 
         let built = SystemTime::now();
         let ahead = Arc::new(ReadAhead::new());
-        let overlay = Overlay::new(self.case_insensitive);
+        let overlay = Overlay::new(self.case_insensitive, self.upload_delay);
         let entries = recovered
             .entries
             .into_iter()
@@ -325,26 +374,34 @@ impl S3BackendBuilder {
             );
         }
 
-        Ok(S3Backend {
-            shared: Arc::new(Shared {
-                client,
-                prefix: self.prefix,
-                case_insensitive: self.case_insensitive,
-                request_timeout: self.request_timeout,
-                listing_metadata_max: self.listing_metadata_max,
-                head_concurrency: head_concurrency(self.upload_concurrency),
-                built,
-                cache: Mutex::new(MetaCache::new(self.metadata_ttl)),
-                read_chunk: u64::from(self.read_chunk),
-                ahead,
-                read_only: self.read_only,
-                overlay,
-                local,
-                root_own: Mutex::new(Own {
-                    times: same_times(built),
-                    attributes: 0,
-                }),
+        let jobs = Jobs::new(self.part_size, self.upload_concurrency);
+        #[cfg(test)]
+        jobs.held
+            .store(self.held_uploads, std::sync::atomic::Ordering::SeqCst);
+        let shared = Arc::new(Shared {
+            client,
+            prefix: self.prefix,
+            case_insensitive: self.case_insensitive,
+            request_timeout: self.request_timeout,
+            listing_metadata_max: self.listing_metadata_max,
+            head_concurrency: head_concurrency(self.upload_concurrency),
+            built,
+            cache: Mutex::new(MetaCache::new(self.metadata_ttl)),
+            read_chunk: u64::from(self.read_chunk),
+            ahead,
+            read_only: self.read_only,
+            overlay,
+            local,
+            root_own: Mutex::new(Own {
+                times: same_times(built),
+                attributes: 0,
             }),
+            jobs,
+        });
+        let worker = Arc::new(Guard::start(&shared));
+        Ok(S3Backend {
+            shared,
+            _worker: worker,
         })
     }
 
@@ -367,6 +424,11 @@ impl S3BackendBuilder {
         }
         if self.upload_concurrency == 0 {
             return Err(S3Error::InvalidArgument("the upload concurrency is zero"));
+        }
+        if !(MIN_PART_SIZE..=MAX_PART_SIZE).contains(&self.part_size) {
+            return Err(S3Error::InvalidArgument(
+                "the part size is not between 5 MiB and 5 GiB",
+            ));
         }
         if !(MIN_CHUNK..=MAX_CHUNK).contains(&self.read_chunk) {
             return Err(S3Error::InvalidArgument(
@@ -541,6 +603,20 @@ mod tests {
             .credentials("a", "s")
             .cache_dir("cache");
         assert!(writable.check().is_ok());
+    }
+
+    #[test]
+    fn the_part_size_is_between_5_mib_and_5_gib() {
+        assert!(builder().check().is_ok(), "the default");
+        for ok in [5 << 20, (5 << 20) + 1, 64 << 20, 5 << 30] {
+            assert!(builder().part_size(ok).check().is_ok(), "{ok}");
+        }
+        for refused in [0, 1, (5 << 20) - 1, (5 << 30) + 1, u64::MAX] {
+            assert!(
+                refusal(builder().part_size(refused)).contains("part size"),
+                "{refused}"
+            );
+        }
     }
 
     #[test]

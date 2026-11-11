@@ -8,7 +8,7 @@ use crate::backend::{FILE_ATTRIBUTE_READONLY, FileInfo, VALID_SET_ATTRIBUTES};
 use crate::utils::{FILETIME_OFFSET, system_time_to_filetime};
 
 use super::keys::FileStamp;
-use super::object::ObjectHead;
+use super::object::{Metadata, ObjectHead};
 
 const MTIME: &str = "mtime";
 const BTIME: &str = "btime";
@@ -109,6 +109,19 @@ pub(super) fn stored_metadata(times: [u64; 4], attributes: u32) -> BTreeMap<Stri
     .into_iter()
     .map(|(name, value)| (name.to_owned(), value))
     .collect()
+}
+
+/// The content type of the marker object of a directory.
+pub(super) const MARKER_TYPE: &str = "application/x-directory";
+
+/// The metadata of the marker object of a directory with these times and
+/// attributes.
+pub(super) fn marker_metadata(times: [u64; 4], attributes: u32) -> Metadata {
+    Metadata {
+        user: stored_metadata(times, attributes),
+        content_type: Some(MARKER_TYPE.to_owned()),
+        ..Metadata::default()
+    }
 }
 
 /// Unix seconds with an optional fraction, as in `1700000000.123456789`.

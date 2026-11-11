@@ -4,13 +4,14 @@
 use std::fs::File;
 use std::io;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::backend::FileInfo;
 use crate::error::{SmbError, SmbResult};
 use crate::utils::now_filetime;
 
 use super::cachedir::new_id;
+use super::error::S3Error;
 use super::keys::last_name;
 use super::lookup::{DirRef, Found};
 use super::meta;
@@ -18,6 +19,7 @@ use super::object::ObjectHead;
 use super::ranges::RangeSet;
 use super::readahead::{Pin, ReadAhead, Version};
 use super::record::{BaseRecord, EntryRecord, LocalRecord, RecordId};
+use super::retry::Stop;
 
 /// The local data of a file: a sparse file with the bytes written into it
 /// and the ranges of those that count.
@@ -112,15 +114,33 @@ pub(super) struct State {
     pub(super) may_exist: bool,
     /// `None` while the times and attributes are those of the base.
     pub(super) own: Option<Own>,
-    /// Bumped by every change.
+    /// Bumped by every change, by [`State::bump`] only.
     pub(super) generation: u64,
     /// Handles open on the entry, and tasks that act for one.
     pub(super) handles: u32,
-    /// The time of the last change or close.
+    /// The time of the last change.
     pub(super) changed: Instant,
+    /// The entry gets no job before this time: its last job met a full disk.
+    pub(super) rest_until: Option<Instant>,
     /// A record of the entry is on disk.
     pub(super) recorded: bool,
-    pub(super) failed: bool,
+    /// Why the last job of the entry failed for good. The entry gets no job
+    /// until the next backend is built.
+    pub(super) failure: Option<S3Error>,
+    /// Keys to delete from the bucket once the entry's content is stored.
+    pub(super) gone: Vec<String>,
+    /// Stops the job that is running for the entry.
+    pub(super) job: Option<Stop>,
+    /// The entry is in the queue for a job.
+    pub(super) queued: bool,
+    /// The entry came back from the cache directory, and its job is due at
+    /// once.
+    pub(super) eager: bool,
+    /// The newest generation whose content a job has stored.
+    pub(super) uploaded: u64,
+    /// The directory is being made: the open that made it is putting its
+    /// marker object.
+    pub(super) creating: bool,
     /// The entry left the overlay while handles were open on it, and nothing
     /// may change through it.
     pub(super) detached: bool,
@@ -138,8 +158,15 @@ impl State {
             generation: 0,
             handles: 0,
             changed: Instant::now(),
+            rest_until: None,
             recorded: false,
-            failed: false,
+            failure: None,
+            gone: Vec::new(),
+            job: None,
+            queued: false,
+            eager: false,
+            uploaded: 0,
+            creating: false,
             detached: false,
             body: if is_dir {
                 Body::Dir {
@@ -209,6 +236,55 @@ impl State {
             return Err(SmbError::AccessDenied);
         }
         Ok(())
+    }
+
+    /// Notes a change: the generation moves, the time of the last change is
+    /// now, and the job running for the entry is told to stop. The caller
+    /// holds the `io` lock of the entry.
+    pub(super) fn bump(&mut self) {
+        self.generation += 1;
+        self.changed = Instant::now();
+        self.eager = false;
+        if let Some(stop) = &self.job {
+            stop.stop();
+        }
+    }
+
+    /// Whether a job has something to store: the local data of a file, or
+    /// the marker object of a directory.
+    pub(super) fn has_work(&self) -> bool {
+        match &self.body {
+            Body::File { local, .. } => local.is_some(),
+            Body::Dir { marker_pending } => *marker_pending,
+        }
+    }
+
+    /// When a job may start for the entry, or `None` if none may now: the
+    /// entry has nothing to store, a job is running, it failed for good, it
+    /// left the overlay, or its directory is still being made.
+    pub(super) fn job_due(&self, delay: Duration) -> Option<Instant> {
+        let blocked = self.job.is_some()
+            || self.failure.is_some()
+            || self.detached
+            || self.creating
+            || !self.has_work();
+        if blocked {
+            return None;
+        }
+        if self.eager {
+            return Some(self.changed);
+        }
+        // A delay too long for the clock never comes.
+        let due = self.changed.checked_add(delay)?;
+        Some(self.rest_until.map_or(due, |rest| due.max(rest)))
+    }
+
+    /// The path of the entry below the share root `prefix`.
+    pub(super) fn path(&self, prefix: &str) -> String {
+        self.key
+            .strip_prefix(prefix)
+            .map_or(self.key.as_str(), |rest| rest.trim_start_matches('/'))
+            .to_owned()
     }
 
     /// Whether the entry holds something that is not in the bucket.
@@ -285,7 +361,43 @@ impl State {
             times: [created, accessed, now, now],
             attributes: own.attributes,
         });
-        self.generation += 1;
+        self.bump();
+    }
+
+    /// Takes in a job that stored the content the entry held at `generation`
+    /// as the object `head` at `key`, and the deletion of the keys `deleted`:
+    /// the object is the base of the entry from now on. Returns whether
+    /// nothing changed the entry since. If so, everything it held is in the
+    /// bucket, and [`settled`](Self::settled) drops it. The caller holds the
+    /// `io` lock of the entry.
+    pub(super) fn landed(
+        &mut self,
+        ahead: &Arc<ReadAhead>,
+        generation: u64,
+        key: &str,
+        head: Arc<ObjectHead>,
+        deleted: &[String],
+    ) -> bool {
+        self.base = Some(Base::new(ahead, key.to_owned(), head, true));
+        self.may_exist = true;
+        self.gone.retain(|gone| !deleted.contains(gone));
+        self.uploaded = generation;
+        if let Body::File { upload_id, .. } = &mut self.body {
+            *upload_id = None;
+        }
+        self.generation == generation
+    }
+
+    /// Drops what the entry held, which the bucket has: its local data,
+    /// record and times. A later change makes them under a new id.
+    pub(super) fn settled(&mut self) {
+        if let Body::File { local, sealed, .. } = &mut self.body {
+            *local = None;
+            *sealed = None;
+        }
+        self.id = None;
+        self.recorded = false;
+        self.own = None;
     }
 
     /// Takes in what a lookup found while the entry has nothing to keep: the
@@ -313,6 +425,14 @@ impl State {
             }
         }
     }
+}
+
+/// How an entry stands with a call that waits for its changes to reach the
+/// bucket.
+pub(super) enum Progress {
+    Done,
+    Waiting,
+    Failed(S3Error),
 }
 
 /// A file or directory with a handle open on it, or with changes the bucket
@@ -388,6 +508,7 @@ impl Entry {
         });
         state.generation = 1;
         state.may_exist = true;
+        state.creating = true;
         state.set_marker_pending(true);
         Entry::from_state(state)
     }
@@ -445,8 +566,22 @@ impl Entry {
         }
         state.generation = record.generation;
         state.recorded = true;
-        state.failed = record.failed;
+        state.gone = record.gone;
+        state.eager = true;
         Entry::from_state(state)
+    }
+
+    /// How the entry stands for a call that waits for the changes made up to
+    /// `generation` to reach the bucket.
+    pub(super) fn progress(&self, generation: u64) -> Progress {
+        let state = self.state();
+        if let Some(failure) = &state.failure {
+            return Progress::Failed(failure.clone());
+        }
+        if state.uploaded >= generation || state.detached || !state.has_work() {
+            return Progress::Done;
+        }
+        Progress::Waiting
     }
 
     /// What a client sees of the entry.
@@ -471,11 +606,7 @@ impl Entry {
     ) -> io::Result<EntryRecord> {
         let id = state.id()?;
         let own = state.own_or_base(built);
-        let path = state
-            .key
-            .strip_prefix(prefix)
-            .map_or(state.key.as_str(), |rest| rest.trim_start_matches('/'))
-            .to_owned();
+        let path = state.path(prefix);
         let (local, upload_id, marker_pending) = match &state.body {
             Body::File {
                 local, upload_id, ..
@@ -494,7 +625,7 @@ impl Entry {
             is_dir: state.is_dir(),
             path,
             key: state.key.clone(),
-            gone: Vec::new(),
+            gone: state.gone.clone(),
             base: state.base.as_ref().map(|base| BaseRecord {
                 key: base.key.clone(),
                 head: (*base.head).clone(),
@@ -505,9 +636,187 @@ impl Entry {
             attributes: own.attributes,
             generation: state.generation,
             upload_id,
-            failed: state.failed,
+            failed: state.failure.is_some(),
             meta_pending: state.own.is_some(),
             marker_pending,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::s3::object::Metadata;
+
+    fn head(etag: &str, size: u64) -> Arc<ObjectHead> {
+        Arc::new(ObjectHead {
+            size,
+            etag: etag.to_owned(),
+            last_modified: SystemTime::UNIX_EPOCH,
+            metadata: Metadata::default(),
+        })
+    }
+
+    /// A file with 10 bytes of local data, a record, times of its own and an
+    /// upload that is running.
+    fn kept(generation: u64) -> State {
+        let mut state = State::new("f".to_owned(), false);
+        state.id = Some(RecordId::parse(&"a".repeat(32)).unwrap());
+        state.set_local(Local {
+            file: Arc::new(tempfile::tempfile().unwrap()),
+            len: 10,
+            present: std::iter::once(0..10).collect(),
+        });
+        state.set_sealed(Sealed {
+            generation,
+            len: 10,
+        });
+        if let Body::File { upload_id, .. } = &mut state.body {
+            *upload_id = Some("upload".to_owned());
+        }
+        state.own = Some(Own {
+            times: [1; 4],
+            attributes: 0,
+        });
+        state.recorded = true;
+        state.generation = generation;
+        state.gone = vec!["a".to_owned(), "b".to_owned()];
+        state
+    }
+
+    #[test]
+    fn a_change_moves_the_generation_and_stops_the_job_that_runs() {
+        let mut state = kept(3);
+        state.eager = true;
+        let stop = Stop::new();
+        state.job = Some(stop.clone());
+        state.bump();
+        assert_eq!(state.generation, 4);
+        assert!(stop.is_stopped());
+        assert!(!state.eager);
+
+        let mut idle = kept(3);
+        idle.bump();
+        assert_eq!(idle.generation, 4);
+    }
+
+    #[test]
+    fn a_job_of_a_generation_the_entry_still_has_takes_everything_the_entry_held() {
+        let ahead = Arc::new(ReadAhead::new());
+        let mut state = kept(3);
+        assert!(state.landed(&ahead, 3, "f", head("\"new\"", 10), &["a".to_owned()]));
+        assert!(state.local().is_some(), "settled drops it");
+        state.settled();
+        assert!(state.local().is_none());
+        assert!(state.sealed().is_none());
+        assert!(state.own.is_none());
+        assert!(!state.recorded);
+        assert!(state.id.is_none());
+        assert_eq!(state.gone, ["b"]);
+        assert_eq!(state.uploaded, 3);
+        assert!(state.may_exist);
+        let base = state.base.as_ref().unwrap();
+        assert_eq!(
+            (base.key.as_str(), base.head.etag.as_str()),
+            ("f", "\"new\"")
+        );
+        assert!(matches!(
+            state.body,
+            Body::File {
+                upload_id: None,
+                ..
+            }
+        ));
+        assert!(!state.has_work());
+    }
+
+    #[test]
+    fn a_job_of_an_older_generation_keeps_what_the_entry_holds() {
+        let ahead = Arc::new(ReadAhead::new());
+        let mut state = kept(3);
+        state.bump();
+        assert!(!state.landed(&ahead, 3, "f", head("\"new\"", 10), &[]));
+        assert_eq!(state.local().unwrap().len, 10);
+        assert!(state.own.is_some());
+        assert!(state.recorded);
+        assert!(state.id.is_some());
+        assert_eq!(
+            state.uploaded, 3,
+            "the generation the job stored, not the entry's"
+        );
+        assert_eq!(state.base.as_ref().unwrap().head.etag, "\"new\"");
+        assert!(matches!(
+            state.body,
+            Body::File {
+                upload_id: None,
+                ..
+            }
+        ));
+        assert!(state.has_work());
+    }
+
+    #[test]
+    fn an_entry_waits_its_delay_after_the_last_change_unless_it_came_back_from_disk() {
+        let delay = Duration::from_secs(5);
+        let mut state = kept(1);
+        let changed = state.changed;
+        assert_eq!(state.job_due(delay), Some(changed + delay));
+        state.eager = true;
+        assert_eq!(state.job_due(delay), Some(changed));
+        state.eager = false;
+        state.bump();
+        assert_eq!(state.job_due(delay), Some(state.changed + delay));
+    }
+
+    #[test]
+    fn an_entry_that_met_a_full_disk_waits_for_its_rest_when_that_is_longer_than_the_delay() {
+        let mut state = kept(1);
+        let rest = state.changed + Duration::from_secs(1);
+        state.rest_until = Some(rest);
+        assert_eq!(state.job_due(Duration::ZERO), Some(rest));
+        assert_eq!(
+            state.job_due(Duration::from_secs(5)),
+            Some(state.changed + Duration::from_secs(5))
+        );
+    }
+
+    #[test]
+    fn an_entry_gets_no_job_while_one_runs_after_it_failed_or_left_or_has_nothing_to_store() {
+        let delay = Duration::from_secs(5);
+        let mut running = kept(1);
+        running.job = Some(Stop::new());
+        assert_eq!(running.job_due(delay), None);
+        let mut failed = kept(1);
+        failed.failure = Some(S3Error::Stopped);
+        assert_eq!(failed.job_due(delay), None);
+        let mut detached = kept(1);
+        detached.detached = true;
+        assert_eq!(detached.job_due(delay), None);
+        assert_eq!(State::new("g".to_owned(), false).job_due(delay), None);
+
+        let mut dir = State::new("d".to_owned(), true);
+        assert_eq!(dir.job_due(delay), None);
+        dir.set_marker_pending(true);
+        assert!(dir.job_due(delay).is_some());
+        dir.creating = true;
+        assert_eq!(dir.job_due(delay), None);
+    }
+
+    #[test]
+    fn a_waiting_call_sees_done_waiting_and_failed() {
+        let entry = Entry::from_state(kept(4));
+        assert!(matches!(entry.progress(4), Progress::Waiting));
+        entry.state().uploaded = 4;
+        assert!(matches!(entry.progress(4), Progress::Done));
+        assert!(matches!(entry.progress(5), Progress::Waiting));
+        entry.state().failure = Some(S3Error::Stopped);
+        assert!(matches!(entry.progress(5), Progress::Failed(_)));
+        entry.state().detached = true;
+        assert!(
+            matches!(entry.progress(5), Progress::Failed(_)),
+            "a file moved to conflicts fails the call"
+        );
+        entry.state().failure = None;
+        assert!(matches!(entry.progress(5), Progress::Done));
     }
 }
