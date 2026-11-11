@@ -46,9 +46,7 @@ static GATEWAY: OnceLock<Result<Gateway, String>> = OnceLock::new();
 pub(crate) struct Gateway {
     /// Address the gateway listens on; its endpoint is `http://` and this.
     pub(crate) addr: SocketAddr,
-    #[expect(dead_code, reason = "used by the S3 backend tests")]
     pub(crate) access_key: String,
-    #[expect(dead_code, reason = "used by the S3 backend tests")]
     pub(crate) secret_key: String,
     next_bucket: AtomicU32,
     /// Holds the stdin pipe whose closing stops the gateway.
@@ -57,7 +55,6 @@ pub(crate) struct Gateway {
 
 impl Gateway {
     /// A bucket name no earlier call returned. The bucket does not exist yet.
-    #[expect(dead_code, reason = "used by the S3 backend tests")]
     pub(crate) fn bucket_name(&self) -> String {
         let n = self.next_bucket.fetch_add(1, Ordering::Relaxed);
         format!("smb-test-{n}")
