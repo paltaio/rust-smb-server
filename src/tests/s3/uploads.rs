@@ -29,7 +29,7 @@ const DELAY: Duration = Duration::from_millis(150);
 const PART: u64 = 5 << 20;
 
 /// Settings for a backend that stores changes, in parts of 5 MiB.
-fn uploading(builder: S3BackendBuilder) -> S3BackendBuilder {
+pub(super) fn uploading(builder: S3BackendBuilder) -> S3BackendBuilder {
     builder
         .held_uploads(false)
         .upload_delay(DELAY)
@@ -38,11 +38,11 @@ fn uploading(builder: S3BackendBuilder) -> S3BackendBuilder {
 
 /// Settings for a backend that stores nothing until a test lets it, with the
 /// delay and part size of [`uploading`].
-fn held(builder: S3BackendBuilder) -> S3BackendBuilder {
+pub(super) fn held(builder: S3BackendBuilder) -> S3BackendBuilder {
     builder.upload_delay(DELAY).part_size(PART)
 }
 
-async fn sync(backend: &S3Backend) -> Result<(), S3Error> {
+pub(super) async fn sync(backend: &S3Backend) -> Result<(), S3Error> {
     tokio::time::timeout(Duration::from_secs(60), backend.sync())
         .await
         .expect("sync returns")
@@ -54,7 +54,7 @@ fn sha(data: &[u8]) -> String {
 
 /// The bytes and the description of the object `key`, read from the bucket
 /// itself.
-async fn stored(rig: &Rig, key: &str) -> (Vec<u8>, ObjectHead) {
+pub(super) async fn stored(rig: &Rig, key: &str) -> (Vec<u8>, ObjectHead) {
     let head = rig.store().head_object(key, foreground()).await.unwrap();
     if head.size == 0 {
         return (Vec::new(), head);
@@ -68,12 +68,12 @@ async fn stored(rig: &Rig, key: &str) -> (Vec<u8>, ObjectHead) {
 }
 
 /// How many files are in `dir` of the cache directory.
-fn left(rig: &Rig, dir: &str) -> usize {
+pub(super) fn left(rig: &Rig, dir: &str) -> usize {
     fs::read_dir(rig.cache_dir().join(dir)).unwrap().count()
 }
 
 /// Writes `data` from the start of the open `id`.
-async fn fill(smb: &mut Smb, id: FileId, data: &[u8]) {
+pub(super) async fn fill(smb: &mut Smb, id: FileId, data: &[u8]) {
     const PIECE: usize = 60_000;
     for (at, piece) in data.chunks(PIECE).enumerate() {
         assert_eq!(
@@ -83,7 +83,7 @@ async fn fill(smb: &mut Smb, id: FileId, data: &[u8]) {
     }
 }
 
-fn is_put_of(bucket: &str, key: &str) -> impl Fn(&Seen) -> bool + Send + Sync + 'static {
+pub(super) fn is_put_of(bucket: &str, key: &str) -> impl Fn(&Seen) -> bool + Send + Sync + 'static {
     let target = format!("/{bucket}/{}", uri_encode(key, true));
     move |seen| {
         seen.method == "PUT"
@@ -92,7 +92,10 @@ fn is_put_of(bucket: &str, key: &str) -> impl Fn(&Seen) -> bool + Send + Sync + 
     }
 }
 
-fn is_head_of(bucket: &str, key: &str) -> impl Fn(&Seen) -> bool + Send + Sync + 'static {
+pub(super) fn is_head_of(
+    bucket: &str,
+    key: &str,
+) -> impl Fn(&Seen) -> bool + Send + Sync + 'static {
     let target = format!("/{bucket}/{}", uri_encode(key, true));
     move |seen| seen.method == "HEAD" && seen.target.split('?').next() == Some(target.as_str())
 }
@@ -115,7 +118,16 @@ fn is_create_upload(seen: &Seen) -> bool {
     seen.method == "POST" && seen.has_param("uploads")
 }
 
-fn is_complete(seen: &Seen) -> bool {
+/// A request that starts a multipart upload of `key`.
+pub(super) fn is_create_of(
+    bucket: &str,
+    key: &str,
+) -> impl Fn(&Seen) -> bool + Send + Sync + 'static {
+    let target = format!("/{bucket}/{}", uri_encode(key, true));
+    move |seen| is_create_upload(seen) && seen.target.split('?').next() == Some(target.as_str())
+}
+
+pub(super) fn is_complete(seen: &Seen) -> bool {
     seen.method == "POST" && seen.has_param("uploadId")
 }
 
@@ -163,6 +175,7 @@ fn write_pending_dir(cache: &std::path::Path, id: u8, path: &str) {
         attributes: 0,
         generation: 1,
         upload_id: None,
+        upload_key: None,
         failed: false,
         meta_pending: true,
         marker_pending: true,
@@ -731,7 +744,10 @@ async fn a_multipart_upload_left_by_an_earlier_backend_is_aborted() {
         .await
         .unwrap();
     let (bucket, proxy, cache) = rig.stop().await;
-    rewrite_record(cache.path(), |record| record.upload_id = Some(id.clone()));
+    rewrite_record(cache.path(), |record| {
+        record.upload_id = Some(id.clone());
+        record.upload_key = Some("left.bin".to_owned());
+    });
 
     let rig = Rig::start(bucket, proxy, cache, uploading).await;
     sync(&rig.backend).await.unwrap();
@@ -747,6 +763,37 @@ async fn a_multipart_upload_left_by_an_earlier_backend_is_aborted() {
     assert_eq!(refused.code(), Some("NoSuchUpload"));
     assert_eq!(sha(&stored(&rig, "left.bin").await.0), sha(&data));
     assert_eq!(left(&rig, "records"), 0);
+}
+
+#[tokio::test]
+async fn a_stale_upload_is_aborted_against_the_key_it_was_made_for() {
+    let mut rig = Rig::writable_with(held).await;
+    let data = pattern(4, 6 * MIB);
+    let file = rig.smb.create("renamed.bin", create_file()).await.unwrap();
+    fill(&mut rig.smb, file.id, &data).await;
+    assert_eq!(rig.smb.flush(file.id).await, 0);
+    let id = rig
+        .store()
+        .create_multipart_upload("first.bin", &Metadata::default(), foreground())
+        .await
+        .unwrap();
+    let (bucket, proxy, cache) = rig.stop().await;
+    rewrite_record(cache.path(), |record| {
+        record.upload_id = Some(id.clone());
+        record.upload_key = Some("first.bin".to_owned());
+    });
+
+    let rig = Rig::start(bucket, proxy, cache, uploading).await;
+    sync(&rig.backend).await.unwrap();
+
+    let aborts: Vec<Seen> = rig.proxy.seen().into_iter().filter(is_abort).collect();
+    assert_eq!(aborts.len(), 1);
+    assert_eq!(
+        aborts[0].target.split('?').next(),
+        Some(format!("/{}/first.bin", rig.bucket.name).as_str())
+    );
+    assert_eq!(param(&aborts[0], "uploadId"), id);
+    assert_eq!(sha(&stored(&rig, "renamed.bin").await.0), sha(&data));
 }
 
 #[tokio::test]

@@ -69,6 +69,11 @@ impl RangeSet {
         self.ranges.iter().map(|(&start, &end)| start..end)
     }
 
+    /// Whether every byte below `len` is held.
+    pub(crate) fn covers(&self, len: u64) -> bool {
+        self.segments(0..len).iter().all(|(_, held)| *held)
+    }
+
     /// Cuts `range` into consecutive pieces that are each held entirely or
     /// not at all, with whether they are held.
     pub(crate) fn segments(&self, range: Range<u64>) -> Vec<(Range<u64>, bool)> {

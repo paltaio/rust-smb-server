@@ -31,6 +31,7 @@ use super::payload::Payload;
 use super::ranges::RangeSet;
 use super::record::{EntryRecord, LocalRecord, RecordId};
 use super::retry::Retry;
+use super::unlink::drop_superseded;
 
 /// Runs `work` on a blocking thread, for `held`: the entry stays in the
 /// overlay until it is done, even if the request that asked for it is
@@ -38,7 +39,7 @@ use super::retry::Retry;
 async fn blocking<T: Send + 'static>(
     shared: &Arc<Shared>,
     held: &Held,
-    work: impl FnOnce(&Shared, &Entry) -> SmbResult<T> + Send + 'static,
+    work: impl FnOnce(&Shared, &Arc<Entry>) -> SmbResult<T> + Send + 'static,
 ) -> SmbResult<T> {
     let (shared, task) = (Arc::clone(shared), held.another());
     spawn_blocking(move || work(&shared, &task.entry))
@@ -66,6 +67,29 @@ fn commit<T>(
             Err(e)
         }
     }
+}
+
+/// [`commit`] for a change that may have written `record`. If it did, the
+/// state also notes the record, and the overlay counts the source of the entry
+/// again and drops the key of the entry from the keys to delete.
+fn commit_record(
+    shared: &Shared,
+    entry: &Arc<Entry>,
+    record: Option<&EntryRecord>,
+    apply: impl FnOnce(&mut State),
+) -> SmbResult<()> {
+    let cache = shared.local()?;
+    commit(cache, entry, record.map(|record| &record.id), |state| {
+        apply(state);
+        if let Some(record) = record {
+            state.set_recorded(record);
+        }
+    })?;
+    if record.is_some() {
+        recount_source(shared, entry);
+        superseded(shared, entry);
+    }
+    Ok(())
 }
 
 /// Writes `data` at `offset`, making the local data of the entry if it has
@@ -126,7 +150,11 @@ fn write_data(shared: &Shared, entry: &Entry, offset: u64, data: &[u8]) -> SmbRe
 /// The data file of the entry, made if the entry has none: `len` bytes long
 /// with none of them present, or as long as the entry. The caller holds the
 /// `io` lock.
-fn ensure_local(cache: &CacheDir, entry: &Entry, len: Option<u64>) -> SmbResult<Arc<File>> {
+pub(super) fn ensure_local(
+    cache: &CacheDir,
+    entry: &Entry,
+    len: Option<u64>,
+) -> SmbResult<Arc<File>> {
     let (id, len) = {
         let mut state = entry.state();
         if entry.is_dir() {
@@ -172,7 +200,7 @@ pub(super) async fn overwrite(shared: &Arc<Shared>, held: &Held) -> SmbResult<()
 
 /// Sets the length of the file to `new_len`. With `force`, a file already
 /// `new_len` long still counts as written: its write and change times move.
-fn set_len(shared: &Shared, entry: &Entry, new_len: u64, force: bool) -> SmbResult<()> {
+fn set_len(shared: &Shared, entry: &Arc<Entry>, new_len: u64, force: bool) -> SmbResult<()> {
     let cache = shared.local()?;
     let _io = entry.lock_io();
     let old_len = {
@@ -228,25 +256,20 @@ fn set_len(shared: &Shared, entry: &Entry, new_len: u64, force: bool) -> SmbResu
         };
         file.sync_all().map_err(disk_error)?;
         write_record(cache, &record)?;
-        replaced = Some((
-            record.id,
-            Sealed {
-                generation: record.generation,
-                len: new_len,
-            },
-        ));
+        replaced = Some(record);
     }
     file.set_len(new_len).map_err(disk_error)?;
-    let written = replaced.as_ref().map(|(id, _)| id);
-    commit(cache, entry, written, |state| {
+    commit_record(shared, entry, replaced.as_ref(), |state| {
         if let Some(local) = state.local_mut() {
             local.len = new_len;
             local.present.truncate(new_len);
         }
         state.wrote(shared.built, now);
-        if let Some((_, sealed)) = replaced {
-            state.set_sealed(sealed);
-            state.recorded = true;
+        if let Some(record) = &replaced {
+            state.set_sealed(Sealed {
+                generation: record.generation,
+                len: new_len,
+            });
         }
     })
 }
@@ -273,13 +296,13 @@ pub(super) async fn flush(shared: &Arc<Shared>, held: &Held) -> SmbResult<()> {
 ///
 /// A record sealed at the current generation is not written again unless
 /// `force`.
-pub(super) fn seal(shared: &Shared, entry: &Entry, force: bool) -> SmbResult<()> {
+pub(super) fn seal(shared: &Shared, entry: &Arc<Entry>, force: bool) -> SmbResult<()> {
     let _seal = entry.lock_seal();
     seal_held(shared, entry, force)
 }
 
 /// [`seal`] for a caller that holds the `seal` lock of the entry.
-pub(super) fn seal_held(shared: &Shared, entry: &Entry, force: bool) -> SmbResult<()> {
+pub(super) fn seal_held(shared: &Shared, entry: &Arc<Entry>, force: bool) -> SmbResult<()> {
     let cache = shared.local()?;
     let (file, record, first) = {
         let mut state = entry.state();
@@ -305,10 +328,53 @@ pub(super) fn seal_held(shared: &Shared, entry: &Entry, force: bool) -> SmbResul
         cache.sync_data_dir().map_err(disk_error)?;
     }
     write_record(cache, &record)?;
-    commit(cache, entry, Some(&record.id), |state| {
-        state.set_sealed(sealed);
-        state.recorded = true;
+    commit_record(shared, entry, Some(&record), |state| {
+        state.set_sealed(sealed)
     })
+}
+
+/// Recounts the key the entry copies from after a record write or removal
+/// changed it, and wakes the entries that wait for a key it let go.
+pub(super) fn recount_source(shared: &Shared, entry: &Arc<Entry>) {
+    let changed = {
+        let state = entry.state();
+        state.counted.source.as_deref() != state.source()
+    };
+    if changed {
+        shared.overlay.track(entry);
+    }
+}
+
+/// Writes the record of the entry as it is now, sealing its local data if it
+/// has some.
+pub(super) fn persist(shared: &Shared, entry: &Arc<Entry>, force: bool) -> SmbResult<()> {
+    let _seal = entry.lock_seal();
+    persist_held(shared, entry, force)
+}
+
+/// [`persist`] for a caller that holds the `seal` lock of the entry.
+pub(super) fn persist_held(shared: &Shared, entry: &Arc<Entry>, force: bool) -> SmbResult<()> {
+    if entry.state().local().is_some() {
+        seal_held(shared, entry, force)
+    } else {
+        record_held(shared, entry)
+    }
+}
+
+/// Takes the key of the entry off the record of the keys to delete that names
+/// it, now that the entry has a record of its own. The caller holds the
+/// `seal` lock of the entry, so the entry stays in the overlay meanwhile.
+pub(super) fn superseded(shared: &Shared, entry: &Entry) {
+    let key = {
+        let state = entry.state();
+        if state.detached || state.is_dir() {
+            return;
+        }
+        state.key.clone()
+    };
+    if shared.overlay.tomb_named(&key) {
+        drop_superseded(shared, &[key]);
+    }
 }
 
 /// Writes the record of the entry as it is now.
@@ -317,18 +383,21 @@ pub(super) async fn record(shared: &Arc<Shared>, held: &Held) -> SmbResult<()> {
 }
 
 /// Writes the record of the entry as it is now, on the calling thread.
-pub(super) fn record_now(shared: &Shared, entry: &Entry) -> SmbResult<()> {
-    let cache = shared.local()?;
+pub(super) fn record_now(shared: &Shared, entry: &Arc<Entry>) -> SmbResult<()> {
     let _seal = entry.lock_seal();
+    record_held(shared, entry)
+}
+
+/// [`record_now`] for a caller that holds the `seal` lock of the entry.
+pub(super) fn record_held(shared: &Shared, entry: &Arc<Entry>) -> SmbResult<()> {
+    let cache = shared.local()?;
     let record = {
         let mut state = entry.state();
         state.attached()?;
         Entry::record(&mut state, &shared.prefix, shared.built).map_err(SmbError::Io)?
     };
     write_record(cache, &record)?;
-    commit(cache, entry, Some(&record.id), |state| {
-        state.recorded = true
-    })
+    commit_record(shared, entry, Some(&record), |_| {})
 }
 
 /// Puts the marker object of the directory `key` with `metadata`, and makes
@@ -484,7 +553,7 @@ pub(super) fn apply_attributes(own: &mut Own, attributes: u32) {
 /// `change` sets that. An entry without local data has its record written
 /// before this returns; with local data, the record follows at the next
 /// flush.
-fn change_own(shared: &Shared, entry: &Entry, change: impl FnOnce(&mut Own)) -> SmbResult<()> {
+fn change_own(shared: &Shared, entry: &Arc<Entry>, change: impl FnOnce(&mut Own)) -> SmbResult<()> {
     let cache = shared.local()?;
     let _io = entry.lock_io();
     let _seal = entry.lock_seal();
@@ -511,10 +580,9 @@ fn change_own(shared: &Shared, entry: &Entry, change: impl FnOnce(&mut Own)) -> 
         (own, record)
     };
     write_record(cache, &record)?;
-    commit(cache, entry, Some(&record.id), |state| {
+    commit_record(shared, entry, Some(&record), |state| {
         state.own = Some(own);
         state.bump();
-        state.recorded = true;
     })
 }
 

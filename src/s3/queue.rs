@@ -88,7 +88,6 @@ impl<T> Queue<T> {
 
     /// Wakes the worker. A wake-up that finds nobody waiting is kept for the
     /// next wait.
-    #[cfg(test)]
     pub(super) fn wake(&self) {
         self.wake.notify_one();
     }

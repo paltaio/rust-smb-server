@@ -14,13 +14,14 @@ use tracing::warn;
 use crate::error::{SmbError, SmbResult};
 
 use super::backend::Shared;
-use super::change::{record_now, seal_held};
+use super::change::{ensure_local, persist, persist_held, record_held, recount_source};
 use super::data::disk_error;
-use super::entry::{Body, Entry};
+use super::entry::{Body, Entry, Landing, Upload};
 use super::error::S3Error;
 use super::object::ObjectHead;
 use super::ranges::RangeSet;
 use super::record::RecordId;
+use super::retry::Stop;
 
 /// The parts of `range` that a fill writes into a file of `len` bytes that
 /// holds `present`: the bytes it does not hold yet, below its length now.
@@ -88,88 +89,197 @@ pub(super) fn fill(
     Ok(grew)
 }
 
-/// Gets the record of the entry ready for the first request that writes its
-/// key: the key is noted as one that may exist in the bucket, and the record
-/// is written again when that is news, or when a fill added bytes (`filled`)
-/// that the record does not claim yet.
-pub(super) fn before_store(shared: &Shared, entry: &Entry, filled: bool) -> SmbResult<()> {
-    let first = !std::mem::replace(&mut entry.state().may_exist, true);
-    if first || filled {
-        super::change::seal(shared, entry, true)
-    } else {
-        Ok(())
+/// Gets the entry ready for the first request that writes `key`: the key is
+/// noted as one that may exist in the bucket, and the record is written again
+/// when the key was not noted before, or when a fill added bytes (`filled`) that the record
+/// does not claim yet. Then the entries that own `key` to delete, and the
+/// records of keys to delete that name it, let it go. All of it happens under
+/// the `io` and `seal` locks of the entry and of those owners, which are taken
+/// in one order. Returns whether the key may have existed before, or `None`,
+/// having changed nothing, if the entry left the overlay, is at another key, or
+/// the job was stopped.
+pub(super) fn before_store(
+    shared: &Shared,
+    entry: &Arc<Entry>,
+    key: &str,
+    filled: bool,
+    stop: &Stop,
+) -> SmbResult<Option<bool>> {
+    let owners = shared.overlay.owners(key, entry);
+    let locking: Vec<&Arc<Entry>> = std::iter::once(entry).chain(&owners).collect();
+    let _locks = Entry::lock_all(&locking);
+    {
+        let state = entry.state();
+        if state.detached || state.key != key || stop.is_stopped() {
+            return Ok(None);
+        }
     }
+    let existed = std::mem::replace(&mut entry.state().may_exist, true);
+    if !existed || filled {
+        persist_held(shared, entry, true)?;
+    }
+    for owner in &owners {
+        match deleted_held(shared, owner, &[key.to_owned()]) {
+            Ok(()) | Err(SmbError::AccessDenied) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    if let Some(cache) = shared.local.as_deref()
+        && shared.overlay.tomb_named(key)
+    {
+        shared
+            .overlay
+            .drop_tombs(cache, &[key.to_owned()])
+            .map_err(SmbError::Io)?;
+    }
+    Ok(Some(existed))
+}
+
+/// Gives a file that copies from its base an empty data file of the same
+/// length, so a fill can bring the bytes in.
+pub(super) fn local_copy(shared: &Shared, entry: &Entry) -> SmbResult<()> {
+    let cache = shared.local()?;
+    let _io = entry.lock_io();
+    ensure_local(cache, entry, None)?;
+    Ok(())
 }
 
 /// Notes that the object at `key`, as `head` describes it, holds the content
-/// the job stored for `generation`, and that `deleted` are no longer in the
-/// bucket. The entry takes that in at once.
+/// the job stored for `generation`. The entry takes that in at once. Returns
+/// whether it did: an entry that moved to another key meanwhile does not.
 ///
-/// If nothing changed the entry since `generation`, its record goes, then its
-/// data file, and then its local data is dropped: the bucket has the content.
-/// If the record cannot be removed, the entry keeps the record and its local
-/// data, and the call fails. If the entry changed, it keeps its local data and
+/// If nothing changed the entry since `generation`, the bucket has all it
+/// held: its local data and times go, and with them its record and data file
+/// unless it still has keys to delete, in which case the record is written
+/// again with the new base. If the entry changed, it keeps its local data and
 /// gets a record with the new base. The generation is compared under the `io`
 /// and `seal` locks, which every change takes, so it cannot move meanwhile.
+/// The key the entry copied from is let go of once its record no longer names
+/// it.
 pub(super) fn landed(
     shared: &Shared,
-    entry: &Entry,
+    entry: &Arc<Entry>,
     generation: u64,
     key: &str,
     head: Arc<ObjectHead>,
-    deleted: &[String],
-) -> SmbResult<()> {
+) -> SmbResult<bool> {
     let cache = shared.local()?;
     let io = entry.lock_io();
-    let seal = entry.lock_seal();
-    let (stored, id) = {
+    let _seal = entry.lock_seal();
+    let (landing, id, keeps_keys) = {
         let mut state = entry.state();
         state.attached()?;
-        let stored = state.landed(&shared.ahead, generation, key, head, deleted);
-        (stored, state.id.clone())
+        let landing = state.landed(&shared.ahead, generation, key, head);
+        (landing, state.id.clone(), !state.gone.is_empty())
     };
-    if stored {
-        if let Some(id) = &id {
-            cache.remove_record(id).map_err(SmbError::Io)?;
-            if let Err(e) = cache.remove_data(id) {
-                warn!(error = %e, "a data file that is no longer needed could not be removed");
-            }
+    match landing {
+        Landing::Moved => return Ok(false),
+        Landing::Newer => {
+            drop(io);
+            persist_held(shared, entry, true)?;
+            return Ok(true);
         }
-        entry.state().settled();
-        return Ok(());
+        Landing::Whole => {}
     }
-    drop(io);
-    let sealed = seal_held(shared, entry, true);
-    drop(seal);
-    sealed
+    if keeps_keys {
+        entry.state().stored();
+        if id.is_some() {
+            record_held(shared, entry)?;
+        }
+    } else if let Some(id) = &id {
+        cache.remove_record(id).map_err(SmbError::Io)?;
+    }
+    if let Some(id) = &id
+        && let Err(e) = cache.remove_data(id)
+    {
+        warn!(error = %e, "a data file that is no longer needed could not be removed");
+    }
+    if !keeps_keys {
+        entry.state().settled();
+    }
+    recount_source(shared, entry);
+    Ok(true)
 }
 
-/// Notes the multipart upload `id` of the entry, or with `None` that it has
-/// none, in the record of the entry.
-pub(super) fn upload_id(shared: &Shared, entry: &Entry, id: Option<String>) -> SmbResult<()> {
+/// Writes the record of the entry again, or removes it and the local data if
+/// the entry has nothing left to do. The caller holds the `io` and `seal`
+/// locks of the entry.
+fn rest(shared: &Shared, entry: &Arc<Entry>) -> SmbResult<()> {
+    let cache = shared.local()?;
+    let (idle, id, recorded) = {
+        let state = entry.state();
+        (!state.has_work(), state.id.clone(), state.recorded)
+    };
+    if !idle {
+        return persist_held(shared, entry, true);
+    }
+    if let (true, Some(id)) = (recorded, &id) {
+        cache.remove_record(id).map_err(SmbError::Io)?;
+    }
+    entry.state().settled();
+    recount_source(shared, entry);
+    Ok(())
+}
+
+/// Notes that the keys `removed` are gone from the bucket, or are not the
+/// entry's to delete: they leave the entry's record. An entry with nothing
+/// left to do drops its record and local data.
+pub(super) fn deleted(shared: &Shared, entry: &Arc<Entry>, removed: &[String]) -> SmbResult<()> {
+    let _io = entry.lock_io();
+    let _seal = entry.lock_seal();
+    deleted_held(shared, entry, removed)
+}
+
+/// [`deleted`] for a caller that holds the `io` and `seal` locks of the entry.
+fn deleted_held(shared: &Shared, entry: &Arc<Entry>, removed: &[String]) -> SmbResult<()> {
     {
         let mut state = entry.state();
         state.attached()?;
-        if let Body::File { upload_id, .. } = &mut state.body {
-            *upload_id = id;
+        state.gone.retain(|key| !removed.contains(key));
+    }
+    shared.overlay.track(entry);
+    rest(shared, entry)
+}
+
+/// Drops the times and attributes of the entry that the store cannot take,
+/// if nothing changed it since `generation`.
+pub(super) fn dropped(shared: &Shared, entry: &Arc<Entry>, generation: u64) -> SmbResult<()> {
+    let _io = entry.lock_io();
+    let _seal = entry.lock_seal();
+    {
+        let mut state = entry.state();
+        state.attached()?;
+        if state.generation != generation {
+            return Ok(());
+        }
+        state.own = None;
+        state.uploaded = generation;
+    }
+    rest(shared, entry)
+}
+
+/// Notes the multipart upload of the entry, or with `None` that it has
+/// none, in the record of the entry.
+pub(super) fn note_upload(
+    shared: &Shared,
+    entry: &Arc<Entry>,
+    upload: Option<Upload>,
+) -> SmbResult<()> {
+    {
+        let mut state = entry.state();
+        state.attached()?;
+        if let Body::File { upload: held, .. } = &mut state.body {
+            *held = upload;
         }
     }
-    super::change::seal(shared, entry, true)
+    persist(shared, entry, true)
 }
 
 /// Notes that the job of the entry failed for good with `error`, in the
 /// record of the entry.
-pub(super) fn failed(shared: &Shared, entry: &Entry, error: S3Error) -> SmbResult<()> {
-    let has_local = {
-        let mut state = entry.state();
-        state.failure = Some(error);
-        state.local().is_some()
-    };
-    if has_local {
-        super::change::seal(shared, entry, true)
-    } else {
-        record_now(shared, entry)
-    }
+pub(super) fn failed(shared: &Shared, entry: &Arc<Entry>, error: S3Error) -> SmbResult<()> {
+    entry.state().failure = Some(error);
+    persist(shared, entry, true)
 }
 
 /// Moves the data file and the record of the entry to the conflicts

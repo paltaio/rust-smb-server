@@ -27,7 +27,7 @@ use crate::backend::VolumeInfo;
 
 use super::data::{self, private_options};
 use super::error::S3Error;
-use super::keys::{dir_prefix, join_key, slot};
+use super::keys::{Slot, dir_prefix, join_key, slot};
 use super::record::{EntryRecord, MAX_RECORD_LEN, Record, RecordId, TombstoneRecord, escape};
 
 const SUBDIRS: [&str; 4] = ["data", "records", "conflicts", "tmp"];
@@ -48,6 +48,8 @@ pub(crate) struct CacheDir {
 #[derive(Default)]
 pub(crate) struct Hooks {
     pub(crate) record_writes: AtomicUsize,
+    /// The record writes that succeed before `record_writes` starts to fail.
+    pub(crate) record_write_skips: AtomicUsize,
     pub(crate) record_removals: AtomicUsize,
     /// A failed data write has put the first half of its bytes in the file.
     pub(crate) data_writes: AtomicUsize,
@@ -248,7 +250,16 @@ impl CacheDir {
     /// one, never a partial write.
     pub(crate) fn write_record(&self, id: &RecordId, text: &str) -> io::Result<()> {
         #[cfg(test)]
-        self.hooks.take(&self.hooks.record_writes)?;
+        {
+            let skipped = self.hooks.record_write_skips.fetch_update(
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+                |n| n.checked_sub(1),
+            );
+            if skipped.is_err() {
+                self.hooks.take(&self.hooks.record_writes)?;
+            }
+        }
         self.write_file(id.as_str(), self.record_path(id), text)
     }
 
@@ -302,7 +313,7 @@ impl CacheDir {
     /// `conflicts/` with an error in the log, with its data file if it has
     /// one. Data files that no record uses are deleted. A key to delete that
     /// an entry holds is dropped from its tombstone record, which is removed
-    /// when it has no key left.
+    /// when it has no key left. Keys match as spelled.
     ///
     /// # Errors
     ///
@@ -315,6 +326,7 @@ impl CacheDir {
         let inside = dir_prefix(prefix);
         let mut recovered = Recovered::default();
         let mut keys = HashSet::new();
+        let mut exact = HashSet::new();
         let mut dead_keys = HashSet::new();
         let mut live = HashSet::new();
         let mut tombstones = Vec::new();
@@ -361,6 +373,10 @@ impl CacheDir {
                 }
                 Record::Entry(entry) => match self.revive(&entry, prefix, fold, &mut keys) {
                     Ok(data) => {
+                        exact.insert(entry.key.clone());
+                        if entry.is_dir {
+                            exact.insert(dir_prefix(&entry.key));
+                        }
                         if data.is_some() {
                             live.insert(id);
                         }
@@ -373,9 +389,7 @@ impl CacheDir {
 
         for mut tombstone in tombstones {
             let held = tombstone.keys.len();
-            tombstone
-                .keys
-                .retain(|key| !keys.contains(&slot(key, fold)));
+            tombstone.keys.retain(|key| !exact.contains(key));
             if tombstone.keys.len() == held {
                 recovered.tombstones.push(tombstone);
             } else if tombstone.keys.is_empty() {
@@ -408,7 +422,7 @@ impl CacheDir {
         entry: &EntryRecord,
         prefix: &str,
         fold: bool,
-        keys: &mut HashSet<String>,
+        keys: &mut HashSet<Slot>,
     ) -> Result<Option<File>, String> {
         if entry.key != join_key(prefix, &entry.path) {
             return Err("the key is not the path below the prefix".to_owned());
@@ -578,6 +592,7 @@ mod tests {
             attributes: 0,
             generation: 1,
             upload_id: None,
+            upload_key: None,
             failed: false,
             meta_pending: false,
             marker_pending: false,
@@ -920,10 +935,8 @@ mod tests {
                 vec!["pre/fix/a.txt/".to_owned()],
                 vec!["pre/fix/c.txt".to_owned()],
                 vec!["pre/fix/other".to_owned()],
+                vec!["pre/fix/sub/b.txt".to_owned()],
             ];
-            if !fold {
-                expected.push(vec!["pre/fix/sub/b.txt".to_owned()]);
-            }
             expected.sort();
             assert_eq!(tombstone_keys(&recovered), expected, "fold {fold}");
 
@@ -940,8 +953,11 @@ mod tests {
             assert_eq!(on_disk(&some.id), keys(&some.id, &["pre/fix/other"]));
             assert_eq!(on_disk(&all.id), keys(&all.id, &["pre/fix/a.txt/"]));
             assert_eq!(on_disk(&none.id), keys(&none.id, &["pre/fix/c.txt"]));
-            let cased_left = (!fold).then(|| keys(&cased.id, &["pre/fix/sub/b.txt"]));
-            assert_eq!(on_disk(&cased.id), cased_left.flatten());
+            assert_eq!(
+                on_disk(&cased.id),
+                keys(&cased.id, &["pre/fix/sub/b.txt"]),
+                "keys match as spelled, whatever the names do"
+            );
             assert!(conflicts(temp.path()).is_empty());
         }
     }

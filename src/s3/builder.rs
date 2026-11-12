@@ -188,8 +188,12 @@ impl S3BackendBuilder {
 
     /// Sets whether names match without regard to case. On by default: a name
     /// that no key spells exactly opens the first key that differs only in
-    /// case. Off, every name is exactly a key. A
-    /// [cache directory](Self::cache_dir) is used with one setting only.
+    /// case, and a job that stores a file waits while another job stores, or a
+    /// request deletes, a key that differs from its own only in case. Off,
+    /// every name is exactly a key, so the store has to keep case: on a store
+    /// that holds `Doc` and `doc` as one object, a change to one overwrites
+    /// or deletes the other. A [cache directory](Self::cache_dir) is used with
+    /// one setting only.
     #[must_use]
     pub fn case_insensitive(mut self, case_insensitive: bool) -> Self {
         self.case_insensitive = case_insensitive;
@@ -228,9 +232,13 @@ impl S3BackendBuilder {
     /// stores it in the bucket. A file that is open and left alone is stored
     /// too. Opening a file without overwriting it, or closing it, is not a
     /// change. A change to a file that is being stored stops the upload, and
-    /// the file rests this long again. Times and attributes set on a file the
-    /// backend holds no bytes of, or on a directory that has no marker object
-    /// to put, are not stored in the bucket. The default is 5 seconds.
+    /// the file rests this long again. Renames, and times and attributes set
+    /// on a file or directory, are stored after the same rest. The old key of
+    /// a renamed file is deleted once the new key holds its content.
+    /// The objects of deleted files are deleted in batches once nothing has
+    /// been deleted for this long, at most a minute after the first of them
+    /// was due.
+    /// The default is 5 seconds.
     #[must_use]
     pub fn upload_delay(mut self, delay: Duration) -> Self {
         self.upload_delay = delay;
@@ -297,12 +305,12 @@ impl S3BackendBuilder {
     ///
     /// Files an earlier backend recorded come back into the share with their
     /// times and attributes. The backend stores them, and the directory
-    /// markers an earlier one left, without waiting for the upload delay,
-    /// including those whose upload failed. A file comes back as last
-    /// recorded: one made and never recorded is gone, and an object changed
-    /// and never recorded reads as the bucket has it. A file in the cache
-    /// directory that cannot be read back moves to its `conflicts` directory,
-    /// with an error in the log.
+    /// markers, renames and deletes an earlier one left, without waiting for
+    /// the upload delay, including those whose upload failed. A file comes
+    /// back as last recorded: one made and never recorded is gone, and an
+    /// object changed and never recorded reads as the bucket has it. A file in
+    /// the cache directory that cannot be read back moves to its `conflicts`
+    /// directory, with an error in the log.
     pub async fn build(self) -> Result<S3Backend, S3Error> {
         let credentials = self.check()?;
         let local = match &self.cache_dir {

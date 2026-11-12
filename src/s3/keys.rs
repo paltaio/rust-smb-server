@@ -36,6 +36,11 @@ pub(super) fn last_name(key: &str) -> &str {
     key.rsplit_once('/').map_or(key, |(_, name)| name)
 }
 
+/// The key of the directory `key` is in. Empty for a key with one name.
+pub(super) fn parent_key(key: &str) -> &str {
+    key.rsplit_once('/').map_or("", |(dir, _)| dir)
+}
+
 /// The prefix of the keys below the directory with key `dir`, which is also
 /// the key of its marker object. Empty for the root of a share without a
 /// prefix, which has no marker.
@@ -47,14 +52,34 @@ pub(super) fn dir_prefix(dir: &str) -> String {
     }
 }
 
+/// The path of `key` below the share root `prefix`, with `/` between the
+/// names.
+pub(super) fn path_below(prefix: &str, key: &str) -> String {
+    key.strip_prefix(prefix)
+        .map_or(key, |rest| rest.trim_start_matches('/'))
+        .to_owned()
+}
+
+/// A key or a name as names are compared. Only [`slot`] makes one, so a map
+/// keyed by slots is never looked up by a spelling.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(super) struct Slot(String);
+
+impl Slot {
+    /// Whether the slot begins with the whole of `prefix`.
+    pub(super) fn starts_with(&self, prefix: &Slot) -> bool {
+        self.0.starts_with(&prefix.0)
+    }
+}
+
 /// `text`, a key or a name, as names are compared: lowercased when `fold` is
 /// set, which is when names match without regard to case.
-pub(super) fn slot(text: &str, fold: bool) -> String {
-    if fold {
+pub(super) fn slot(text: &str, fold: bool) -> Slot {
+    Slot(if fold {
         text.to_lowercase()
     } else {
         text.to_owned()
-    }
+    })
 }
 
 /// The key of the entry at `components` below the share root `root`.
@@ -115,6 +140,18 @@ impl DirListing {
         rows.push(row);
         rows.sort_by(by_key);
         DirListing { rows }
+    }
+
+    /// The listing without the row named `name`.
+    pub(super) fn without_row(&self, name: &str) -> DirListing {
+        DirListing {
+            rows: self
+                .rows
+                .iter()
+                .filter(|held| held.name != name)
+                .cloned()
+                .collect(),
+        }
     }
 
     /// The row named exactly `name`.
@@ -300,10 +337,24 @@ mod tests {
     }
 
     #[test]
+    fn the_directory_of_a_key_is_everything_before_its_last_component() {
+        assert_eq!(parent_key("a/b/c.txt"), "a/b");
+        assert_eq!(parent_key("c.txt"), "");
+    }
+
+    #[test]
     fn names_are_compared_as_lowercase_only_when_case_is_ignored() {
-        assert_eq!(slot("Dir/\u{c9}COLE.TXT", true), "dir/\u{e9}cole.txt");
-        assert_eq!(slot("Dir/\u{c9}COLE.TXT", false), "Dir/\u{c9}COLE.TXT");
+        assert_eq!(
+            slot("Dir/\u{c9}COLE.TXT", true),
+            slot("dir/\u{e9}cole.txt", false)
+        );
+        assert_ne!(
+            slot("Dir/\u{c9}COLE.TXT", false),
+            slot("dir/\u{e9}cole.txt", false)
+        );
         assert_eq!(slot("A\u{3a3}/B", true), slot("a\u{3c2}/b", true));
+        assert!(slot("Dir/A", true).starts_with(&slot("DIR/", true)));
+        assert!(!slot("Dir/A", false).starts_with(&slot("dir/", false)));
     }
 
     #[test]

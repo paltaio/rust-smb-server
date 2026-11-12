@@ -71,8 +71,9 @@ async fn a_file_without_stored_times_has_the_time_the_store_modified_it() {
     assert_eq!(file.times[0], file.times[2]);
     assert_eq!(file.times[1], file.times[2]);
     assert_eq!(file.times[3], file.times[2]);
-    // The header has whole seconds.
-    let floor = before / 10_000_000 * 10_000_000;
+    // The header has whole seconds, and the coarse clock of the store can
+    // trail this one by a few milliseconds.
+    let floor = before.saturating_sub(2 * 10_000_000);
     assert!(
         (floor..=after).contains(&file.times[2]),
         "{} not in {floor}..={after}",

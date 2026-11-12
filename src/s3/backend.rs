@@ -72,7 +72,9 @@ use super::retry::Retry;
 /// it needs bytes of the store and the object under the file changed since
 /// the file was opened. What the backend holds shows in lookups and listings
 /// at once. A directory made through the share has its marker object put in
-/// the store before the open returns. Deletes and renames are refused.
+/// the store before the open returns. A file that is deleted or renamed is
+/// gone or has its new name in the share at once, and the bucket follows in
+/// the background. Directories cannot be deleted or renamed.
 ///
 /// A file the backend holds bytes of is stored in the bucket in the
 /// background, [`upload_delay`](crate::S3BackendBuilder::upload_delay) after
@@ -85,8 +87,12 @@ use super::retry::Retry;
 /// starts no more requests, a multipart upload is aborted, and a request
 /// already sent may still store the earlier content. Another upload starts
 /// after the delay. Times and attributes set on a file the backend holds no
-/// bytes of, or on a directory that has no marker object to put, stay in the
-/// cache directory and are not stored in the bucket.
+/// bytes of are stored by copying the object onto itself with the new
+/// metadata, and those set on a directory by putting its marker object, which
+/// a directory without one gets. If the store refuses to copy an object onto
+/// itself, an object of up to `part_size` bytes is read and put again, and the
+/// times and attributes of a larger one are not stored, with a warning in the
+/// log.
 ///
 /// Before it stores a file that was changed in part, the backend reads the
 /// rest of its bytes from the object. If the object has changed or is gone by
@@ -96,16 +102,52 @@ use super::retry::Retry;
 /// file whose bytes are all local replaces the object with no check of what
 /// the bucket holds.
 ///
-/// An upload fails for good when the store refuses a request in a way trying
-/// again cannot fix, or when the cache directory cannot be read or written.
-/// It is logged, shows in [`failures`](S3Backend::failures), and is tried
-/// again when the next backend is built on the cache directory. That backend
+/// An upload, or the delete of the old keys of a renamed file, fails for good
+/// when the store refuses a request in a way trying again cannot fix, or when
+/// the cache directory cannot be read or written. It is logged, shows in
+/// [`failures`](S3Backend::failures), and is tried again when the next backend
+/// is built on the cache directory. That backend
 /// stores the files and directory markers an earlier one left without waiting
 /// for the upload delay, and aborts the multipart uploads the earlier one left
 /// running. A bucket should have a lifecycle rule that aborts incomplete
-/// multipart uploads. [`sync`](S3Backend::sync) waits until the files the
-/// backend holds bytes of, and the directory markers it has not put, are
-/// stored.
+/// multipart uploads. [`sync`](S3Backend::sync) waits until what the backend
+/// holds for the bucket has reached it.
+///
+/// A renamed file is stored at its new key, and the old key is deleted once
+/// the new key holds its content. A file the backend holds no bytes of is copied within the
+/// bucket with the metadata the object had, in parts above 5 GiB. The object
+/// of a deleted file is deleted in the background, in batches, once no file
+/// has been deleted for
+/// [`upload_delay`](crate::S3BackendBuilder::upload_delay), and at most a
+/// minute after the first of them was due. A file made again under the exact name of
+/// one that was deleted replaces the object, and the object is not deleted.
+/// Before the backend deletes an object it puts a marker object for each
+/// directory above it that would be left with no object, so a directory does
+/// not vanish with its last file. If the store answers the marker with
+/// `ObjectParentIsFile` or `ExistingObjectIsDirectory`, the directory is left
+/// without a marker; if it refuses the marker any other way, the object stays
+/// in the bucket and [`sync`](S3Backend::sync) fails (`OperationAborted` is
+/// tried again).
+///
+/// Files renamed in a ring, as when two names swap through a third, are
+/// stored in turn. For each ring, the backend downloads one file and uploads
+/// it again, and that file has to fit in the free space of the cache
+/// directory.
+///
+/// When names match without regard to case, which is the default, a job that
+/// stores a file and a request that deletes keys wait for each other if their
+/// keys differ in case only, and for a file that still copies from such a
+/// key. Keys that differ in case only can go out in one delete request, and
+/// directory markers do not wait. A store that treats such names as
+/// one name keeps the object under its old spelling when a file is renamed
+/// to a new spelling of its name. Before it deletes an object whose name
+/// differs in case only from the name of a file the backend holds, and when
+/// it has just stored a file under a name that differs in case only from an
+/// object it is to delete, the backend asks the store for both names: if they
+/// have the same size, ETag and modification time and are not both listed,
+/// they are one object, and it is not deleted. With
+/// [`case_insensitive(false)`](crate::S3BackendBuilder::case_insensitive) the
+/// store has to keep case.
 ///
 /// Dropping the last clone ends the uploads. The cache directory stays locked
 /// until the handles opened through the backend are closed and the requests
@@ -175,31 +217,37 @@ impl Shared {
 }
 
 impl S3Backend {
-    /// Waits until the files the backend holds bytes of, and the directories
-    /// whose marker objects it has not put, are stored in the bucket. Only
-    /// what the backend holds when the call begins counts. A file that keeps
-    /// changing delays the call, as it delays its upload. The call waits as
-    /// long as the uploads take, through failures that trying again may fix
-    /// and through a full disk of the cache directory.
+    /// Waits until the files the backend holds bytes of, the times, attributes
+    /// and names it has not stored, the directories whose marker objects it has
+    /// not put, and the objects it is to delete are stored in or deleted from
+    /// the bucket. Only what the backend holds when the call begins counts. A
+    /// file that keeps changing delays the call, as it delays its upload. The
+    /// call waits as long as the uploads take, through failures that trying
+    /// again may fix and through a full disk of the cache directory.
     ///
     /// # Errors
     ///
     /// Fails with the error of one of those files or directories whose upload
     /// failed for good, or whose changes moved to the `conflicts` directory of
     /// the cache directory because the object changed or is gone in the
-    /// bucket. Fails with [`S3Error::Stopped`] if the background worker has
-    /// ended.
+    /// bucket, or with the error of an object the store refuses to delete.
+    /// Fails with [`S3Error::Stopped`] if the background worker has ended.
     pub async fn sync(&self) -> Result<(), S3Error> {
         self.shared.sync().await
     }
 
-    /// The paths whose upload failed for good, with the error of each. A path
-    /// has `/` between its names and no `/` before the first.
+    /// The paths of the files and directories whose upload, or whose delete
+    /// of keys they own, failed for good, with the error of each. A path has
+    /// `/` between its names and no `/` before the first. A renamed file is on
+    /// the list with its new path.
     ///
     /// A file or directory on the list keeps what the backend holds for it,
     /// which clients still see. It gets no other upload until the next backend
     /// is built on the cache directory, which tries it again. A file that
-    /// moved to the `conflicts` directory is not on the list.
+    /// moved to the `conflicts` directory is not on the list. Nor is the
+    /// object of a file that was deleted, or replaced by a rename, when the
+    /// store refuses to delete it: that is logged and fails
+    /// [`sync`](Self::sync).
     #[must_use]
     pub fn failures(&self) -> Vec<(String, S3Error)> {
         self.shared.overlay.failures(&self.shared.prefix)
@@ -243,6 +291,17 @@ impl S3Backend {
         self.shared.overlay.len()
     }
 
+    /// How many times a job was put off because a key stood in its way.
+    pub(crate) fn parks(&self) -> usize {
+        self.shared.overlay.parks()
+    }
+
+    /// Whether a job writes a key of the slot of `key`, a file copies from
+    /// one, or a request deletes one.
+    pub(crate) fn key_in_use(&self, key: &str) -> bool {
+        self.shared.overlay.in_use(key)
+    }
+
     /// What tests make the cache directory do.
     pub(crate) fn hooks(&self) -> &super::cachedir::Hooks {
         &self
@@ -262,6 +321,16 @@ impl S3Backend {
         self.shared.overlay.queue().wake();
     }
 
+    /// Keeps the worker from deleting keys no entry owns, or lets it delete
+    /// them again.
+    pub(crate) fn hold_sweeps(&self, held: bool) {
+        self.shared
+            .jobs
+            .sweeps_held
+            .store(held, std::sync::atomic::Ordering::SeqCst);
+        self.shared.overlay.queue().wake();
+    }
+
     /// Makes the next job that has hashed a file wait: it notifies the first
     /// `Notify`, and goes on when the second is notified.
     pub(crate) fn pause_after_hash(&self) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
@@ -273,6 +342,37 @@ impl S3Backend {
     /// dropped meanwhile, the job ends without noting what it stored.
     pub(crate) fn pause_after_store(&self) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
         gates(&self.shared.jobs.pause_stored)
+    }
+
+    /// Makes the next lookup that found an object wait before it takes a hold
+    /// on the entry for it, as [`pause_after_hash`](Self::pause_after_hash)
+    /// does.
+    pub(crate) fn pause_after_lookup(
+        &self,
+    ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        gates(&self.shared.jobs.pause_found)
+    }
+
+    /// Makes the next rename wait after it has reserved its name, as
+    /// [`pause_after_hash`](Self::pause_after_hash) does.
+    pub(crate) fn pause_after_reserve(
+        &self,
+    ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        gates(&self.shared.jobs.pause_reserved)
+    }
+
+    /// Lowers the size of the largest object one copy request takes.
+    pub(crate) fn limit_copy(&self, bytes: u64) {
+        self.shared.jobs.limit_copy(bytes);
+    }
+
+    /// Makes the next job that has stored an entry's content wait before it
+    /// deletes the keys the entry owns, as
+    /// [`pause_after_hash`](Self::pause_after_hash) does.
+    pub(crate) fn pause_after_landing(
+        &self,
+    ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        gates(&self.shared.jobs.pause_landed)
     }
 
     /// Whether the worker has ended, which it does after the last clone of
@@ -354,17 +454,12 @@ impl ShareBackend for S3Backend {
         self.shared.open(path, opts).await
     }
 
-    async fn unlink(&self, _path: &SmbPath) -> SmbResult<()> {
-        Err(SmbError::AccessDenied)
+    async fn unlink(&self, path: &SmbPath) -> SmbResult<()> {
+        self.shared.unlink(path).await
     }
 
-    async fn rename(
-        &self,
-        _from: &SmbPath,
-        _to: &SmbPath,
-        _replace_if_exists: bool,
-    ) -> SmbResult<()> {
-        Err(SmbError::AccessDenied)
+    async fn rename(&self, from: &SmbPath, to: &SmbPath, replace_if_exists: bool) -> SmbResult<()> {
+        self.shared.rename(from, to, replace_if_exists).await
     }
 
     fn capabilities(&self) -> BackendCapabilities {

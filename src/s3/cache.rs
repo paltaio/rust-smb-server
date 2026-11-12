@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::time::Instant;
 
-use super::keys::{DirListing, FileStamp, Row};
+use super::keys::{DirListing, FileStamp, Row, last_name};
 use super::object::ObjectHead;
 
 /// Most keys the cache remembers a lookup of.
@@ -200,6 +200,17 @@ impl MetaCache {
             return;
         };
         let (at, listing) = (slot.at, Arc::new(slot.value.with_row(row)));
+        self.put_listing(dir, listing, at);
+    }
+
+    /// Drops what is known of the object at `key`, which the backend
+    /// deleted, and its row in the cached listing of the directory `dir`.
+    pub(super) fn deleted_file(&mut self, key: &str, dir: &str) {
+        self.keys.remove(key);
+        let Some(slot) = self.listings.get(dir) else {
+            return;
+        };
+        let (at, listing) = (slot.at, Arc::new(slot.value.without_row(last_name(key))));
         self.put_listing(dir, listing, at);
     }
 

@@ -319,7 +319,6 @@ pub(crate) struct ListRequest<'a> {
 
 /// The metadata a copy gives the new object.
 #[derive(Debug, Clone, Copy)]
-#[cfg_attr(not(test), expect(dead_code, reason = "used by tests only"))]
 pub(crate) enum CopyMetadata<'a> {
     /// The metadata of the source, in the storage class given.
     Copy { storage_class: Option<&'a str> },
@@ -480,7 +479,6 @@ impl S3Client {
     }
 
     /// CopyObject from `source` to `key`, in this bucket.
-    #[cfg_attr(not(test), expect(dead_code, reason = "called by tests only"))]
     pub(crate) async fn copy_object(
         &self,
         source: &str,
@@ -554,7 +552,6 @@ impl S3Client {
     }
 
     /// UploadPartCopy of `range` of `source`.
-    #[cfg_attr(not(test), expect(dead_code, reason = "called by tests only"))]
     pub(crate) async fn upload_part_copy(
         &self,
         key: &str,

@@ -6,6 +6,7 @@ mod fixture;
 mod gateway;
 mod listings;
 mod lookups;
+mod moves;
 mod proxy;
 mod readonly;
 mod reads;

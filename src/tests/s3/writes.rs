@@ -272,23 +272,6 @@ async fn writes_from_two_handles_at_once_all_land() {
 }
 
 #[tokio::test]
-async fn unlink_and_rename_are_refused() {
-    let rig = Rig::writable().await;
-    put(rig.store(), "a.txt", b"a").await;
-    let a: SmbPath = "a.txt".parse().unwrap();
-    let b: SmbPath = "b.txt".parse().unwrap();
-    assert!(matches!(
-        rig.backend.unlink(&a).await,
-        Err(SmbError::AccessDenied)
-    ));
-    assert!(matches!(
-        rig.backend.rename(&a, &b, false).await,
-        Err(SmbError::AccessDenied)
-    ));
-    assert_eq!(changes(&rig), 0);
-}
-
-#[tokio::test]
 async fn a_file_cut_below_its_object_and_grown_again_has_zeros_where_it_grew() {
     let mut rig = Rig::writable().await;
     let data = pattern(0, 300);

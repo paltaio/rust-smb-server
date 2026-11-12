@@ -2,13 +2,19 @@
 //! state the entry holds.
 //!
 //! A file with local data is filled where it still stands for bytes of its
-//! base, hashed, and put in the bucket, in one request or in parts. A
-//! directory gets its marker object. Everything that touches the disk runs on
-//! a blocking thread, and nothing waits for the store while a lock is held.
+//! base, hashed, and put in the bucket, in one request or in parts. A file
+//! without local data whose base is at another key, or that has new times or
+//! attributes, gets a copy of its base at its key, in one request or in
+//! parts; a copy onto the same key stores new metadata. A directory gets its
+//! marker object. Once its content is in the bucket, a file deletes the keys
+//! it owns to delete. Everything that touches the disk runs on a blocking
+//! thread, and nothing waits for the store while a lock is held.
 
 use std::fs::File;
+use std::future::Future;
 use std::io;
 use std::ops::Range;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -21,19 +27,21 @@ use crate::error::{SmbError, SmbResult};
 use super::backend::Shared;
 use super::cache::Known;
 use super::change;
-use super::client::MAX_DELETE_KEYS;
-use super::entry::{Body, Entry};
+use super::entry::{Body, Entry, Upload};
 use super::error::S3Error;
 use super::jobs::Running;
 use super::keys::{FileStamp, RowKind};
 use super::meta;
 use super::object::{ByteRange, Metadata, ObjectHead};
 use super::outcome;
+use super::overlay::{Fence, GoneClaim};
 use super::parts::{hash_range, part_size_for, parts};
 use super::payload::Payload;
 use super::read::same_version;
 use super::retry::{Retry, Stop};
 use super::xml::CompletedPart;
+
+mod copy;
 
 /// The content type of a file that was never in the bucket.
 const NEW_FILE_TYPE: &str = "application/octet-stream";
@@ -52,6 +60,9 @@ enum Halt {
     /// The bytes under the job changed or are not all there: the entry gets
     /// a job again after it has rested.
     Again,
+    /// The key the job writes is in use: the entry is queued again and waits
+    /// for it.
+    Blocked,
     /// The disk of the cache directory is full: the entry gets a job again
     /// after it has rested for the upload delay, and at least
     /// [`FULL_DISK_REST`].
@@ -83,6 +94,34 @@ struct Snapshot {
     metadata: Metadata,
     /// The ETag the key had before, if the entry knows it.
     replaced: Option<String>,
+}
+
+/// A part of a multipart upload that is ready to send.
+type PartFuture = Pin<Box<dyn Future<Output = Result<CompletedPart, S3Error>> + Send>>;
+
+/// What a job does for a file.
+enum Kind {
+    /// Stores the local data.
+    Upload,
+    /// Copies the base to the key, or stores new times and attributes.
+    Copy,
+    /// Has no object to store. Times and attributes with no object to go on
+    /// are dropped.
+    Nothing,
+}
+
+/// A copy of the base of a file to its key.
+struct CopyJob {
+    key: String,
+    from: String,
+    head: Arc<ObjectHead>,
+    /// The metadata the object gets.
+    metadata: Metadata,
+    /// Whether the metadata is not the base's.
+    replace: bool,
+    /// The ETag the key had before, if the entry knows it.
+    prior: Option<String>,
+    generation: u64,
 }
 
 /// A piece of the file to fetch from the base.
@@ -175,6 +214,7 @@ impl Job<'_> {
         match halt {
             Halt::Stopped => debug!(path = %self.path, "the job was stopped"),
             Halt::Gone => debug!(path = %self.path, "the entry left the overlay during its job"),
+            Halt::Blocked => debug!(path = %self.path, "the key is in use; the job waits for it"),
             Halt::Again => {
                 debug!(path = %self.path, "the bytes changed under the job");
                 // The entry rests again before its next job.
@@ -259,6 +299,33 @@ impl Job<'_> {
 
     async fn file(&self) -> Result<(), Halt> {
         self.abort_stale().await;
+        if self.run.cycle && self.entry().state().local().is_none() {
+            self.blocking(|shared, entry| outcome::local_copy(shared, entry))
+                .await?;
+        }
+        let kind = {
+            let state = self.entry().state();
+            if state.detached {
+                return Err(Halt::Gone);
+            }
+            if state.local().is_some() {
+                Kind::Upload
+            } else if state.base.is_some() && (state.moved() || state.own.is_some()) {
+                Kind::Copy
+            } else {
+                Kind::Nothing
+            }
+        };
+        match kind {
+            Kind::Upload => self.upload().await?,
+            Kind::Copy => self.copy().await?,
+            Kind::Nothing => self.drop_own().await?,
+        }
+        self.finish().await
+    }
+
+    /// Stores the local data of the file at its key.
+    async fn upload(&self) -> Result<(), Halt> {
         self.blocking(|shared, entry| change::seal(shared, entry, false))
             .await?;
         let filled = self.fill().await?;
@@ -268,30 +335,28 @@ impl Job<'_> {
         let part_size =
             (snapshot.len > jobs.part_size).then(|| part_size_for(snapshot.len, jobs.part_size));
         let hashes = self.hash(&snapshot, part_size).await?;
-        #[cfg(test)]
-        self.pause(&self.shared.jobs.pause).await;
         self.check()?;
-        self.blocking(move |shared, entry| outcome::before_store(shared, entry, filled))
-            .await?;
+        #[cfg(test)]
+        super::jobs::pause(&self.shared.jobs.pause).await;
+        let existed = self.before_store(&snapshot.key, filled).await?;
         let etag = match part_size {
             None => self.put(&snapshot, &hashes[0]).await?,
-            Some(size) => self.multipart(&snapshot, size, &hashes).await?,
-        };
-        #[cfg(test)]
-        {
-            self.pause(&self.shared.jobs.pause_stored).await;
-            if self.shared.jobs.stop.is_stopped() {
-                return Err(Halt::Stopped);
+            Some(size) => {
+                let prior = self
+                    .prior_etag(&snapshot.key, snapshot.replaced.clone(), existed)
+                    .await?;
+                self.upload_parts(&snapshot, size, &hashes, prior.as_deref())
+                    .await?
             }
-        }
+        };
+        // The answer carries the ETag only; the time is the local clock's and
+        // is never compared with one the store reports.
         let head = Arc::new(ObjectHead {
             size: snapshot.len,
             etag,
             last_modified: SystemTime::now(),
             metadata: snapshot.metadata.clone(),
         });
-        self.remember(&snapshot.key, &head);
-        let deleted = self.delete_gone().await?;
         let Snapshot {
             key,
             generation,
@@ -299,10 +364,114 @@ impl Job<'_> {
             ..
         } = snapshot;
         drop(file);
-        self.blocking(move |shared, entry| {
-            outcome::landed(shared, entry, generation, &key, head, &deleted)
-        })
-        .await
+        self.land(generation, key, head).await
+    }
+
+    /// The first step of a request that writes `key`: the entry's record
+    /// says the key may exist, the other entries let go of it, and the job
+    /// notes that it writes it, unless the key is in use. Returns whether the
+    /// key may have existed before.
+    async fn before_store(&self, key: &str, filled: bool) -> Result<bool, Halt> {
+        let (name, stop) = (key.to_owned(), self.stop().clone());
+        let taken = self
+            .blocking(move |shared, entry| {
+                outcome::before_store(shared, entry, &name, filled, &stop)
+            })
+            .await?;
+        let Some(existed) = taken else {
+            self.check()?;
+            return Err(Halt::Stopped);
+        };
+        match self
+            .shared
+            .overlay
+            .begin_write(self.entry(), key, self.stop())
+        {
+            Ok(()) => Ok(existed),
+            Err(Fence::Gone) => Err(Halt::Gone),
+            Err(Fence::Stopped) => Err(Halt::Stopped),
+            Err(Fence::Blocked) => Err(Halt::Blocked),
+        }
+    }
+
+    /// The ETag of the object at `key` before a multipart upload replaces it,
+    /// so the upload can tell its own object from the old one: `known` if the
+    /// entry has it, else the ETag a HEAD returns if the key `existed`.
+    async fn prior_etag(
+        &self,
+        key: &str,
+        known: Option<String>,
+        existed: bool,
+    ) -> Result<Option<String>, Halt> {
+        if known.is_some() || !existed {
+            return Ok(known);
+        }
+        match self.shared.client.head_object(key, self.retry()).await {
+            Ok(head) => Ok(Some(head.etag).filter(|etag| !etag.is_empty())),
+            Err(e) if e.is_no_such_key() => Ok(None),
+            Err(e) => Err(self.halt(e)),
+        }
+    }
+
+    /// Takes in the object the job stored at `key`, once the keys to delete
+    /// that differ from it in case only are settled. A job whose entry moved
+    /// to another key meanwhile ends: the entry took nothing in.
+    async fn land(&self, generation: u64, key: String, head: Arc<ObjectHead>) -> Result<(), Halt> {
+        #[cfg(test)]
+        self.pause_or_stop(&self.shared.jobs.pause_stored).await?;
+        self.remember(&key, &head);
+        self.settle_variants(&key).await?;
+        let took = self
+            .blocking(move |shared, entry| outcome::landed(shared, entry, generation, &key, head))
+            .await?;
+        if !took {
+            return Err(Halt::Stopped);
+        }
+        Ok(())
+    }
+
+    /// Settles the keys to delete that differ in case only from `key`, which
+    /// the entry has just stored, before the entry takes the object in. When
+    /// names match without regard to case there can be such keys, and a store
+    /// that ignores case holds one and `key` as one object, so deleting it
+    /// would delete the object just stored. A key that names the object at
+    /// `key` leaves the records of the keys to delete, without a delete. The
+    /// job's note that it writes the slot of `key` keeps the variants from
+    /// being deleted meanwhile. The requests stop with the backend, not with
+    /// the job.
+    async fn settle_variants(&self, key: &str) -> Result<(), Halt> {
+        let variants = self.shared.overlay.variants(key, self.entry());
+        let mut checked: Vec<(String, bool)> = Vec::new();
+        for (variant, owner) in variants {
+            let one = match checked.iter().find(|(seen, _)| *seen == variant) {
+                Some((_, one)) => *one,
+                None => {
+                    let one = self
+                        .shared
+                        .one_object(&variant, key, &self.shared.jobs.stop)
+                        .await
+                        .map_err(|e| classify(e, true))?
+                        .is_some();
+                    checked.push((variant.clone(), one));
+                    one
+                }
+            };
+            if !one {
+                continue;
+            }
+            self.blocking(move |shared, _| match owner {
+                Some(owner) => match outcome::deleted(shared, &owner, &[variant]) {
+                    Err(SmbError::AccessDenied) => Ok(()),
+                    done => done,
+                },
+                None => shared
+                    .overlay
+                    .drop_tombs(shared.local()?, &[variant])
+                    .map_err(SmbError::Io),
+            })
+            .await?;
+        }
+        Ok(())
     }
 
     /// Aborts a multipart upload an earlier backend left running.
@@ -311,14 +480,14 @@ impl Job<'_> {
             let state = self.entry().state();
             match &state.body {
                 Body::File {
-                    upload_id: Some(id),
+                    upload: Some(upload),
                     ..
-                } => Some((state.key.clone(), id.clone())),
+                } => Some(upload.clone()),
                 _ => None,
             }
         };
-        if let Some((key, id)) = stale {
-            self.abort(&key, &id).await;
+        if let Some(upload) = stale {
+            self.abort(&upload.key, &upload.id).await;
         }
     }
 
@@ -424,12 +593,7 @@ impl Job<'_> {
         let Some(local) = state.local() else {
             return Err(Halt::Gone);
         };
-        if local
-            .present
-            .segments(0..local.len)
-            .iter()
-            .any(|(_, present)| !present)
-        {
+        if !local.present.covers(local.len) {
             return Err(Halt::Again);
         }
         let own = state.own_or_base(self.shared.built);
@@ -443,32 +607,28 @@ impl Job<'_> {
         metadata
             .user
             .extend(meta::stored_metadata(own.times, own.attributes));
-        let replaced = state
-            .base
-            .as_ref()
-            .filter(|base| base.key == state.key && !base.head.etag.is_empty())
-            .map(|base| base.head.etag.clone());
         Ok(Snapshot {
             key: state.key.clone(),
             generation: state.generation,
             file: Arc::clone(&local.file),
             len: local.len,
             metadata,
-            replaced,
+            replaced: state.prior.clone(),
         })
     }
 
-    /// Waits here if a test put up `gates` for the job.
+    /// Waits here if a test put up `gates` for the job. Fails with `Stopped`
+    /// if the backend has ended by then.
     #[cfg(test)]
-    async fn pause(&self, gates: &std::sync::Mutex<Option<super::jobs::Gates>>) {
-        let gates = gates
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        if let Some((reached, resume)) = gates {
-            reached.notify_one();
-            resume.notified().await;
+    async fn pause_or_stop(
+        &self,
+        gates: &std::sync::Mutex<Option<super::jobs::Gates>>,
+    ) -> Result<(), Halt> {
+        super::jobs::pause(gates).await;
+        if self.shared.jobs.stop.is_stopped() {
+            return Err(Halt::Stopped);
         }
+        Ok(())
     }
 
     /// The hash of each part, or of the whole file for one request. The file
@@ -503,45 +663,84 @@ impl Job<'_> {
             .map_err(|e| self.halt(e))
     }
 
-    /// Stores the file as a multipart upload of parts of `part_size`. The
-    /// upload id is in the record of the entry before the first part goes
-    /// up, and a failed or stopped upload is aborted. Returns the ETag of the
-    /// object.
-    async fn multipart(
+    /// Stores the file as a multipart upload of parts of `part_size`.
+    /// Returns the ETag of the object.
+    async fn upload_parts(
         &self,
         snapshot: &Snapshot,
         part_size: u64,
         hashes: &[String],
+        prior: Option<&str>,
+    ) -> Result<String, Halt> {
+        self.multipart(
+            &snapshot.key,
+            &snapshot.metadata,
+            snapshot.len,
+            part_size,
+            prior,
+            |id, number, range, retry| {
+                let hash = &hashes[(number - 1) as usize];
+                let payload = Payload::file(
+                    Arc::clone(&snapshot.file),
+                    range.start,
+                    range.end - range.start,
+                    hash,
+                )?;
+                let (client, key, id) = (
+                    self.shared.client.clone(),
+                    snapshot.key.clone(),
+                    id.to_owned(),
+                );
+                Ok(Box::pin(async move {
+                    client
+                        .upload_part(&key, &id, number, payload, retry)
+                        .await
+                        .map(|etag| CompletedPart { number, etag })
+                }) as PartFuture)
+            },
+        )
+        .await
+    }
+
+    /// Stores `len` bytes as a multipart upload at `key`, in parts of
+    /// `part_size`, each sent by the future `part` makes for it. `prior` is
+    /// the ETag the key had before. The upload id is in the record of the
+    /// entry before the first part goes up, and a failed or stopped upload is
+    /// aborted. Returns the ETag of the object.
+    async fn multipart(
+        &self,
+        key: &str,
+        metadata: &Metadata,
+        len: u64,
+        part_size: u64,
+        prior: Option<&str>,
+        part: impl Fn(&str, u32, Range<u64>, Retry) -> Result<PartFuture, S3Error>,
     ) -> Result<String, Halt> {
         let client = &self.shared.client;
         let id = client
-            .create_multipart_upload(&snapshot.key, &snapshot.metadata, self.retry())
+            .create_multipart_upload(key, metadata, self.retry())
             .await
             .map_err(|e| self.halt(e))?;
-        let noted = id.clone();
+        let noted = Upload {
+            key: key.to_owned(),
+            id: id.clone(),
+        };
         let sent = match self
-            .blocking(move |shared, entry| outcome::upload_id(shared, entry, Some(noted)))
+            .blocking(move |shared, entry| outcome::note_upload(shared, entry, Some(noted)))
             .await
         {
-            Ok(()) => self.send_parts(snapshot, &id, part_size, hashes).await,
+            Ok(()) => self.send_parts(&id, len, part_size, part).await,
             Err(halt) => Err(halt),
         };
         let done = match sent {
             Ok(parts) => client
-                .complete_multipart_upload(
-                    &snapshot.key,
-                    &id,
-                    &parts,
-                    snapshot.len,
-                    snapshot.replaced.as_deref(),
-                    self.retry(),
-                )
+                .complete_multipart_upload(key, &id, &parts, len, prior, self.retry())
                 .await
                 .map_err(|e| self.halt(e)),
             Err(halt) => Err(halt),
         };
         if done.is_err() {
-            self.abort(&snapshot.key, &id).await;
+            self.abort(key, &id).await;
         }
         done
     }
@@ -551,16 +750,16 @@ impl Job<'_> {
     /// finish.
     async fn send_parts(
         &self,
-        snapshot: &Snapshot,
         id: &str,
+        len: u64,
         part_size: u64,
-        hashes: &[String],
+        part: impl Fn(&str, u32, Range<u64>, Retry) -> Result<PartFuture, S3Error>,
     ) -> Result<Vec<CompletedPart>, Halt> {
         let concurrency = self.shared.jobs.concurrency;
         let mut sending: JoinSet<Result<CompletedPart, S3Error>> = JoinSet::new();
         let mut sent = Vec::new();
         let mut failure = None;
-        for (number, range) in parts(snapshot.len, part_size) {
+        for (number, range) in parts(len, part_size) {
             while sending.len() >= concurrency {
                 if let Some(joined) = sending.join_next().await {
                     note(joined, &mut sent, &mut failure);
@@ -569,31 +768,15 @@ impl Job<'_> {
             if failure.is_some() || self.stop().is_stopped() {
                 break;
             }
-            let hash = &hashes[(number - 1) as usize];
-            let payload = match Payload::file(
-                Arc::clone(&snapshot.file),
-                range.start,
-                range.end - range.start,
-                hash,
-            ) {
-                Ok(payload) => payload,
+            match part(id, number, range, self.retry()) {
+                Ok(next) => {
+                    sending.spawn(next);
+                }
                 Err(e) => {
                     failure = Some(e);
                     break;
                 }
-            };
-            let (client, key, id, retry) = (
-                self.shared.client.clone(),
-                snapshot.key.clone(),
-                id.to_owned(),
-                self.retry(),
-            );
-            sending.spawn(async move {
-                client
-                    .upload_part(&key, &id, number, payload, retry)
-                    .await
-                    .map(|etag| CompletedPart { number, etag })
-            });
+            }
         }
         while let Some(joined) = sending.join_next().await {
             note(joined, &mut sent, &mut failure);
@@ -601,7 +784,7 @@ impl Job<'_> {
         if let Some(failure) = failure {
             return Err(self.halt(failure));
         }
-        if sent.len() as u64 != snapshot.len.div_ceil(part_size) {
+        if sent.len() as u64 != len.div_ceil(part_size) {
             return Err(Halt::Stopped);
         }
         sent.sort_by_key(|part| part.number);
@@ -622,9 +805,9 @@ impl Job<'_> {
         {
             Ok(()) => {
                 let cleared = self
-                    .blocking(|shared, entry| outcome::upload_id(shared, entry, None))
+                    .blocking(|shared, entry| outcome::note_upload(shared, entry, None))
                     .await;
-                if cleared.is_err() {
+                if cleared.is_err() && !self.entry().state().detached {
                     warn!(path = %self.path, "the record of an aborted upload could not be written");
                 }
             }
@@ -635,28 +818,6 @@ impl Job<'_> {
                 "a multipart upload could not be aborted"
             ),
         }
-    }
-
-    /// Deletes the keys in `gone`, now that the entry's content is stored.
-    /// Returns them.
-    async fn delete_gone(&self) -> Result<Vec<String>, Halt> {
-        let gone = self.entry().state().gone.clone();
-        for keys in gone.chunks(MAX_DELETE_KEYS) {
-            let failed = self
-                .shared
-                .client
-                .delete_objects(keys, self.retry())
-                .await
-                .map_err(|e| self.halt(e))?;
-            if let Some(first) = failed.first() {
-                return Err(Halt::Failed(S3Error::status(
-                    200,
-                    first.code.as_deref(),
-                    None,
-                )));
-            }
-        }
-        Ok(gone)
     }
 
     /// Makes what the metadata cache holds for `key` the object `head`, and
@@ -671,6 +832,59 @@ impl Job<'_> {
             .remember(key, Known::File(Arc::clone(head)), RowKind::File(stamp));
     }
 
+    /// Drops the times and attributes of an entry that has no object to put
+    /// them on.
+    async fn drop_own(&self) -> Result<(), Halt> {
+        let (pending, generation) = {
+            let state = self.entry().state();
+            (state.own.is_some(), state.generation)
+        };
+        if pending {
+            self.blocking(move |shared, entry| outcome::dropped(shared, entry, generation))
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Deletes the keys the entry owns to delete, now that its content is in
+    /// the bucket: first the markers of the directories those objects leave,
+    /// then the objects. A key a job writes or an entry copies from stays
+    /// with the entry, and the job ends without it. A key another entry holds
+    /// is left, and the entry lets it go. These requests stop with the
+    /// backend, not with the job.
+    async fn finish(&self) -> Result<(), Halt> {
+        #[cfg(test)]
+        self.pause_or_stop(&self.shared.jobs.pause_landed).await?;
+        let gone = self.entry().state().gone.clone();
+        if gone.is_empty() {
+            return Ok(());
+        }
+        let GoneClaim {
+            claimed,
+            left,
+            busy,
+        } = self.shared.overlay.claim_gone(&gone, self.entry());
+        if !busy.is_empty() {
+            debug!(path = %self.path, keys = busy.len(), "keys to delete are in use and stay");
+        }
+        let done = self.shared.delete_claimed(&claimed).await;
+        drop(claimed);
+        let done = done.map_err(|refused| classify(refused.error, true))?;
+        let mut removed = left;
+        removed.extend(done.deleted);
+        if !removed.is_empty() {
+            self.blocking(move |shared, entry| outcome::deleted(shared, entry, &removed))
+                .await?;
+        }
+        if done.stopped {
+            return Err(Halt::Stopped);
+        }
+        match done.failed.into_iter().next() {
+            Some((_, error)) => Err(Halt::Failed(error)),
+            None => Ok(()),
+        }
+    }
+
     /// Puts the marker object of a directory, with the times and attributes
     /// the entry holds.
     async fn directory(&self) -> Result<(), Halt> {
@@ -680,11 +894,13 @@ impl Job<'_> {
                 return Err(Halt::Gone);
             }
             let own = state.own_or_base(self.shared.built);
-            (
-                state.key.clone(),
-                state.generation,
-                meta::marker_metadata(own.times, own.attributes),
-            )
+            let mut metadata = meta::marker_metadata(own.times, own.attributes);
+            if let Some(base) = &state.base {
+                let mut kept = base.head.metadata.clone();
+                kept.user.extend(metadata.user);
+                metadata = kept;
+            }
+            (state.key.clone(), state.generation, metadata)
         };
         self.check()?;
         let head = change::store_marker(self.shared, &key, metadata, self.retry())

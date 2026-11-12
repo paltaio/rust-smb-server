@@ -202,6 +202,15 @@ impl Rig {
 
     /// Ends the backend, which releases the cache directory.
     pub(super) async fn stop(self) -> (TestBucket, Proxy, tempfile::TempDir) {
+        self.stop_after(|| {}).await
+    }
+
+    /// [`stop`](Self::stop), calling `released` once the backend is dropped
+    /// and before the wait for its worker.
+    pub(super) async fn stop_after(
+        self,
+        released: impl FnOnce(),
+    ) -> (TestBucket, Proxy, tempfile::TempDir) {
         let Rig {
             bucket,
             proxy,
@@ -213,6 +222,7 @@ impl Rig {
         drop(smb);
         let mut exited = backend.worker_exited();
         drop(backend);
+        released();
         tokio::time::timeout(Duration::from_secs(10), exited.wait_for(|exited| *exited))
             .await
             .expect("the worker ends once the backend is dropped")
@@ -715,10 +725,24 @@ impl Smb {
         self.set_info(id, 4, buffer).await
     }
 
+    /// Sets the write time of the open `id` to `secs` after the Unix epoch.
+    /// Returns the status.
+    pub(super) async fn set_write_time(&mut self, id: FileId, secs: u64) -> u32 {
+        let stamp = filetime(secs, 0) as i64;
+        self.set_basic(id, [0, 0, stamp, 0], 0).await
+    }
+
     /// Renames the open `id` to `to`. Returns the status.
     pub(super) async fn rename(&mut self, id: FileId, to: &str) -> u32 {
+        self.rename_with(id, to, false).await
+    }
+
+    /// Renames the open `id` to `to`, replacing a file that has the name if
+    /// `replace`. Returns the status.
+    pub(super) async fn rename_with(&mut self, id: FileId, to: &str, replace: bool) -> u32 {
         let target = crate::utils::utf16le(to);
         let mut buffer = vec![0u8; 16];
+        buffer[0] = u8::from(replace);
         buffer.extend_from_slice(&(target.len() as u32).to_le_bytes());
         buffer.extend_from_slice(&target);
         self.set_info(id, 10, buffer).await

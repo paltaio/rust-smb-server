@@ -14,7 +14,7 @@ use super::client::ListRequest;
 use super::error::S3Error;
 use super::keys::{
     DirListing, ListingBuilder, MAX_KEY_LEN, Row, RowKind, child_key, dir_prefix, last_name,
-    path_key,
+    parent_key, path_key,
 };
 use super::meta;
 use super::object::ObjectHead;
@@ -73,14 +73,21 @@ impl Shared {
     /// Drops what is cached of the object at `key`, which has changed, and of
     /// the listing of its directory.
     pub(super) fn forget_file(&self, key: &str) {
-        let dir = key.rsplit_once('/').map_or("", |(dir, _)| dir);
+        let dir = parent_key(key);
         self.cache().forget_file(key, dir);
+    }
+
+    /// Drops what is cached of the object at `key`, which the backend
+    /// deleted, and its row in the cached listing of its directory.
+    pub(super) fn deleted(&self, key: &str) {
+        let dir = parent_key(key);
+        self.cache().deleted_file(key, dir);
     }
 
     /// Makes what is cached of the object at `key` `known`, and puts `kind`
     /// as its row in the cached listing of its directory.
     pub(super) fn remember(&self, key: &str, known: Known, kind: RowKind) {
-        let dir = key.rsplit_once('/').map_or("", |(dir, _)| dir);
+        let dir = parent_key(key);
         let mut cache = self.cache();
         cache.put_known(key, known, Instant::now());
         cache.add_row(
@@ -130,7 +137,11 @@ impl Shared {
             return Ok(held);
         }
         let found = self.lookup(path, retry).await?;
-        Ok(self.overlay.take_found(found, &self.ahead))
+        #[cfg(test)]
+        super::jobs::pause(&self.jobs.pause_found).await;
+        self.overlay
+            .take_found(found, &self.ahead)
+            .ok_or(SmbError::NotFound)
     }
 
     /// The directory `path` is in, as the bucket spells it. Fails with

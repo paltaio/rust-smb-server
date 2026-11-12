@@ -111,8 +111,10 @@ pub(crate) struct EntryRecord {
     pub(crate) times: [u64; 4],
     pub(crate) attributes: u32,
     pub(crate) generation: u64,
-    /// The multipart upload that is running for the entry.
+    /// The id of the multipart upload that is running for the entry.
     pub(crate) upload_id: Option<String>,
+    /// The key that multipart upload stores.
+    pub(crate) upload_key: Option<String>,
     /// Whether the entry's upload failed for good.
     pub(crate) failed: bool,
     /// Whether the times or attributes are not in the bucket yet.
@@ -234,7 +236,34 @@ fn line(out: &mut String, name: &str, value: &str) {
     out.push('\n');
 }
 
+/// The key a file copies its content from: its base key, when that is not its
+/// own `key` and `covered`, which tells whether the local data holds every
+/// byte of the file, is false. Directories copy from nothing.
+pub(super) fn copy_source<'a>(
+    is_dir: bool,
+    key: &str,
+    base: Option<&'a str>,
+    covered: impl FnOnce() -> bool,
+) -> Option<&'a str> {
+    base.filter(|base| !is_dir && *base != key && !covered())
+}
+
 impl EntryRecord {
+    /// The key a restart copies the content of the file from: the base key
+    /// when it is not the key and the local data does not hold every byte.
+    pub(crate) fn source(&self) -> Option<&str> {
+        copy_source(
+            self.is_dir,
+            &self.key,
+            self.base.as_ref().map(|base| base.key.as_str()),
+            || {
+                self.local
+                    .as_ref()
+                    .is_some_and(|local| local.present.covers(local.len))
+            },
+        )
+    }
+
     /// The text of the record.
     pub(crate) fn encode(&self) -> String {
         let mut out = String::with_capacity(512);
@@ -272,8 +301,9 @@ impl EntryRecord {
         );
         line(out, "attributes", &format!("{:x}", self.attributes));
         line(out, "generation", &self.generation.to_string());
-        if let Some(upload) = &self.upload_id {
+        if let (Some(upload), Some(key)) = (&self.upload_id, &self.upload_key) {
             line(out, "upload", &escape(upload));
+            line(out, "upload-key", &escape_path(key));
         }
         line(out, "failed", flag(self.failed));
         line(out, "pending-meta", flag(self.meta_pending));
@@ -347,6 +377,17 @@ impl EntryRecord {
                     .ok_or(Malformed("upload"))?,
             ),
         };
+        let upload_key = match fields.take("upload-key")? {
+            None => None,
+            Some(text) => Some(
+                unescape(text)
+                    .filter(|key| valid_key(key))
+                    .ok_or(Malformed("upload-key"))?,
+            ),
+        };
+        if upload_id.is_some() != upload_key.is_some() {
+            return Err(Malformed("upload-key"));
+        }
         if is_dir && upload_id.is_some() {
             return Err(Malformed("upload"));
         }
@@ -378,6 +419,7 @@ impl EntryRecord {
             attributes,
             generation,
             upload_id,
+            upload_key,
             failed,
             meta_pending,
             marker_pending,
@@ -652,6 +694,7 @@ mod tests {
             attributes: 0x21,
             generation: 7,
             upload_id: Some("upload id/1".into()),
+            upload_key: Some("dir/a b".into()),
             failed: true,
             meta_pending: true,
             marker_pending: false,
@@ -687,6 +730,7 @@ mod tests {
             attributes: 0,
             generation: 0,
             upload_id: None,
+            upload_key: None,
             failed: false,
             meta_pending: false,
             marker_pending: true,
@@ -795,6 +839,7 @@ mod tests {
             attributes: 0x20,
             generation: 3,
             upload_id: None,
+            upload_key: None,
             failed: false,
             meta_pending: false,
             marker_pending: false,
@@ -1092,6 +1137,7 @@ mod tests {
         assert_eq!(fails_on(&text), "present");
         let mut with_upload = dir_record();
         with_upload.upload_id = Some("u".into());
+        with_upload.upload_key = Some("k".into());
         assert_eq!(fails_on(&encoded(&with_upload)), "upload");
         let with_entry_field = Record::Tombstone(TombstoneRecord {
             id: id(ID),
@@ -1107,6 +1153,7 @@ mod tests {
             is_dir: true,
             local: None,
             upload_id: None,
+            upload_key: None,
             ..entry()
         }
     }
@@ -1208,5 +1255,28 @@ mod tests {
         for bad in ["", "abc", &ID.to_uppercase(), &format!("{ID}0"), &ID[1..]] {
             assert_eq!(RecordId::parse(bad), None, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn an_upload_id_and_its_key_come_together() {
+        let text = entry().encode();
+        let without_key: String = text
+            .lines()
+            .filter(|line| !line.starts_with("upload-key"))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        assert_eq!(
+            Record::decode(without_key.as_bytes()),
+            Err(Malformed("upload-key"))
+        );
+        let without_id: String = text
+            .lines()
+            .filter(|line| !line.starts_with("upload "))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        assert_eq!(
+            Record::decode(without_id.as_bytes()),
+            Err(Malformed("upload-key"))
+        );
     }
 }

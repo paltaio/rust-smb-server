@@ -132,7 +132,7 @@ impl S3Error {
     /// 408, 429, 500, 502, 503 and 504, status 400 with the code
     /// `RequestTimeout`, and the codes `SlowDown`, `InternalError` and
     /// `ServiceUnavailable`, which a store may send under status 200 once the
-    /// answer has begun.
+    /// answer has begun, and `OperationAborted` under any status.
     ///
     /// A clock the store rejects is not included. Waiting can fix it, so a
     /// background call tries again, and a call somebody waits on does not.
@@ -143,7 +143,12 @@ impl S3Error {
                 matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
                     || matches!(
                         code.as_deref(),
-                        Some("SlowDown" | "InternalError" | "ServiceUnavailable")
+                        Some(
+                            "SlowDown"
+                                | "InternalError"
+                                | "ServiceUnavailable"
+                                | "OperationAborted"
+                        )
                     )
                     || (*status == 400 && code.as_deref() == Some("RequestTimeout"))
             }
@@ -369,6 +374,7 @@ mod tests {
             status(200, "InternalError"),
             status(200, "SlowDown"),
             status(200, "ServiceUnavailable"),
+            status(409, "OperationAborted"),
         ] {
             assert!(transient.is_transient(), "{transient:?}");
         }

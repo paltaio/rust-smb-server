@@ -30,9 +30,12 @@ mod ranges;
 mod read;
 mod readahead;
 pub(crate) mod record;
+mod rename;
 pub(crate) mod retry;
 pub(crate) mod sigv4;
+mod tombs;
 pub(crate) mod transport;
+mod unlink;
 pub(crate) mod xml;
 
 pub use backend::S3Backend;

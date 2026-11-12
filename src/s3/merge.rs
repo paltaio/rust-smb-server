@@ -4,7 +4,7 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
-use super::keys::{Row, RowKind, slot};
+use super::keys::{Row, RowKind, Slot, slot};
 
 /// An entry of the overlay directly in the directory.
 pub(super) struct Direct {
@@ -55,7 +55,7 @@ pub(super) fn merge(
     fold: bool,
 ) -> Vec<Picked> {
     let key = |name: &str| slot(name, fold);
-    let mut touched: HashMap<String, Touch> = HashMap::new();
+    let mut touched: HashMap<Slot, Touch> = HashMap::new();
     for (at, entry) in direct.iter().enumerate() {
         touched.entry(key(&entry.name)).or_default().entry = Some(at);
     }
