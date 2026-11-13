@@ -11,8 +11,8 @@ use super::fixture::{TestBucket, foreground, pattern, put};
 use super::gateway::REGION;
 use super::proxy::{Fault, Reply};
 use super::share::{
-    Listed, READ, Rig, Smb, Spec, WRITE_ATTRIBUTES, filetime, names, wait_for_requests, wait_until,
-    wait_until_async, writable_builder,
+    Listed, Logs, READ, Rig, Smb, Spec, WRITE_ATTRIBUTES, filetime, names, wait_for_requests,
+    wait_until, wait_until_async, writable_builder,
 };
 use super::writes::{changes, create_dir, create_file, open_rw, records};
 use crate::ntstatus::STATUS_OBJECT_NAME_NOT_FOUND;
@@ -330,36 +330,13 @@ async fn records_and_data_that_cannot_be_used_move_to_conflicts_and_the_rest_com
 
 #[tokio::test]
 async fn a_move_to_conflicts_is_logged_at_error_level() {
-    use std::sync::Mutex;
-
-    #[derive(Clone, Default)]
-    struct Sink(Arc<Mutex<Vec<u8>>>);
-    impl std::io::Write for Sink {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().write(buf)
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
     let temp = tempfile::tempdir().unwrap();
     let junk = "2".repeat(32);
-    let sink = Sink::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer({
-            let sink = sink.clone();
-            move || sink.clone()
-        })
-        .with_ansi(false)
-        .finish();
-    {
-        let _logging = tracing::subscriber::set_default(subscriber);
-        let dir = crate::s3::cachedir::CacheDir::open(temp.path(), "identity").unwrap();
-        fs::write(temp.path().join("records").join(&junk), b"junk").unwrap();
-        dir.recover("", false).unwrap();
-    }
-    let log = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+    let logs = Logs::capture();
+    let dir = crate::s3::cachedir::CacheDir::open(temp.path(), "identity").unwrap();
+    fs::write(temp.path().join("records").join(&junk), b"junk").unwrap();
+    dir.recover("", false).unwrap();
+    let log = logs.text();
     assert!(log.contains("ERROR"), "{log}");
     assert!(log.contains(&junk), "{log}");
     assert!(log.contains("conflicts"), "{log}");

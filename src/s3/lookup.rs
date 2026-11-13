@@ -10,7 +10,7 @@ use crate::path::{SmbPath, is_valid_component};
 
 use super::backend::Shared;
 use super::cache::Known;
-use super::client::ListRequest;
+use super::client::{ListRequest, MAX_LISTED};
 use super::error::S3Error;
 use super::keys::{
     DirListing, ListingBuilder, MAX_KEY_LEN, Row, RowKind, child_key, dir_prefix, last_name,
@@ -78,14 +78,18 @@ impl Shared {
     }
 
     /// Drops what is cached of the object at `key`, which the backend
-    /// deleted, and its row in the cached listing of its directory.
+    /// deleted, and its row in the cached listing of its directory. The key
+    /// of a directory marker drops the directory.
     pub(super) fn deleted(&self, key: &str) {
+        let key = key.strip_suffix('/').unwrap_or(key);
         let dir = parent_key(key);
         self.cache().deleted_file(key, dir);
     }
 
     /// Makes what is cached of the object at `key` `known`, and puts `kind`
-    /// as its row in the cached listing of its directory.
+    /// as its row in the cached listing of its directory. The directories
+    /// above the key are there now, with or without a marker object of their
+    /// own: each gets its row in the cached listing of the directory above.
     pub(super) fn remember(&self, key: &str, known: Known, kind: RowKind) {
         let dir = parent_key(key);
         let mut cache = self.cache();
@@ -97,6 +101,17 @@ impl Shared {
                 kind,
             },
         );
+        let mut above = dir;
+        while above.len() > self.prefix.len() {
+            cache.add_row(
+                parent_key(above),
+                Row {
+                    name: last_name(above).to_owned(),
+                    kind: RowKind::Dir,
+                },
+            );
+            above = parent_key(above);
+        }
     }
 
     /// Resolves `path`, as far as the bucket and the cache tell. Fails with
@@ -105,6 +120,12 @@ impl Shared {
     /// object. An object whose key is to be deleted does not resolve, and a
     /// directory that only entries of the overlay below it imply does.
     pub(super) async fn lookup(&self, path: &SmbPath, retry: &Retry) -> SmbResult<Found> {
+        if self
+            .overlay
+            .dead_above(&path_key(&self.prefix, path.components())?)
+        {
+            return Err(SmbError::PathNotFound);
+        }
         match self.resolve(path, retry).await {
             Ok(found) => self.visible(found),
             Err(e @ (SmbError::NotFound | SmbError::PathNotFound)) => {
@@ -139,9 +160,7 @@ impl Shared {
         let found = self.lookup(path, retry).await?;
         #[cfg(test)]
         super::jobs::pause(&self.jobs.pause_found).await;
-        self.overlay
-            .take_found(found, &self.ahead)
-            .ok_or(SmbError::NotFound)
+        self.overlay.take_found(found, &self.ahead)
     }
 
     /// The directory `path` is in, as the bucket spells it. Fails with
@@ -178,10 +197,17 @@ impl Shared {
 
     /// `found`, unless the overlay has the key of the object to delete. An
     /// object that entries of the overlay are below is the directory they
-    /// imply.
+    /// imply. A directory whose marker key is to be deleted is not there.
     fn visible(&self, found: Found) -> SmbResult<Found> {
-        let Found::File(file) = &found else {
-            return Ok(found);
+        let file = match &found {
+            Found::File(file) => file,
+            Found::Dir(dir) => {
+                return if self.overlay.dir_dead(&dir.key) {
+                    Err(SmbError::NotFound)
+                } else {
+                    Ok(found)
+                };
+            }
         };
         if let Some(dir) = self.implied(&file.key) {
             return Ok(dir);
@@ -447,22 +473,44 @@ impl Shared {
         Ok(listing)
     }
 
-    /// Whether no key but the marker of the directory with key `dir` is
-    /// below it.
+    /// Whether the directory with key `dir` holds nothing: no entry of the
+    /// overlay, and no key below it but its marker and the keys to delete.
+    /// The store is asked for two keys, and for more when the keys to delete
+    /// below the directory could fill the answer.
     pub(super) async fn is_empty(&self, dir: &str, retry: &Retry) -> SmbResult<bool> {
+        if self.overlay.spelling(dir).is_some() {
+            return Ok(false);
+        }
         let prefix = dir_prefix(dir);
-        let request = ListRequest {
-            prefix: &prefix,
-            delimited: false,
-            continuation_token: None,
-            max_keys: Some(2),
-        };
-        let page = self
-            .client
-            .list_objects(&request, retry.clone())
-            .await
-            .map_err(S3Error::into_smb_error)?;
-        Ok(page.objects.iter().all(|object| object.key == prefix))
+        let hidden = self.overlay.hidden_below(&prefix);
+        let max_keys = u32::try_from(hidden + 2)
+            .unwrap_or(u32::MAX)
+            .min(MAX_LISTED);
+        let mut token: Option<String> = None;
+        loop {
+            let request = ListRequest {
+                prefix: &prefix,
+                delimited: false,
+                continuation_token: token.as_deref(),
+                max_keys: Some(max_keys),
+            };
+            let page = self
+                .client
+                .list_objects(&request, retry.clone())
+                .await
+                .map_err(S3Error::into_smb_error)?;
+            let stays = page
+                .objects
+                .iter()
+                .any(|object| object.key != prefix && !self.overlay.tombstoned(&object.key));
+            if stays {
+                return Ok(false);
+            }
+            token = page.next_token;
+            if token.is_none() {
+                return Ok(true);
+            }
+        }
     }
 }
 

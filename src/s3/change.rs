@@ -8,7 +8,7 @@
 
 use std::fs::File;
 use std::io;
-use std::sync::Arc;
+use std::sync::{Arc, MutexGuard};
 use std::time::SystemTime;
 
 use tokio::task::spawn_blocking;
@@ -26,7 +26,8 @@ use super::entry::{Base, Entry, Local, Own, Sealed, State};
 use super::error::S3Error;
 use super::keys::{RowKind, dir_prefix};
 use super::object::{Metadata, ObjectHead};
-use super::overlay::Held;
+use super::outcome;
+use super::overlay::{Held, TombsHeld};
 use super::payload::Payload;
 use super::ranges::RangeSet;
 use super::record::{EntryRecord, LocalRecord, RecordId};
@@ -71,11 +72,13 @@ fn commit<T>(
 
 /// [`commit`] for a change that may have written `record`. If it did, the
 /// state also notes the record, and the overlay counts the source of the entry
-/// again and drops the key of the entry from the keys to delete.
+/// again and drops the key of the entry from the keys to delete. A caller that
+/// holds the lock of the keys to delete passes it as `tombs`.
 fn commit_record(
     shared: &Shared,
     entry: &Arc<Entry>,
     record: Option<&EntryRecord>,
+    tombs: TombsHeld<'_>,
     apply: impl FnOnce(&mut State),
 ) -> SmbResult<()> {
     let cache = shared.local()?;
@@ -87,7 +90,7 @@ fn commit_record(
     })?;
     if record.is_some() {
         recount_source(shared, entry);
-        superseded(shared, entry);
+        superseded(shared, entry, tombs);
     }
     Ok(())
 }
@@ -259,7 +262,7 @@ fn set_len(shared: &Shared, entry: &Arc<Entry>, new_len: u64, force: bool) -> Sm
         replaced = Some(record);
     }
     file.set_len(new_len).map_err(disk_error)?;
-    commit_record(shared, entry, replaced.as_ref(), |state| {
+    commit_record(shared, entry, replaced.as_ref(), None, |state| {
         if let Some(local) = state.local_mut() {
             local.len = new_len;
             local.present.truncate(new_len);
@@ -303,8 +306,22 @@ pub(super) fn seal(shared: &Shared, entry: &Arc<Entry>, force: bool) -> SmbResul
 
 /// [`seal`] for a caller that holds the `seal` lock of the entry.
 pub(super) fn seal_held(shared: &Shared, entry: &Arc<Entry>, force: bool) -> SmbResult<()> {
+    seal_with(shared, entry, force, None, None)
+}
+
+/// [`seal_held`] that also makes `gone`, when given, the keys the entry owns to
+/// delete: the record says so, and the entry takes it in once the record is
+/// written. A caller that holds the lock of the keys to delete passes it as
+/// `tombs`.
+fn seal_with(
+    shared: &Shared,
+    entry: &Arc<Entry>,
+    force: bool,
+    gone: Option<Vec<String>>,
+    tombs: TombsHeld<'_>,
+) -> SmbResult<()> {
     let cache = shared.local()?;
-    let (file, record, first) = {
+    let (file, mut record, first) = {
         let mut state = entry.state();
         state.attached()?;
         let Some(local) = state.local() else {
@@ -319,6 +336,9 @@ pub(super) fn seal_held(shared: &Shared, entry: &Arc<Entry>, force: bool) -> Smb
             Entry::record(&mut state, &shared.prefix, shared.built).map_err(SmbError::Io)?;
         (file, record, sealed.is_none())
     };
+    if let Some(gone) = &gone {
+        record.gone.clone_from(gone);
+    }
     let sealed = Sealed {
         generation: record.generation,
         len: record.local.as_ref().map_or(0, |local| local.len),
@@ -328,8 +348,11 @@ pub(super) fn seal_held(shared: &Shared, entry: &Arc<Entry>, force: bool) -> Smb
         cache.sync_data_dir().map_err(disk_error)?;
     }
     write_record(cache, &record)?;
-    commit_record(shared, entry, Some(&record), |state| {
-        state.set_sealed(sealed)
+    commit_record(shared, entry, Some(&record), tombs, |state| {
+        state.set_sealed(sealed);
+        if let Some(gone) = gone {
+            state.gone = gone;
+        }
     })
 }
 
@@ -354,17 +377,42 @@ pub(super) fn persist(shared: &Shared, entry: &Arc<Entry>, force: bool) -> SmbRe
 
 /// [`persist`] for a caller that holds the `seal` lock of the entry.
 pub(super) fn persist_held(shared: &Shared, entry: &Arc<Entry>, force: bool) -> SmbResult<()> {
+    persist_with(shared, entry, force, None, None)
+}
+
+/// [`persist_held`] for a caller that holds the lock of the keys to delete,
+/// which it passes as `tombs`.
+pub(super) fn persist_locked(
+    shared: &Shared,
+    entry: &Arc<Entry>,
+    tombs: &MutexGuard<'_, ()>,
+) -> SmbResult<()> {
+    persist_with(shared, entry, true, None, Some(tombs))
+}
+
+/// [`persist_held`] that also makes `gone`, when given, the keys the entry owns
+/// to delete: the record says so, and the entry takes it in once the record is
+/// written. If the record cannot be written the entry is as it was. A caller
+/// that holds the lock of the keys to delete passes it as `tombs`.
+pub(super) fn persist_with(
+    shared: &Shared,
+    entry: &Arc<Entry>,
+    force: bool,
+    gone: Option<Vec<String>>,
+    tombs: TombsHeld<'_>,
+) -> SmbResult<()> {
     if entry.state().local().is_some() {
-        seal_held(shared, entry, force)
+        seal_with(shared, entry, force, gone, tombs)
     } else {
-        record_held(shared, entry)
+        record_with(shared, entry, gone, tombs)
     }
 }
 
 /// Takes the key of the entry off the record of the keys to delete that names
 /// it, now that the entry has a record of its own. The caller holds the
-/// `seal` lock of the entry, so the entry stays in the overlay meanwhile.
-pub(super) fn superseded(shared: &Shared, entry: &Entry) {
+/// `seal` lock of the entry, so the entry stays in the overlay meanwhile, and
+/// passes the lock of the keys to delete as `tombs` if it holds it.
+pub(super) fn superseded(shared: &Shared, entry: &Entry, tombs: TombsHeld<'_>) {
     let key = {
         let state = entry.state();
         if state.detached || state.is_dir() {
@@ -373,8 +421,22 @@ pub(super) fn superseded(shared: &Shared, entry: &Entry) {
         state.key.clone()
     };
     if shared.overlay.tomb_named(&key) {
-        drop_superseded(shared, &[key]);
+        drop_superseded(shared, &[key], tombs);
     }
+}
+
+/// [`outcome::take_over`] for the marker object of the new directory `key` of
+/// `held`, which has just been put.
+pub(super) async fn take_over_marker(
+    shared: &Arc<Shared>,
+    held: &Held,
+    key: &str,
+) -> SmbResult<bool> {
+    let marker = dir_prefix(key);
+    blocking(shared, held, move |shared, entry| {
+        outcome::take_over(shared, entry, &marker, &shared.jobs.stop)
+    })
+    .await
 }
 
 /// Writes the record of the entry as it is now.
@@ -390,14 +452,32 @@ pub(super) fn record_now(shared: &Shared, entry: &Arc<Entry>) -> SmbResult<()> {
 
 /// [`record_now`] for a caller that holds the `seal` lock of the entry.
 pub(super) fn record_held(shared: &Shared, entry: &Arc<Entry>) -> SmbResult<()> {
+    record_with(shared, entry, None, None)
+}
+
+/// [`record_held`] that also makes `gone`, when given, the keys the entry owns
+/// to delete, as [`persist_with`] does.
+fn record_with(
+    shared: &Shared,
+    entry: &Arc<Entry>,
+    gone: Option<Vec<String>>,
+    tombs: TombsHeld<'_>,
+) -> SmbResult<()> {
     let cache = shared.local()?;
-    let record = {
+    let mut record = {
         let mut state = entry.state();
         state.attached()?;
         Entry::record(&mut state, &shared.prefix, shared.built).map_err(SmbError::Io)?
     };
+    if let Some(gone) = &gone {
+        record.gone.clone_from(gone);
+    }
     write_record(cache, &record)?;
-    commit_record(shared, entry, Some(&record), |_| {})
+    commit_record(shared, entry, Some(&record), tombs, |state| {
+        if let Some(gone) = gone {
+            state.gone = gone;
+        }
+    })
 }
 
 /// Puts the marker object of the directory `key` with `metadata`, and makes
@@ -438,59 +518,81 @@ pub(super) async fn store_marker(
 ///
 /// A directory changes only through the `seal` lock, which is held here, so
 /// the generation cannot move while this runs.
+///
+/// Returns whether the directory took the marker in: a directory that moved to
+/// another key meanwhile took nothing in, and its marker at the new key is
+/// still to be put.
 pub(super) async fn marker_put(
     shared: &Arc<Shared>,
     held: &Held,
     generation: u64,
     key: &str,
     head: Option<Arc<ObjectHead>>,
-) -> SmbResult<()> {
+) -> SmbResult<bool> {
     let marker = dir_prefix(key);
     blocking(shared, held, move |shared, entry| {
         let cache = shared.local()?;
         let _seal = entry.lock_seal();
-        let id = {
-            let state = entry.state();
+        let (unchanged, id, keeps_keys) = {
+            let mut state = entry.state();
             state.attached()?;
-            (state.generation == generation)
-                .then(|| state.id.clone())
-                .flatten()
-        };
-        let gone = id.is_some_and(|id| match cache.remove_record(&id) {
-            Ok(()) => true,
-            Err(e) => {
-                warn!(error = %e, "the record of a new directory could not be removed");
-                false
+            if !state.is_write_key(&marker) {
+                state.creating = false;
+                return Ok(false);
             }
-        });
+            (
+                state.generation == generation,
+                state.id.clone(),
+                !state.gone.is_empty(),
+            )
+        };
+        let gone = match id.filter(|_| unchanged && !keeps_keys) {
+            Some(id) => match cache.remove_record(&id) {
+                Ok(()) => true,
+                Err(e) => {
+                    warn!(error = %e, "the record of a new directory could not be removed");
+                    false
+                }
+            },
+            None => false,
+        };
         let record = {
             let mut state = entry.state();
             state.creating = false;
             state.set_marker_pending(false);
             state.may_exist = true;
             state.base = head.map(|head| Base::new(&shared.ahead, marker, head, false));
-            if gone {
+            if gone || (unchanged && keeps_keys) {
                 state.own = None;
+            }
+            if gone {
                 state.recorded = false;
-                return Ok(());
+                return Ok(true);
             }
             Entry::record(&mut state, &shared.prefix, shared.built).map_err(SmbError::Io)?
         };
         write_record(cache, &record)?;
         entry.state().recorded = true;
-        Ok(())
+        Ok(true)
     })
     .await
 }
 
 /// Takes back a directory made but not put: its record is removed, and the
 /// entry holds nothing. If the record cannot be removed, the entry stays as it
-/// is.
+/// is. A directory that was deleted meanwhile keeps its record, which is the
+/// tombstone record of its keys to delete by then.
 pub(super) async fn abandon(shared: &Arc<Shared>, held: &Held) -> SmbResult<()> {
     blocking(shared, held, |shared, entry| {
         let cache = shared.local()?;
         let _seal = entry.lock_seal();
-        let id = entry.state().id.clone();
+        let id = {
+            let state = entry.state();
+            if state.detached {
+                return Ok(());
+            }
+            state.id.clone()
+        };
         if let Some(id) = id {
             cache.remove_record(&id).map_err(disk_error)?;
         }
@@ -580,7 +682,7 @@ fn change_own(shared: &Shared, entry: &Arc<Entry>, change: impl FnOnce(&mut Own)
         (own, record)
     };
     write_record(cache, &record)?;
-    commit_record(shared, entry, Some(&record), |state| {
+    commit_record(shared, entry, Some(&record), None, |state| {
         state.own = Some(own);
         state.bump();
     })

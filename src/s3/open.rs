@@ -19,7 +19,7 @@ use super::entry::Entry;
 use super::handle::S3Handle;
 use super::keys::child_key;
 use super::meta;
-use super::overlay::Held;
+use super::overlay::{Fence, Held, Writes};
 use super::retry::Retry;
 
 /// How many times an open looks again after it finds a name taken that it
@@ -100,6 +100,8 @@ impl Shared {
         let parent = self.parent_dir(path, retry).await?;
         let name = path.file_name().ok_or(SmbError::NameInvalid)?;
         let key = child_key(&parent.key, name)?;
+        #[cfg(test)]
+        super::jobs::pause(&self.jobs.pause_create).await;
         let now = now_filetime();
         let held = if opts.directory {
             self.create_dir(key, now, retry).await?
@@ -122,12 +124,12 @@ impl Shared {
         spawn_blocking(move || {
             let file = local.create_data(&id, 0).map_err(disk_error)?;
             let held = overlay.insert_new(Entry::created_file(key, id.clone(), now, file));
-            if held.is_none() {
-                // Another create of the name won; the file made for this one
-                // is removed.
+            if held.is_err() {
+                // The name is taken or cannot be made; the file made for this
+                // one is removed.
                 let _ = local.remove_data(&id);
             }
-            Ok(held)
+            created(held)
         })
         .await
         .map_err(|e| SmbError::Io(io::Error::other(e)))?
@@ -142,7 +144,7 @@ impl Shared {
         now: u64,
         retry: &Retry,
     ) -> SmbResult<Option<Held>> {
-        let Some(held) = self.overlay.insert_new(Entry::created_dir(key, now)) else {
+        let Some(held) = created(self.overlay.insert_new(Entry::created_dir(key, now)))? else {
             return Ok(None);
         };
         let task = tokio::spawn({
@@ -158,9 +160,12 @@ impl Shared {
 
     /// Writes the record of the new directory, puts its marker object, and
     /// makes the directory known to the cache. A marker the store refuses
-    /// because the directory is there already counts as put. If the record or
-    /// the marker fails, the open fails and the record is removed; a record
-    /// that cannot be removed stays, with a warning in the log.
+    /// because the directory is there already counts as put. Once the marker
+    /// is put, keys to delete that name it are let go; if that fails, the open
+    /// goes on and the job of the directory puts the marker again and lets
+    /// them go. If the record or the marker fails, the open fails, the record
+    /// is removed, and the keys to delete stay; a record that cannot be
+    /// removed stays, with a warning in the log.
     async fn put_marker(self: &Arc<Self>, held: &Held, retry: Retry) -> SmbResult<()> {
         let (key, metadata, generation) = {
             let state = held.entry.state();
@@ -170,17 +175,22 @@ impl Shared {
         };
         let put = async {
             change::record(self, held).await?;
-            change::store_marker(self, &key, metadata, retry)
+            // The marker key is noted as written until the keys to delete
+            // that name it are let go.
+            let _writes = self.await_marker_write(held, &retry).await?;
+            let head = change::store_marker(self, &key, metadata, retry.clone())
                 .await
                 .map_err(|e| {
                     if !matches!(e.http_status(), Some(400..=499)) {
                         self.forget_file(&key);
                     }
                     e.into_smb_error()
-                })
+                })?;
+            let taken = change::take_over_marker(self, held, &key).await;
+            Ok::<_, SmbError>((head, taken))
         };
-        let head = match put.await {
-            Ok(head) => head,
+        let (head, taken) = match put.await {
+            Ok(put) => put,
             Err(e) => {
                 if let Err(abandoned) = change::abandon(self, held).await {
                     warn!(error = %abandoned, "the record of a directory that was not made is still there");
@@ -188,10 +198,57 @@ impl Shared {
                 return Err(e);
             }
         };
-        if let Err(e) = change::marker_put(self, held, generation, &key, head).await {
-            warn!(error = %e, "the record of a new directory was not updated");
+        match taken {
+            Ok(true) => {
+                // A rename refuses a directory whose open has not answered, so
+                // the entry is still at `key`; if it is not, it keeps its
+                // marker to put and its job puts it.
+                if let Err(e) = change::marker_put(self, held, generation, &key, head).await {
+                    warn!(error = %e, "the record of a new directory was not updated");
+                }
+            }
+            // The directory was deleted while its marker was put, or the
+            // backend ends: the keys to delete stay as they are.
+            Ok(false) => {}
+            Err(e) => {
+                warn!(error = %e, "the keys to delete that name a new directory could not be let go; its job puts the marker again");
+                held.entry.state().creating = false;
+            }
         }
         Ok(())
+    }
+}
+
+impl Shared {
+    /// Notes that the marker object of the new directory of `held` is about to
+    /// be put, as a job notes its writes, once no request in flight deletes or
+    /// writes that key: a delete that lands after the marker would take it
+    /// away. Waits for that until the deadline of `retry`. The note ends when
+    /// the value returned is dropped.
+    async fn await_marker_write(&self, held: &Held, retry: &Retry) -> SmbResult<Writes> {
+        let key = held.entry.state().write_key();
+        self.await_clear(retry, || {
+            match self
+                .overlay
+                .begin_marker_write(&held.entry, &key, &self.jobs.stop)
+            {
+                Ok(writes) => Ok(Some(writes)),
+                Err(Fence::Blocked) => Ok(None),
+                Err(Fence::Gone) => Err(SmbError::AccessDenied),
+                Err(Fence::Stopped) => Err(SmbError::Io(io::Error::other("the backend has ended"))),
+            }
+        })
+        .await
+    }
+}
+
+/// `made`, the result of putting a new entry in the overlay, with a name that
+/// was taken by another create as `None`.
+fn created(made: SmbResult<Held>) -> SmbResult<Option<Held>> {
+    match made {
+        Ok(held) => Ok(Some(held)),
+        Err(SmbError::Exists) => Ok(None),
+        Err(e) => Err(e),
     }
 }
 

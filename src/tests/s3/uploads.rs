@@ -100,6 +100,12 @@ pub(super) fn is_head_of(
     move |seen| seen.method == "HEAD" && seen.target.split('?').next() == Some(target.as_str())
 }
 
+/// A request that reads data of the object `key`.
+pub(super) fn is_get_of(bucket: &str, key: &str) -> impl Fn(&Seen) -> bool + Send + Sync + 'static {
+    let target = format!("/{bucket}/{}", uri_encode(key, true));
+    move |seen| seen.method == "GET" && seen.target.split('?').next() == Some(target.as_str())
+}
+
 fn is_part_put(seen: &Seen) -> bool {
     seen.method == "PUT" && seen.has_param("partNumber")
 }

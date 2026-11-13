@@ -67,14 +67,38 @@ use super::retry::Retry;
 /// at once. Times and attributes reach the disk at once, except those of a
 /// file the backend holds bytes of, which reach it at the next flush or when
 /// the backend starts to store the file. The share root keeps its times and
-/// attributes in memory. A read
-/// returns the bytes written and gets the rest from the store; it fails when
-/// it needs bytes of the store and the object under the file changed since
-/// the file was opened. What the backend holds shows in lookups and listings
-/// at once. A directory made through the share has its marker object put in
-/// the store before the open returns. A file that is deleted or renamed is
-/// gone or has its new name in the share at once, and the bucket follows in
-/// the background. Directories cannot be deleted or renamed.
+/// attributes in memory. A read returns the bytes written and gets the rest
+/// from the store; it fails when it needs bytes of the store and the object
+/// under the file changed since the file was opened. If the backend stored
+/// the file meanwhile, the read returns the bytes from the object it stored.
+/// What the backend holds shows in lookups and listings at once. A directory
+/// made through the share has its marker object put in the store before the
+/// open returns. A file that is deleted or renamed is gone or has its new
+/// name in the share at once, and the bucket follows in the background.
+///
+/// A directory can be deleted when nothing is below it, and renamed with
+/// everything below it. The share shows the result at once. The objects of a
+/// renamed directory are copied and the old keys deleted in the background,
+/// and the directory and every directory below it have a marker object in
+/// the new place. Both calls wait for the requests in flight that delete keys
+/// below the directory, and fail with an I/O error once
+/// [`request_timeout`](crate::S3BackendBuilder::request_timeout) has passed.
+/// Both fail with `AccessDenied` for the share root. A delete fails with
+/// `NotEmpty` if the backend holds a change below the directory, or the
+/// bucket has an object there that is not to be deleted. A rename fails with
+/// `AccessDenied` and changes nothing if the directory holds more than
+/// [`max_dir_rename_objects`](crate::S3BackendBuilder::max_dir_rename_objects)
+/// objects, if a key below it cannot move, or if the move is too large for
+/// one record in the cache directory. A key cannot move if no client could
+/// open its name, if another key lands on the same name, or, when the rename
+/// changes only the case of the name, if a directory of the new spelling is
+/// beside it. Both fail with `Sharing` if the directory, one above it or one
+/// below it is being renamed or deleted; a rename also if a directory below
+/// it is still being made, or if the keys below it keep changing while they
+/// are listed. While a directory is being renamed or checked for a delete, a
+/// create or a rename that lands below it fails with `Sharing`. While a
+/// rename moves the entries, so does an open of an existing name below it
+/// that the backend holds nothing of.
 ///
 /// A file the backend holds bytes of is stored in the bucket in the
 /// background, [`upload_delay`](crate::S3BackendBuilder::upload_delay) after
@@ -106,24 +130,24 @@ use super::retry::Retry;
 /// when the store refuses a request in a way trying again cannot fix, or when
 /// the cache directory cannot be read or written. It is logged, shows in
 /// [`failures`](S3Backend::failures), and is tried again when the next backend
-/// is built on the cache directory. That backend
-/// stores the files and directory markers an earlier one left without waiting
-/// for the upload delay, and aborts the multipart uploads the earlier one left
-/// running. A bucket should have a lifecycle rule that aborts incomplete
-/// multipart uploads. [`sync`](S3Backend::sync) waits until what the backend
-/// holds for the bucket has reached it.
+/// is built on the cache directory. That backend stores the files and
+/// directory markers an earlier one left without waiting for the upload
+/// delay, and aborts the multipart uploads the earlier one left running. A
+/// bucket should have a lifecycle rule that aborts incomplete multipart
+/// uploads. [`sync`](S3Backend::sync) waits until what the backend holds for
+/// the bucket has reached it.
 ///
 /// A renamed file is stored at its new key, and the old key is deleted once
-/// the new key holds its content. A file the backend holds no bytes of is copied within the
-/// bucket with the metadata the object had, in parts above 5 GiB. The object
-/// of a deleted file is deleted in the background, in batches, once no file
-/// has been deleted for
+/// the new key holds its content. A file the backend holds no bytes of is
+/// copied within the bucket with the metadata the object had, in parts above
+/// 5 GiB. The object of a deleted file is deleted in the background, in
+/// batches, once no file has been deleted for
 /// [`upload_delay`](crate::S3BackendBuilder::upload_delay), and at most a
-/// minute after the first of them was due. A file made again under the exact name of
-/// one that was deleted replaces the object, and the object is not deleted.
-/// Before the backend deletes an object it puts a marker object for each
-/// directory above it that would be left with no object, so a directory does
-/// not vanish with its last file. If the store answers the marker with
+/// minute after the first of them was due. A file made again under the exact
+/// name of one that was deleted replaces the object, and the object is not
+/// deleted. Before the backend deletes an object it puts a marker object for
+/// each directory above it that would be left with no object, so a directory
+/// does not vanish with its last file. If the store answers the marker with
 /// `ObjectParentIsFile` or `ExistingObjectIsDirectory`, the directory is left
 /// without a marker; if it refuses the marker any other way, the object stays
 /// in the bucket and [`sync`](S3Backend::sync) fails (`OperationAborted` is
@@ -135,17 +159,19 @@ use super::retry::Retry;
 /// directory.
 ///
 /// When names match without regard to case, which is the default, a job that
-/// stores a file and a request that deletes keys wait for each other if their
-/// keys differ in case only, and for a file that still copies from such a
-/// key. Keys that differ in case only can go out in one delete request, and
-/// directory markers do not wait. A store that treats such names as
-/// one name keeps the object under its old spelling when a file is renamed
-/// to a new spelling of its name. Before it deletes an object whose name
-/// differs in case only from the name of a file the backend holds, and when
-/// it has just stored a file under a name that differs in case only from an
-/// object it is to delete, the backend asks the store for both names: if they
-/// have the same size, ETag and modification time and are not both listed,
-/// they are one object, and it is not deleted. With
+/// stores a file or a directory marker and a request that deletes keys wait
+/// for each other if their keys differ in case only, and for a file that still
+/// copies from such a key. Creating a directory waits the same way for the
+/// requests in flight, and fails with an I/O error once
+/// [`request_timeout`](crate::S3BackendBuilder::request_timeout) has passed.
+/// Keys that differ in case only can go out in one delete request. A store
+/// that treats such names as one name keeps the object under its old spelling
+/// when a file is renamed to a new spelling of its name. Before it deletes an
+/// object whose name differs in case only from the name of a file the backend
+/// holds, and when it has just stored a file under a name that differs in case
+/// only from an object it is to delete, the backend asks the store for both
+/// names: if they have the same size, ETag and modification time and are not
+/// both listed, they are one object, and it is not deleted. With
 /// [`case_insensitive(false)`](crate::S3BackendBuilder::case_insensitive) the
 /// store has to keep case.
 ///
@@ -178,6 +204,8 @@ pub(super) struct Shared {
     pub(super) cache: Mutex<MetaCache>,
     /// The size of the requests that read file data.
     pub(super) read_chunk: u64,
+    /// The most objects a renamed directory may hold.
+    pub(super) max_dir_rename_objects: usize,
     /// The chunks read requests brought, shared by every handle.
     pub(super) ahead: Arc<ReadAhead>,
     pub(super) read_only: bool,
@@ -197,6 +225,34 @@ impl Shared {
     /// The deadline of the store requests one call makes.
     pub(super) fn retry(&self) -> Retry {
         Retry::within(self.request_timeout)
+    }
+
+    /// Calls `check` until it answers `Some`, and again each time the overlay
+    /// changes. A `check` that fails fails the wait. Fails with `Io` once the
+    /// deadline of `retry` has passed.
+    pub(super) async fn await_clear<T>(
+        &self,
+        retry: &Retry,
+        mut check: impl FnMut() -> SmbResult<Option<T>>,
+    ) -> SmbResult<T> {
+        let mut progress = self.overlay.subscribe();
+        loop {
+            if let Some(done) = check()? {
+                return Ok(done);
+            }
+            #[cfg(test)]
+            self.jobs
+                .waits
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let changed = progress.changed();
+            let woken = match retry.deadline() {
+                Some(deadline) => tokio::time::timeout_at(deadline, changed)
+                    .await
+                    .map_err(|_| S3Error::DeadlineExceeded.into_smb_error())?,
+                None => changed.await,
+            };
+            woken.map_err(|e| SmbError::Io(io::Error::other(e)))?;
+        }
     }
 
     /// The cache. Never held across an await.
@@ -286,6 +342,16 @@ impl S3Backend {
         self.shared.ahead.waiting()
     }
 
+    /// Whether the store holds the keys `a` and `b`, which differ in case
+    /// only, as one object.
+    pub(crate) async fn one_object(&self, a: &str, b: &str) -> bool {
+        self.shared
+            .one_object(a, b, &self.shared.jobs.stop)
+            .await
+            .expect("the store answers")
+            .is_some()
+    }
+
     /// The files and directories the overlay holds.
     pub(crate) fn overlay_len(&self) -> usize {
         self.shared.overlay.len()
@@ -294,6 +360,11 @@ impl S3Backend {
     /// How many times a job was put off because a key stood in its way.
     pub(crate) fn parks(&self) -> usize {
         self.shared.overlay.parks()
+    }
+
+    /// How many jobs wait for the slot of `key` to clear.
+    pub(crate) fn waiting_for(&self, key: &str) -> usize {
+        self.shared.overlay.waiting_for(key)
     }
 
     /// Whether a job writes a key of the slot of `key`, a file copies from
@@ -361,6 +432,52 @@ impl S3Backend {
         gates(&self.shared.jobs.pause_reserved)
     }
 
+    /// Makes the next directory rename wait once its batch record is written
+    /// and its entries are at their new keys, before the entries get records
+    /// of their own, as [`pause_after_hash`](Self::pause_after_hash) does. If
+    /// the backend is dropped meanwhile, the entries are left to the batch
+    /// record.
+    pub(crate) fn pause_after_batch(&self) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        gates(&self.shared.jobs.pause_batch)
+    }
+
+    /// Makes the next create wait once it has checked the directory it is in
+    /// and before it enters the overlay, as
+    /// [`pause_after_hash`](Self::pause_after_hash) does.
+    pub(crate) fn pause_before_create(
+        &self,
+    ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        gates(&self.shared.jobs.pause_create)
+    }
+
+    /// Makes the next directory rename wait once it has read the keys below
+    /// the directory, as [`pause_after_hash`](Self::pause_after_hash) does.
+    pub(crate) fn pause_after_listing(
+        &self,
+    ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        gates(&self.shared.jobs.pause_listed)
+    }
+
+    /// Makes the task that records the entries of the next moved directory
+    /// panic.
+    pub(crate) fn panic_dissolve(&self) {
+        self.shared.jobs.panic_dissolve.raise();
+    }
+
+    /// Makes the tasks that read the metadata of the objects of a moved
+    /// directory panic.
+    pub(crate) fn panic_read_base(&self) {
+        self.shared.jobs.panic_read_base.raise();
+    }
+
+    /// How many times a call waited for requests in flight or keys to clear.
+    pub(crate) fn waits(&self) -> usize {
+        self.shared
+            .jobs
+            .waits
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Lowers the size of the largest object one copy request takes.
     pub(crate) fn limit_copy(&self, bytes: u64) {
         self.shared.jobs.limit_copy(bytes);
@@ -383,10 +500,7 @@ impl S3Backend {
 
     /// Makes the worker panic.
     pub(crate) fn panic_worker(&self) {
-        self.shared
-            .jobs
-            .panic_worker
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.shared.jobs.panic_worker.raise();
         self.shared.overlay.queue().wake();
     }
 

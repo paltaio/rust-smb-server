@@ -40,6 +40,7 @@ impl std::error::Error for Malformed {}
 pub(crate) enum Record {
     Entry(Box<EntryRecord>),
     Tombstone(TombstoneRecord),
+    Batch(BatchRecord),
 }
 
 /// The id of a record: 32 lowercase hexadecimal digits. It names the record
@@ -79,11 +80,23 @@ pub(crate) struct TombstoneRecord {
     pub(crate) keys: Vec<String>,
 }
 
+/// The entries a directory rename gave new keys, written as one file so the
+/// rename is whole on disk or not there at all. The entries have records of
+/// their own soon after, and the batch goes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BatchRecord {
+    pub(crate) id: RecordId,
+    /// At least one entry.
+    pub(crate) members: Vec<EntryRecord>,
+}
+
 /// The remote version an entry starts from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BaseRecord {
     pub(crate) key: String,
     pub(crate) head: ObjectHead,
+    /// The head came from a listing and has no user metadata.
+    pub(crate) bare: bool,
 }
 
 /// The local data of an entry.
@@ -194,6 +207,7 @@ impl Record {
         match self {
             Record::Entry(entry) => &entry.id,
             Record::Tombstone(tombstone) => &tombstone.id,
+            Record::Batch(batch) => &batch.id,
         }
     }
 
@@ -203,6 +217,7 @@ impl Record {
         match self {
             Record::Entry(entry) => entry.encode(),
             Record::Tombstone(tombstone) => tombstone.encode(),
+            Record::Batch(batch) => batch.encode(),
         }
     }
 
@@ -222,6 +237,7 @@ impl Record {
         let record = match fields.one("kind")? {
             "entry" => Record::Entry(Box::new(EntryRecord::decode(&mut fields)?)),
             "tombstone" => Record::Tombstone(TombstoneRecord::decode(&mut fields)?),
+            "batch" => Record::Batch(BatchRecord::decode(&mut fields)?),
             _ => return Err(Malformed("kind")),
         };
         fields.finish()?;
@@ -249,6 +265,21 @@ pub(super) fn copy_source<'a>(
 }
 
 impl EntryRecord {
+    /// Whether storing the entry needs a job: it has local data, a marker
+    /// object to put, new times or attributes, content to copy from another
+    /// key, or keys to delete.
+    pub(crate) fn has_work(&self) -> bool {
+        self.local.is_some()
+            || self.marker_pending
+            || self.meta_pending
+            || !self.gone.is_empty()
+            || self.source().is_some()
+            || self
+                .base
+                .as_ref()
+                .is_some_and(|base| !self.is_dir && base.key != self.key)
+    }
+
     /// The key a restart copies the content of the file from: the base key
     /// when it is not the key and the local data does not hold every byte.
     pub(crate) fn source(&self) -> Option<&str> {
@@ -310,6 +341,9 @@ impl EntryRecord {
         line(out, "pending-marker", flag(self.marker_pending));
         if let Some(base) = &self.base {
             line(out, "base-key", &escape_path(&base.key));
+            if base.bare {
+                line(out, "base-bare", "1");
+            }
             line(out, "base-etag", &escape(&base.head.etag));
             line(out, "base-size", &base.head.size.to_string());
             line(
@@ -403,6 +437,11 @@ impl EntryRecord {
                 key: unescape(text)
                     .filter(|key| valid_key(key))
                     .ok_or(Malformed("base-key"))?,
+                bare: match fields.take("base-bare")? {
+                    None => false,
+                    Some("1") => true,
+                    Some(_) => return Err(Malformed("base-bare")),
+                },
                 head: decode_head(fields)?,
             }),
         };
@@ -465,6 +504,42 @@ fn decode_head(fields: &mut Fields<'_>) -> Result<ObjectHead, Malformed> {
         last_modified,
         metadata,
     })
+}
+
+impl BatchRecord {
+    /// The text of the record: the text of each member on a line of its own,
+    /// percent-encoded.
+    pub(crate) fn encode(&self) -> String {
+        let mut out = String::from(HEADER);
+        out.push('\n');
+        line(&mut out, "kind", "batch");
+        line(&mut out, "id", self.id.as_str());
+        for member in &self.members {
+            line(&mut out, "member", &escape(&member.encode()));
+        }
+        out.push_str("end\n");
+        out
+    }
+
+    fn decode(fields: &mut Fields<'_>) -> Result<BatchRecord, Malformed> {
+        let id = fields.id()?;
+        let mut members = Vec::new();
+        let mut seen = HashSet::new();
+        for text in fields.all("member") {
+            let text = unescape(text).ok_or(Malformed("member"))?;
+            let Ok(Record::Entry(member)) = Record::decode(text.as_bytes()) else {
+                return Err(Malformed("member"));
+            };
+            if !seen.insert(member.id.clone()) {
+                return Err(Malformed("member"));
+            }
+            members.push(*member);
+        }
+        if members.is_empty() {
+            return Err(Malformed("member"));
+        }
+        Ok(BatchRecord { id, members })
+    }
 }
 
 impl TombstoneRecord {
@@ -684,6 +759,7 @@ mod tests {
             base: Some(BaseRecord {
                 key: "pre/old name.txt".into(),
                 head: head(),
+                bare: false,
             }),
             remote: true,
             local: Some(LocalRecord {
@@ -746,6 +822,75 @@ mod tests {
             Record::decode(text.as_bytes()).unwrap(),
             Record::Entry(Box::new(record))
         );
+    }
+
+    fn member(id_text: &str, key: &str) -> EntryRecord {
+        EntryRecord {
+            id: id(id_text),
+            key: key.into(),
+            path: key.into(),
+            ..entry()
+        }
+    }
+
+    #[test]
+    fn a_batch_record_reads_back_as_written() {
+        let mut listed = member(OTHER, "d/b%.txt");
+        if let Some(base) = &mut listed.base {
+            base.bare = true;
+        }
+        let record = Record::Batch(BatchRecord {
+            id: id(ID),
+            members: vec![member(ID, "d/a b.txt"), listed],
+        });
+        let text = record.encode();
+        assert!(text.lines().any(|l| l == "kind batch"));
+        assert!(
+            text.lines().filter(|l| l.starts_with("member ")).count() == 2,
+            "{text}"
+        );
+        assert_eq!(Record::decode(text.as_bytes()).unwrap(), record);
+    }
+
+    #[test]
+    fn a_batch_record_with_no_member_a_repeated_member_or_a_member_that_is_not_an_entry_is_refused()
+    {
+        let batch = |lines: &[String]| {
+            let mut text = format!("smb-s3-record 1\nkind batch\nid {ID}\n");
+            for line in lines {
+                text.push_str(&format!("member {}\n", escape(line)));
+            }
+            text.push_str("end\n");
+            Record::decode(text.as_bytes())
+        };
+        assert_eq!(batch(&[]), Err(Malformed("member")));
+        let one = member(ID, "d/a").encode();
+        assert!(batch(std::slice::from_ref(&one)).is_ok());
+        assert_eq!(batch(&[one.clone(), one]), Err(Malformed("member")));
+        let tombstone = Record::Tombstone(TombstoneRecord {
+            id: id(ID),
+            keys: vec!["k".into()],
+        })
+        .encode();
+        assert_eq!(batch(&[tombstone]), Err(Malformed("member")));
+        assert_eq!(
+            batch(&["not a record".to_owned()]),
+            Err(Malformed("member"))
+        );
+    }
+
+    #[test]
+    fn a_base_that_a_listing_described_is_marked_bare() {
+        let mut record = entry();
+        record.base.as_mut().unwrap().bare = true;
+        let text = record.encode();
+        assert!(text.lines().any(|l| l == "base-bare 1"));
+        assert_eq!(
+            Record::decode(text.as_bytes()).unwrap(),
+            Record::Entry(Box::new(record))
+        );
+        let plain = entry().encode();
+        assert!(!plain.contains("base-bare"));
     }
 
     #[test]

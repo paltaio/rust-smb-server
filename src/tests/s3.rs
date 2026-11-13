@@ -1,6 +1,7 @@
 //! Tests that need an S3 endpoint, served by a local Versity Gateway.
 
 mod client;
+mod dirs;
 mod faults;
 mod fixture;
 mod gateway;

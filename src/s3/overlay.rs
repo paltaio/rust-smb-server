@@ -7,8 +7,7 @@
 //! while any of them is held. The index and state locks are held across no
 //! await and no disk or network I/O.
 
-use std::collections::BTreeMap;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -17,9 +16,12 @@ use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tracing::error;
 
+use crate::error::{SmbError, SmbResult};
+
 use super::cachedir::CacheDir;
 use super::client::MAX_DELETE_KEYS;
-use super::entry::{Counted, Entry, Progress, State};
+use super::dirmove::{Batch, Left};
+use super::entry::{Counted, Entry, Progress, Sealed, State};
 use super::error::S3Error;
 use super::keys::{Slot, dir_prefix, slot};
 use super::lookup::Found;
@@ -64,7 +66,10 @@ struct Index {
     /// The entries that own each key to delete, by key.
     gone: HashMap<String, Vec<Arc<Entry>>>,
     /// The keys to delete, owned or not, by slot.
-    hidden: HashMap<Slot, Vec<String>>,
+    hidden: BTreeMap<Slot, Vec<String>>,
+    /// The entries that left a batch with a tombstone record standing for
+    /// them, with the batch, until its record is rewritten without them.
+    covered: HashMap<RecordId, Arc<Batch>>,
     /// The entries that copy from a key that is not their own, by the slot of
     /// the key: one for each key, several for a slot.
     sources: HashMap<Slot, Vec<Source>>,
@@ -72,6 +77,15 @@ struct Index {
     deleting: HashMap<Slot, usize>,
     /// The names a rename is about to take.
     reserved: HashSet<Slot>,
+    /// The directories being renamed or deleted, by the slot of the prefix of
+    /// the keys below them, and the directories they move to while the move is
+    /// made. The rename holds the entries below the first. No entry is put,
+    /// no name reserved and no key deleted below any of them meanwhile.
+    moving: HashSet<Slot>,
+    /// The directories among `moving` below which no entry is made for an
+    /// object of the bucket either: the rename holds every entry below the
+    /// one it moves, and is making its move.
+    frozen: HashSet<Slot>,
     /// How many running jobs write a key of each slot.
     writing: HashMap<Slot, usize>,
     /// The entries that wait for a slot to clear.
@@ -132,6 +146,108 @@ impl Index {
         self.hidden.contains_key(&self.slot(key))
     }
 
+    /// Whether a key other than `marker` itself is to be deleted below the
+    /// directory marker `marker`, which ends in `/`.
+    fn has_hidden_below(&self, marker: &str) -> bool {
+        let name = self.slot(marker);
+        self.hidden
+            .range(name.clone()..)
+            .take_while(|(held, _)| held.starts_with(&name))
+            .any(|(held, _)| *held != name)
+    }
+
+    /// Whether the exact key `key` is to be deleted, whatever its case.
+    fn hides_exact(&self, key: &str) -> bool {
+        self.hidden
+            .get(&self.slot(key))
+            .is_some_and(|keys| keys.iter().any(|held| held == key))
+    }
+
+    /// Whether an entry is at the directory `key` or below it.
+    fn has_entry_at_or_below(&self, key: &str) -> bool {
+        if self.entries.contains_key(&self.slot(key)) {
+            return true;
+        }
+        let below = self.slot(&dir_prefix(key));
+        self.entries
+            .range(below.clone()..)
+            .next()
+            .is_some_and(|(held, _)| held.starts_with(&below))
+    }
+
+    /// Whether the directory `key` is gone: its marker key is to be deleted
+    /// and no entry is at the directory or below it.
+    fn dir_dead(&self, key: &str) -> bool {
+        self.hides(&dir_prefix(key)) && !self.has_entry_at_or_below(key)
+    }
+
+    /// Whether a directory above the name `key` is gone.
+    fn dead_above(&self, key: &str) -> bool {
+        key.match_indices('/')
+            .any(|(at, _)| self.dir_dead(&key[..at]))
+    }
+
+    /// Whether the name `key` is below one of the directories `dirs`, which
+    /// are `moving` or `frozen`.
+    fn below(&self, dirs: &HashSet<Slot>, key: &str) -> bool {
+        let name = self.slot(key);
+        dirs.iter().any(|prefix| name.starts_with(prefix))
+    }
+
+    /// Whether the key `key` is inside a directory that a rename or delete
+    /// holds, and not the marker of the directory itself.
+    fn fenced(&self, key: &str) -> bool {
+        let name = self.slot(key);
+        self.moving
+            .iter()
+            .any(|prefix| name.starts_with(prefix) && name != *prefix)
+    }
+
+    /// Whether `existing` are in the index under their keys, and no entry that
+    /// does not move holds a name that an entry of `moves` moves to.
+    fn moves_cleanly(&self, moves: &[Moved], existing: &[Arc<Entry>]) -> bool {
+        let all_there = existing.iter().all(|entry| {
+            let state = entry.state();
+            !state.detached
+                && self
+                    .entries
+                    .get(&self.slot(&state.key))
+                    .is_some_and(|held| Arc::ptr_eq(held, entry))
+        });
+        if !all_there {
+            return false;
+        }
+        let leaving: HashSet<*const Entry> = moves
+            .iter()
+            .filter(|moved| moved.from.is_some())
+            .map(|moved| Arc::as_ptr(&moved.entry))
+            .collect();
+        moves.iter().all(|moved| {
+            self.entries
+                .get(&self.slot(&moved.to))
+                .is_none_or(|held| leaving.contains(&Arc::as_ptr(held)))
+        })
+    }
+
+    /// The entries below the directory whose key prefix has the slot `prefix`.
+    fn entries_under(&self, prefix: &Slot) -> Vec<Arc<Entry>> {
+        self.entries
+            .range(prefix.clone()..)
+            .take_while(|(slot, _)| slot.starts_with(prefix))
+            .map(|(_, entry)| Arc::clone(entry))
+            .collect()
+    }
+
+    /// How many entries are below the directory whose key prefix has the slot
+    /// `prefix`, counted up to `limit + 1`.
+    fn count_under(&self, prefix: &Slot, limit: usize) -> usize {
+        self.entries
+            .range(prefix.clone()..)
+            .take_while(|(slot, _)| slot.starts_with(prefix))
+            .take(limit.saturating_add(1))
+            .count()
+    }
+
     /// How many keys are to be deleted, owned or not.
     #[cfg(test)]
     fn hidden_keys(&self) -> usize {
@@ -163,14 +279,18 @@ impl Index {
         }
     }
 
-    /// Whether a file entry other than those in `except` holds `key`. Locks
-    /// the state of the entry at the slot unless it is in `except`.
+    /// Whether an entry other than those in `except` holds `key`: a file at
+    /// the key, or for a key that ends in `/` a directory with that marker.
+    /// Locks the state of the entry at the slot unless it is in `except`.
     fn held(&self, key: &str, except: &[&Arc<Entry>]) -> bool {
-        self.entries.get(&self.slot(key)).is_some_and(|entry| {
-            !entry.is_dir() && !except.iter().any(|other| Arc::ptr_eq(other, entry)) && {
-                let state = entry.state();
-                !state.detached && state.key == key
-            }
+        let name = key.strip_suffix('/').unwrap_or(key);
+        self.entries.get(&self.slot(name)).is_some_and(|entry| {
+            entry.is_dir() == (name.len() < key.len())
+                && !except.iter().any(|other| Arc::ptr_eq(other, entry))
+                && {
+                    let state = entry.state();
+                    !state.detached && state.is_write_key(key)
+                }
         })
     }
 
@@ -194,6 +314,19 @@ impl Index {
             self.entries.remove(&name);
         }
         self.cleared(key);
+    }
+
+    /// Takes `entry`, whose state is `state`, out of the overlay if nothing
+    /// holds it, it has nothing to keep and no batch lists it. Returns whether
+    /// it left.
+    fn vacate_if_idle(&mut self, entry: &Arc<Entry>, state: &mut State) -> bool {
+        if state.handles > 0 || state.pending() || state.detached || state.batch.is_some() {
+            return false;
+        }
+        let key = state.key.clone();
+        self.recount(entry, state, false);
+        self.vacate(&key, entry);
+        true
     }
 
     /// Whether a job other than the one of `owner` writes a key of the slot
@@ -230,12 +363,34 @@ impl Index {
 
     /// Whether a job writes a key of the slot of `key`, an entry copies from
     /// one, or a request deletes one: nothing is deleted or written there
-    /// until that ends. The writes of `owner` do not count.
+    /// until that ends. The writes of `owner` do not count. A directory
+    /// marker is in use while a key below it is to be deleted: a store keeps
+    /// the directory of an object, and refuses to delete one that is not
+    /// empty. A key inside a directory that a rename or delete holds is in
+    /// use until it lets go.
     fn in_use(&self, key: &str, owner: Option<&Arc<Entry>>) -> bool {
         let name = self.slot(key);
         self.written_by_other(&name, owner)
             || self.deleting.contains_key(&name)
             || !self.holders(&name, None).is_empty()
+            || (key.ends_with('/') && self.has_hidden_below(key))
+            || self.fenced(key)
+    }
+
+    /// Notes that no rename or delete holds the directory `dir` any more: the
+    /// entries that wait for a key inside it wake, and the worker looks for
+    /// keys to delete again.
+    fn unfence(&mut self, dir: &Slot) {
+        self.cleared = true;
+        let waiting: Vec<Slot> = self
+            .parked
+            .keys()
+            .filter(|name| name.starts_with(dir))
+            .cloned()
+            .collect();
+        for name in waiting {
+            self.wake_slot(&name);
+        }
     }
 
     /// Whether the key `key` may be deleted now: nothing is in use in its
@@ -294,18 +449,23 @@ impl Index {
         }
     }
 
-    /// The file entry that holds the name of `key` under another spelling,
-    /// when names ignore case, with its key.
+    /// The entry that holds the name of `key` under another spelling, when
+    /// names ignore case, with the key of its object. A key that ends in `/`
+    /// is the marker of a directory, and the entry is a directory.
     fn twin(&self, key: &str) -> Option<(String, Arc<Entry>)> {
         if !self.fold {
             return None;
         }
-        let entry = self.entries.get(&self.slot(key))?;
-        if entry.is_dir() {
+        let (name, marker) = match key.strip_suffix('/') {
+            Some(name) => (name, true),
+            None => (key, false),
+        };
+        let entry = self.entries.get(&self.slot(name))?;
+        if entry.is_dir() != marker {
             return None;
         }
         let state = entry.state();
-        (!state.detached && state.key != key).then(|| (state.key.clone(), Arc::clone(entry)))
+        (!state.detached && state.key != name).then(|| (state.write_key(), Arc::clone(entry)))
     }
 
     /// Notes that a request deletes `keys`. Returns the keys among them that
@@ -322,11 +482,27 @@ impl Index {
         twins
     }
 
-    /// Wakes the entries that wait for the slot of `key`.
+    /// Wakes the entries that wait for the slot of `key`, and those that wait
+    /// to delete the marker of a directory above it.
     fn cleared(&mut self, key: &str) {
         self.cleared = true;
+        self.wake(key);
+        for (at, _) in key.match_indices('/') {
+            if at + 1 < key.len() {
+                self.wake(&key[..=at]);
+            }
+        }
+    }
+
+    /// Queues the entries that wait for the slot of `key`.
+    fn wake(&mut self, key: &str) {
         let name = self.slot(key);
-        if let Some(waiting) = self.parked.remove(&name) {
+        self.wake_slot(&name);
+    }
+
+    /// Queues the entries that wait for the slot `name`.
+    fn wake_slot(&mut self, name: &Slot) {
+        if let Some(waiting) = self.parked.remove(name) {
             for entry in waiting {
                 self.parked_at.remove(&(Arc::as_ptr(&entry) as usize));
                 self.ready.push(entry);
@@ -532,15 +708,19 @@ impl Index {
     /// waits only for a copy that waits for it is part of a cycle; the one
     /// whose base has the least key resolves it.
     fn blocked(&mut self, entry: &Arc<Entry>, now: Instant) -> Blocked {
-        let (key, writes, gone, base) = {
+        let (key, writes, gone, base, batch) = {
             let state = entry.state();
             (
-                state.key.clone(),
-                state.writes() && !state.is_dir(),
+                state.write_key(),
+                state.writes(),
                 state.gone.clone(),
                 state.moved_from().map(str::to_owned),
+                state.batch.clone(),
             )
         };
+        if let Some(batch) = batch {
+            return Blocked::Yes(batch.key().to_owned());
+        }
         if !writes {
             let mut waits_for = None;
             for key in &gone {
@@ -628,6 +808,10 @@ pub(super) struct Overlay {
     progress: watch::Sender<u64>,
 }
 
+/// The lock of the keys to delete, passed on by a caller that holds it, so
+/// code it calls does not take it a second time.
+pub(super) type TombsHeld<'a> = Option<&'a MutexGuard<'a, ()>>;
+
 /// The longest keys to delete wait for a pause in the deletes.
 const MAX_QUIET: Duration = Duration::from_secs(60);
 
@@ -698,6 +882,120 @@ pub(super) struct Moving<'a> {
     pub(super) gone: &'a [String],
 }
 
+/// One entry a directory rename moves, and what its state becomes.
+pub(super) struct Moved {
+    pub(super) entry: Arc<Entry>,
+    /// The key the entry has in the overlay now; `None` for an entry made for
+    /// an object of the bucket.
+    pub(super) from: Option<String>,
+    pub(super) to: String,
+    /// The keys the entry owns to delete once it has moved.
+    pub(super) gone: Vec<String>,
+    /// Whether `to` may exist in the bucket.
+    pub(super) may_exist: bool,
+    /// What the batch record seals of the local data.
+    pub(super) sealed: Option<Sealed>,
+    /// The key the batch record says the content is copied from.
+    pub(super) source: Option<String>,
+}
+
+/// Holds on the entries below a directory that is being renamed or deleted, so
+/// none leaves the overlay but by a change of its own. No entry is put, no name
+/// reserved and no key deleted inside the directory while this lasts. After
+/// [`freeze`](Self::freeze), no entry is made for an object of the bucket
+/// below it, or below the directory it moves to, either.
+pub(super) struct Subtree {
+    overlay: Arc<Overlay>,
+    prefix: Slot,
+    /// The prefix of the directory it moves to, while that is fenced.
+    target: Option<Slot>,
+    held: Vec<Held>,
+}
+
+impl Subtree {
+    pub(super) fn entries(&self) -> Vec<Arc<Entry>> {
+        self.held
+            .iter()
+            .map(|held| Arc::clone(&held.entry))
+            .collect()
+    }
+
+    /// Takes a hold on the entries below the directory that were made since
+    /// the first hold, and fences the directory and `to`, the directory it
+    /// moves to: no entry is made below either, so none can appear between the
+    /// check of a move and the move itself.
+    ///
+    /// # Errors
+    ///
+    /// Fails with `Sharing` if `to` is, or is in, or has in it a directory
+    /// that is being renamed, and with `AccessDenied` if more than `limit`
+    /// entries of the overlay are below the directory.
+    pub(super) fn freeze(&mut self, to: &str, limit: usize) -> SmbResult<()> {
+        let mut index = self.overlay.lock();
+        let target = index.slot(&dir_prefix(to));
+        let own = target == self.prefix;
+        let overlaps = index.moving.iter().any(|held| {
+            *held != self.prefix && (held.starts_with(&target) || target.starts_with(held))
+        });
+        if overlaps {
+            return Err(SmbError::Sharing);
+        }
+        if index.count_under(&self.prefix, limit) > limit {
+            return Err(SmbError::AccessDenied);
+        }
+        if !own {
+            index.moving.insert(target.clone());
+            index.frozen.insert(target.clone());
+            self.target = Some(target);
+        }
+        index.frozen.insert(self.prefix.clone());
+        let mut known: HashSet<*const Entry> = self
+            .held
+            .iter()
+            .map(|held| Arc::as_ptr(&held.entry))
+            .collect();
+        for entry in index.entries_under(&self.prefix) {
+            if known.insert(Arc::as_ptr(&entry)) {
+                entry.state().handles += 1;
+                self.held.push(self.overlay.held(entry));
+            }
+        }
+        Ok(())
+    }
+
+    /// Lifts the fences of [`freeze`](Self::freeze), so names below the
+    /// directory can be looked up while it is listed again. The entries stay
+    /// held.
+    pub(super) fn thaw(&mut self) {
+        let mut index = self.overlay.lock();
+        index.frozen.remove(&self.prefix);
+        if let Some(target) = self.target.take() {
+            index.moving.remove(&target);
+            index.frozen.remove(&target);
+            index.unfence(&target);
+        }
+    }
+
+    /// Whether a request deletes a key inside the directory. None starts
+    /// while the directory is held.
+    pub(super) fn deleting(&self) -> bool {
+        self.overlay
+            .lock()
+            .deleting
+            .keys()
+            .any(|name| name.starts_with(&self.prefix) && *name != self.prefix)
+    }
+}
+
+impl Drop for Subtree {
+    fn drop(&mut self) {
+        self.thaw();
+        let mut index = self.overlay.lock();
+        index.moving.remove(&self.prefix);
+        index.unfence(&self.prefix);
+    }
+}
+
 /// A name a rename is about to take. No entry is made at it meanwhile.
 pub(super) struct Reservation<'a> {
     overlay: &'a Overlay,
@@ -707,6 +1005,19 @@ pub(super) struct Reservation<'a> {
 impl Drop for Reservation<'_> {
     fn drop(&mut self) {
         self.overlay.lock().reserved.remove(&self.name);
+    }
+}
+
+/// The keys a request writes for an entry. They count as written until this
+/// is dropped.
+pub(super) struct Writes {
+    overlay: Arc<Overlay>,
+    entry: Arc<Entry>,
+}
+
+impl Drop for Writes {
+    fn drop(&mut self) {
+        self.overlay.end_writes(&self.entry);
     }
 }
 
@@ -948,13 +1259,19 @@ impl Overlay {
 
     /// A hold on the entry for what a lookup found. An entry for the name
     /// that has nothing to keep follows the lookup; one that has is kept as
-    /// it is. `None` if the lookup is out of date: a rename has reserved the
-    /// name, or the object became a key to delete after the lookup.
+    /// it is.
+    ///
+    /// # Errors
+    ///
+    /// Fails with `NotFound` if the lookup is out of date: a rename has
+    /// reserved the name, or the object became a key to delete after the
+    /// lookup, or it is a directory that is gone. Fails with `Sharing` if an
+    /// entry would be made below a directory that is being renamed.
     pub(super) fn take_found(
         self: &Arc<Self>,
         found: Found,
         ahead: &Arc<ReadAhead>,
-    ) -> Option<Held> {
+    ) -> SmbResult<Held> {
         let (key, is_dir) = match &found {
             Found::File(file) => (file.key.clone(), false),
             Found::Dir(dir) => (dir.key.clone(), true),
@@ -970,11 +1287,17 @@ impl Overlay {
                 }
                 state.handles += 1;
                 drop(state);
-                return Some(self.held(Arc::clone(entry)));
+                return Ok(self.held(Arc::clone(entry)));
             }
         }
         if index.reserved.contains(&slot) || (!is_dir && index.hides(&key)) {
-            return None;
+            return Err(SmbError::NotFound);
+        }
+        if (is_dir && index.dir_dead(&key)) || index.dead_above(&key) {
+            return Err(SmbError::NotFound);
+        }
+        if index.below(&index.frozen, &key) {
+            return Err(SmbError::Sharing);
         }
         if let Some(entry) = held {
             // What was a file is a directory, or the other way round. Handles
@@ -988,18 +1311,30 @@ impl Overlay {
         let entry = Entry::found(found, ahead);
         entry.state().handles = 1;
         index.entries.insert(slot, Arc::clone(&entry));
-        Some(self.held(entry))
+        Ok(self.held(entry))
     }
 
-    /// Puts `entry` in the overlay with a hold on it, unless an entry for
-    /// the name is there or a rename has reserved it. Looking and putting are
+    /// Puts `entry` in the overlay with a hold on it. Looking and putting are
     /// one step, so two creates of one name never both succeed. A key to delete
     /// from the bucket may be there still, so the entry's key may exist.
-    pub(super) fn insert_new(self: &Arc<Self>, entry: Arc<Entry>) -> Option<Held> {
-        let slot = self.slot(&entry.state().key);
+    ///
+    /// # Errors
+    ///
+    /// Fails with `Exists` if an entry for the name is there or a rename has
+    /// reserved it, with `Sharing` below a directory that is being renamed,
+    /// and with `PathNotFound` below a directory that is gone.
+    pub(super) fn insert_new(self: &Arc<Self>, entry: Arc<Entry>) -> SmbResult<Held> {
+        let key = entry.state().key.clone();
+        let slot = self.slot(&key);
         let mut index = self.lock();
         if index.entries.contains_key(&slot) || index.reserved.contains(&slot) {
-            return None;
+            return Err(SmbError::Exists);
+        }
+        if index.below(&index.moving, &key) {
+            return Err(SmbError::Sharing);
+        }
+        if index.dead_above(&key) {
+            return Err(SmbError::PathNotFound);
         }
         {
             let mut state = entry.state();
@@ -1008,24 +1343,29 @@ impl Overlay {
             self.schedule(&entry, &mut state);
         }
         index.entries.insert(slot, Arc::clone(&entry));
-        Some(self.held(entry))
+        Ok(self.held(entry))
     }
 
     /// Ends one hold on `entry`, and queues the entry for a job if it has one
     /// to run. Every change to an entry holds it for its task, so the end of
-    /// that hold is where a change reaches the queue.
+    /// that hold is where a change reaches the queue. An entry of a batch
+    /// stays until the batch is released.
     fn release(&self, entry: &Arc<Entry>) {
         let mut index = self.lock();
         let mut state = entry.state();
         state.handles = state.handles.saturating_sub(1);
-        if state.handles == 0 && !state.pending() {
-            let key = state.key.clone();
-            index.recount(entry, &mut state, false);
-            drop(state);
-            index.vacate(&key, entry);
-            return;
+        if !index.vacate_if_idle(entry, &mut state) {
+            self.schedule(entry, &mut state);
         }
-        self.schedule(entry, &mut state);
+    }
+
+    /// Takes `entry` out of the overlay if nothing holds it and it has nothing
+    /// to keep. An entry loses its work without a job of its own when another
+    /// entry takes a key to delete from it, and no release follows then.
+    pub(super) fn leave_if_idle(&self, entry: &Arc<Entry>) {
+        let mut index = self.lock();
+        let mut state = entry.state();
+        index.vacate_if_idle(entry, &mut state);
     }
 
     /// The spelling of the directory `key` in the keys of the entries below
@@ -1095,8 +1435,8 @@ impl Overlay {
         let prefix = self.slot(prefix);
         self.lock()
             .hidden
-            .iter()
-            .filter(|(name, _)| name.starts_with(&prefix))
+            .range(prefix.clone()..)
+            .take_while(|(name, _)| name.starts_with(&prefix))
             .map(|(_, keys)| keys.len())
             .sum()
     }
@@ -1105,6 +1445,62 @@ impl Overlay {
     /// be deleted from the bucket.
     pub(super) fn tombstoned(&self, key: &str) -> bool {
         self.lock().hides(key)
+    }
+
+    /// Whether the exact key `key` is to be deleted from the bucket: other
+    /// spellings of it do not count.
+    pub(super) fn to_delete(&self, key: &str) -> bool {
+        self.lock().hides_exact(key)
+    }
+
+    /// Whether the directory `key` is gone: its marker key is to be deleted,
+    /// and no entry is at the directory or below it.
+    pub(super) fn dir_dead(&self, key: &str) -> bool {
+        self.lock().dir_dead(key)
+    }
+
+    /// Whether a directory above the name `key` is gone.
+    pub(super) fn dead_above(&self, key: &str) -> bool {
+        self.lock().dead_above(key)
+    }
+
+    /// Takes a hold on every entry in the overlay below the directory `dir`,
+    /// whether it holds something to keep or not, and makes the index refuse
+    /// to put entries or reservations below the directory, and to start
+    /// deleting keys inside it, until the value returned is dropped: a
+    /// directory rename needs the entries it lists to stay, and the keys it
+    /// lists to be there. Lookups still make entries for objects of the bucket
+    /// there, until [`Subtree::freeze`].
+    ///
+    /// # Errors
+    ///
+    /// Fails with `Sharing` if the directory is, or is in, or has in it a
+    /// directory that is being renamed.
+    pub(super) fn hold_below(self: &Arc<Self>, dir: &str) -> SmbResult<Subtree> {
+        let (prefix, _) = self.below_bounds(dir);
+        let mut index = self.lock();
+        if index
+            .moving
+            .iter()
+            .any(|held| held.starts_with(&prefix) || prefix.starts_with(held))
+        {
+            return Err(SmbError::Sharing);
+        }
+        index.moving.insert(prefix.clone());
+        let held = index
+            .entries_under(&prefix)
+            .into_iter()
+            .map(|entry| {
+                entry.state().handles += 1;
+                self.held(entry)
+            })
+            .collect();
+        Ok(Subtree {
+            overlay: Arc::clone(self),
+            prefix,
+            target: None,
+            held,
+        })
     }
 
     /// Puts what was read from the cache directory in the overlay. `entries`
@@ -1161,21 +1557,32 @@ impl Overlay {
     }
 
     /// Reserves the name `to` for a rename of `entry`, which replaces
-    /// `replaced` if that holds the name. Fails if another entry holds the
-    /// name or another rename has reserved it. No entry is made at a reserved
+    /// `replaced` if that holds the name. No entry is made at a reserved
     /// name until the reservation ends.
+    ///
+    /// # Errors
+    ///
+    /// Fails with `Exists` if another entry holds the name or another rename
+    /// has reserved it, with `Sharing` below a directory that is being
+    /// renamed, and with `PathNotFound` below a directory that is gone.
     pub(super) fn reserve(
         &self,
         to: &str,
         entry: &Arc<Entry>,
         replaced: Option<&Arc<Entry>>,
-    ) -> Option<Reservation<'_>> {
+    ) -> SmbResult<Reservation<'_>> {
         let mut index = self.lock();
         let name = index.slot(to);
-        if index.taken(to, entry, replaced) || !index.reserved.insert(name.clone()) {
-            return None;
+        if index.below(&index.moving, to) {
+            return Err(SmbError::Sharing);
         }
-        Some(Reservation {
+        if index.dead_above(to) {
+            return Err(SmbError::PathNotFound);
+        }
+        if index.taken(to, entry, replaced) || !index.reserved.insert(name.clone()) {
+            return Err(SmbError::Exists);
+        }
+        Ok(Reservation {
             overlay: self,
             name,
         })
@@ -1214,6 +1621,154 @@ impl Overlay {
         self.touch();
     }
 
+    /// Whether the entries of a directory can be moved as `moves` says: those
+    /// of `existing` are in the overlay under their keys, and no entry that
+    /// stays holds a name that an entry moves to. The caller holds the `io` and
+    /// `seal` locks of the entries, so the answer stands until the move is made
+    /// if the names below the directories are fenced.
+    pub(super) fn can_move_dir(&self, moves: &[Moved], existing: &[Arc<Entry>]) -> bool {
+        self.lock().moves_cleanly(moves, existing)
+    }
+
+    /// Moves the entries of a directory to their new keys in one step, and
+    /// notes that they wait for the batch `batch`. The caller has reserved the
+    /// new name of the directory, and holds the `io` and `seal` locks of the
+    /// entries that are in the overlay, which are `existing`. Returns `false`,
+    /// having changed nothing, unless [`can_move_dir`](Self::can_move_dir)
+    /// holds. The fence on the names below the directory keeps it from
+    /// returning `false` once the batch record is written, and the check
+    /// guards that case, since the record is already on disk.
+    pub(super) fn moved_dir(
+        &self,
+        moves: &[Moved],
+        batch: &Arc<Batch>,
+        existing: &[Arc<Entry>],
+    ) -> bool {
+        let mut index = self.lock();
+        if !index.moves_cleanly(moves, existing) {
+            return false;
+        }
+        for moved in moves {
+            if let Some(old) = &moved.from {
+                index.vacate(old, &moved.entry);
+            }
+        }
+        for moved in moves {
+            {
+                let mut state = moved.entry.state();
+                state.key.clone_from(&moved.to);
+                state.gone.clone_from(&moved.gone);
+                state.may_exist = moved.may_exist;
+                state.prior = None;
+                state.bump();
+                if let Some(sealed) = moved.sealed {
+                    state.set_sealed(sealed);
+                }
+                state.recorded_source.clone_from(&moved.source);
+                if state.is_dir() {
+                    state.set_marker_pending(true);
+                }
+                state.batch = Some(Arc::clone(batch));
+                index.recount(&moved.entry, &mut state, true);
+                self.schedule(&moved.entry, &mut state);
+            }
+            index
+                .entries
+                .insert(self.slot(&moved.to), Arc::clone(&moved.entry));
+        }
+        drop(index);
+        self.touch();
+        true
+    }
+
+    /// Ends the wait of `members` for the batch `batch`: the entries are on
+    /// disk on their own, and wake. Those that have nothing to keep leave the
+    /// overlay.
+    pub(super) fn release_batch(&self, members: &[Arc<Entry>], batch: &Arc<Batch>) {
+        let mut index = self.lock();
+        for member in members {
+            let mut state = member.state();
+            if state.in_batch(batch) {
+                state.batch = None;
+                index.vacate_if_idle(member, &mut state);
+            }
+        }
+        index.covered.retain(|_, held| !Arc::ptr_eq(held, batch));
+        index.cleared(batch.key());
+        drop(index);
+        self.touch();
+    }
+
+    /// Notes that the records of the entries of `batch` could not be written:
+    /// the entries that still wait for it, and have something to keep, fail,
+    /// and the entries that wait for the batch wake. The others leave the
+    /// batch, and the overlay once nothing holds them. Entries that another
+    /// batch holds now are left as they are.
+    pub(super) fn fail_batch(&self, members: &[Arc<Entry>], batch: &Arc<Batch>, failure: &S3Error) {
+        let mut index = self.lock();
+        for member in members {
+            let mut state = member.state();
+            if !state.in_batch(batch) || state.detached {
+                continue;
+            }
+            if state.pending() {
+                state.failure = Some(failure.clone());
+            } else {
+                state.batch = None;
+                index.vacate_if_idle(member, &mut state);
+            }
+        }
+        index.cleared(batch.key());
+        drop(index);
+        self.touch();
+    }
+
+    /// Notes that the entry `id` left `batch` in memory only: a tombstone
+    /// record stands for it, and the record of the batch is written without
+    /// the entry before the tombstone record goes. Returns what puts the entry
+    /// back.
+    pub(super) fn left_batch(&self, batch: &Arc<Batch>, id: &RecordId) -> Option<Left> {
+        let left = batch.cover(id)?;
+        self.lock().covered.insert(id.clone(), Arc::clone(batch));
+        Some(left)
+    }
+
+    /// Puts an entry back in the batch it left, as it was.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the record of the batch cannot be written with the entry. It
+    /// is a member in memory all the same.
+    pub(super) fn rejoin_batch(&self, cache: &CacheDir, left: Left) -> io::Result<()> {
+        self.lock().covered.remove(left.id());
+        Batch::rejoin(left, cache)
+    }
+
+    /// Writes the batch records that have a tombstone record of `ids` to stand
+    /// for entries that left them, without those entries.
+    fn flush_batches(&self, cache: &CacheDir, ids: &[&RecordId]) -> io::Result<()> {
+        let mut batches: Vec<Arc<Batch>> = Vec::new();
+        {
+            let index = self.lock();
+            for id in ids {
+                if let Some(batch) = index.covered.get(*id)
+                    && !batches.iter().any(|held| Arc::ptr_eq(held, batch))
+                {
+                    batches.push(Arc::clone(batch));
+                }
+            }
+        }
+        for batch in &batches {
+            batch.flush(cache)?;
+        }
+        if !batches.is_empty() {
+            self.lock()
+                .covered
+                .retain(|_, held| !batches.iter().any(|batch| Arc::ptr_eq(batch, held)));
+        }
+        Ok(())
+    }
+
     /// Makes the counts of `entry` those of its state, after its keys to
     /// delete, its base or its local data changed.
     pub(super) fn track(&self, entry: &Arc<Entry>) {
@@ -1236,20 +1791,53 @@ impl Overlay {
         key: &str,
         stop: &Stop,
     ) -> Result<(), Fence> {
+        self.begin(entry, key, stop, false)
+    }
+
+    /// [`begin_write`](Self::begin_write) for the open that makes a directory
+    /// and puts its marker object: only a request in flight for a key of the
+    /// slot stands in the way. A file of the name of the directory that is to
+    /// be deleted does not. The key stays noted until the value returned is
+    /// dropped.
+    pub(super) fn begin_marker_write(
+        self: &Arc<Self>,
+        entry: &Arc<Entry>,
+        key: &str,
+        stop: &Stop,
+    ) -> Result<Writes, Fence> {
+        self.begin(entry, key, stop, true)?;
+        Ok(Writes {
+            overlay: Arc::clone(self),
+            entry: Arc::clone(entry),
+        })
+    }
+
+    fn begin(
+        &self,
+        entry: &Arc<Entry>,
+        key: &str,
+        stop: &Stop,
+        requests_only: bool,
+    ) -> Result<(), Fence> {
         let mut index = self.lock();
         {
             let state = entry.state();
             if state.detached {
                 return Err(Fence::Gone);
             }
-            if state.key != key || stop.is_stopped() {
+            if !state.is_write_key(key) || stop.is_stopped() {
                 return Err(Fence::Stopped);
             }
         }
-        if index.write_block(key, entry, Instant::now()).is_some() {
+        let name = index.slot(key);
+        let blocked = if requests_only {
+            index.deleting.contains_key(&name) || index.writing.contains_key(&name)
+        } else {
+            index.write_block(key, entry, Instant::now()).is_some()
+        };
+        if blocked {
             return Err(Fence::Blocked);
         }
-        let name = index.slot(key);
         add(&mut index.writing, name);
         entry.state().writing.push(key.to_owned());
         Ok(())
@@ -1378,7 +1966,18 @@ impl Overlay {
     ///
     /// Fails when a record cannot be written or removed. The keys stay.
     pub(super) fn drop_tombs(&self, cache: &CacheDir, keys: &[String]) -> io::Result<()> {
-        let _io = self.tomb_io.lock().unwrap_or_else(PoisonError::into_inner);
+        let tombs = self.lock_tombs();
+        self.drop_tombs_held(&tombs, cache, keys)
+    }
+
+    /// [`drop_tombs`](Self::drop_tombs) for a caller that holds the lock of
+    /// [`lock_tombs`](Self::lock_tombs), which it passes as `tombs`.
+    pub(super) fn drop_tombs_held(
+        &self,
+        _tombs: &MutexGuard<'_, ()>,
+        cache: &CacheDir,
+        keys: &[String],
+    ) -> io::Result<()> {
         let rewrites: Vec<(RecordId, Vec<String>)> = {
             let index = self.lock();
             let mut ids: Vec<RecordId> = keys
@@ -1400,6 +1999,12 @@ impl Overlay {
                 })
                 .collect()
         };
+        let removed: Vec<&RecordId> = rewrites
+            .iter()
+            .filter(|(_, left)| left.is_empty())
+            .map(|(id, _)| id)
+            .collect();
+        self.flush_batches(cache, &removed)?;
         for (id, left) in rewrites {
             if left.is_empty() {
                 cache.remove_record(&id)?;
@@ -1591,15 +2196,28 @@ impl Overlay {
     pub(super) fn in_use(&self, key: &str) -> bool {
         self.lock().in_use(key, None)
     }
+
+    /// How many entries wait for the slot of `key` to clear.
+    #[cfg(test)]
+    pub(super) fn waiting_for(&self, key: &str) -> usize {
+        let index = self.lock();
+        index
+            .parked
+            .get(&index.slot(key))
+            .map_or(0, std::vec::Vec::len)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::s3::cachedir::CacheDir;
+    use crate::s3::cachedir::{CacheDir, RecordOp};
     use crate::s3::entry::State;
     use crate::s3::lookup::DirRef;
-    use crate::s3::record::RecordId;
+    use crate::s3::record::{BatchRecord, RecordId};
+
+    /// A bound on the entries below a directory that no test reaches.
+    const NO_LIMIT: usize = usize::MAX;
 
     fn test_overlay(fold: bool) -> Arc<Overlay> {
         Overlay::new(fold, Duration::from_secs(5))
@@ -1642,10 +2260,10 @@ mod tests {
     fn two_inserts_of_one_name_never_both_succeed() {
         let overlay = test_overlay(false);
         let first = overlay.insert_new(plain("a"));
-        assert!(first.is_some());
-        assert!(overlay.insert_new(plain("a")).is_none());
+        assert!(first.is_ok());
+        assert!(overlay.insert_new(plain("a")).is_err());
         let upper = overlay.insert_new(plain("A"));
-        assert!(upper.is_some());
+        assert!(upper.is_ok());
         assert_eq!(overlay.len(), 2);
     }
 
@@ -1653,7 +2271,7 @@ mod tests {
     fn names_that_differ_in_case_are_one_name_when_case_is_ignored() {
         let overlay = test_overlay(true);
         let held = overlay.insert_new(kept("Dir/File.TXT")).unwrap();
-        assert!(overlay.insert_new(plain("dir/file.txt")).is_none());
+        assert!(overlay.insert_new(plain("dir/file.txt")).is_err());
         let found = overlay.take_pending("DIR/FILE.txt").unwrap();
         assert!(Arc::ptr_eq(&found.entry, &held.entry));
         assert_eq!(found.entry.state().key, "Dir/File.TXT");
@@ -1857,7 +2475,7 @@ mod tests {
         let renamed = plain("f");
         let _renamed = overlay.insert_new(Arc::clone(&renamed)).unwrap();
         let reservation = overlay.reserve("T", &renamed, None).unwrap();
-        assert!(overlay.take_found(found_file("t"), &ahead).is_none());
+        assert!(overlay.take_found(found_file("t"), &ahead).is_err());
         assert_eq!(overlay.len(), 1);
         drop(reservation);
         let held = overlay.take_found(found_file("t"), &ahead).unwrap();
@@ -1866,7 +2484,7 @@ mod tests {
 
         let id = RecordId::parse(&"c".repeat(32)).unwrap();
         overlay.unlinked(&kept("u"), &["u".to_owned()], &id);
-        assert!(overlay.take_found(found_file("U"), &ahead).is_none());
+        assert!(overlay.take_found(found_file("U"), &ahead).is_err());
     }
 
     #[test]
@@ -2451,18 +3069,15 @@ mod tests {
         let replaced = plain("T");
         let _a = overlay.insert_new(Arc::clone(&renamed)).unwrap();
         let _t = overlay.insert_new(Arc::clone(&replaced)).unwrap();
-        assert!(overlay.reserve("t", &renamed, None).is_none(), "t is held");
+        assert!(overlay.reserve("t", &renamed, None).is_err(), "t is held");
         let reservation = overlay.reserve("t", &renamed, Some(&replaced)).unwrap();
-        assert!(overlay.reserve("T", &renamed, Some(&replaced)).is_none());
-        assert!(overlay.insert_new(plain("free")).is_some());
+        assert!(overlay.reserve("T", &renamed, Some(&replaced)).is_err());
+        assert!(overlay.insert_new(plain("free")).is_ok());
         drop(overlay.lock().entries.remove(&overlay.slot("t")));
-        assert!(overlay.insert_new(plain("t")).is_none(), "reserved");
+        assert!(overlay.insert_new(plain("t")).is_err(), "reserved");
         drop(reservation);
-        assert!(overlay.insert_new(plain("t")).is_some());
-        assert!(
-            overlay.reserve("a", &renamed, None).is_some(),
-            "its own name"
-        );
+        assert!(overlay.insert_new(plain("t")).is_ok());
+        assert!(overlay.reserve("a", &renamed, None).is_ok(), "its own name");
     }
 
     #[test]
@@ -2704,5 +3319,467 @@ mod tests {
         assert_eq!(queued(&overlay), 0, "it waits");
         drop(claim);
         assert_eq!(queued(&overlay), 1, "the end of the delete woke it");
+    }
+
+    #[test]
+    fn a_directory_is_gone_when_its_marker_is_to_be_deleted_and_no_entry_is_at_or_below_it() {
+        let overlay = test_overlay(true);
+        overlay.install(Vec::new(), vec![tombstone(&["Up/"])]);
+        assert!(overlay.dir_dead("up"));
+        assert!(overlay.dead_above("UP/f"));
+        assert!(!overlay.dead_above("up"));
+        assert!(!overlay.dir_dead("other"));
+
+        overlay.install(vec![kept("up/Down/f")], Vec::new());
+        assert!(!overlay.dir_dead("up"), "an entry is below it");
+        assert!(!overlay.dead_above("up/down/f"));
+    }
+
+    #[test]
+    fn a_directory_with_an_entry_of_its_own_is_not_gone_whatever_is_to_be_deleted() {
+        let overlay = test_overlay(false);
+        overlay.install(vec![dir("d")], vec![tombstone(&["d/", "d/f"])]);
+        assert!(!overlay.dir_dead("d"));
+        assert!(overlay.tombstoned("d/f"));
+    }
+
+    #[test]
+    fn nothing_is_made_below_a_directory_that_is_gone() {
+        let overlay = test_overlay(false);
+        overlay.install(Vec::new(), vec![tombstone(&["d/"])]);
+        assert!(matches!(
+            overlay.insert_new(plain("d/x/f")),
+            Err(SmbError::PathNotFound)
+        ));
+        assert!(matches!(
+            overlay.reserve("d/f", &plain("x"), None),
+            Err(SmbError::PathNotFound)
+        ));
+        let ahead = Arc::new(ReadAhead::new());
+        assert!(matches!(
+            overlay.take_found(found_file("d/f"), &ahead),
+            Err(SmbError::NotFound)
+        ));
+        let _made = overlay.insert_new(dir("d")).unwrap();
+        assert!(overlay.insert_new(plain("d/f")).is_ok());
+    }
+
+    #[test]
+    fn exact_keys_to_delete_are_found_by_their_spelling() {
+        let overlay = test_overlay(true);
+        overlay.install(Vec::new(), vec![tombstone(&["Dir/A.txt"])]);
+        assert!(overlay.to_delete("Dir/A.txt"));
+        assert!(!overlay.to_delete("Dir/a.txt"));
+        assert!(overlay.tombstoned("Dir/a.txt"));
+    }
+
+    #[test]
+    fn names_below_a_directory_held_for_a_rename_are_not_made_and_its_entries_stay() {
+        let overlay = test_overlay(true);
+        let idle = overlay.insert_new(plain("D/idle")).unwrap();
+        let subtree = overlay.hold_below("d").unwrap();
+        drop(idle);
+        assert_eq!(
+            overlay.len(),
+            1,
+            "the hold keeps an entry with nothing to keep"
+        );
+
+        assert!(matches!(
+            overlay.insert_new(plain("d/g")),
+            Err(SmbError::Sharing)
+        ));
+        let renamed = plain("x");
+        let _x = overlay.insert_new(Arc::clone(&renamed)).unwrap();
+        assert!(matches!(
+            overlay.reserve("D/h", &renamed, None),
+            Err(SmbError::Sharing)
+        ));
+        assert!(
+            overlay.insert_new(plain("dd")).is_ok(),
+            "beside the directory"
+        );
+        for other in ["d", "d/e", ""] {
+            assert!(
+                matches!(overlay.hold_below(other), Err(SmbError::Sharing)),
+                "{other}"
+            );
+        }
+
+        drop(subtree);
+        assert_eq!(overlay.len(), 1, "the entry the hold kept is let go");
+        assert!(overlay.insert_new(plain("d/g")).is_ok());
+    }
+
+    #[test]
+    fn a_frozen_rename_makes_no_entry_for_an_object_of_the_bucket_below_the_directory() {
+        let overlay = test_overlay(false);
+        let ahead = Arc::new(ReadAhead::new());
+        let mut subtree = overlay.hold_below("d").unwrap();
+        let before = overlay.take_found(found_file("d/a"), &ahead).unwrap();
+        subtree.freeze("e", NO_LIMIT).unwrap();
+        assert!(matches!(
+            overlay.take_found(found_file("d/b"), &ahead),
+            Err(SmbError::Sharing)
+        ));
+        let again = overlay.take_found(found_file("d/a"), &ahead).unwrap();
+        assert!(Arc::ptr_eq(&again.entry, &before.entry));
+        drop((before, again));
+        assert_eq!(overlay.len(), 1, "the freeze took a hold on the entry");
+        drop(subtree);
+        assert_eq!(overlay.len(), 0);
+        assert!(overlay.take_found(found_file("d/b"), &ahead).is_ok());
+    }
+
+    #[test]
+    fn a_frozen_rename_fences_the_directory_it_moves_to_until_it_thaws_or_ends() {
+        let overlay = test_overlay(true);
+        let ahead = Arc::new(ReadAhead::new());
+        let mut subtree = overlay.hold_below("d").unwrap();
+        subtree.freeze("E", NO_LIMIT).unwrap();
+
+        assert!(matches!(
+            overlay.insert_new(plain("e/x")),
+            Err(SmbError::Sharing)
+        ));
+        let renamed = plain("m");
+        let _m = overlay.insert_new(Arc::clone(&renamed)).unwrap();
+        assert!(matches!(
+            overlay.reserve("e/y", &renamed, None),
+            Err(SmbError::Sharing)
+        ));
+        assert!(matches!(
+            overlay.take_found(found_file("e/z"), &ahead),
+            Err(SmbError::Sharing)
+        ));
+        assert!(
+            overlay.reserve("e", &renamed, None).is_ok(),
+            "the name of the directory itself is not below it"
+        );
+
+        subtree.thaw();
+        assert!(
+            overlay.insert_new(plain("e/x")).is_ok(),
+            "the fence is lifted"
+        );
+        assert!(overlay.take_found(found_file("d/b"), &ahead).is_ok());
+        assert!(matches!(
+            overlay.insert_new(plain("d/c")),
+            Err(SmbError::Sharing)
+        ));
+
+        subtree.freeze("e2", NO_LIMIT).unwrap();
+        drop(subtree);
+        assert!(overlay.insert_new(plain("e2/x")).is_ok());
+        assert!(overlay.insert_new(plain("d/c")).is_ok());
+    }
+
+    #[test]
+    fn a_freeze_refuses_more_entries_than_a_rename_takes_before_it_holds_any() {
+        let overlay = test_overlay(false);
+        let ahead = Arc::new(ReadAhead::new());
+        let _held: Vec<Held> = ["d/a", "d/b"]
+            .into_iter()
+            .map(|key| overlay.insert_new(kept(key)).unwrap())
+            .collect();
+        let mut subtree = overlay.hold_below("d").unwrap();
+        let later: Vec<Held> = ["d/c", "d/d"]
+            .into_iter()
+            .map(|key| overlay.take_found(found_file(key), &ahead).unwrap())
+            .collect();
+
+        assert!(matches!(
+            subtree.freeze("e", 3),
+            Err(SmbError::AccessDenied)
+        ));
+        assert_eq!(
+            subtree.entries().len(),
+            2,
+            "the entries made since are not held"
+        );
+        assert!(later.iter().all(|held| held.entry.state().handles == 1));
+        {
+            let index = overlay.lock();
+            assert!(index.frozen.is_empty());
+            assert_eq!(index.moving.len(), 1, "only the directory is held");
+        }
+
+        subtree.freeze("e", 4).unwrap();
+        assert_eq!(subtree.entries().len(), 4);
+        assert!(later.iter().all(|held| held.entry.state().handles == 2));
+    }
+
+    #[test]
+    fn a_rename_cannot_fence_the_place_another_rename_holds() {
+        let overlay = test_overlay(false);
+        let mut first = overlay.hold_below("a").unwrap();
+        let mut second = overlay.hold_below("b").unwrap();
+        first.freeze("z", NO_LIMIT).unwrap();
+        assert!(matches!(
+            second.freeze("z", NO_LIMIT),
+            Err(SmbError::Sharing)
+        ));
+        assert!(matches!(
+            second.freeze("a/z", NO_LIMIT),
+            Err(SmbError::Sharing)
+        ));
+        drop(first);
+        second.freeze("z", NO_LIMIT).unwrap();
+    }
+
+    #[test]
+    fn a_case_only_rename_fences_nothing_beyond_the_directory() {
+        let overlay = test_overlay(true);
+        let mut subtree = overlay.hold_below("docs").unwrap();
+        subtree.freeze("DOCS", NO_LIMIT).unwrap();
+        for beside in ["DOCS", "doc", "docsx", "x/docs"] {
+            assert!(overlay.insert_new(plain(beside)).is_ok(), "{beside}");
+        }
+        {
+            let index = overlay.lock();
+            assert_eq!(index.moving.len(), 1);
+            assert_eq!(index.frozen.len(), 1);
+        }
+        subtree.thaw();
+        assert!(matches!(
+            overlay.insert_new(plain("docs/x")),
+            Err(SmbError::Sharing)
+        ));
+        drop(subtree);
+        assert!(overlay.insert_new(plain("docs/x")).is_ok());
+    }
+
+    #[test]
+    fn keys_inside_a_directory_held_for_a_rename_are_not_deleted_until_it_is_let_go() {
+        let overlay = test_overlay(false);
+        let id = RecordId::parse(&"c".repeat(32)).unwrap();
+        overlay.unlinked(&kept("d/old"), &["d/old".to_owned()], &id);
+        overlay.unlinked(&kept("other"), &["other".to_owned()], &id);
+        let owner = moved("e/x", "z", &["d/gone"]);
+        let _owner = overlay.insert_new(Arc::clone(&owner)).unwrap();
+        overlay.track(&owner);
+        let later = Instant::now() + Duration::from_secs(6);
+
+        let subtree = overlay.hold_below("d").unwrap();
+        assert_eq!(claimed(&overlay, later), ["other"]);
+        let claim = overlay.claim_gone(&["d/gone".to_owned()], &owner);
+        assert_eq!(claim.busy, ["d/gone"]);
+        assert!(claim.claimed.keys().is_empty());
+        drop(claim);
+
+        drop(subtree);
+        assert_eq!(claimed(&overlay, later), ["d/old", "other"]);
+        let claim = overlay.claim_gone(&["d/gone".to_owned()], &owner);
+        assert_eq!(claim.claimed.keys(), ["d/gone"]);
+    }
+
+    #[test]
+    fn the_marker_of_a_directory_held_for_a_rename_is_not_inside_it() {
+        let overlay = test_overlay(false);
+        let id = RecordId::parse(&"c".repeat(32)).unwrap();
+        overlay.unlinked(&kept("m/"), &["m/".to_owned()], &id);
+        let _subtree = overlay.hold_below("m").unwrap();
+        let later = Instant::now() + Duration::from_secs(6);
+        assert_eq!(claimed(&overlay, later), ["m/"]);
+    }
+
+    #[test]
+    fn an_entry_that_waits_for_a_key_inside_a_held_directory_wakes_when_it_is_let_go() {
+        let overlay = test_overlay(false);
+        let owner = moved("e", "e", &["d/old"]);
+        let _owner = overlay.insert_new(Arc::clone(&owner)).unwrap();
+        overlay.track(&owner);
+        let subtree = overlay.hold_below("d").unwrap();
+        let later = Instant::now() + Duration::from_secs(60);
+        while overlay.queue().pop_due(later).is_some() {}
+        owner.state().queued = false;
+        assert!(matches!(
+            overlay.claim(Arc::clone(&owner), later),
+            Claim::Skip
+        ));
+        assert!(owner.state().queued, "it waits in the overlay");
+        assert!(overlay.queue().pop_due(later).is_none());
+
+        drop(subtree);
+        let woke = overlay
+            .queue()
+            .pop_due(later)
+            .expect("the directory was let go");
+        assert!(Arc::ptr_eq(&woke, &owner));
+        assert!(matches!(
+            overlay.claim(woke, later),
+            Claim::Run(_, _, false)
+        ));
+    }
+
+    #[test]
+    fn a_hold_sees_the_requests_that_delete_inside_the_directory() {
+        let overlay = test_overlay(false);
+        let id = RecordId::parse(&"c".repeat(32)).unwrap();
+        overlay.unlinked(&kept("d/old"), &["d/old".to_owned()], &id);
+        overlay.unlinked(&kept("other"), &["other".to_owned()], &id);
+        let later = Instant::now() + Duration::from_secs(6);
+        let claim = overlay.claim_tombs(later).unwrap();
+        assert_eq!(claim.keys(), ["d/old", "other"]);
+
+        let subtree = overlay.hold_below("d").unwrap();
+        assert!(subtree.deleting());
+        drop(claim);
+        assert!(!subtree.deleting());
+    }
+
+    fn batch_of(entries: &[&Arc<Entry>]) -> (Arc<Batch>, BatchRecord) {
+        let members = entries
+            .iter()
+            .map(|entry| {
+                Entry::record(&mut entry.state(), "", std::time::SystemTime::UNIX_EPOCH).unwrap()
+            })
+            .collect();
+        let record = BatchRecord {
+            id: RecordId::parse(&"9".repeat(32)).unwrap(),
+            members,
+        };
+        let batch = Arc::new(Batch::new(record.clone()));
+        for entry in entries {
+            entry.state().batch = Some(Arc::clone(&batch));
+        }
+        (batch, record)
+    }
+
+    #[test]
+    fn an_entry_of_a_batch_stays_until_the_batch_is_released_and_leaves_then_if_idle() {
+        let overlay = test_overlay(false);
+        let idle = overlay.insert_new(plain("a")).unwrap();
+        let busy = overlay.insert_new(kept("b")).unwrap();
+        let (a, b) = (Arc::clone(&idle.entry), Arc::clone(&busy.entry));
+        let (batch, _) = batch_of(&[&a, &b]);
+        drop((idle, busy));
+        assert_eq!(overlay.len(), 2, "the batch holds both");
+
+        overlay.release_batch(&[Arc::clone(&a), Arc::clone(&b)], &batch);
+        assert_eq!(overlay.len(), 1, "only the entry with a record stays");
+        assert!(a.state().batch.is_none() && b.state().batch.is_none());
+    }
+
+    #[test]
+    fn a_failed_batch_fails_the_entries_that_still_wait_for_it_and_wakes_what_waits_on_it() {
+        let overlay = test_overlay(false);
+        let first = overlay.insert_new(kept("a")).unwrap();
+        let second = overlay.insert_new(kept("b")).unwrap();
+        let idle = overlay.insert_new(plain("c")).unwrap();
+        let (a, b, c) = (
+            Arc::clone(&first.entry),
+            Arc::clone(&second.entry),
+            Arc::clone(&idle.entry),
+        );
+        let (batch, _) = batch_of(&[&a, &c]);
+        let (later, _) = batch_of(&[&b]);
+        drop((first, second, idle));
+        {
+            let mut index = overlay.lock();
+            a.state().queued = true;
+            index.park(&a, batch.key());
+        }
+        let before = queued(&overlay);
+
+        let failure = S3Error::InvalidResponse("not recorded");
+        overlay.fail_batch(&[a.clone(), b.clone(), c.clone()], &batch, &failure);
+        assert!(a.state().failure.is_some());
+        assert!(
+            b.state().failure.is_none() && b.state().in_batch(&later),
+            "a later batch holds it"
+        );
+        assert_eq!(overlay.len(), 2, "the idle entry left");
+        assert_eq!(queued(&overlay), before + 1, "the entry that waited wakes");
+    }
+
+    #[test]
+    fn an_entry_that_goes_back_to_its_batch_is_no_longer_covered_by_a_tombstone_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = CacheDir::open(&dir.path().join("c"), "identity").unwrap();
+        let overlay = test_overlay(false);
+        let (a, b) = (kept("a"), kept("b"));
+        let (batch, record) = batch_of(&[&a, &b]);
+        cache.write_record(&record.id, &record.encode()).unwrap();
+        let id = record.members[0].id.clone();
+
+        let left = overlay.left_batch(&batch, &id).unwrap();
+        assert!(overlay.left_batch(&batch, &id).is_none(), "it left once");
+        assert_eq!(overlay.lock().covered.len(), 1);
+        overlay.rejoin_batch(&cache, left).unwrap();
+        assert!(overlay.lock().covered.is_empty());
+        assert!(
+            overlay.left_batch(&batch, &id).is_some(),
+            "it is a member again"
+        );
+    }
+
+    #[test]
+    fn a_failed_batch_lets_an_idle_entry_with_an_open_handle_go_when_the_handle_closes() {
+        let overlay = test_overlay(false);
+        let open = overlay.insert_new(plain("c")).unwrap();
+        let c = Arc::clone(&open.entry);
+        let (batch, _) = batch_of(&[&c]);
+
+        let failure = S3Error::InvalidResponse("not recorded");
+        overlay.fail_batch(&[Arc::clone(&c)], &batch, &failure);
+        assert!(c.state().batch.is_none());
+        assert_eq!(overlay.len(), 1, "the handle holds it");
+        drop(open);
+        assert_eq!(overlay.len(), 0);
+    }
+
+    #[test]
+    fn the_record_of_a_batch_is_written_without_the_entries_that_left_it_before_their_tombstone_goes()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = CacheDir::open(&dir.path().join("c"), "identity").unwrap();
+        let overlay = test_overlay(false);
+        let (a, b, c) = (kept("a"), kept("b"), kept("c"));
+        let (batch, record) = batch_of(&[&a, &b, &c]);
+        cache.write_record(&record.id, &record.encode()).unwrap();
+        let ids = [record.members[0].id.clone(), record.members[1].id.clone()];
+        for (entry, id, key) in [(&a, &ids[0], "k"), (&b, &ids[1], "l")] {
+            let tomb = TombstoneRecord {
+                id: id.clone(),
+                keys: vec![key.to_owned()],
+            };
+            cache.write_record(id, &tomb.encode()).unwrap();
+            overlay.unlinked(entry, &[key.to_owned()], id);
+            overlay.left_batch(&batch, id).unwrap();
+        }
+
+        let on_disk = || cache.batch_members(&record.id).unwrap().len();
+        assert_eq!(
+            on_disk(),
+            3,
+            "the record on disk still lists the entries that left"
+        );
+        cache.hooks.record_ops.lock().unwrap().clear();
+        overlay
+            .drop_tombs(&cache, &["k".to_owned(), "l".to_owned()])
+            .unwrap();
+        assert_eq!(on_disk(), 1, "the tombstone records went after it");
+        for id in &ids {
+            assert!(!dir.path().join("c/records").join(id.as_str()).exists());
+        }
+        // One rewrite of the batch record for both entries, and it comes before
+        // the first tombstone record goes.
+        let ops = cache.hooks.record_ops.lock().unwrap().clone();
+        let batch_writes: Vec<usize> = ops
+            .iter()
+            .enumerate()
+            .filter(|(_, (op, id))| *op == RecordOp::Write && *id == record.id)
+            .map(|(at, _)| at)
+            .collect();
+        let removals: Vec<usize> = ops
+            .iter()
+            .enumerate()
+            .filter(|(_, (op, id))| *op == RecordOp::Remove && ids.contains(id))
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(batch_writes.len(), 1, "{ops:?}");
+        assert_eq!(removals.len(), 2, "{ops:?}");
+        assert!(batch_writes[0] < removals[0], "{ops:?}");
     }
 }

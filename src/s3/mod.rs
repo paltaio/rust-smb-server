@@ -8,6 +8,7 @@ mod change;
 pub(crate) mod client;
 mod data;
 pub(crate) mod date;
+mod dirmove;
 pub(crate) mod encode;
 mod entry;
 pub(crate) mod error;

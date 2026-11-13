@@ -30,6 +30,7 @@ const DEFAULT_UPLOAD_DELAY: Duration = Duration::from_secs(5);
 const DEFAULT_PART_SIZE: u64 = 16 << 20;
 const DEFAULT_UPLOAD_CONCURRENCY: usize = 4;
 const DEFAULT_READ_CHUNK: u32 = 8 << 20;
+const DEFAULT_MAX_DIR_RENAME_OBJECTS: usize = 10_000;
 
 /// Settings of an [`S3Backend`], set through the methods below and applied by
 /// [`build`](S3BackendBuilder::build).
@@ -50,6 +51,7 @@ pub struct S3BackendBuilder {
     part_size: u64,
     upload_concurrency: usize,
     read_chunk: u32,
+    max_dir_rename_objects: usize,
     /// Keeps the worker from starting jobs until a test lets it.
     #[cfg(test)]
     held_uploads: bool,
@@ -105,6 +107,7 @@ impl S3Backend {
             part_size: DEFAULT_PART_SIZE,
             upload_concurrency: DEFAULT_UPLOAD_CONCURRENCY,
             read_chunk: DEFAULT_READ_CHUNK,
+            max_dir_rename_objects: DEFAULT_MAX_DIR_RENAME_OBJECTS,
             #[cfg(test)]
             held_uploads: false,
         }
@@ -277,6 +280,18 @@ impl S3BackendBuilder {
         self
     }
 
+    /// Sets the most objects a renamed directory may hold: the objects below
+    /// it in the bucket and the entries the backend holds for it. A rename of
+    /// a directory with more fails with
+    /// [`AccessDenied`](crate::SmbError::AccessDenied) and changes nothing.
+    /// The objects move after the rename answers. The cap bounds the memory
+    /// and the cache directory space a move takes. The default is 10,000.
+    #[must_use]
+    pub fn max_dir_rename_objects(mut self, max: usize) -> Self {
+        self.max_dir_rename_objects = max;
+        self
+    }
+
     /// Keeps the backend from starting uploads until
     /// [`hold_uploads`](S3Backend::hold_uploads) lets it.
     #[cfg(test)]
@@ -396,6 +411,7 @@ impl S3BackendBuilder {
             built,
             cache: Mutex::new(MetaCache::new(self.metadata_ttl)),
             read_chunk: u64::from(self.read_chunk),
+            max_dir_rename_objects: self.max_dir_rename_objects,
             ahead,
             read_only: self.read_only,
             overlay,

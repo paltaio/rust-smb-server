@@ -27,10 +27,11 @@ use crate::error::{SmbError, SmbResult};
 use super::backend::Shared;
 use super::cache::Known;
 use super::change;
+use super::data::disk_error;
 use super::entry::{Body, Entry, Upload};
 use super::error::S3Error;
 use super::jobs::Running;
-use super::keys::{FileStamp, RowKind};
+use super::keys::{FileStamp, RowKind, dir_prefix};
 use super::meta;
 use super::object::{ByteRange, Metadata, ObjectHead};
 use super::outcome;
@@ -48,7 +49,7 @@ const NEW_FILE_TYPE: &str = "application/octet-stream";
 
 /// The least an entry rests after a job met a full disk, whatever the upload
 /// delay is.
-const FULL_DISK_REST: Duration = Duration::from_secs(1);
+pub(super) const FULL_DISK_REST: Duration = Duration::from_secs(1);
 
 /// Why a job ended before it stored what its entry holds.
 #[derive(Debug)]
@@ -178,12 +179,10 @@ impl Job<'_> {
         if self.entry().state().detached {
             return Halt::Gone;
         }
-        let error = match error {
-            SmbError::DiskFull => return Halt::Full,
-            SmbError::Io(error) => error,
-            other => io::Error::other(other.to_string()),
-        };
-        Halt::Failed(S3Error::Cache(Arc::new(error)))
+        match error {
+            SmbError::DiskFull => Halt::Full,
+            other => Halt::Failed(S3Error::cache(other)),
+        }
     }
 
     /// Fails if the job was stopped, which every change to the entry does, or
@@ -263,6 +262,9 @@ impl Job<'_> {
                 "the object changed or was deleted in the bucket while the file held changes of its own; \
                  the changes were moved to the conflicts directory"
             ),
+            Err(Halt::Gone) => {
+                debug!(path = %self.path, "the entry left the overlay during its job")
+            }
             Err(halt) => {
                 error!(
                     path = %self.path,
@@ -297,8 +299,46 @@ impl Job<'_> {
         }
     }
 
+    /// Reads the metadata of the object the entry starts from when its base
+    /// came from a listing, so the requests of the job keep that metadata. A
+    /// file whose object changed or is gone is a conflict; a directory takes
+    /// its marker as it is, or goes on without one.
+    async fn refresh(&self) -> Result<(), Halt> {
+        let (key, head, is_dir) = {
+            let state = self.entry().state();
+            if state.detached {
+                return Err(Halt::Gone);
+            }
+            match &state.base {
+                Some(base) if base.bare => {
+                    (base.key.clone(), Arc::clone(&base.head), state.is_dir())
+                }
+                _ => return Ok(()),
+            }
+        };
+        let found = match self.shared.client.head_object(&key, self.retry()).await {
+            Ok(found) => Arc::new(found),
+            Err(e) if e.is_no_such_key() && is_dir => return Ok(()),
+            Err(e) if e.is_no_such_key() => return Err(Halt::Conflict(e)),
+            Err(e) => return Err(self.halt(e)),
+        };
+        if !is_dir && !head.same_object(&found) {
+            return Err(Halt::Conflict(S3Error::status(
+                412,
+                Some("PreconditionFailed"),
+                None,
+            )));
+        }
+        self.check()?;
+        self.entry()
+            .state()
+            .complete_base(&self.shared.ahead, &key, found);
+        Ok(())
+    }
+
     async fn file(&self) -> Result<(), Halt> {
         self.abort_stale().await;
+        self.refresh().await?;
         if self.run.cycle && self.entry().state().local().is_none() {
             self.blocking(|shared, entry| outcome::local_copy(shared, entry))
                 .await?;
@@ -460,14 +500,14 @@ impl Job<'_> {
                 continue;
             }
             self.blocking(move |shared, _| match owner {
-                Some(owner) => match outcome::deleted(shared, &owner, &[variant]) {
+                Some(owner) => match outcome::taken_over(shared, &owner, &[variant]) {
                     Err(SmbError::AccessDenied) => Ok(()),
                     done => done,
                 },
                 None => shared
                     .overlay
                     .drop_tombs(shared.local()?, &[variant])
-                    .map_err(SmbError::Io),
+                    .map_err(disk_error),
             })
             .await?;
         }
@@ -885,9 +925,26 @@ impl Job<'_> {
         }
     }
 
-    /// Puts the marker object of a directory, with the times and attributes
-    /// the entry holds.
+    /// Puts the marker object of a directory that has none in the bucket or
+    /// has new times or attributes, with the times and attributes the entry
+    /// holds, and deletes the keys the directory owns to delete.
     async fn directory(&self) -> Result<(), Halt> {
+        self.refresh().await?;
+        let writes = {
+            let state = self.entry().state();
+            if state.detached {
+                return Err(Halt::Gone);
+            }
+            state.writes()
+        };
+        if writes {
+            self.marker().await?;
+        }
+        self.finish().await
+    }
+
+    /// Puts the marker object of the directory.
+    async fn marker(&self) -> Result<(), Halt> {
         let (key, generation, metadata) = {
             let state = self.entry().state();
             if state.detached {
@@ -903,12 +960,16 @@ impl Job<'_> {
             (state.key.clone(), state.generation, metadata)
         };
         self.check()?;
+        self.before_store(&dir_prefix(&key), false).await?;
         let head = change::store_marker(self.shared, &key, metadata, self.retry())
             .await
             .map_err(|e| self.halt(e))?;
-        change::marker_put(self.shared, self.run.held(), generation, &key, head)
+        let took = change::marker_put(self.shared, self.run.held(), generation, &key, head)
             .await
             .map_err(|e| self.local(e))?;
+        if !took {
+            return Err(Halt::Stopped);
+        }
         let mut state = self.entry().state();
         state.uploaded = generation;
         Ok(())

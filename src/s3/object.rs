@@ -103,6 +103,14 @@ pub(crate) struct ObjectHead {
 }
 
 impl ObjectHead {
+    /// Whether `found`, read from the key this head was described at, is the
+    /// same object: it has the same size, and the same ETag when both have
+    /// one.
+    pub(crate) fn same_object(&self, found: &ObjectHead) -> bool {
+        self.size == found.size
+            && (self.etag.is_empty() || found.etag.is_empty() || self.etag == found.etag)
+    }
+
     /// Reads the headers of an answer about an object of `size` bytes.
     pub(crate) fn from_headers(headers: &HeaderMap, size: u64) -> Result<Self, S3Error> {
         let last_modified = headers
@@ -252,6 +260,21 @@ mod tests {
         assert_eq!(read("STANDARD"), None);
         assert_eq!(read("STANDARD_IA").as_deref(), Some("STANDARD_IA"));
         assert_eq!(read("standard").as_deref(), Some("standard"));
+    }
+
+    #[test]
+    fn two_heads_are_one_object_when_the_size_and_any_etags_agree() {
+        let head = |size, etag: &str| ObjectHead {
+            size,
+            etag: etag.to_owned(),
+            last_modified: UNIX_EPOCH,
+            metadata: Metadata::default(),
+        };
+        assert!(head(3, "\"a\"").same_object(&head(3, "\"a\"")));
+        assert!(head(3, "\"a\"").same_object(&head(3, "")));
+        assert!(head(3, "").same_object(&head(3, "\"b\"")));
+        assert!(!head(3, "\"a\"").same_object(&head(3, "\"b\"")));
+        assert!(!head(3, "\"a\"").same_object(&head(4, "\"a\"")));
     }
 
     #[test]

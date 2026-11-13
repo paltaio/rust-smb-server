@@ -166,6 +166,19 @@ impl S3Error {
         S3Error::Transport(Arc::from(source.into()))
     }
 
+    /// The failure that a change to the cache directory ending in `error`
+    /// gives a job or a batch. An `Io` error is kept as it is; a full disk or
+    /// an exceeded quota keeps its kind; any other error is the source.
+    pub(crate) fn cache(error: SmbError) -> Self {
+        let cause = match error {
+            SmbError::Io(cause) => cause,
+            SmbError::DiskFull => io::Error::new(io::ErrorKind::StorageFull, error),
+            SmbError::QuotaExceeded => io::Error::new(io::ErrorKind::QuotaExceeded, error),
+            other => io::Error::other(other),
+        };
+        S3Error::Cache(Arc::new(cause))
+    }
+
     /// The messages of the errors behind a transport failure, from the
     /// outermost to the innermost, joined by `: `. They carry no credentials,
     /// signatures or bodies.
@@ -405,6 +418,35 @@ mod tests {
 
     fn smb(error: S3Error) -> SmbError {
         error.into_smb_error()
+    }
+
+    fn cause(error: S3Error) -> Arc<io::Error> {
+        match error {
+            S3Error::Cache(cause) => cause,
+            other => panic!("not a cache error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_cache_failure_keeps_the_kind_and_the_source_of_the_error() {
+        let kept = cause(S3Error::cache(SmbError::Io(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "no access",
+        ))));
+        assert_eq!(kept.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(kept.to_string(), "no access");
+
+        let full = cause(S3Error::cache(SmbError::DiskFull));
+        assert_eq!(full.kind(), io::ErrorKind::StorageFull);
+        let quota = cause(S3Error::cache(SmbError::QuotaExceeded));
+        assert_eq!(quota.kind(), io::ErrorKind::QuotaExceeded);
+
+        let other = cause(S3Error::cache(SmbError::Sharing));
+        let source = other.get_ref().expect("the error is the source");
+        assert!(matches!(
+            source.downcast_ref::<SmbError>(),
+            Some(SmbError::Sharing)
+        ));
     }
 
     #[test]

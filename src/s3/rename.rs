@@ -3,7 +3,7 @@
 //! replaces, if any, gives its keys up to be deleted.
 
 use std::io;
-use std::sync::Arc;
+use std::sync::{Arc, MutexGuard};
 
 use tokio::task::spawn_blocking;
 use tracing::warn;
@@ -13,21 +13,25 @@ use crate::path::SmbPath;
 
 use super::backend::Shared;
 use super::data::disk_error;
+use super::dirmove::Left;
 use super::entry::{Entry, Sealed, State};
-use super::keys::{child_key, path_below};
+use super::keys::{RowKind, child_key, last_name, path_below, slot};
 use super::overlay::{Held, Moving};
 use super::record::RecordId;
-use super::unlink::{supersede, write_tombs};
+use super::retry::Retry;
+use super::unlink::{drop_record, leave_batch, supersede};
 
 impl Shared {
-    /// Renames the file at `from` to `to`. The change is local: the only
-    /// requests are the lookups of the two names and of the parent of `to`.
+    /// Renames the file or directory at `from` to `to`. The change of a file
+    /// is local: the only requests are the lookups of the two names and of the
+    /// parent of `to`. A directory also lists the keys below it.
     ///
     /// # Errors
     ///
     /// Fails with `Exists` if another file has the name and `replace` is not
-    /// set, with `AccessDenied` if a directory has it, and with
-    /// `PathNotFound` if the parent of `to` is not a directory.
+    /// set, with `AccessDenied` if a directory has it or a directory is to
+    /// replace a file, and with `PathNotFound` if the parent of `to` is not a
+    /// directory.
     pub(super) async fn rename(
         self: &Arc<Self>,
         from: &SmbPath,
@@ -40,12 +44,21 @@ impl Shared {
         }
         let retry = self.retry();
         let source = self.locate(from, &retry).await?;
-        if source.entry.is_dir() {
-            return Err(SmbError::AccessDenied);
-        }
         let parent = self.parent_dir(to, &retry).await?;
         let name = to.file_name().ok_or(SmbError::NameInvalid)?;
         let key = child_key(&parent.key, name)?;
+        // A store that ignores case answers a lookup of the new spelling with
+        // the directory itself, and the lookup would give the entry that
+        // spelling: the name stays that of the directory.
+        let fold = self.case_insensitive;
+        if source.entry.is_dir() {
+            let held_key = source.entry.state().key.clone();
+            if slot(&key, fold) == slot(&held_key, fold) {
+                self.refuse_case_duplicate(&parent.key, &held_key, &key, &retry)
+                    .await?;
+                return self.rename_dir(source, key, &retry).await;
+            }
+        }
         let mut attempts = 0;
         loop {
             let target = match self.locate(to, &retry).await {
@@ -57,8 +70,12 @@ impl Shared {
                 Some(target) if Arc::ptr_eq(&target.entry, &source.entry) => None,
                 Some(target) if target.entry.is_dir() => return Err(SmbError::AccessDenied),
                 Some(_) if !replace => return Err(SmbError::Exists),
+                Some(_) if source.entry.is_dir() => return Err(SmbError::AccessDenied),
                 other => other,
             };
+            if source.entry.is_dir() {
+                return self.rename_dir(source, key, &retry).await;
+            }
             let (shared, moving, key) = (Arc::clone(self), source.another(), key.clone());
             let done = spawn_blocking(move || rename_file(&shared, &moving, &key, target))
                 .await
@@ -70,6 +87,32 @@ impl Shared {
                 return done;
             }
         }
+    }
+}
+
+impl Shared {
+    /// Fails with `AccessDenied` if the directory `held` in the directory
+    /// `parent` is to get the spelling `key` of its name, which differs in case
+    /// only, and the listing of `parent` has another directory with that
+    /// spelling: the store keeps both, and the rename would mix them.
+    async fn refuse_case_duplicate(
+        &self,
+        parent: &str,
+        held: &str,
+        key: &str,
+        retry: &Retry,
+    ) -> SmbResult<()> {
+        if held == key {
+            return Ok(());
+        }
+        let listing = self.listing(parent, retry).await?;
+        let duplicate = listing
+            .find_exact(last_name(key))
+            .is_some_and(|row| matches!(row.kind, RowKind::Dir) && row.name != last_name(held));
+        if duplicate {
+            return Err(SmbError::AccessDenied);
+        }
+        Ok(())
     }
 }
 
@@ -112,6 +155,8 @@ struct Replaced<'a> {
     /// The entry had a record.
     recorded: bool,
     keys: Vec<String>,
+    /// What puts the entry back in the batch of a directory rename it left.
+    left: Option<Left>,
 }
 
 /// Moves the entry of `source` to `to`, in this order: the record of the
@@ -133,9 +178,7 @@ fn rename_file(shared: &Shared, source: &Held, to: &str, replaced: Option<Held>)
         gone_after(&state.gone, &state.key, state.in_bucket(), to)
     };
     let tombs = shared.overlay.lock_tombs();
-    let Some(_reserved) = shared.overlay.reserve(to, entry, other) else {
-        return Err(SmbError::Exists);
-    };
+    let _reserved = shared.overlay.reserve(to, entry, other)?;
     #[cfg(test)]
     super::jobs::pause_blocking(&shared.jobs.pause_reserved);
 
@@ -143,13 +186,17 @@ fn rename_file(shared: &Shared, source: &Held, to: &str, replaced: Option<Held>)
     let mut replacing = None;
     let (mut prior, mut may_exist) = (None, shared.overlay.tombstoned(to));
     if let Some(x) = other {
-        let (id, recorded) = {
+        let (id, recorded, batch) = {
             let mut state = x.state();
             state.attached()?;
             state.bump();
             prior = prior_etag(&state, to);
             may_exist |= state.in_bucket();
-            (state.id().map_err(SmbError::Io)?, state.recorded)
+            (
+                state.id().map_err(SmbError::Io)?,
+                state.recorded,
+                state.batch.clone(),
+            )
         };
         let moving = Moving {
             entry,
@@ -157,12 +204,13 @@ fn rename_file(shared: &Shared, source: &Held, to: &str, replaced: Option<Held>)
             gone: &gone,
         };
         let keys = shared.overlay.tomb_keys(x, Some(moving));
-        write_tombs(cache, &id, recorded, &keys)?;
+        let left = leave_batch(shared, cache, batch.as_ref(), &id, recorded, &keys)?;
         replacing = Some(Replaced {
             entry: x,
             id,
             recorded,
             keys,
+            left,
         });
     }
 
@@ -170,10 +218,10 @@ fn rename_file(shared: &Shared, source: &Held, to: &str, replaced: Option<Held>)
     let moved = match moved {
         Ok(moved) => moved,
         Err(e) => {
-            drop(tombs);
-            if let Some(x) = &replacing {
-                restore(shared, x);
+            if let Some(x) = replacing {
+                restore(shared, x, &tombs);
             }
+            drop(tombs);
             return Err(e);
         }
     };
@@ -182,6 +230,7 @@ fn rename_file(shared: &Shared, source: &Held, to: &str, replaced: Option<Held>)
     {
         warn!(error = %e, "a data file that is no longer needed could not be removed");
     }
+
     let keys = replacing
         .as_ref()
         .map(|x| x.keys.clone())
@@ -199,30 +248,47 @@ fn rename_file(shared: &Shared, source: &Held, to: &str, replaced: Option<Held>)
             }
             state.recorded = moved.recorded;
             state.recorded_source = moved.source;
+            if moved.left_batch {
+                state.batch = None;
+            }
         },
         replacing
             .as_ref()
             .map(|x| (x.entry, x.keys.as_slice(), &x.id)),
     );
     drop(tombs);
-    super::change::superseded(shared, entry);
+    super::change::superseded(shared, entry, None);
     supersede(shared, &keys);
     Ok(())
 }
 
-/// Puts the record of the replaced entry back as it was before a rename that
-/// failed: the record is written again if the entry had one, and the
-/// tombstone record that took its id goes if not.
-fn restore(shared: &Shared, x: &Replaced<'_>) {
-    let restored = if x.recorded {
-        super::change::persist_held(shared, x.entry, true)
-    } else {
-        shared
-            .local()
-            .and_then(|cache| cache.remove_record(&x.id).map_err(disk_error))
+/// Puts the replaced entry back as it was before a rename that failed: it is
+/// a member of its batch again. Its own record is written again if it had
+/// one, or if the record of the batch could not be written with it, which
+/// replaces the tombstone record that took its id. In every other case, and
+/// when that write fails, the tombstone record is removed. The caller holds
+/// the lock of the keys to delete, `tombs`, so no record of them changes
+/// meanwhile.
+fn restore(shared: &Shared, x: Replaced<'_>, tombs: &MutexGuard<'_, ()>) {
+    let Ok(cache) = shared.local() else {
+        return;
     };
-    if let Err(e) = restored {
-        warn!(error = %e, "the record of an entry that was not replaced could not be written again");
+    let rejoined = x
+        .left
+        .map_or(Ok(()), |left| shared.overlay.rejoin_batch(cache, left));
+    if let Err(e) = &rejoined {
+        warn!(error = %e, "the record of a directory rename could not be written again");
+    }
+    if x.recorded || rejoined.is_err() {
+        match super::change::persist_locked(shared, x.entry, tombs) {
+            Ok(()) => return,
+            Err(e) => {
+                warn!(error = %e, "the record of an entry that was not replaced could not be written again");
+            }
+        }
+    }
+    if let Err(e) = cache.remove_record(&x.id) {
+        warn!(error = %e, "the tombstone record of an entry that was not replaced could not be removed");
     }
 }
 
@@ -234,6 +300,8 @@ struct Moved {
     recorded: bool,
     /// The key the record says the content is copied from.
     source: Option<String>,
+    /// The entry has left the batch of a directory rename.
+    left_batch: bool,
 }
 
 /// Writes the record of `entry` as it is with the key `to`, or removes it if
@@ -246,7 +314,7 @@ fn move_record(
     may_exist: bool,
 ) -> SmbResult<Moved> {
     let cache = shared.local()?;
-    let (record, id, recorded, first, file) = {
+    let (record, id, recorded, first, file, batch) = {
         let mut state = entry.state();
         state.attached()?;
         let work = state.local().is_some()
@@ -260,16 +328,18 @@ fn move_record(
             state.recorded,
             state.sealed().is_none(),
             state.local().map(|local| Arc::clone(&local.file)),
+            state.batch.clone(),
         )
     };
     let Some(record) = record else {
-        if let (true, Some(id)) = (recorded, id) {
-            cache.remove_record(&id).map_err(disk_error)?;
-        }
+        // The entry has nothing to record: a batch that lists it must not
+        // bring its earlier place back.
+        drop_record(shared, cache, batch.as_ref(), id.as_ref(), recorded)?;
         return Ok(Moved {
             sealed: None,
             recorded: false,
             source: None,
+            left_batch: batch.is_some(),
         });
     };
     let mut record = record.map_err(SmbError::Io)?;
@@ -295,6 +365,7 @@ fn move_record(
         sealed,
         recorded: true,
         source: record.source().map(str::to_owned),
+        left_batch: false,
     })
 }
 

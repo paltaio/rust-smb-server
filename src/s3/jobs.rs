@@ -49,6 +49,23 @@ fn take_gates(gates: &std::sync::Mutex<Option<Gates>>) -> Option<Gates> {
         .take()
 }
 
+/// A flag a test raises to make the code that checks it panic.
+#[cfg(test)]
+#[derive(Default)]
+pub(super) struct PanicHook(std::sync::atomic::AtomicBool);
+
+#[cfg(test)]
+impl PanicHook {
+    pub(super) fn raise(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Panics with `what` if a test raised the flag.
+    pub(super) fn check(&self, what: &str) {
+        assert!(!self.0.load(std::sync::atomic::Ordering::SeqCst), "{what}");
+    }
+}
+
 /// The size of the largest object one CopyObject request takes.
 const MAX_COPY: u64 = 5 << 30;
 
@@ -66,6 +83,9 @@ pub(super) struct Jobs {
     pub(super) stop: Stop,
     /// Set when the worker has ended, however it ended.
     pub(super) exited: watch::Sender<bool>,
+    /// How many renames of directories have tasks that run on after the
+    /// rename answered. The worker does not end before they have.
+    dissolving: watch::Sender<usize>,
     /// Keeps the worker from starting jobs while set.
     #[cfg(test)]
     pub(super) held: std::sync::atomic::AtomicBool,
@@ -74,7 +94,7 @@ pub(super) struct Jobs {
     pub(super) sweeps_held: std::sync::atomic::AtomicBool,
     /// Makes the worker panic.
     #[cfg(test)]
-    pub(super) panic_worker: std::sync::atomic::AtomicBool,
+    pub(super) panic_worker: PanicHook,
     /// Makes the next job that has hashed a file wait.
     #[cfg(test)]
     pub(super) pause: std::sync::Mutex<Option<Gates>>,
@@ -92,6 +112,27 @@ pub(super) struct Jobs {
     /// Makes the next rename wait after it has reserved its name.
     #[cfg(test)]
     pub(super) pause_reserved: std::sync::Mutex<Option<Gates>>,
+    /// Makes the next move of a directory wait before it records the entries
+    /// it made.
+    #[cfg(test)]
+    pub(super) pause_batch: std::sync::Mutex<Option<Gates>>,
+    /// Makes the next create wait once it has checked the directory it is in,
+    /// before it enters the overlay.
+    #[cfg(test)]
+    pub(super) pause_create: std::sync::Mutex<Option<Gates>>,
+    /// Makes the next move of a directory wait once it has read the keys below
+    /// it.
+    #[cfg(test)]
+    pub(super) pause_listed: std::sync::Mutex<Option<Gates>>,
+    /// Makes the task that records the entries of a moved directory panic.
+    #[cfg(test)]
+    pub(super) panic_dissolve: PanicHook,
+    /// Makes the tasks that read the metadata of moved objects panic.
+    #[cfg(test)]
+    pub(super) panic_read_base: PanicHook,
+    /// How many times a call waited for requests in flight or keys to clear.
+    #[cfg(test)]
+    pub(super) waits: std::sync::atomic::AtomicUsize,
 }
 
 impl Jobs {
@@ -102,12 +143,13 @@ impl Jobs {
             concurrency,
             stop: Stop::new(),
             exited: watch::Sender::new(false),
+            dissolving: watch::Sender::new(0),
             #[cfg(test)]
             held: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             sweeps_held: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
-            panic_worker: std::sync::atomic::AtomicBool::new(false),
+            panic_worker: PanicHook::default(),
             #[cfg(test)]
             pause: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -118,7 +160,26 @@ impl Jobs {
             pause_found: std::sync::Mutex::new(None),
             #[cfg(test)]
             pause_reserved: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            pause_batch: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            pause_create: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            pause_listed: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            panic_dissolve: PanicHook::default(),
+            #[cfg(test)]
+            panic_read_base: PanicHook::default(),
+            #[cfg(test)]
+            waits: std::sync::atomic::AtomicUsize::new(0),
         })
+    }
+
+    /// Notes the tasks that run on after a directory rename answered, until
+    /// the value returned is dropped.
+    pub(super) fn begin_dissolve(self: &Arc<Self>) -> Dissolving {
+        self.dissolving.send_modify(|count| *count += 1);
+        Dissolving(Arc::clone(self))
     }
 
     /// The size of the largest object one copy request takes.
@@ -151,6 +212,15 @@ impl Jobs {
     #[cfg(not(test))]
     fn are_sweeps_held(&self) -> bool {
         false
+    }
+}
+
+/// The tasks that run on after a directory rename answered.
+pub(super) struct Dissolving(Arc<Jobs>);
+
+impl Drop for Dissolving {
+    fn drop(&mut self) {
+        self.0.dissolving.send_modify(|count| *count -= 1);
     }
 }
 
@@ -243,10 +313,7 @@ async fn run_jobs(shared: Arc<Shared>) {
     loop {
         woken.as_mut().enable();
         #[cfg(test)]
-        assert!(
-            !jobs.panic_worker.load(std::sync::atomic::Ordering::SeqCst),
-            "a test made the worker panic"
-        );
+        jobs.panic_worker.check("a test made the worker panic");
         let may_start = !jobs.is_held() && running.len() < jobs.concurrency;
         // One clock reading serves the claims and the wait, so a time that
         // passes between them is not missed.
@@ -279,6 +346,11 @@ async fn run_jobs(shared: Arc<Shared>) {
     while let Some(ended) = running.join_next_with_id().await {
         ended_job(ended, &mut stops);
     }
+    let _ = jobs
+        .dissolving
+        .subscribe()
+        .wait_for(|count| *count == 0)
+        .await;
 }
 
 /// Waits until `at`, or for ever.

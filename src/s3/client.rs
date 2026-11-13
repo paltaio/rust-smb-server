@@ -35,6 +35,9 @@ pub(crate) const MAX_BODY: usize = 8 << 20;
 /// Most keys one DeleteObjects call takes.
 pub(crate) const MAX_DELETE_KEYS: usize = 1000;
 
+/// Most keys one listing returns.
+pub(crate) const MAX_LISTED: u32 = 1000;
+
 /// Highest part number of a multipart upload.
 const MAX_PART_NUMBER: u32 = 10_000;
 

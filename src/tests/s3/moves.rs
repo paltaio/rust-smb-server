@@ -10,11 +10,12 @@ use tokio::sync::Notify;
 use super::fixture::{MIB, TestBucket, foreground, pattern, put};
 use super::proxy::{Fault, Proxy, Reply, Seen};
 use super::share::{
-    DELETE, READ, Rig, Spec, WRITE_ATTRIBUTES, is_data_read, names, wait_for_requests, wait_until,
-    wait_until_async,
+    DELETE, READ, Rig, Spec, WRITE_ATTRIBUTES, is_data_read, names, open_handle, wait_for_requests,
+    wait_until, wait_until_async,
 };
 use super::uploads::{
-    fill, held, is_complete, is_create_of, is_head_of, is_put_of, left, stored, sync, uploading,
+    fill, held, is_complete, is_create_of, is_get_of, is_head_of, is_put_of, left, stored, sync,
+    uploading,
 };
 use super::writes::{create_dir, create_file, open_rw};
 use crate::ntstatus::{
@@ -25,16 +26,16 @@ use crate::s3::object::Metadata;
 use crate::s3::record::{EntryRecord, Record, RecordId, TombstoneRecord};
 use crate::{OpenOptions, ShareBackend, SmbError, SmbPath};
 
-fn path(name: &str) -> SmbPath {
+pub(super) fn path(name: &str) -> SmbPath {
     name.parse().unwrap()
 }
 
-fn is_delete(seen: &Seen) -> bool {
+pub(super) fn is_delete(seen: &Seen) -> bool {
     (seen.method == "POST" && seen.has_param("delete"))
         || (seen.method == "DELETE" && !seen.has_param("uploadId"))
 }
 
-fn is_copy(seen: &Seen) -> bool {
+pub(super) fn is_copy(seen: &Seen) -> bool {
     seen.method == "PUT"
         && seen.header("x-amz-copy-source").is_some()
         && !seen.has_param("partNumber")
@@ -46,16 +47,16 @@ fn is_part_copy(seen: &Seen) -> bool {
         && seen.has_param("partNumber")
 }
 
-fn deletes(rig: &Rig) -> usize {
+pub(super) fn deletes(rig: &Rig) -> usize {
     rig.proxy.count(is_delete)
 }
 
-fn copies(rig: &Rig) -> usize {
+pub(super) fn copies(rig: &Rig) -> usize {
     rig.proxy.count(is_copy)
 }
 
 /// The bytes of the object `key` in the bucket, if it is there.
-async fn remote(rig: &Rig, key: &str) -> Option<Vec<u8>> {
+pub(super) async fn remote(rig: &Rig, key: &str) -> Option<Vec<u8>> {
     match rig.store().head_object(key, foreground()).await {
         Ok(_) => Some(stored(rig, key).await.0),
         Err(e) if e.is_no_such_key() => None,
@@ -64,7 +65,7 @@ async fn remote(rig: &Rig, key: &str) -> Option<Vec<u8>> {
 }
 
 /// Makes the file `name` through the share with `data`, and closes it.
-async fn make(rig: &mut Rig, name: &str, data: &[u8]) {
+pub(super) async fn make(rig: &mut Rig, name: &str, data: &[u8]) {
     let file = rig.smb.create(name, create_file()).await.unwrap();
     fill(&mut rig.smb, file.id, data).await;
     rig.smb.close(file.id).await;
@@ -72,12 +73,12 @@ async fn make(rig: &mut Rig, name: &str, data: &[u8]) {
 
 /// Whether the gateway holds `Mixed` and `mixed` as one object, as one on a
 /// file system that ignores case does.
-async fn folds_case(rig: &Rig) -> bool {
+pub(super) async fn folds_case(rig: &Rig) -> bool {
     put(rig.store(), "Mixed.case", b"x").await;
     remote(rig, "mixed.case").await.is_some()
 }
 
-async fn exists(rig: &mut Rig, name: &str) -> bool {
+pub(super) async fn exists(rig: &mut Rig, name: &str) -> bool {
     rig.smb.open(name).await.is_ok()
 }
 
@@ -161,20 +162,22 @@ async fn rename_changed_file_by_case(write: bool) {
     assert_eq!(left(&rig, "records"), 0);
 }
 
-/// Every record in the cache directory, by id.
-fn all_records(rig: &Rig) -> Vec<Record> {
+/// Every record in the cache directory, by id. A record the backend removes
+/// while the directory is read is left out.
+pub(super) fn all_records(rig: &Rig) -> Vec<Record> {
     let mut found: Vec<Record> = std::fs::read_dir(rig.cache_dir().join("records"))
         .unwrap()
-        .map(|file| Record::decode(&std::fs::read(file.unwrap().path()).unwrap()).unwrap())
+        .filter_map(|file| std::fs::read(file.unwrap().path()).ok())
+        .map(|bytes| Record::decode(&bytes).unwrap())
         .collect();
     found.sort_by(|a, b| a.id().as_str().cmp(b.id().as_str()));
     found
 }
 
-fn entry_of(record: &Record) -> &EntryRecord {
+pub(super) fn entry_of(record: &Record) -> &EntryRecord {
     match record {
         Record::Entry(entry) => entry,
-        Record::Tombstone(_) => panic!("a tombstone record"),
+        other => panic!("not an entry record: {other:?}"),
     }
 }
 
@@ -226,7 +229,7 @@ async fn lost_complete(rig: &Rig, key: &str) {
 
 /// Ends the backend while a job waits at a pause, as a crash does, then lets
 /// the job go. Returns what a new backend is built on.
-async fn crash(rig: Rig, resume: Arc<Notify>) -> (TestBucket, Proxy, tempfile::TempDir) {
+pub(super) async fn crash(rig: Rig, resume: Arc<Notify>) -> (TestBucket, Proxy, tempfile::TempDir) {
     rig.stop_after(|| resume.notify_one()).await
 }
 
@@ -490,6 +493,86 @@ async fn a_remote_file_renamed_is_there_at_once_and_copied_in_the_background() {
     assert_eq!(copies(&rig), 1);
     assert_eq!(left(&rig, "records"), 0);
     assert_eq!(rig.smb.contents("b.bin", 4096).await, data);
+}
+
+#[tokio::test]
+async fn a_read_of_a_renamed_file_whose_object_is_copied_and_deleted_meanwhile_gets_the_copy() {
+    let rig = Rig::writable_with(held).await;
+    let data = pattern(3, 5000);
+    put(rig.store(), "a.bin", &data).await;
+    rig.backend
+        .rename(&path("a.bin"), &path("b.bin"), false)
+        .await
+        .unwrap();
+
+    // The read plans from a.bin, and its request waits at the proxy until the
+    // copy at b.bin has landed and a.bin is deleted.
+    let gate = Arc::new(Notify::new());
+    rig.proxy.inject(
+        is_get_of(&rig.bucket.name, "a.bin"),
+        Fault::Hold(Arc::clone(&gate)),
+        1,
+    );
+    let handle = open_handle(&rig.backend, "b.bin").await;
+    let reading = tokio::spawn(async move { handle.read(0, 4096).await });
+    wait_for_requests(&rig.proxy, 1, is_get_of(&rig.bucket.name, "a.bin")).await;
+    rig.backend.hold_uploads(false);
+    sync(&rig.backend).await.unwrap();
+    assert_eq!(remote(&rig, "a.bin").await, None);
+
+    gate.notify_one();
+    assert_eq!(reading.await.unwrap().unwrap(), &data[..4096]);
+    assert!(rig.backend.failures().is_empty());
+}
+
+/// A read of a file that has local data over part of its object plans from
+/// that object, and its request waits at the proxy until the job of the file
+/// has stored it, at the key of the object or, with `rename`, at another. The
+/// read gets the bytes of the file.
+async fn read_while_the_job_stores_the_file(rename: bool) {
+    let mut rig = Rig::writable_with(held).await;
+    let base = pattern(1, 3000);
+    put(rig.store(), "edit.bin", &base).await;
+    let file = rig.smb.create("edit.bin", open_rw()).await.unwrap();
+    assert_eq!(rig.smb.write(file.id, 10, b"EDITED").await, Ok(6));
+    rig.smb.close(file.id).await;
+    let mut expected = base.to_vec();
+    expected[10..16].copy_from_slice(b"EDITED");
+    let name = if rename { "moved.bin" } else { "edit.bin" };
+    if rename {
+        rig.backend
+            .rename(&path("edit.bin"), &path(name), false)
+            .await
+            .unwrap();
+    }
+
+    let gate = Arc::new(Notify::new());
+    rig.proxy.inject(
+        is_get_of(&rig.bucket.name, "edit.bin"),
+        Fault::Hold(Arc::clone(&gate)),
+        1,
+    );
+    let handle = open_handle(&rig.backend, name).await;
+    let reading = tokio::spawn(async move { handle.read(0, 4096).await });
+    wait_for_requests(&rig.proxy, 1, is_get_of(&rig.bucket.name, "edit.bin")).await;
+    rig.backend.hold_uploads(false);
+    sync(&rig.backend).await.unwrap();
+    assert_eq!(remote(&rig, name).await.unwrap(), expected);
+    assert_eq!(remote(&rig, "edit.bin").await.is_some(), !rename);
+
+    gate.notify_one();
+    assert_eq!(reading.await.unwrap().unwrap(), expected);
+    assert!(rig.backend.failures().is_empty());
+}
+
+#[tokio::test]
+async fn a_read_over_local_data_whose_object_the_job_stored_over_gets_the_bytes_of_the_file() {
+    read_while_the_job_stores_the_file(false).await;
+}
+
+#[tokio::test]
+async fn a_read_over_local_data_whose_object_the_job_moved_gets_the_bytes_of_the_file() {
+    read_while_the_job_stores_the_file(true).await;
 }
 
 #[tokio::test]
@@ -1242,7 +1325,7 @@ async fn an_unlink_rewrites_the_record_of_the_entry_as_a_tombstone_with_its_id()
             assert_eq!(tombstone.id, id);
             assert_eq!(tombstone.keys, ["a.txt"]);
         }
-        Record::Entry(_) => panic!("the record is still an entry"),
+        other => panic!("the record is not a tombstone: {other:?}"),
     }
     assert_eq!(left(&rig, "data"), 0);
 }
@@ -1300,7 +1383,7 @@ async fn a_replacing_rename_turns_the_record_of_the_replaced_entry_into_a_tombst
         .iter()
         .filter_map(|record| match record {
             Record::Tombstone(tombstone) => Some(tombstone),
-            Record::Entry(_) => None,
+            _ => None,
         })
         .collect();
     assert_eq!(tombstones.len(), 1);
@@ -1311,7 +1394,7 @@ async fn a_replacing_rename_turns_the_record_of_the_replaced_entry_into_a_tombst
         .iter()
         .filter_map(|record| match record {
             Record::Entry(entry) => Some(entry),
-            Record::Tombstone(_) => None,
+            _ => None,
         })
         .collect();
     assert_eq!(moved.len(), 1);
@@ -1563,30 +1646,6 @@ async fn a_marker_refused_with_another_conflict_keeps_the_object_in_the_bucket()
     let error = sync(&rig.backend).await.unwrap_err();
     assert_eq!(error.http_status(), Some(409));
     assert!(remote(&rig, "dir/only.txt").await.is_some());
-}
-
-#[tokio::test]
-async fn directories_cannot_be_deleted_or_renamed() {
-    let mut rig = Rig::writable_with(held).await;
-    put(rig.store(), "d/f.txt", b"x").await;
-    let made = rig.smb.create("e", create_dir()).await.unwrap();
-    rig.smb.close(made.id).await;
-    assert!(matches!(
-        rig.backend.unlink(&path("d")).await,
-        Err(SmbError::AccessDenied)
-    ));
-    assert!(matches!(
-        rig.backend.unlink(&path("e")).await,
-        Err(SmbError::AccessDenied)
-    ));
-    assert!(matches!(
-        rig.backend.rename(&path("d"), &path("d2"), false).await,
-        Err(SmbError::AccessDenied)
-    ));
-    assert!(matches!(
-        rig.backend.unlink(&SmbPath::default()).await,
-        Err(SmbError::AccessDenied)
-    ));
 }
 
 #[tokio::test]

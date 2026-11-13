@@ -3,7 +3,7 @@
 
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -355,6 +355,34 @@ pub(super) async fn wait_until_async(what: &str, ready: impl AsyncFn() -> bool) 
     panic!("{what}");
 }
 
+/// Runs the scenario `make` returns on a runtime of its own, on a thread of
+/// its own, and panics with `what` if it does not end within `limit`. A
+/// deadlock blocks the threads of a runtime, so this thread keeps the time. A
+/// panic in the scenario is the panic of the test.
+pub(super) fn run_bounded<F: std::future::Future<Output = ()>>(
+    what: &str,
+    limit: Duration,
+    make: impl FnOnce() -> F + Send + 'static,
+) {
+    let (done, finished) = std::sync::mpsc::channel();
+    let running = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(make());
+        let _ = done.send(());
+    });
+    match finished.recv_timeout(limit) {
+        Ok(()) => running.join().unwrap(),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!("{what}"),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            std::panic::resume_unwind(running.join().expect_err("the scenario panicked"));
+        }
+    }
+}
+
 /// Waits until the proxy has seen at least `count` requests that `matches`.
 /// Panics if that takes more than about 5 s.
 pub(super) async fn wait_for_requests(
@@ -393,6 +421,47 @@ pub(super) struct Listed {
 impl Listed {
     pub(super) fn is_dir(&self) -> bool {
         self.attributes & FILE_ATTRIBUTE_DIRECTORY != 0
+    }
+}
+
+/// Collects the tracing events of the thread that made it, while it lives.
+/// A test on a runtime of one thread sees the events of its tasks.
+pub(super) struct Logs {
+    text: Arc<Mutex<Vec<u8>>>,
+    _guard: tracing::subscriber::DefaultGuard,
+}
+
+impl Logs {
+    pub(super) fn capture() -> Logs {
+        #[derive(Clone)]
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .write(buf)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let text = Arc::new(Mutex::new(Vec::new()));
+        let sink = Sink(Arc::clone(&text));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || sink.clone())
+            .with_ansi(false)
+            .finish();
+        Logs {
+            text,
+            _guard: tracing::subscriber::set_default(subscriber),
+        }
+    }
+
+    /// Everything written so far.
+    pub(super) fn text(&self) -> String {
+        let text = self.text.lock().unwrap_or_else(PoisonError::into_inner);
+        String::from_utf8_lossy(&text).into_owned()
     }
 }
 

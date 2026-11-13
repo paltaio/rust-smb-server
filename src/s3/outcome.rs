@@ -5,6 +5,7 @@
 //! the entry, in that order, and the state lock only for short reads and
 //! writes of the state.
 
+use std::io;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -14,7 +15,9 @@ use tracing::warn;
 use crate::error::{SmbError, SmbResult};
 
 use super::backend::Shared;
-use super::change::{ensure_local, persist, persist_held, record_held, recount_source};
+use super::change::{
+    ensure_local, persist, persist_held, persist_with, record_held, recount_source,
+};
 use super::data::disk_error;
 use super::entry::{Body, Entry, Landing, Upload};
 use super::error::S3Error;
@@ -22,6 +25,7 @@ use super::object::ObjectHead;
 use super::ranges::RangeSet;
 use super::record::RecordId;
 use super::retry::Stop;
+use super::unlink::drop_record;
 
 /// The parts of `range` that a fill writes into a file of `len` bytes that
 /// holds `present`: the bytes it does not hold yet, below its length now.
@@ -89,15 +93,44 @@ pub(super) fn fill(
     Ok(grew)
 }
 
-/// Gets the entry ready for the first request that writes `key`: the key is
-/// noted as one that may exist in the bucket, and the record is written again
-/// when the key was not noted before, or when a fill added bytes (`filled`) that the record
-/// does not claim yet. Then the entries that own `key` to delete, and the
-/// records of keys to delete that name it, let it go. All of it happens under
-/// the `io` and `seal` locks of the entry and of those owners, which are taken
-/// in one order. Returns whether the key may have existed before, or `None`,
-/// having changed nothing, if the entry left the overlay, is at another key, or
-/// the job was stopped.
+/// Runs `work` with the `io` and `seal` locks of `entry` and of the entries
+/// that own `key` to delete, which are taken in one order, and passes it those
+/// entries. Returns `None`, having run nothing, if the entry left the overlay,
+/// is at another key, or the job was stopped: such an entry takes no key over.
+fn taking<T>(
+    shared: &Shared,
+    entry: &Arc<Entry>,
+    key: &str,
+    stop: &Stop,
+    work: impl FnOnce(&[Arc<Entry>]) -> SmbResult<T>,
+) -> SmbResult<Option<T>> {
+    let owners = shared.overlay.owners(key, entry);
+    let locking: Vec<&Arc<Entry>> = std::iter::once(entry).chain(&owners).collect();
+    let _locks = Entry::lock_all(&locking);
+    {
+        let state = entry.state();
+        if state.detached || !state.is_write_key(key) || stop.is_stopped() {
+            return Ok(None);
+        }
+    }
+    work(&owners).map(Some)
+}
+
+/// Gets the entry ready for the first request that writes `key`, which is its
+/// key, or for a directory the key of its marker object: the key is noted as
+/// one that may exist in the bucket, and the record is written again when the
+/// key was not noted before, or when a fill added bytes (`filled`) that the
+/// record does not claim yet. Then the entries that own `key` to delete, and
+/// the records of keys to delete that name it, let it go. All of it happens
+/// under the `io` and `seal` locks of the entry and of those owners. Returns
+/// whether the key may have existed before, or `None`, having changed nothing,
+/// if the entry left the overlay, is at another key, or the job was stopped.
+///
+/// # Errors
+///
+/// Fails when an owner cannot record that it let the key go. The owner is as
+/// it was then, and the entry writes nothing: a full disk is `DiskFull`, and
+/// any other failure has failed the owner.
 pub(super) fn before_store(
     shared: &Shared,
     entry: &Arc<Entry>,
@@ -105,21 +138,40 @@ pub(super) fn before_store(
     filled: bool,
     stop: &Stop,
 ) -> SmbResult<Option<bool>> {
-    let owners = shared.overlay.owners(key, entry);
-    let locking: Vec<&Arc<Entry>> = std::iter::once(entry).chain(&owners).collect();
-    let _locks = Entry::lock_all(&locking);
-    {
-        let state = entry.state();
-        if state.detached || state.key != key || stop.is_stopped() {
-            return Ok(None);
+    taking(shared, entry, key, stop, |owners| {
+        let existed = std::mem::replace(&mut entry.state().may_exist, true);
+        if !existed || filled {
+            persist_held(shared, entry, true)?;
         }
-    }
-    let existed = std::mem::replace(&mut entry.state().may_exist, true);
-    if !existed || filled {
-        persist_held(shared, entry, true)?;
-    }
-    for owner in &owners {
-        match deleted_held(shared, owner, &[key.to_owned()]) {
+        release_key(shared, owners, key)?;
+        Ok(existed)
+    })
+}
+
+/// Takes `key`, the key of an object that `entry` has stored, off the keys that
+/// other entries own to delete and off the keys to delete that no entry owns.
+/// Returns whether it did: an entry that left the overlay, is at another key or
+/// was stopped takes nothing over.
+///
+/// # Errors
+///
+/// As [`before_store`].
+pub(super) fn take_over(
+    shared: &Shared,
+    entry: &Arc<Entry>,
+    key: &str,
+    stop: &Stop,
+) -> SmbResult<bool> {
+    let taken = taking(shared, entry, key, stop, |owners| {
+        release_key(shared, owners, key)
+    })?;
+    Ok(taken.is_some())
+}
+
+/// Makes `owners` and the records of keys to delete let go of `key`.
+fn release_key(shared: &Shared, owners: &[Arc<Entry>], key: &str) -> SmbResult<()> {
+    for owner in owners {
+        match taken_over_held(shared, owner, &[key.to_owned()]) {
             Ok(()) | Err(SmbError::AccessDenied) => {}
             Err(e) => return Err(e),
         }
@@ -130,9 +182,9 @@ pub(super) fn before_store(
         shared
             .overlay
             .drop_tombs(cache, &[key.to_owned()])
-            .map_err(SmbError::Io)?;
+            .map_err(disk_error)?;
     }
-    Ok(Some(existed))
+    Ok(())
 }
 
 /// Gives a file that copies from its base an empty data file of the same
@@ -202,22 +254,38 @@ pub(super) fn landed(
 }
 
 /// Writes the record of the entry again, or removes it and the local data if
-/// the entry has nothing left to do. The caller holds the `io` and `seal`
-/// locks of the entry.
-fn rest(shared: &Shared, entry: &Arc<Entry>) -> SmbResult<()> {
+/// the entry has nothing left to do. `gone`, when given, is what the entry owns
+/// to delete from now on: the entry and the index take it in once the disk has
+/// it, so if the disk fails nothing changes. The caller holds the `io` and
+/// `seal` locks of the entry.
+fn rest(shared: &Shared, entry: &Arc<Entry>, gone: Option<Vec<String>>) -> SmbResult<()> {
     let cache = shared.local()?;
-    let (idle, id, recorded) = {
+    let (idle, id, recorded, batch) = {
         let state = entry.state();
-        (!state.has_work(), state.id.clone(), state.recorded)
+        let owned = gone.as_deref().unwrap_or(&state.gone);
+        (
+            !state.writes() && owned.is_empty(),
+            state.id.clone(),
+            state.recorded,
+            state.batch.clone(),
+        )
     };
-    if !idle {
-        return persist_held(shared, entry, true);
+    if idle {
+        // A batch that lists the entry must not bring back what it had.
+        drop_record(shared, cache, batch.as_ref(), id.as_ref(), recorded)?;
+        let mut state = entry.state();
+        if let Some(gone) = gone {
+            state.gone = gone;
+        }
+        state.batch = None;
+        state.settled();
+    } else {
+        persist_with(shared, entry, true, gone, None)?;
     }
-    if let (true, Some(id)) = (recorded, &id) {
-        cache.remove_record(id).map_err(SmbError::Io)?;
+    shared.overlay.track(entry);
+    if idle {
+        shared.overlay.leave_if_idle(entry);
     }
-    entry.state().settled();
-    recount_source(shared, entry);
     Ok(())
 }
 
@@ -232,13 +300,41 @@ pub(super) fn deleted(shared: &Shared, entry: &Arc<Entry>, removed: &[String]) -
 
 /// [`deleted`] for a caller that holds the `io` and `seal` locks of the entry.
 fn deleted_held(shared: &Shared, entry: &Arc<Entry>, removed: &[String]) -> SmbResult<()> {
-    {
-        let mut state = entry.state();
+    let gone = {
+        let state = entry.state();
         state.attached()?;
-        state.gone.retain(|key| !removed.contains(key));
+        state
+            .gone
+            .iter()
+            .filter(|key| !removed.contains(key))
+            .cloned()
+            .collect()
+    };
+    rest(shared, entry, Some(gone))
+}
+
+/// [`deleted`] for the owner of keys that another entry takes over. If the
+/// record of the owner cannot be written nothing changes: a full disk is
+/// `DiskFull`, and any other failure fails the owner for good, as a call that
+/// waits for it reports.
+pub(super) fn taken_over(shared: &Shared, owner: &Arc<Entry>, keys: &[String]) -> SmbResult<()> {
+    let _io = owner.lock_io();
+    let _seal = owner.lock_seal();
+    taken_over_held(shared, owner, keys)
+}
+
+/// [`taken_over`] for a caller that holds the `io` and `seal` locks of the
+/// owner.
+fn taken_over_held(shared: &Shared, owner: &Arc<Entry>, keys: &[String]) -> SmbResult<()> {
+    match deleted_held(shared, owner, keys) {
+        Err(e) if !matches!(e, SmbError::AccessDenied | SmbError::DiskFull) => {
+            let failure = S3Error::cache(e);
+            owner.state().failure = Some(failure.clone());
+            shared.overlay.touch();
+            Err(SmbError::Io(io::Error::other(failure)))
+        }
+        done => done,
     }
-    shared.overlay.track(entry);
-    rest(shared, entry)
 }
 
 /// Drops the times and attributes of the entry that the store cannot take,
@@ -255,7 +351,7 @@ pub(super) fn dropped(shared: &Shared, entry: &Arc<Entry>, generation: u64) -> S
         state.own = None;
         state.uploaded = generation;
     }
-    rest(shared, entry)
+    rest(shared, entry, None)
 }
 
 /// Notes the multipart upload of the entry, or with `None` that it has
@@ -287,6 +383,11 @@ pub(super) fn failed(shared: &Shared, entry: &Arc<Entry>, error: S3Error) -> Smb
 /// have there. The entry keeps `error`, which a call that waits for the entry
 /// reports. If the files cannot be moved, the call fails and the entry stays
 /// as it is.
+///
+/// # Errors
+///
+/// Fails with `AccessDenied`, having moved nothing, if the entry left the
+/// overlay: its id names the tombstone record of its keys to delete then.
 pub(super) fn conflict(
     shared: &Shared,
     entry: &Arc<Entry>,
@@ -295,7 +396,11 @@ pub(super) fn conflict(
     let cache = shared.local()?;
     let _io = entry.lock_io();
     let _seal = entry.lock_seal();
-    let id = entry.state().id.clone();
+    let id = {
+        let state = entry.state();
+        state.attached()?;
+        state.id.clone()
+    };
     let moved = id
         .map(|id| cache.keep_conflict(&id).map_err(SmbError::Io))
         .transpose()?;

@@ -125,9 +125,14 @@ async fn single(
 }
 
 impl Shared {
-    /// Whether the overlay has the key of the object of `row` to delete.
+    /// Whether the overlay hides `row`: a file whose key is to be deleted, or a
+    /// directory that is gone.
     fn hidden(&self, dir: &str, row: &Row) -> bool {
-        matches!(row.kind, RowKind::File(_)) && self.overlay.tombstoned(&join_key(dir, &row.name))
+        let key = join_key(dir, &row.name);
+        match row.kind {
+            RowKind::File(_) => self.overlay.tombstoned(&key),
+            RowKind::Dir => self.overlay.dir_dead(&key),
+        }
     }
 }
 

@@ -11,8 +11,9 @@ use crate::error::{SmbError, SmbResult};
 use crate::utils::now_filetime;
 
 use super::cachedir::new_id;
+use super::dirmove::Batch;
 use super::error::S3Error;
-use super::keys::{last_name, path_below};
+use super::keys::{dir_prefix, last_name, path_below};
 use super::lookup::{DirRef, Found};
 use super::meta;
 use super::object::ObjectHead;
@@ -59,6 +60,9 @@ impl Own {
 pub(super) struct Base {
     pub(super) key: String,
     pub(super) head: Arc<ObjectHead>,
+    /// The head came from a listing: it has the size, ETag and time of the
+    /// object and none of its metadata.
+    pub(super) bare: bool,
     /// Keeps the chunks read of the object while the entry exists.
     _pin: Option<Pin>,
 }
@@ -78,7 +82,22 @@ impl Base {
         Base {
             key,
             head,
+            bare: false,
             _pin: pin,
+        }
+    }
+
+    /// The base a listing describes: [`new`](Self::new) for a head without
+    /// the metadata of the object.
+    pub(super) fn listed(
+        ahead: &Arc<ReadAhead>,
+        key: String,
+        head: Arc<ObjectHead>,
+        is_file: bool,
+    ) -> Self {
+        Base {
+            bare: true,
+            ..Base::new(ahead, key, head, is_file)
         }
     }
 }
@@ -187,6 +206,9 @@ pub(super) struct State {
     /// not the key and the record's local data does not hold every byte: a
     /// restart copies the content from there.
     pub(super) recorded_source: Option<String>,
+    /// The batch record of a directory rename that holds the entry, until
+    /// the entries have records of their own. The entry gets no job meanwhile.
+    pub(super) batch: Option<Arc<Batch>>,
     pub(super) body: Body,
 }
 
@@ -215,6 +237,7 @@ impl State {
             writing: Vec::new(),
             prior: None,
             recorded_source: None,
+            batch: None,
             body: if is_dir {
                 Body::Dir {
                     marker_pending: false,
@@ -269,6 +292,13 @@ impl State {
         }
     }
 
+    /// Whether the entry waits for the batch `batch` to be recorded.
+    pub(super) fn in_batch(&self, batch: &Arc<Batch>) -> bool {
+        self.batch
+            .as_ref()
+            .is_some_and(|held| Arc::ptr_eq(held, batch))
+    }
+
     /// Notes whether the marker object of a directory is not in the bucket.
     pub(super) fn set_marker_pending(&mut self, pending: bool) {
         if let Body::Dir { marker_pending } = &mut self.body {
@@ -316,7 +346,30 @@ impl State {
     /// Whether the key of the entry may hold an object: the entry or a job of
     /// it put one, or the base is at the key.
     pub(super) fn in_bucket(&self) -> bool {
-        self.may_exist || self.base.as_ref().is_some_and(|base| base.key == self.key)
+        self.may_exist
+            || self
+                .base
+                .as_ref()
+                .is_some_and(|base| self.is_write_key(&base.key))
+    }
+
+    /// The key of the object the entry stores: its key, or for a directory
+    /// the key of its marker object.
+    pub(super) fn write_key(&self) -> String {
+        if self.is_dir() {
+            dir_prefix(&self.key)
+        } else {
+            self.key.clone()
+        }
+    }
+
+    /// Whether `key` is the key of the object the entry stores.
+    pub(super) fn is_write_key(&self, key: &str) -> bool {
+        if self.is_dir() {
+            key.strip_suffix('/') == Some(self.key.as_str())
+        } else {
+            key == self.key
+        }
     }
 
     /// The key whose object the entry still needs: its base key while it
@@ -510,6 +563,23 @@ impl State {
         self.recorded_source = None;
     }
 
+    /// Gives the bare base of the entry at `key` the full description `found`
+    /// of the object.
+    pub(super) fn complete_base(
+        &mut self,
+        ahead: &Arc<ReadAhead>,
+        key: &str,
+        found: Arc<ObjectHead>,
+    ) {
+        let bare = self
+            .base
+            .as_ref()
+            .is_some_and(|base| base.bare && base.key == key);
+        if bare {
+            self.base = Some(Base::new(ahead, key.to_owned(), found, !self.is_dir()));
+        }
+    }
+
     /// Takes in what a lookup found while the entry has nothing to keep: the
     /// entry follows the bucket.
     pub(super) fn follow(&mut self, found: Found, ahead: &Arc<ReadAhead>) {
@@ -672,9 +742,10 @@ impl Entry {
         let mut state = State::new(record.key, record.is_dir);
         state.id = Some(record.id);
         state.may_exist = record.remote;
-        state.base = record
-            .base
-            .map(|base| Base::new(ahead, base.key, Arc::new(base.head), !record.is_dir));
+        state.base = record.base.map(|base| {
+            let make = if base.bare { Base::listed } else { Base::new };
+            make(ahead, base.key, Arc::new(base.head), !record.is_dir)
+        });
         match &mut state.body {
             Body::File {
                 local,
@@ -721,7 +792,7 @@ impl Entry {
         if let Some(failure) = &state.failure {
             return Progress::Failed(failure.clone());
         }
-        if state.detached || !state.has_work() {
+        if state.detached || !state.pending() {
             return Progress::Done;
         }
         let deleted = !state.gone.iter().any(|key| gone.contains(key));
@@ -774,6 +845,7 @@ impl Entry {
             base: state.base.as_ref().map(|base| BaseRecord {
                 key: base.key.clone(),
                 head: (*base.head).clone(),
+                bare: base.bare,
             }),
             remote: state.may_exist,
             local,

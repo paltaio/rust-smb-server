@@ -506,7 +506,7 @@ async fn a_create_of_a_name_that_exists_fails_whether_it_is_in_the_bucket_or_not
     assert_eq!(status, STATUS_OBJECT_PATH_NOT_FOUND);
 }
 
-fn create_options(directory: bool) -> OpenOptions {
+pub(super) fn create_options(directory: bool) -> OpenOptions {
     OpenOptions {
         write: true,
         intent: OpenIntent::Create,

@@ -138,9 +138,6 @@ impl Handle for S3Handle {
 
     async fn dir_is_empty(&self) -> SmbResult<bool> {
         let dir = self.dir()?;
-        if self.shared.overlay.spelling(&dir.key).is_some() {
-            return Ok(false);
-        }
         self.shared.is_empty(&dir.key, &self.shared.retry()).await
     }
 

@@ -12,7 +12,7 @@ use tracing::{debug, error, warn};
 use super::backend::Shared;
 use super::cache::Known;
 use super::change;
-use super::client::{ListRequest, MAX_DELETE_KEYS};
+use super::client::{ListRequest, MAX_DELETE_KEYS, MAX_LISTED};
 use super::error::S3Error;
 use super::keys::{dir_prefix, join_key};
 use super::meta;
@@ -20,8 +20,8 @@ use super::object::ObjectHead;
 use super::overlay::Deleting;
 use super::retry::{BASE_DELAY, Retry, Stop};
 
-/// The most keys one listing returns.
-const MAX_LISTED: u32 = 1000;
+/// The most pages of a directory listing that the comparison of two keys reads.
+const MAX_LIST_PAGES: usize = 100;
 
 /// What a run of DeleteObjects requests did.
 #[derive(Default)]
@@ -74,6 +74,13 @@ pub(super) fn needs_marker(dir: &str, listed: &[String], stays: impl Fn(&str) ->
     !listed.iter().any(|key| *key == marker || stays(key))
 }
 
+/// Whether `error` says the store keeps the directory `key` for the objects
+/// in it, which is all a marker key can name there: no marker object is left
+/// to delete.
+fn is_marker_kept(key: &str, error: &S3Error) -> bool {
+    key.ends_with('/') && error.code() == Some("ErrDirectoryNotEmpty")
+}
+
 /// Whether the store refuses a marker for good where an object of the same
 /// name is: the directory is left as it is.
 fn is_marker_conflict(error: &S3Error) -> bool {
@@ -108,6 +115,55 @@ impl Shared {
         Ok(page.objects.first().is_some_and(|object| object.key == key))
     }
 
+    /// Whether the store lists the keys `a` and `b`, which differ in case
+    /// only, as two objects. When the last name differs, each key is looked
+    /// up in a listing. When a directory above it differs, a store that
+    /// ignores case answers a listing under either spelling of the directory
+    /// with the spelling asked for, so the directory above the first
+    /// difference is listed instead: a store that tells the two apart lists
+    /// both spellings there. A directory too large to list in full counts as
+    /// one object, which keeps both keys.
+    async fn listed_apart(&self, a: &str, b: &str, stop: &Stop) -> Result<bool, S3Error> {
+        let (names_a, names_b): (Vec<&str>, Vec<&str>) =
+            (a.split('/').collect(), b.split('/').collect());
+        let Some(at) = names_a.iter().zip(&names_b).position(|(x, y)| x != y) else {
+            return Ok(false);
+        };
+        if at + 1 == names_a.len().min(names_b.len()) {
+            return Ok(self.lists(a, stop).await? && self.lists(b, stop).await?);
+        }
+        let above = dir_prefix(&names_a[..at].join("/"));
+        let wanted = [
+            format!("{above}{}/", names_a[at]),
+            format!("{above}{}/", names_b[at]),
+        ];
+        let mut seen = [false, false];
+        let mut token: Option<String> = None;
+        for _ in 0..MAX_LIST_PAGES {
+            let request = ListRequest {
+                prefix: &above,
+                delimited: true,
+                continuation_token: token.as_deref(),
+                max_keys: None,
+            };
+            let page = self
+                .client
+                .list_objects(&request, Retry::until(stop))
+                .await?;
+            for (found, name) in seen.iter_mut().zip(&wanted) {
+                *found |= page.prefixes.contains(name);
+            }
+            if seen == [true, true] {
+                return Ok(true);
+            }
+            token = page.next_token;
+            if token.is_none() {
+                break;
+            }
+        }
+        Ok(false)
+    }
+
     /// The object that `a` and `b`, which differ in case only, both name, as
     /// on a store that ignores case: a HEAD of each finds the same size, ETag
     /// and time, and the store does not list both names. `None` if they name
@@ -132,7 +188,7 @@ impl Shared {
         };
         let alike = (first.size, &first.etag, first.last_modified)
             == (second.size, &second.etag, second.last_modified);
-        if alike && !(self.lists(a, stop).await? && self.lists(b, stop).await?) {
+        if alike && !self.listed_apart(a, b, stop).await? {
             return Ok(Some(second));
         }
         Ok(None)
@@ -275,7 +331,7 @@ impl Shared {
                                 }
                                 Some(failure) => {
                                     let error = S3Error::status(200, failure.code.as_deref(), None);
-                                    if error.is_no_such_key() {
+                                    if error.is_no_such_key() || is_marker_kept(&key, &error) {
                                         self.deleted(&key);
                                         done.deleted.push(key);
                                     } else if error.is_transient() {
@@ -367,6 +423,17 @@ mod tests {
 
     fn keys(keys: &[&str]) -> Vec<String> {
         keys.iter().map(|key| (*key).to_owned()).collect()
+    }
+
+    #[test]
+    fn a_store_that_keeps_a_directory_for_its_objects_has_no_marker_to_delete() {
+        let kept = S3Error::status(200, Some("ErrDirectoryNotEmpty"), None);
+        assert!(is_marker_kept("d/", &kept));
+        assert!(!is_marker_kept("d/file", &kept));
+        assert!(!is_marker_kept(
+            "d/",
+            &S3Error::status(200, Some("AccessDenied"), None)
+        ));
     }
 
     #[test]

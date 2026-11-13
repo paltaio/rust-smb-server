@@ -12,12 +12,15 @@
 //!
 //! An id is 128 random bits as 32 hexadecimal digits.
 
-use std::collections::HashSet;
+use std::collections::hash_map::Entry as MapEntry;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, DirBuilder, File, TryLockError};
 use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Mutex;
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -50,6 +53,9 @@ pub(crate) struct Hooks {
     pub(crate) record_writes: AtomicUsize,
     /// The record writes that succeed before `record_writes` starts to fail.
     pub(crate) record_write_skips: AtomicUsize,
+    /// The records written and removed, in order. Calls that a hook made fail
+    /// are left out.
+    pub(crate) record_ops: Mutex<Vec<(RecordOp, RecordId)>>,
     pub(crate) record_removals: AtomicUsize,
     /// A failed data write has put the first half of its bytes in the file.
     pub(crate) data_writes: AtomicUsize,
@@ -60,6 +66,14 @@ pub(crate) struct Hooks {
     pub(crate) data_moves: AtomicUsize,
     /// The failures injected are those of a full disk.
     pub(crate) disk_full: AtomicBool,
+}
+
+/// What a call of the directory did to a record.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecordOp {
+    Write,
+    Remove,
 }
 
 #[cfg(test)]
@@ -73,6 +87,13 @@ impl Hooks {
             Ok(_) => Err(io::Error::other("injected failure")),
             Err(_) => Ok(()),
         }
+    }
+
+    fn log(&self, op: RecordOp, id: &RecordId) {
+        self.record_ops
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((op, id.clone()));
     }
 }
 
@@ -210,6 +231,17 @@ impl CacheDir {
         }
     }
 
+    /// The ids of the entries the batch record `id` lists, in order, or `None`
+    /// if the record is not there.
+    #[cfg(test)]
+    pub(crate) fn batch_members(&self, id: &RecordId) -> Option<Vec<RecordId>> {
+        let bytes = fs::read(self.record_path(id)).ok()?;
+        match Record::decode(&bytes).expect("a record that decodes") {
+            Record::Batch(batch) => Some(batch.members.into_iter().map(|m| m.id).collect()),
+            other => panic!("not a batch record: {other:?}"),
+        }
+    }
+
     fn data_path(&self, id: &RecordId) -> PathBuf {
         self.root.join("data").join(id.as_str())
     }
@@ -259,13 +291,17 @@ impl CacheDir {
             if skipped.is_err() {
                 self.hooks.take(&self.hooks.record_writes)?;
             }
+            self.hooks.log(RecordOp::Write, id);
         }
         self.write_file(id.as_str(), self.record_path(id), text)
     }
 
     pub(crate) fn remove_record(&self, id: &RecordId) -> io::Result<()> {
         #[cfg(test)]
-        self.hooks.take(&self.hooks.record_removals)?;
+        {
+            self.hooks.take(&self.hooks.record_removals)?;
+            self.hooks.log(RecordOp::Remove, id);
+        }
         ignore_missing(fs::remove_file(self.record_path(id)))?;
         sync_dir(&self.root.join("records"))
     }
@@ -315,10 +351,15 @@ impl CacheDir {
     /// an entry holds is dropped from its tombstone record, which is removed
     /// when it has no key left. Keys match as spelled.
     ///
+    /// The entries of a batch record that a directory rename wrote get records
+    /// of their own, and the batch goes. An entry that has a record of its own
+    /// with the generation the batch gives it or a newer one, or a tombstone
+    /// record, is not taken from the batch.
+    ///
     /// # Errors
     ///
-    /// Fails when a directory cannot be listed or synced, a tombstone record
-    /// cannot be rewritten or removed, or an unused data file cannot be
+    /// Fails when a directory cannot be listed or synced, a record cannot be
+    /// written, rewritten or removed, or an unused data file cannot be
     /// deleted.
     pub(crate) fn recover(&self, prefix: &str, fold: bool) -> io::Result<Recovered> {
         let mut names = list_names(&self.root.join("records"))?;
@@ -330,6 +371,8 @@ impl CacheDir {
         let mut dead_keys = HashSet::new();
         let mut live = HashSet::new();
         let mut tombstones = Vec::new();
+
+        let mut found: Vec<(OsString, RecordId, Record)> = Vec::new();
         for name in names {
             let Some(id) = name.to_str().and_then(RecordId::parse) else {
                 self.quarantine(&name, None, "the file name is not a record id", &mut live);
@@ -339,18 +382,31 @@ impl CacheDir {
                 Ok(bytes) => Record::decode(&bytes).map_err(|e| e.to_string()),
                 Err(e) => Err(e.to_string()),
             };
-            let record = match decoded {
-                Ok(record) if *record.id() == id => record,
+            match decoded {
+                Ok(record) if *record.id() == id => found.push((name, id, record)),
                 Ok(_) => {
                     self.quarantine(&name, Some(&id), "the record has another id", &mut live);
-                    continue;
                 }
-                Err(why) => {
-                    self.quarantine(&name, Some(&id), &why, &mut live);
-                    continue;
-                }
-            };
+                Err(why) => self.quarantine(&name, Some(&id), &why, &mut live),
+            }
+        }
+
+        let (batches, found): (Vec<_>, Vec<_>) = found
+            .into_iter()
+            .partition(|(_, _, record)| matches!(record, Record::Batch(_)));
+        let Adopted {
+            entries: adopted,
+            idle,
+            replaced,
+        } = adopt(&batches, &found);
+        for id in &idle {
+            ignore_missing(fs::remove_file(self.record_path(id)))?;
+        }
+
+        let mut written = Vec::new();
+        for (name, id, record) in found {
             match record {
+                Record::Batch(_) => {}
                 Record::Tombstone(tombstone) => {
                     if !tombstone.keys.iter().all(|key| key.starts_with(&inside)) {
                         self.quarantine(
@@ -371,20 +427,27 @@ impl CacheDir {
                         tombstones.push(tombstone);
                     }
                 }
+                Record::Entry(_) if replaced.contains(&id) => {}
                 Record::Entry(entry) => match self.revive(&entry, prefix, fold, &mut keys) {
-                    Ok(data) => {
-                        exact.insert(entry.key.clone());
-                        if entry.is_dir {
-                            exact.insert(dir_prefix(&entry.key));
-                        }
-                        if data.is_some() {
-                            live.insert(id);
-                        }
-                        recovered.entries.push((*entry, data));
-                    }
+                    Ok(data) => revived(*entry, data, &mut exact, &mut live, &mut recovered),
                     Err(why) => self.quarantine(&name, Some(&id), &why, &mut live),
                 },
             }
+        }
+        for member in adopted {
+            match self.revive(&member, prefix, fold, &mut keys) {
+                Ok(data) => {
+                    written.push((member.id.clone(), member.encode()));
+                    revived(member, data, &mut exact, &mut live, &mut recovered);
+                }
+                Err(why) => self.reject(&member, &why, &mut live),
+            }
+        }
+        for (id, text) in written {
+            self.write_record(&id, &text)?;
+        }
+        for (name, _, _) in batches {
+            ignore_missing(fs::remove_file(self.root.join("records").join(name)))?;
         }
 
         for mut tombstone in tombstones {
@@ -413,6 +476,47 @@ impl CacheDir {
         sync_dir(&self.root.join("records"))?;
         sync_dir(&self.root.join("conflicts"))?;
         Ok(recovered)
+    }
+
+    /// Moves an entry that a batch record held, and that cannot be used, to
+    /// `conflicts/` with its data file, and removes the older record of the
+    /// entry. A data file that is not there is left out.
+    fn reject(&self, entry: &EntryRecord, why: &str, live: &mut HashSet<RecordId>) {
+        let Ok(fresh) = new_id() else {
+            live.insert(entry.id.clone());
+            error!(
+                reason = why,
+                "an entry of a batch record in the cache directory is unusable"
+            );
+            return;
+        };
+        let conflicts = self.root.join("conflicts");
+        let moved = self
+            .move_data(&entry.id, &conflicts.join(format!("{fresh}.data")))
+            .and_then(|()| sync_dir(&conflicts))
+            .and_then(|()| {
+                self.write_file(
+                    &format!("{fresh}.record"),
+                    conflicts.join(format!("{fresh}.record")),
+                    &entry.encode(),
+                )
+            })
+            .and_then(|()| ignore_missing(fs::remove_file(self.record_path(&entry.id))));
+        match moved {
+            Ok(()) => error!(
+                moved_to = %fresh,
+                reason = why,
+                "an entry of a batch record in the cache directory is unusable and was moved to its conflicts directory"
+            ),
+            Err(e) => {
+                live.insert(entry.id.clone());
+                error!(
+                    reason = why,
+                    error = %e,
+                    "an entry of a batch record in the cache directory is unusable and could not be moved"
+                );
+            }
+        }
     }
 
     /// Checks `entry` and opens its data file. `keys` collects the names the
@@ -515,6 +619,101 @@ impl CacheDir {
     }
 }
 
+/// Notes an entry that came back from its record, with the open data file it
+/// has if it has local data.
+fn revived(
+    entry: EntryRecord,
+    data: Option<File>,
+    exact: &mut HashSet<String>,
+    live: &mut HashSet<RecordId>,
+    recovered: &mut Recovered,
+) {
+    exact.insert(entry.key.clone());
+    if entry.is_dir {
+        exact.insert(dir_prefix(&entry.key));
+    }
+    if data.is_some() {
+        live.insert(entry.id.clone());
+    }
+    recovered.entries.push((entry, data));
+}
+
+/// The entries of the batch records that a directory rename wrote, and which
+/// of the other records they outdate.
+struct Adopted {
+    /// The entries to bring back, with their records of their own to be
+    /// written.
+    entries: Vec<EntryRecord>,
+    /// The entries whose newest line has nothing left to do: such an entry is
+    /// not brought back, and its older record goes.
+    idle: Vec<RecordId>,
+    /// The ids of both. A record of one of these entries is outdated.
+    replaced: HashSet<RecordId>,
+}
+
+/// The entries of `batches` that records of their own do not outdate, the
+/// newest of each: an entry with a record of its own is not adopted unless the
+/// batch has the newer generation, and one with a tombstone record is gone.
+fn adopt(
+    batches: &[(OsString, RecordId, Record)],
+    others: &[(OsString, RecordId, Record)],
+) -> Adopted {
+    let mut newest: HashMap<&RecordId, Option<u64>> = HashMap::new();
+    for (_, id, record) in others {
+        newest.insert(
+            id,
+            match record {
+                Record::Entry(entry) => Some(entry.generation),
+                _ => None,
+            },
+        );
+    }
+    let mut adopted: Vec<EntryRecord> = Vec::new();
+    let mut places: HashMap<&RecordId, usize> = HashMap::new();
+    for (_, _, batch) in batches {
+        let Record::Batch(batch) = batch else {
+            continue;
+        };
+        for member in &batch.members {
+            let outdated = match newest.get(&member.id) {
+                Some(Some(held)) => *held >= member.generation,
+                Some(None) => true,
+                None => false,
+            };
+            if outdated {
+                continue;
+            }
+            match places.entry(&member.id) {
+                MapEntry::Occupied(place) => {
+                    let held = &mut adopted[*place.get()];
+                    if held.generation < member.generation {
+                        *held = member.clone();
+                    }
+                }
+                MapEntry::Vacant(place) => {
+                    place.insert(adopted.len());
+                    adopted.push(member.clone());
+                }
+            }
+        }
+    }
+    let mut replaced = HashSet::with_capacity(adopted.len());
+    let (mut entries, mut idle) = (Vec::new(), Vec::new());
+    for member in adopted {
+        replaced.insert(member.id.clone());
+        if member.has_work() {
+            entries.push(member);
+        } else {
+            idle.push(member.id);
+        }
+    }
+    Adopted {
+        entries,
+        idle,
+        replaced,
+    }
+}
+
 fn list_names(dir: &Path) -> io::Result<Vec<OsString>> {
     fs::read_dir(dir)?
         .map(|entry| entry.map(|entry| entry.file_name()))
@@ -576,6 +775,7 @@ mod tests {
             gone: Vec::new(),
             base: Some(BaseRecord {
                 key: join_key("pre/fix", path),
+                bare: false,
                 head: ObjectHead {
                     size: 3,
                     etag: "\"e\"".to_owned(),
@@ -1094,5 +1294,216 @@ mod tests {
         let found = conflicts(temp.path());
         assert_eq!(found.len(), 2, "{found:?}");
         assert_eq!(found.iter().filter(|n| n.ends_with(".record")).count(), 1);
+    }
+
+    /// The record of `old` as a directory rename gives it: another key and the
+    /// next generation.
+    fn moved(old: &EntryRecord, path: &str) -> EntryRecord {
+        EntryRecord {
+            path: path.to_owned(),
+            key: join_key("pre/fix", path),
+            gone: vec![old.key.clone()],
+            generation: old.generation + 1,
+            ..old.clone()
+        }
+    }
+
+    fn batch(dir: &CacheDir, members: Vec<EntryRecord>) -> RecordId {
+        let record = crate::s3::record::BatchRecord {
+            id: new_id().unwrap(),
+            members,
+        };
+        dir.write_record(&record.id, &record.encode()).unwrap();
+        record.id
+    }
+
+    fn keys_of(recovered: &Recovered) -> Vec<String> {
+        let mut found: Vec<String> = recovered
+            .entries
+            .iter()
+            .map(|(record, _)| record.key.clone())
+            .collect();
+        found.sort();
+        found
+    }
+
+    #[test]
+    fn the_entries_of_a_batch_replace_the_older_records_and_get_records_of_their_own() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = CacheDir::open(temp.path(), &who()).unwrap();
+        let held = entry("old/held.txt", Some(4));
+        store(&dir, &held, Some(b"data"));
+        let fresh = entry("old/fresh.txt", None);
+        let id = batch(
+            &dir,
+            vec![moved(&held, "new/held.txt"), moved(&fresh, "new/fresh.txt")],
+        );
+
+        let recovered = dir.recover("pre/fix", false).unwrap();
+        assert_eq!(
+            keys_of(&recovered),
+            ["pre/fix/new/fresh.txt", "pre/fix/new/held.txt"]
+        );
+        let with_data = recovered
+            .entries
+            .iter()
+            .find(|(record, _)| record.id == held.id)
+            .unwrap();
+        assert!(
+            with_data.1.is_some(),
+            "the data file of the old record is used"
+        );
+        assert!(!dir.record_path(&id).exists(), "the batch is gone");
+        assert!(dir.data_path(&held.id).exists());
+        assert_eq!(names(&temp.path().join("records")).len(), 2);
+        // The records on disk are the batch's, so a second start sees the same.
+        let again = dir.recover("pre/fix", false).unwrap();
+        assert_eq!(keys_of(&again), keys_of(&recovered));
+    }
+
+    #[test]
+    fn a_batch_does_not_outdate_a_record_of_the_same_or_a_later_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = CacheDir::open(temp.path(), &who()).unwrap();
+        let first = entry("old/first.txt", None);
+        let second = entry("old/second.txt", None);
+        let (moved_first, moved_second) = (
+            moved(&first, "new/first.txt"),
+            moved(&second, "new/second.txt"),
+        );
+        batch(&dir, vec![moved_first.clone(), moved_second.clone()]);
+        // The first entry was recorded at the generation of the batch, the
+        // second changed again after it.
+        store(&dir, &moved_first, None);
+        let mut later = moved_second.clone();
+        later.key = join_key("pre/fix", "later.txt");
+        later.path = "later.txt".to_owned();
+        later.generation += 5;
+        store(&dir, &later, None);
+
+        let recovered = dir.recover("pre/fix", false).unwrap();
+        assert_eq!(
+            keys_of(&recovered),
+            ["pre/fix/later.txt", "pre/fix/new/first.txt"]
+        );
+        assert_eq!(names(&temp.path().join("records")).len(), 2);
+        assert!(conflicts(temp.path()).is_empty());
+    }
+
+    #[test]
+    fn an_entry_that_became_a_tombstone_after_a_batch_is_not_brought_back() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = CacheDir::open(temp.path(), &who()).unwrap();
+        let gone = entry("old/gone.txt", None);
+        let kept = entry("old/kept.txt", None);
+        batch(
+            &dir,
+            vec![moved(&gone, "new/gone.txt"), moved(&kept, "new/kept.txt")],
+        );
+        let tomb = TombstoneRecord {
+            id: gone.id.clone(),
+            keys: vec!["pre/fix/old/gone.txt".to_owned()],
+        };
+        dir.write_record(&tomb.id, &tomb.encode()).unwrap();
+
+        let recovered = dir.recover("pre/fix", false).unwrap();
+        assert_eq!(keys_of(&recovered), ["pre/fix/new/kept.txt"]);
+        assert_eq!(recovered.tombstones.len(), 1);
+        assert_eq!(names(&temp.path().join("records")).len(), 2);
+    }
+
+    #[test]
+    fn the_newest_batch_gives_an_entry_its_place() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = CacheDir::open(temp.path(), &who()).unwrap();
+        let held = entry("one/f.txt", None);
+        let first = moved(&held, "two/f.txt");
+        let second = moved(&first, "three/f.txt");
+        batch(&dir, vec![first]);
+        batch(&dir, vec![second]);
+        let recovered = dir.recover("pre/fix", false).unwrap();
+        assert_eq!(keys_of(&recovered), ["pre/fix/three/f.txt"]);
+        assert_eq!(names(&temp.path().join("records")).len(), 1);
+    }
+
+    #[test]
+    fn adopted_members_keep_the_order_they_first_appear_in_and_take_the_newest_line() {
+        let older: Vec<EntryRecord> = (0..4).map(|i| entry(&format!("f{i}"), None)).collect();
+        let newer: Vec<EntryRecord> = older
+            .iter()
+            .map(|member| moved(member, &format!("g{}", member.path)))
+            .collect();
+        let ids: Vec<RecordId> = older.iter().map(|member| member.id.clone()).collect();
+        let batches: Vec<(OsString, RecordId, Record)> = [older, newer]
+            .into_iter()
+            .map(|members| {
+                let id = new_id().unwrap();
+                let record = crate::s3::record::BatchRecord {
+                    id: id.clone(),
+                    members,
+                };
+                (OsString::from(id.as_str()), id, Record::Batch(record))
+            })
+            .collect();
+
+        let adopted = adopt(&batches, &[]);
+        let got: Vec<(&RecordId, &str)> = adopted
+            .entries
+            .iter()
+            .map(|member| (&member.id, member.path.as_str()))
+            .collect();
+        assert_eq!(got.len(), ids.len());
+        for (i, (id, path)) in got.into_iter().enumerate() {
+            assert_eq!(id, &ids[i]);
+            assert_eq!(path, format!("gf{i}"));
+        }
+    }
+
+    #[test]
+    fn a_member_of_a_batch_that_cannot_be_used_moves_to_conflicts_with_its_data() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = CacheDir::open(temp.path(), &who()).unwrap();
+        let broken = entry("old/broken.txt", Some(8));
+        let fine = entry("old/fine.txt", None);
+        store(&dir, &broken, Some(b"abcd"));
+        let mut claims_more = moved(&broken, "new/broken.txt");
+        claims_more.local = broken.local.clone();
+        batch(&dir, vec![claims_more, moved(&fine, "new/fine.txt")]);
+        fs::write(dir.data_path(&broken.id), b"ab").unwrap();
+
+        let recovered = dir.recover("pre/fix", false).unwrap();
+        assert_eq!(keys_of(&recovered), ["pre/fix/new/fine.txt"]);
+        assert_eq!(conflicts(temp.path()).len(), 2, "its record and its data");
+        assert_eq!(names(&temp.path().join("records")).len(), 1);
+        assert!(dir.recover("pre/fix", false).unwrap().entries.len() == 1);
+        assert_eq!(conflicts(temp.path()).len(), 2);
+    }
+
+    #[test]
+    fn a_batch_member_with_nothing_left_to_do_is_not_brought_back_and_its_older_record_goes() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = CacheDir::open(temp.path(), &who()).unwrap();
+        let held = entry("old/held.txt", None);
+        let kept = entry("old/kept.txt", None);
+        store(&dir, &held, None);
+        let away = moved(&held, "new/held.txt");
+        // Moved back: the base is at the key again and nothing is left.
+        let back = EntryRecord {
+            path: held.path.clone(),
+            key: held.key.clone(),
+            gone: Vec::new(),
+            generation: away.generation + 1,
+            ..held.clone()
+        };
+        batch(&dir, vec![away.clone(), moved(&kept, "new/kept.txt")]);
+        batch(&dir, vec![back]);
+
+        let recovered = dir.recover("pre/fix", false).unwrap();
+        assert_eq!(keys_of(&recovered), ["pre/fix/new/kept.txt"]);
+        assert_eq!(names(&temp.path().join("records")).len(), 1);
+        assert!(!dir.record_path(&held.id).exists());
+        assert!(conflicts(temp.path()).is_empty());
+        let again = dir.recover("pre/fix", false).unwrap();
+        assert_eq!(keys_of(&again), keys_of(&recovered));
     }
 }

@@ -61,10 +61,11 @@ impl Entry {
         }
     }
 
-    /// Reads from `head` from now on, if the entry has no local data.
-    fn follow_head(&self, ahead: &Arc<ReadAhead>, head: Arc<ObjectHead>) {
+    /// Reads from `head`, the object at `key`, from now on, if the entry has
+    /// no local data and that is the key of its base.
+    fn follow_head(&self, ahead: &Arc<ReadAhead>, key: &str, head: Arc<ObjectHead>) {
         let mut state = self.state();
-        if state.local().is_some() {
+        if state.local().is_some() || state.base.as_ref().is_none_or(|base| base.key != key) {
             return;
         }
         if let Some(base) = state.base.take() {
@@ -75,23 +76,68 @@ impl Entry {
         }
     }
 
+    /// Whether a read of the entry is still planned from `head`, the object at
+    /// `key`: the entry has no local data and that object is its base.
+    fn reads_from(&self, key: &str, head: &ObjectHead) -> bool {
+        let state = self.state();
+        state.local().is_none()
+            && state
+                .base
+                .as_ref()
+                .is_some_and(|base| base.key == key && base.head.same_object(head))
+    }
+
+    /// Whether a read of the entry is still planned over the local data in
+    /// `file` and the object `base`: the entry has that file and that base.
+    fn reads_over(&self, file: &Arc<File>, base: Option<&(String, Arc<ObjectHead>)>) -> bool {
+        let state = self.state();
+        let same_file = state
+            .local()
+            .is_some_and(|local| Arc::ptr_eq(&local.file, file));
+        let same_base = match (state.base.as_ref(), base) {
+            (Some(held), Some((key, head))) => held.key == *key && held.head.same_object(head),
+            (None, None) => true,
+            _ => false,
+        };
+        same_file && same_base
+    }
+
     /// Reads up to `len` bytes at `offset`. The bytes of local data come from
     /// its file, and the others from the object of the base, all of one
     /// version.
     ///
-    /// A read of an entry without local data that finds its object changed or
-    /// gone drops the chunks kept of it, asks the store for the object as it
-    /// is, and reads again from that, once. With local data, the base
-    /// changing fails the read: the bytes of the entry are not those of the
-    /// new object.
+    /// A read that finds the object of the base changed or gone looks at the
+    /// entry again. If the entry is planned another way by now, as when a job
+    /// copied the object to the key of the entry and deleted the old key, or
+    /// stored the local data over the base, the read starts again from the new
+    /// plan, once. Otherwise, without local data, it drops the chunks kept of
+    /// the object, asks the store for the object as it is, and reads again
+    /// from that, once. With local data, the base changing fails the read: the
+    /// bytes of the entry are not those of the new object.
     pub(super) async fn read(&self, shared: &Shared, offset: u64, len: u32) -> SmbResult<Bytes> {
         let retry = shared.retry();
-        let mut refreshed = false;
+        let (mut replanned, mut refreshed) = (false, false);
         loop {
             let (key, head) = match self.plan(offset, len) {
                 Plan::Empty => return Ok(Bytes::new()),
                 Plan::Local { file, base, pieces } => {
-                    return self.read_local(shared, &file, base, &pieces, &retry).await;
+                    let read = self
+                        .read_local(shared, &file, base.as_ref(), &pieces, &retry)
+                        .await?;
+                    if let Some(data) = read {
+                        return Ok(data);
+                    }
+                    if let Some((key, _)) = &base {
+                        shared.forget_file(key);
+                    }
+                    if replanned || self.reads_over(&file, base.as_ref()) {
+                        return Err(SmbError::Io(io::Error::other(
+                            "the object changed after it was opened",
+                        )));
+                    }
+                    debug!("the object under an entry moved while it was read");
+                    replanned = true;
+                    continue;
                 }
                 Plan::Base { key, head } => (key, head),
             };
@@ -100,6 +146,12 @@ impl Entry {
                 Fetched::Failed(e) => return Err(e),
                 Fetched::Changed(error) => error,
             };
+            if !replanned && !self.reads_from(&key, &head) {
+                debug!("the object under an entry moved while it was read");
+                shared.forget_file(&key);
+                replanned = true;
+                continue;
+            }
             if refreshed {
                 shared.forget_file(&key);
                 return Err(error.into_smb_error());
@@ -109,19 +161,22 @@ impl Entry {
                 .refresh(&key, &retry)
                 .await
                 .map_err(S3Error::into_smb_error)?;
-            self.follow_head(&shared.ahead, head);
+            self.follow_head(&shared.ahead, &key, head);
             refreshed = true;
         }
     }
 
+    /// The bytes of `pieces`, those present in `file` and the others from
+    /// `base`. `None` if the object of the base is not the version the plan
+    /// started from.
     async fn read_local(
         &self,
         shared: &Shared,
         file: &Arc<File>,
-        base: Option<(String, Arc<ObjectHead>)>,
+        base: Option<&(String, Arc<ObjectHead>)>,
         pieces: &[(Range<u64>, bool)],
         retry: &Retry,
-    ) -> SmbResult<Bytes> {
+    ) -> SmbResult<Option<Bytes>> {
         let from_file: Vec<Range<u64>> = pieces
             .iter()
             .filter(|(_, present)| *present)
@@ -156,7 +211,7 @@ impl Entry {
                 out.extend_from_slice(&present.next().unwrap_or_default());
                 continue;
             }
-            let Some((key, head)) = &base else {
+            let Some((key, head)) = base else {
                 // No object lies under the missing bytes.
                 out.resize(out.len() + (range.end - range.start) as usize, 0);
                 continue;
@@ -173,16 +228,10 @@ impl Entry {
                     out.resize(out.len() + (len as usize).saturating_sub(data.len()), 0);
                 }
                 Fetched::Failed(e) => return Err(e),
-                Fetched::Changed(_) => {
-                    debug!("the object under an entry changed after it was opened");
-                    shared.forget_file(key);
-                    return Err(SmbError::Io(io::Error::other(
-                        "the object changed after it was opened",
-                    )));
-                }
+                Fetched::Changed(_) => return Ok(None),
             }
         }
-        Ok(Bytes::from(out))
+        Ok(Some(Bytes::from(out)))
     }
 }
 
