@@ -1,21 +1,20 @@
 //! Backend that stores file contents and names encrypted under a caller key.
 
+mod backend;
 mod base32;
-#[cfg_attr(not(test), expect(dead_code, reason = "only tests use it so far"))]
 mod block;
-#[cfg_attr(not(test), expect(dead_code, reason = "only tests use it so far"))]
+mod builder;
+mod error;
 mod format;
-#[cfg_attr(not(test), expect(dead_code, reason = "only tests use it so far"))]
 mod header;
-#[cfg_attr(not(test), expect(dead_code, reason = "only tests use it so far"))]
+mod inner;
 mod keys;
-#[cfg_attr(not(test), expect(dead_code, reason = "only tests use it so far"))]
 mod marker;
-#[cfg_attr(not(test), expect(dead_code, reason = "only tests use it so far"))]
 mod names;
-#[cfg_attr(not(test), expect(dead_code, reason = "only tests use it so far"))]
+#[cfg_attr(not(test), expect(dead_code, reason = "only tests call it"))]
 mod random;
-#[cfg_attr(not(test), expect(dead_code, reason = "only tests use it so far"))]
+mod restore;
+mod setup;
 mod size;
 #[cfg(test)]
 mod testing;
@@ -23,3 +22,7 @@ mod testing;
 mod wycheproof_gcm;
 #[cfg(test)]
 mod wycheproof_siv;
+
+pub use backend::EncryptedBackend;
+pub use builder::EncryptedBackendBuilder;
+pub use error::EncryptionError;

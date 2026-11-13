@@ -1,5 +1,5 @@
 //! A backend wrapper that fails or cuts short the opens, unlinks, renames,
-//! writes, truncates and reads that pass through it.
+//! writes, flushes, truncates, closes and reads that pass through it.
 
 use std::any::Any;
 use std::sync::{Arc, Mutex};
@@ -16,12 +16,13 @@ use crate::error::{SmbError, SmbResult};
 use crate::path::SmbPath;
 use crate::stream::{StreamInfo, StreamName};
 
-/// Wraps `inner` and fails chosen opens, unlinks, renames, writes and
-/// truncates, and cuts reads and writes short.
+/// Wraps `inner` and fails chosen opens, unlinks, renames, writes, flushes,
+/// truncates and closes, and cuts reads and writes short.
 ///
 /// A fault hits the nth call from the moment it is set and then clears. A
 /// call it hits fails without reaching the inner backend; a torn write
-/// applies its first bytes there first. `write` and `write_owned` count as
+/// applies its first bytes there first, and a failed close closes the handle
+/// all the same. `write` and `write_owned` count as
 /// writes. `open_stream` is neither counted nor faulted. Short reads and
 /// short writes stay in force until changed. The counters count every call
 /// that reaches this backend, a clone of it or one of their handles,
@@ -45,7 +46,9 @@ struct State {
     unlink_fault: Option<Fault>,
     rename_fault: Option<Fault>,
     write_fault: Option<Fault>,
+    flush_fault: Option<Fault>,
     truncate_fault: Option<Fault>,
+    close_fault: Option<Fault>,
     max_read: Option<u32>,
     max_write: Option<usize>,
 }
@@ -185,9 +188,20 @@ impl<B: ShareBackend> Faulty<B> {
         });
     }
 
+    /// Fails the `nth` flush from now (1 is the next one) with `error`.
+    pub(crate) fn fail_flush(&self, nth: usize, error: SmbError) {
+        self.state.lock().unwrap().flush_fault = Some(Fault::new(nth, error));
+    }
+
     /// Fails the `nth` truncate from now (1 is the next one) with `error`.
     pub(crate) fn fail_truncate(&self, nth: usize, error: SmbError) {
         self.state.lock().unwrap().truncate_fault = Some(Fault::new(nth, error));
+    }
+
+    /// Fails the `nth` close from now (1 is the next one) with `error`. The
+    /// handle is closed in the inner backend first.
+    pub(crate) fn fail_close(&self, nth: usize, error: SmbError) {
+        self.state.lock().unwrap().close_fault = Some(Fault::new(nth, error));
     }
 
     /// Makes every read return at most `max` bytes, or lifts the limit.
@@ -384,7 +398,11 @@ impl Handle for FaultyHandle {
     }
 
     async fn flush(&self) -> SmbResult<()> {
-        self.inner.flush().await
+        let fault = due(&mut self.state.lock().unwrap().flush_fault);
+        match fault {
+            Some(fault) => Err(fault.error),
+            None => self.inner.flush().await,
+        }
     }
 
     async fn stat(&self) -> SmbResult<FileInfo> {
@@ -424,7 +442,12 @@ impl Handle for FaultyHandle {
     }
 
     async fn close(self: Box<Self>) -> SmbResult<()> {
-        self.inner.close().await
+        let fault = due(&mut self.state.lock().unwrap().close_fault);
+        let closed = self.inner.close().await;
+        match fault {
+            Some(fault) => Err(fault.error),
+            None => closed,
+        }
     }
 
     async fn link_count(&self) -> SmbResult<u32> {
@@ -640,6 +663,23 @@ mod tests {
         assert_eq!(files.contents("f"), Some(b"ab".to_vec()));
         assert_eq!(faulty.truncates(), 3);
         assert_eq!(faulty.writes(), 0);
+    }
+
+    #[tokio::test]
+    async fn fails_the_nth_flush_and_close_with_the_chosen_error() {
+        let (files, faulty, handle) = faulty_file(b"").await;
+        faulty.fail_flush(2, SmbError::DiskFull);
+        handle.flush().await.unwrap();
+        assert!(matches!(handle.flush().await, Err(SmbError::DiskFull)));
+        handle.flush().await.unwrap();
+
+        faulty.fail_close(1, io_error());
+        assert!(matches!(handle.close().await, Err(SmbError::Io(_))));
+        assert_eq!(
+            files.open_handles(),
+            0,
+            "the failed close closed the handle"
+        );
     }
 
     #[tokio::test]

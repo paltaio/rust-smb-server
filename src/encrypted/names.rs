@@ -140,6 +140,7 @@ fn hash_part<'a>(name: &'a str, suffix: &str) -> Option<&'a str> {
 /// `threshold` (62 to 255): the spelling of its AES-SIV output when that has
 /// at most `threshold` characters, else a long entry and its side object.
 /// `None` when `name` is not a valid path component.
+#[cfg_attr(not(test), expect(dead_code, reason = "only tests call it"))]
 pub(crate) fn encode_name(keys: &KeySchedule, name: &str, threshold: u8) -> Option<StoredName> {
     if !is_valid_component(name) {
         return None;

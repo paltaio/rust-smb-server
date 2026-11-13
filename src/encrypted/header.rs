@@ -24,6 +24,7 @@ pub(crate) enum HeaderError {
 impl Header {
     /// The header of a file with `file_id`. `None` when `file_id` is all
     /// zero.
+    #[cfg_attr(not(test), expect(dead_code, reason = "only tests call it"))]
     pub(crate) fn new(shift: BlockShift, file_id: [u8; FILE_ID_LEN]) -> Option<Self> {
         if is_zero(&file_id) {
             return None;

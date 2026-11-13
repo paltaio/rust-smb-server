@@ -476,6 +476,8 @@ pub use bytes::Bytes;
 #[cfg(feature = "discovery")]
 pub use discovery::Discovery;
 pub use ea::Ea;
+#[cfg(feature = "encryption")]
+pub use encrypted::{EncryptedBackend, EncryptedBackendBuilder, EncryptionError};
 pub use error::{SmbError, SmbResult};
 pub use files::{
     DEFAULT_DURABLE_HANDLE_TIMEOUT, DEFAULT_MAX_DISCONNECTED_OPENS, DEFAULT_MAX_LOCKS_PER_OPEN,
