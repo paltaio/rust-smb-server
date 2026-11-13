@@ -447,16 +447,22 @@ mod tests {
     mod durable;
     mod dynamic_config;
     mod eas;
+    pub(crate) mod faulty;
+    pub(crate) mod file_ids;
     #[cfg(all(target_os = "linux", feature = "localfs"))]
     pub(crate) mod filesystems;
+    pub(crate) mod folding;
+    pub(crate) mod gated;
     pub(crate) mod memfs;
     mod notify;
     pub(crate) mod peer;
     mod pipes;
+    pub(crate) mod recorder;
     #[cfg(feature = "s3")]
     mod s3;
     mod stream_leases;
     mod streams;
+    pub(crate) mod util;
 }
 mod utils;
 mod wildcard;
