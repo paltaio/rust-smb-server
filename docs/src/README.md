@@ -10,7 +10,7 @@ SMB file-sharing server library for Rust.
 - Server-side copy and block cloning
 - Share listing, mDNS and WS-Discovery
 - Users and shares changeable at run time
-- Pluggable storage: implement `ShareBackend`, or use `LocalFsBackend`
+- Pluggable storage: implement `ShareBackend`, or use `LocalFsBackend` or `S3Backend`
 
 Works with Windows Explorer, macOS Finder, Linux cifs mounts, and `smbclient`.
 

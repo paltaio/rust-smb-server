@@ -54,6 +54,7 @@ SmbServer::builder()
 //! SET_INFO on that open until the open is closed. `LocalFsBackend`
 //! (feature `localfs`) is the reference implementation; its documentation
 //! says where it keeps named streams and extended attributes on each host.
+//! `S3Backend` (feature `s3`) serves a bucket of an S3-compatible store.
 //!
 //! What the protocol layer does around the backend calls:
 //!

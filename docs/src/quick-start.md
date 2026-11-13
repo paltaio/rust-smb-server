@@ -10,6 +10,7 @@ cargo add smb-server
 |---|---|---|
 | `localfs` | on | `LocalFsBackend` |
 | `discovery` | off | mDNS and WS-Discovery announcements |
+| `s3` | off | `S3Backend` |
 
 ```toml
 [dependencies]
@@ -64,6 +65,7 @@ Listens on `127.0.0.1:4445`. Serves directories under `smb-example` in the syste
 | `SMB_DISCOVERY=1` | Announce on the network. Needs `--features discovery` and a non-loopback address |
 | `SMB_STREAMS=0` | Named streams off |
 | `SMB_COPY=0` | Server-side copy off |
+| `SMB_S3_BUCKET` | Serve this S3 bucket as the only share, `s3`. Needs `--features s3`. See [backends](backends.md#example) |
 
 ```sh
 SMB_DISCOVERY=1 SMB_LISTEN='[::]:4445' cargo run -p minimal-smb-example --features discovery

@@ -13,3 +13,4 @@ uuid.workspace = true
 
 [features]
 discovery = ["smb-server/discovery"]
+s3 = ["smb-server/s3"]
