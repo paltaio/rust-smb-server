@@ -96,8 +96,10 @@ fn expand<const N: usize>(prk: &[u8; HASH_LEN], info: &[&[u8]]) -> Zeroizing<[u8
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use sha2::Digest;
+
+    use super::super::testing::{file_id, key_schedule, unhex};
+    use super::*;
 
     const SUITE: u8 = 1;
 
@@ -109,20 +111,6 @@ mod tests {
     );
     const FILE_KEY: &str = "2f66b269cfb6b9910b856a29c32e9b2e07289928c74454bb42fb28bf216fef90";
     const OKM_DIGEST: &str = "e3963f0e8b66c425fb6879cf9bdaf9aac0ffdbac3093b9857871bb35b0056dce";
-
-    fn unhex(s: &str) -> Vec<u8> {
-        hex::decode(s).unwrap()
-    }
-
-    /// Key 0x00..=0x1f.
-    fn schedule() -> KeySchedule {
-        KeySchedule::new(Zeroizing::new(std::array::from_fn(|i| i as u8)))
-    }
-
-    /// File id 0xa0..=0xaf.
-    fn file_id() -> [u8; 16] {
-        std::array::from_fn(|i| 0xa0 + i as u8)
-    }
 
     fn check_rfc5869<const L: usize>(ikm: &[u8], salt: &[u8], info: &[u8], prk: &str, okm: &str) {
         let got_prk = extract(salt, ikm);
@@ -176,31 +164,31 @@ mod tests {
 
     #[test]
     fn prk_vector() {
-        assert_eq!(schedule().prk.as_slice(), unhex(PRK));
+        assert_eq!(key_schedule().prk.as_slice(), unhex(PRK));
     }
 
     #[test]
     fn marker_key_vector() {
         assert_eq!(
-            schedule().marker_key().as_bytes().as_slice(),
+            key_schedule().marker_key().as_bytes().as_slice(),
             unhex(MARKER_KEY)
         );
     }
 
     #[test]
     fn name_key_vector() {
-        assert_eq!(schedule().name_key().as_slice(), unhex(NAME_KEY));
+        assert_eq!(key_schedule().name_key().as_slice(), unhex(NAME_KEY));
     }
 
     #[test]
     fn file_key_vector() {
-        let key = schedule().file_key(SUITE, &file_id());
+        let key = key_schedule().file_key(SUITE, &file_id());
         assert_eq!(key.as_bytes().as_slice(), unhex(FILE_KEY));
     }
 
     #[test]
     fn file_key_depends_on_suite_and_file_id() {
-        let keys = schedule();
+        let keys = key_schedule();
         let id = file_id();
         let base = keys.file_key(SUITE, &id);
         assert_ne!(base.as_bytes(), keys.file_key(SUITE + 1, &id).as_bytes());
