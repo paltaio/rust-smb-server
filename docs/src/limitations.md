@@ -26,7 +26,7 @@ The settings named here, and how `S3Backend` works, are in [backends](backends.m
 ### Writers and storage
 
 - One server per bucket prefix. Other writers to the same keys are last-writer-wins. Only a file the server changed in part, whose object has since changed or been deleted, moves to the `conflicts` directory of the cache directory; the bucket keeps the other version.
-- A crash, or a stop without `sync`, can lose file data the cache directory has not recorded. See [cache directory](backends.md#cache-directory).
+- A crash, or a stop without `sync`, can lose file data written since it was last recorded in the cache directory. A file never recorded is gone if it is new, and reads as the bucket has it if it was changed. See [cache directory](backends.md#cache-directory) for when data is recorded.
 - The largest file is the free space of the cache disk. A write that does not fit fails with STATUS_DISK_FULL.
 - Changing part of a large file downloads the rest of it and uploads all of it.
 - Server-side copy reads and writes the data through the server.

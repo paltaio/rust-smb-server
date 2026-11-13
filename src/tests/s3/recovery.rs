@@ -3,6 +3,7 @@
 
 use std::fs;
 use std::sync::Arc;
+use std::sync::atomic::Ordering::SeqCst;
 
 use tokio::sync::Notify;
 use tokio::task::JoinSet;
@@ -141,7 +142,7 @@ async fn files_directories_times_and_attributes_come_back_after_a_restart() {
 }
 
 #[tokio::test]
-async fn bytes_written_past_the_flushed_ranges_are_not_kept() {
+async fn bytes_written_past_the_flushed_ranges_are_not_kept_when_the_save_at_close_fails() {
     let mut rig = Rig::writable().await;
     let base = pattern(0, 100);
     put(rig.store(), "f.bin", &base).await;
@@ -150,7 +151,10 @@ async fn bytes_written_past_the_flushed_ranges_are_not_kept() {
     assert_eq!(rig.smb.flush(file.id).await, 0);
     assert_eq!(rig.smb.write(file.id, 50, &[b'b'; 10]).await, Ok(10));
     assert_eq!(rig.smb.write(file.id, 90, &[b'c'; 20]).await, Ok(20));
+    rig.backend.hooks().disk_full.store(true, SeqCst);
+    rig.backend.hooks().record_writes.store(1, SeqCst);
     rig.smb.close(file.id).await;
+    assert_eq!(rig.backend.hooks().record_writes.load(SeqCst), 0);
 
     let mut rig = rig.restart().await;
     let mut expected = base.to_vec();

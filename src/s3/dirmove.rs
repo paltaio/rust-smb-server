@@ -343,7 +343,7 @@ impl Shared {
     fn finish_move(self: &Arc<Self>, committed: Committed) {
         let Committed { batch, members } = committed;
         let members: Arc<[Arc<Entry>]> = members.into();
-        let (shared, guard) = (Arc::clone(self), self.jobs.begin_dissolve());
+        let (shared, guard) = (Arc::clone(self), self.jobs.begin_task());
         tokio::spawn(async move {
             let recording = tokio::spawn(dissolve(
                 Arc::clone(&shared),

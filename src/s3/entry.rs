@@ -167,6 +167,8 @@ pub(super) struct State {
     pub(super) generation: u64,
     /// Handles open on the entry, and tasks that act for one.
     pub(super) handles: u32,
+    /// Handles open on the entry.
+    pub(super) open: u32,
     /// The time of the last change.
     pub(super) changed: Instant,
     /// The entry gets no job before this time: its last job met a full disk.
@@ -222,6 +224,7 @@ impl State {
             own: None,
             generation: 0,
             handles: 0,
+            open: 0,
             changed: Instant::now(),
             rest_until: None,
             recorded: false,
@@ -290,6 +293,14 @@ impl State {
         if let Body::File { sealed, .. } = &mut self.body {
             *sealed = Some(new);
         }
+    }
+
+    /// Whether the entry has local data that no record covers as it is now.
+    pub(super) fn unsealed(&self) -> bool {
+        self.local().is_some()
+            && self
+                .sealed()
+                .is_none_or(|sealed| sealed.generation != self.generation)
     }
 
     /// Whether the entry waits for the batch `batch` to be recorded.

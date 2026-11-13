@@ -39,6 +39,7 @@ impl S3Handle {
     }
 
     pub(super) fn entry(shared: Arc<Shared>, held: Held) -> Self {
+        held.entry.state().open += 1;
         S3Handle {
             shared,
             node: Node::Entry(held),
@@ -133,6 +134,10 @@ impl Handle for S3Handle {
     }
 
     async fn close(self: Box<Self>) -> SmbResult<()> {
+        let mut handle = *self;
+        if let Node::Entry(held) = std::mem::replace(&mut handle.node, Node::Root) {
+            change::close_file(&handle.shared, held);
+        }
         Ok(())
     }
 
@@ -143,6 +148,15 @@ impl Handle for S3Handle {
 
     fn as_any(&self) -> Option<&(dyn Any + Send + Sync)> {
         Some(self)
+    }
+}
+
+impl Drop for S3Handle {
+    fn drop(&mut self) {
+        if let Node::Entry(held) = &self.node {
+            let mut state = held.entry.state();
+            state.open = state.open.saturating_sub(1);
+        }
     }
 }
 

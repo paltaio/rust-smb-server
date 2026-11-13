@@ -83,9 +83,15 @@ pub(super) struct Jobs {
     pub(super) stop: Stop,
     /// Set when the worker has ended, however it ended.
     pub(super) exited: watch::Sender<bool>,
-    /// How many renames of directories have tasks that run on after the
-    /// rename answered. The worker does not end before they have.
-    dissolving: watch::Sender<usize>,
+    /// How many tasks run on after the call that started them answered: those
+    /// of a renamed directory and those that record a closed file. The worker
+    /// does not end before those that began by then have. A task that begins
+    /// later holds the backend state, so the cache directory stays locked until
+    /// it ends.
+    tasks: watch::Sender<usize>,
+    /// How many of those tasks record closed files.
+    #[cfg(test)]
+    pub(super) saves: watch::Sender<usize>,
     /// Keeps the worker from starting jobs while set.
     #[cfg(test)]
     pub(super) held: std::sync::atomic::AtomicBool,
@@ -124,6 +130,10 @@ pub(super) struct Jobs {
     /// it.
     #[cfg(test)]
     pub(super) pause_listed: std::sync::Mutex<Option<Gates>>,
+    /// Makes the next task that records a closed file wait before it takes the
+    /// locks of the entry.
+    #[cfg(test)]
+    pub(super) pause_close: std::sync::Mutex<Option<Gates>>,
     /// Makes the task that records the entries of a moved directory panic.
     #[cfg(test)]
     pub(super) panic_dissolve: PanicHook,
@@ -143,7 +153,9 @@ impl Jobs {
             concurrency,
             stop: Stop::new(),
             exited: watch::Sender::new(false),
-            dissolving: watch::Sender::new(0),
+            tasks: watch::Sender::new(0),
+            #[cfg(test)]
+            saves: watch::Sender::new(0),
             #[cfg(test)]
             held: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -167,6 +179,8 @@ impl Jobs {
             #[cfg(test)]
             pause_listed: std::sync::Mutex::new(None),
             #[cfg(test)]
+            pause_close: std::sync::Mutex::new(None),
+            #[cfg(test)]
             panic_dissolve: PanicHook::default(),
             #[cfg(test)]
             panic_read_base: PanicHook::default(),
@@ -175,11 +189,23 @@ impl Jobs {
         })
     }
 
-    /// Notes the tasks that run on after a directory rename answered, until
-    /// the value returned is dropped.
-    pub(super) fn begin_dissolve(self: &Arc<Self>) -> Dissolving {
-        self.dissolving.send_modify(|count| *count += 1);
-        Dissolving(Arc::clone(self))
+    /// Notes a task that runs on after the call that started it answered,
+    /// until the value returned is dropped.
+    pub(super) fn begin_task(self: &Arc<Self>) -> Task {
+        self.tasks.send_modify(|count| *count += 1);
+        Task(Arc::clone(self))
+    }
+
+    /// Notes a task that records a closed file, until the value returned is
+    /// dropped.
+    pub(super) fn begin_save(self: &Arc<Self>) -> Save {
+        #[cfg(test)]
+        self.saves.send_modify(|count| *count += 1);
+        Save {
+            _task: self.begin_task(),
+            #[cfg(test)]
+            jobs: Arc::clone(self),
+        }
     }
 
     /// The size of the largest object one copy request takes.
@@ -215,12 +241,26 @@ impl Jobs {
     }
 }
 
-/// The tasks that run on after a directory rename answered.
-pub(super) struct Dissolving(Arc<Jobs>);
+/// A task that runs on after the call that started it answered.
+pub(super) struct Task(Arc<Jobs>);
 
-impl Drop for Dissolving {
+impl Drop for Task {
     fn drop(&mut self) {
-        self.0.dissolving.send_modify(|count| *count -= 1);
+        self.0.tasks.send_modify(|count| *count -= 1);
+    }
+}
+
+/// A task that records a closed file.
+pub(super) struct Save {
+    _task: Task,
+    #[cfg(test)]
+    jobs: Arc<Jobs>,
+}
+
+#[cfg(test)]
+impl Drop for Save {
+    fn drop(&mut self) {
+        self.jobs.saves.send_modify(|count| *count -= 1);
     }
 }
 
@@ -346,11 +386,7 @@ async fn run_jobs(shared: Arc<Shared>) {
     while let Some(ended) = running.join_next_with_id().await {
         ended_job(ended, &mut stops);
     }
-    let _ = jobs
-        .dissolving
-        .subscribe()
-        .wait_for(|count| *count == 0)
-        .await;
+    let _ = jobs.tasks.subscribe().wait_for(|count| *count == 0).await;
 }
 
 /// Waits until `at`, or for ever.

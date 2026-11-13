@@ -919,7 +919,7 @@ async fn the_deadline_of_a_directory_create_starts_with_the_open() {
 }
 
 #[tokio::test]
-async fn flush_seals_the_ranges_written_and_close_does_not() {
+async fn flush_and_the_close_of_the_last_handle_seal_the_ranges_written() {
     let mut rig = Rig::writable().await;
     let base = pattern(0, 100);
     put(rig.store(), "s.bin", &base).await;
@@ -938,19 +938,17 @@ async fn flush_seals_the_ranges_written_and_close_does_not() {
     assert_eq!(&data[..10], &[b'a'; 10]);
     assert_eq!(&data[20..25], &[b'b'; 5]);
 
-    // Later writes are not in the record until the next flush, and a close
-    // does not write one.
+    // Later writes are not in the record until the next flush or the close of
+    // the last handle.
     assert_eq!(rig.smb.write(file.id, 30, b"cc").await, Ok(2));
     assert_eq!(claimed(&rig, "s.bin"), (100, vec![(0, 10), (20, 25)]));
     rig.smb.close(file.id).await;
-    assert_eq!(claimed(&rig, "s.bin"), (100, vec![(0, 10), (20, 25)]));
+    let all = (100, vec![(0, 10), (20, 25), (30, 32)]);
+    assert_eq!(claimed(&rig, "s.bin"), all);
     let file = rig.smb.create("s.bin", open_rw()).await.unwrap();
     assert_eq!(file.size, 100);
     assert_eq!(rig.smb.flush(file.id).await, 0);
-    assert_eq!(
-        claimed(&rig, "s.bin"),
-        (100, vec![(0, 10), (20, 25), (30, 32)])
-    );
+    assert_eq!(claimed(&rig, "s.bin"), all);
     let mut expected = base.to_vec();
     expected[..10].fill(b'a');
     expected[20..25].fill(b'b');

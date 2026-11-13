@@ -71,6 +71,18 @@ pub(super) async fn make(rig: &mut Rig, name: &str, data: &[u8]) {
     rig.smb.close(file.id).await;
 }
 
+/// [`make`] for a file that has no record afterwards: the save at its close
+/// fails.
+pub(super) async fn make_unrecorded(rig: &mut Rig, name: &str, data: &[u8]) {
+    rig.backend.hooks().record_writes.store(1, SeqCst);
+    make(rig, name, data).await;
+    assert_eq!(
+        rig.backend.hooks().record_writes.load(SeqCst),
+        0,
+        "the save at close failed"
+    );
+}
+
 /// Whether the gateway holds `Mixed` and `mixed` as one object, as one on a
 /// file system that ignores case does.
 pub(super) async fn folds_case(rig: &Rig) -> bool {

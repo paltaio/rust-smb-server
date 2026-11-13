@@ -10,7 +10,8 @@ use tokio::sync::Notify;
 
 use super::fixture::{MIB, foreground, pattern, put};
 use super::moves::{
-    all_records, copies, crash, deletes, exists, folds_case, is_delete, make, path, remote,
+    all_records, copies, crash, deletes, exists, folds_case, is_delete, make, make_unrecorded,
+    path, remote,
 };
 use super::proxy::{Fault, Reply, Seen};
 use super::share::{
@@ -918,7 +919,7 @@ async fn a_crash_after_the_batch_record_leaves_the_rename_whole() {
     put(rig.store(), "d/a.txt", b"alpha").await;
     put(rig.store(), "d/sub/b.txt", b"beta").await;
     mark(&rig, "d/empty/", &[("owner", "me")]).await;
-    make(&mut rig, "d\\new.txt", b"local bytes").await;
+    make_unrecorded(&mut rig, "d\\new.txt", b"local bytes").await;
     let (reached, resume) = rig.backend.pause_after_batch();
     rig.backend
         .rename(&path("d"), &path("e"), false)
@@ -2089,7 +2090,9 @@ async fn failed_replace_of_an_unrecorded_member(
     put(rig.store(), "f.txt", b"f").await;
     let file = rig.smb.create("d\\new.txt", create_file()).await.unwrap();
     fill(&mut rig.smb, file.id, b"only here").await;
+    rig.backend.hooks().record_writes.store(1, SeqCst);
     rig.smb.close(file.id).await;
+    assert_eq!(rig.backend.hooks().record_writes.load(SeqCst), 0);
     let (reached, resume) = rig.backend.pause_after_batch();
     rig.backend
         .rename(&path("d"), &path("e"), false)

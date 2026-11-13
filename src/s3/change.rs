@@ -292,6 +292,49 @@ pub(super) async fn flush(shared: &Arc<Shared>, held: &Held) -> SmbResult<()> {
     blocking(shared, held, |shared, entry| seal(shared, entry, false)).await
 }
 
+/// Ends the hold of a handle that closes. If it was the last handle open on a
+/// file whose local data no record covers, a task of its own makes the data
+/// durable and records it, as a flush does; the close does not wait for it. The
+/// task holds the backend state, so the cache directory stays locked until it
+/// ends.
+pub(super) fn close_file(shared: &Arc<Shared>, held: Held) {
+    let seals = {
+        let mut state = held.entry.state();
+        state.open = state.open.saturating_sub(1);
+        state.open == 0 && !state.detached && state.unsealed()
+    };
+    if !seals {
+        return;
+    }
+    let (shared, save) = (Arc::clone(shared), shared.jobs.begin_save());
+    tokio::spawn(async move {
+        #[cfg(test)]
+        super::jobs::pause(&shared.jobs.pause_close).await;
+        let sealed = blocking(&shared, &held, seal_closed).await;
+        if let Err(e) = sealed {
+            let path = held.entry.state().path(&shared.prefix);
+            warn!(error = %e, path = %path, "the data of a closed file could not be saved in the cache directory");
+        }
+        // The cache directory stays locked while the backend state lives: let
+        // go of it before the worker is told the task is over.
+        drop(held);
+        drop(shared);
+        drop(save);
+    });
+}
+
+/// [`seal`] for the task of a closed file. It takes the `io` lock too, so no
+/// write is under way.
+fn seal_closed(shared: &Shared, entry: &Arc<Entry>) -> SmbResult<()> {
+    let _io = entry.lock_io();
+    let _seal = entry.lock_seal();
+    match seal_held(shared, entry, false) {
+        // A file that left the overlay has nothing to record.
+        Err(SmbError::AccessDenied) => Ok(()),
+        sealed => sealed,
+    }
+}
+
 /// Writes the record of the entry once the data it claims is on disk. The
 /// record says what the entry held when this started, so it never claims a
 /// byte the data file did not have by then. The first record of an entry

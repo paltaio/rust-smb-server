@@ -549,10 +549,13 @@ pub(super) struct Smb {
     state: Arc<ServerState>,
     /// The opens that are not closed.
     opened: Vec<FileId>,
+    /// How many tasks that record closed files the backend is running.
+    saves: tokio::sync::watch::Receiver<usize>,
 }
 
 impl Smb {
     pub(super) async fn new(backend: S3Backend) -> Self {
+        let saves = backend.saves();
         let server = SmbServer::builder()
             .listen("127.0.0.1:0".parse().unwrap())
             .share(Share::new("home", backend).public())
@@ -563,6 +566,7 @@ impl Smb {
             peer: Peer::new(&state, false).await,
             state,
             opened: Vec::new(),
+            saves,
         }
     }
 
@@ -612,7 +616,21 @@ impl Smb {
         self.create(name, Spec::DIR).await
     }
 
+    /// Closes the open and waits for the backend to record the file if the
+    /// close made it.
     pub(super) async fn close(&mut self, id: FileId) {
+        self.close_now(id).await;
+        self.wait_for_saves().await;
+    }
+
+    /// Waits until the backend has recorded the files whose last handle was
+    /// closed.
+    pub(super) async fn wait_for_saves(&mut self) {
+        let _ = self.saves.wait_for(|count| *count == 0).await;
+    }
+
+    /// Closes the open and does not wait for the backend to record the file.
+    pub(super) async fn close_now(&mut self, id: FileId) {
         let mut body = Vec::new();
         CloseRequest {
             structure_size: 24,

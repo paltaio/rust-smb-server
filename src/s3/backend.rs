@@ -60,13 +60,14 @@ use super::retry::Retry;
 /// A writable backend keeps what clients change in its cache directory: the
 /// bytes written to a file, and the times and attributes set on files and
 /// directories. Bytes written and size changes reach the disk when a client
-/// flushes the file or when the backend starts to store it; closing does not
-/// flush. After a restart a file has what was last recorded: one made and
-/// never recorded is gone, and an object changed and never recorded reads as
-/// the bucket has it. A truncate below the length last recorded is recorded
-/// at once. Times and attributes reach the disk at once, except those of a
-/// file the backend holds bytes of, which reach it at the next flush or when
-/// the backend starts to store the file. The share root keeps its times and
+/// flushes the file, when the last handle open on the file closes, or when
+/// the backend starts to store it. The record of a closed file is written in
+/// the background. After a restart a file has what was last recorded: one
+/// made and never recorded is gone, and an object changed and never recorded
+/// reads as the bucket has it. A truncate below the length last recorded is
+/// recorded at once. Times and attributes reach
+/// the disk at once, except those of a file the backend holds bytes of, which
+/// reach it when the file is recorded. The share root keeps its times and
 /// attributes in memory. A read returns the bytes written and gets the rest
 /// from the store; it fails when it needs bytes of the store and the object
 /// under the file changed since the file was opened. If the backend stored
@@ -177,7 +178,8 @@ use super::retry::Retry;
 ///
 /// Dropping the last clone ends the uploads. The cache directory stays locked
 /// until the handles opened through the backend are closed and the requests
-/// in flight have ended. A change made through a handle after the last clone
+/// in flight and the saves of closed files have ended. A change made through
+/// a handle after the last clone
 /// is dropped is not stored by this backend; the next backend built on the
 /// cache directory stores what the directory records.
 ///
@@ -456,6 +458,20 @@ impl S3Backend {
         &self,
     ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
         gates(&self.shared.jobs.pause_listed)
+    }
+
+    /// Makes the next task that records a closed file wait before it takes
+    /// the locks of the file, as [`pause_after_hash`](Self::pause_after_hash)
+    /// does.
+    pub(crate) fn pause_before_close_seal(
+        &self,
+    ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        gates(&self.shared.jobs.pause_close)
+    }
+
+    /// How many tasks that record closed files are running.
+    pub(crate) fn saves(&self) -> tokio::sync::watch::Receiver<usize> {
+        self.shared.jobs.saves.subscribe()
     }
 
     /// Makes the task that records the entries of the next moved directory

@@ -66,9 +66,9 @@ let share = Share::new("s3", s3.clone()).user("alice", Access::ReadWrite);
 
 Holds every change that is not in the bucket yet: file data, times, attributes, renames and deletes. It must be on durable local storage. If the directory is lost, so are those changes.
 
-- Made if missing. One backend uses it at a time. It stays locked until every clone of the backend is dropped, the handles opened through it are closed and the requests in flight have ended.
+- Made if missing. One backend uses it at a time. It stays locked until every clone of the backend is dropped, the handles opened through it are closed, and the requests in flight and the background saves of closed files have ended.
 - Belongs to one endpoint, bucket, prefix and case setting. `build` refuses it with another.
-- Written data is recorded when a client flushes the file, and otherwise when its upload starts: `upload_delay` after the last change, or later while `upload_concurrency` uploads are running. Closing a file does not record it. A crash, or a stop without `sync`, loses data not recorded by then: a new file is gone, and a changed existing file reads as the bucket has it. The next `build` deletes data files that were never recorded. Renames and deletes are recorded before the client gets its answer.
+- Written data is recorded when a client flushes the file or closes its last handle, and otherwise, as for a file a lease or a durable handle keeps open, when its upload starts: `upload_delay` after the last change, or later while `upload_concurrency` uploads are running. The record of a closed file is written in the background. The next `build` deletes data files that were never recorded. Renames and deletes are recorded before the client gets its answer. What a crash loses is in [limitations](limitations.md#writers-and-storage).
 - Clients see the size and free space of its disk as the size and free space of the share.
 - A backend built on a directory that holds changes brings the files, times, renames and deletes back and stores them without waiting for `upload_delay`. It also retries uploads that failed for good and aborts multipart uploads left running.
 - Data that cannot be read back moves to the `conflicts` directory inside it, with an error in the log.
