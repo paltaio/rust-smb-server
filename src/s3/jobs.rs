@@ -389,7 +389,7 @@ async fn run_jobs(shared: Arc<Shared>) {
     let _ = jobs.tasks.subscribe().wait_for(|count| *count == 0).await;
 }
 
-/// Waits until `at`, or for ever.
+/// Waits until `at`, or forever.
 async fn wait_until(at: Option<Instant>) {
     match at {
         Some(at) => tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await,

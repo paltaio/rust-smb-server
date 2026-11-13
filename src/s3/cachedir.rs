@@ -123,7 +123,7 @@ pub(crate) fn identity(
     )
 }
 
-/// A new id.
+/// A random id.
 pub(crate) fn new_id() -> io::Result<RecordId> {
     let mut bytes = [0u8; 16];
     crate::utils::fill_random(&mut bytes).map_err(io::Error::other)?;

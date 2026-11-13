@@ -2391,7 +2391,7 @@ mod tests {
     }
 
     #[test]
-    fn implied_names_that_differ_in_case_count_once() {
+    fn implicit_directories_that_differ_in_case_count_once() {
         let overlay = test_overlay(true);
         overlay.install(vec![kept("p/Sub/a"), kept("p/sub/b")], Vec::new());
         let below = overlay.below("p");

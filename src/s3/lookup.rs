@@ -401,7 +401,7 @@ impl Shared {
         prefix: &str,
         retry: &Retry,
     ) -> Result<Option<String>, S3Error> {
-        // No key below a prefix longer than a key can be stored.
+        // A prefix longer than any key has no key below it.
         if prefix.len() > MAX_KEY_LEN {
             return Ok(None);
         }

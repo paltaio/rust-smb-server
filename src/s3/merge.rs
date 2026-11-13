@@ -45,9 +45,9 @@ fn is_dir(row: &Row) -> bool {
 /// The entries of a directory in the order of their keys: the `rows` of its
 /// listing, with the `direct` entries of the overlay in place of the rows of
 /// their names, and a directory for each of the `implied` names that has no
-/// row. A name that is both a file and a directory is the directory. Names
-/// that differ only in case are one name when `fold` is set; the overlay's
-/// names are, for the rows they replace.
+/// row. A name that is both a file and a directory is the directory. When
+/// `fold` is set, an overlay name stands for the rows whose names differ from
+/// it only in case; rows the overlay does not touch are kept as listed.
 pub(super) fn merge(
     rows: &[&Row],
     direct: &[Direct],
@@ -188,7 +188,7 @@ mod tests {
     }
 
     #[test]
-    fn new_entries_and_implied_directories_join_the_rows_in_key_order() {
+    fn new_entries_and_implicit_directories_join_the_rows_in_key_order() {
         let rows = [file("b.txt"), dir("m")];
         let direct = [entry("a.txt", false), entry("z", true)];
         let picked = run(&rows, &direct, &["n"], false);
@@ -228,7 +228,7 @@ mod tests {
 
     #[test]
     fn a_directory_wins_over_a_file_of_the_same_name() {
-        // An implied directory over a row that is a file.
+        // An implicit directory over a row that is a file.
         let rows = [file("x")];
         let picked = run(&rows, &[], &["x"], false);
         assert_eq!(picked, [("x".to_owned(), Source::Implied(0))]);
@@ -240,13 +240,13 @@ mod tests {
         let rows = [file("x")];
         let picked = run(&rows, &[entry("x", true)], &[], false);
         assert_eq!(picked, [("x".to_owned(), Source::Entry(0))]);
-        // An implied directory over an entry that is a file.
+        // An implicit directory over an entry that is a file.
         let picked = run(&[], &[entry("x", false)], &["x"], false);
         assert_eq!(picked, [("x".to_owned(), Source::Implied(0))]);
     }
 
     #[test]
-    fn a_directory_row_stands_for_an_implied_directory_of_its_name() {
+    fn a_directory_row_stands_for_an_implicit_directory_of_its_name() {
         let rows = [dir("sub")];
         let picked = run(&rows, &[], &["sub"], false);
         assert_eq!(picked, [("sub".to_owned(), Source::Row(0))]);

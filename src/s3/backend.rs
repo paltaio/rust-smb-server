@@ -65,17 +65,17 @@ use super::retry::Retry;
 /// the background. After a restart a file has what was last recorded: one
 /// made and never recorded is gone, and an object changed and never recorded
 /// reads as the bucket has it. A truncate below the length last recorded is
-/// recorded at once. Times and attributes reach
-/// the disk at once, except those of a file the backend holds bytes of, which
-/// reach it when the file is recorded. The share root keeps its times and
-/// attributes in memory. A read returns the bytes written and gets the rest
-/// from the store; it fails when it needs bytes of the store and the object
-/// under the file changed since the file was opened. If the backend stored
-/// the file meanwhile, the read returns the bytes from the object it stored.
-/// What the backend holds shows in lookups and listings at once. A directory
-/// made through the share has its marker object put in the store before the
-/// open returns. A file that is deleted or renamed is gone or has its new
-/// name in the share at once, and the bucket follows in the background.
+/// recorded at once. Times and attributes reach the disk at once, except
+/// those of a file the backend holds bytes of, which reach it when the file
+/// is recorded. The share root keeps its times and attributes in memory. A
+/// read returns the bytes written and gets the rest from the store; it fails
+/// when it needs bytes of the store and the object under the file changed
+/// since the file was opened. If the backend stored the file meanwhile, the
+/// read returns the bytes from the object it stored. What the backend holds
+/// shows in lookups and listings at once. A directory made through the share
+/// has its marker object put in the store before the open returns. A file
+/// that is deleted or renamed is gone or has its new name in the share at
+/// once, and the bucket follows in the background.
 ///
 /// A directory can be deleted when nothing is below it, and renamed with
 /// everything below it. The share shows the result at once. The objects of a
@@ -179,9 +179,9 @@ use super::retry::Retry;
 /// Dropping the last clone ends the uploads. The cache directory stays locked
 /// until the handles opened through the backend are closed and the requests
 /// in flight and the saves of closed files have ended. A change made through
-/// a handle after the last clone
-/// is dropped is not stored by this backend; the next backend built on the
-/// cache directory stores what the directory records.
+/// a handle after the last clone is dropped is not stored by this backend;
+/// the next backend built on the cache directory stores what the directory
+/// records.
 ///
 /// Build one with [`S3Backend::builder`].
 #[derive(Clone)]

@@ -120,8 +120,8 @@ impl Shared {
 /// change took it.
 const RENAME_ATTEMPTS: u32 = 3;
 
-/// The keys `entry` owns to delete after it moves from `old` to `to`: those
-/// it owned, and `old` if the bucket may hold it, less `to`.
+/// The keys an entry owns to delete after it moves from `old` to `to`:
+/// `owned`, and `old` if `old_exists`, less `to`.
 pub(super) fn gone_after(owned: &[String], old: &str, old_exists: bool, to: &str) -> Vec<String> {
     let mut gone: Vec<String> = Vec::new();
     for key in owned

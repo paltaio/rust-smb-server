@@ -429,7 +429,7 @@ async fn unowned_keys_are_deleted_in_batches() {
 }
 
 #[tokio::test]
-async fn the_last_file_of_an_implied_directory_leaves_a_marker_when_it_is_unlinked() {
+async fn the_last_file_of_an_implicit_directory_leaves_a_marker_when_it_is_unlinked() {
     let mut rig = Rig::writable_with(uploading).await;
     put(rig.store(), "dir/only.txt", b"x").await;
     rig.backend.unlink(&path("dir/only.txt")).await.unwrap();
@@ -715,7 +715,7 @@ async fn a_rename_onto_a_directory_or_into_a_missing_one_fails() {
 }
 
 #[tokio::test]
-async fn a_rename_through_the_share_reports_the_same_failures() {
+async fn a_rename_through_the_share_maps_its_failures_to_statuses() {
     let mut rig = Rig::writable_with(held).await;
     put(rig.store(), "f.txt", b"x").await;
     put(rig.store(), "g.txt", b"y").await;
@@ -1272,7 +1272,7 @@ async fn sync_waits_for_a_rename_and_for_the_deletes_it_leaves() {
 }
 
 #[tokio::test]
-async fn times_set_on_an_implied_directory_reach_the_bucket_on_a_new_marker() {
+async fn times_set_on_an_implicit_directory_reach_the_bucket_on_a_new_marker() {
     let mut rig = Rig::writable_with(uploading).await;
     put(rig.store(), "impl/f.txt", b"x").await;
     let dir = rig
@@ -1580,7 +1580,7 @@ async fn a_new_file_at_the_name_a_rename_left_waits_for_the_copy_of_the_old_cont
 }
 
 #[tokio::test]
-async fn the_last_file_of_an_implied_directory_leaves_a_marker_when_it_is_renamed() {
+async fn the_last_file_of_an_implicit_directory_leaves_a_marker_when_it_is_renamed() {
     let mut rig = Rig::writable_with(uploading).await;
     put(rig.store(), "dir/only.txt", b"x").await;
     rig.backend
@@ -1599,7 +1599,7 @@ async fn the_last_file_of_an_implied_directory_leaves_a_marker_when_it_is_rename
 }
 
 #[tokio::test]
-async fn nested_implied_directories_each_get_a_marker() {
+async fn nested_implicit_directories_each_get_a_marker() {
     let mut rig = Rig::writable_with(uploading).await;
     put(rig.store(), "a/b/c/only.txt", b"x").await;
     rig.backend.unlink(&path("a/b/c/only.txt")).await.unwrap();

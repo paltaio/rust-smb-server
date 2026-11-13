@@ -22,8 +22,8 @@ use super::meta;
 use super::overlay::{Fence, Held, Writes};
 use super::retry::Retry;
 
-/// How many times an open looks again after it finds a name taken that it
-/// found free.
+/// How many times an open looks up the name when another create keeps taking
+/// it first.
 const ATTEMPTS: usize = 4;
 
 type Opened = (Box<dyn Handle>, OpenAction);
@@ -125,8 +125,6 @@ impl Shared {
             let file = local.create_data(&id, 0).map_err(disk_error)?;
             let held = overlay.insert_new(Entry::created_file(key, id.clone(), now, file));
             if held.is_err() {
-                // The name is taken or cannot be made; the file made for this
-                // one is removed.
                 let _ = local.remove_data(&id);
             }
             created(held)

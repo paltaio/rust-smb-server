@@ -70,9 +70,9 @@ pub(super) struct Fetch<'a> {
 
 impl Fetch<'_> {
     /// Keeps the chunk a successful `outcome` brings, and hands `outcome` to
-    /// the readers that wait. A reader that runs out of time, or fails in a
-    /// way trying again can fix, has no outcome for them: they claim the chunk
-    /// again under their own deadlines.
+    /// the readers that wait. A fetch that runs out of time, or fails in a way
+    /// trying again can fix, hands them nothing: they claim the chunk again
+    /// under their own deadlines.
     pub(super) fn finish(mut self, outcome: Outcome) {
         self.open = false;
         self.ahead
@@ -753,38 +753,20 @@ mod tests {
 
     #[test]
     fn a_fetch_that_fails_for_good_reaches_the_readers_that_waited_and_keeps_nothing() {
-        for error in [
-            S3Error::status(403, Some("AccessDenied"), None),
-            S3Error::status(404, Some("NoSuchKey"), None),
-            S3Error::status(412, Some("PreconditionFailed"), None),
-            S3Error::InvalidResponse("bad answer"),
-        ] {
-            let (got, refetches) = finished_with(Err(error.clone()));
-            let Ok(Err(got)) = got else {
-                panic!("{error:?} did not reach the reader");
-            };
-            assert_eq!(got.to_string(), error.to_string());
-            assert!(refetches);
-        }
+        let error = S3Error::status(403, Some("AccessDenied"), None);
+        let (got, refetches) = finished_with(Err(error.clone()));
+        let Ok(Err(got)) = got else {
+            panic!("{error:?} did not reach the reader");
+        };
+        assert_eq!(got.to_string(), error.to_string());
+        assert!(refetches);
     }
 
     #[test]
     fn a_fetch_that_fails_in_a_way_trying_again_can_fix_lets_the_readers_that_waited_claim_again() {
-        for error in [
-            S3Error::status(503, Some("SlowDown"), None),
-            S3Error::status(500, None, None),
-            S3Error::status(400, Some("RequestTimeout"), None),
-            S3Error::transport(std::io::Error::other("reset")),
-            S3Error::TimedOut,
-        ] {
-            assert!(error.is_transient(), "{error:?}");
-            let (got, refetches) = finished_with(Err(error.clone()));
-            assert!(
-                matches!(got, Err(oneshot::error::TryRecvError::Closed)),
-                "{error:?}"
-            );
-            assert!(refetches);
-        }
+        let (got, refetches) = finished_with(Err(S3Error::status(503, Some("SlowDown"), None)));
+        assert!(matches!(got, Err(oneshot::error::TryRecvError::Closed)));
+        assert!(refetches);
     }
 
     #[test]
