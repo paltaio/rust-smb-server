@@ -418,6 +418,8 @@ pub(crate) mod conn;
 mod discovery;
 mod dispatch;
 mod ea;
+#[cfg(feature = "encryption")]
+mod encrypted;
 mod error;
 mod files;
 #[cfg(feature = "localfs")]

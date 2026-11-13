@@ -45,7 +45,7 @@ md4   = "0.10"
 aes   = "0.8"
 cmac  = "0.7"
 rc4   = "0.2"
-aes-gcm = { version = "0.10", default-features = false, features = ["aes"] }
+aes-gcm = { version = "0.10.3", default-features = false, features = ["aes"] }
 ccm   = { version = "0.5", default-features = false }
 
 [dependencies]
@@ -67,6 +67,8 @@ cmac.workspace = true
 rc4.workspace = true
 aes-gcm.workspace = true
 ccm.workspace = true
+aes-siv = { version = "0.7", default-features = false, optional = true }
+zeroize = { version = "1", optional = true }
 socket2 = "0.6"
 if-addrs = { version = "0.15", optional = true, features = ["link-local"] }
 quick-xml = { version = "0.42", optional = true }
@@ -120,6 +122,7 @@ discovery = [
     "windows-sys/Win32_NetworkManagement_Dns",
     "windows-sys/Win32_System_SystemInformation",
 ]
+encryption = ["dep:aes-siv", "dep:zeroize", "aes/zeroize"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
