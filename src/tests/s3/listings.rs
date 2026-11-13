@@ -488,7 +488,7 @@ async fn a_listing_after_the_ttl_reads_the_directory_again() {
 }
 
 #[tokio::test]
-async fn every_page_of_the_listing_goes_out_under_one_delimiter_and_prefix() {
+async fn a_listing_goes_out_under_one_delimiter_and_prefix() {
     let rig = Rig::with(|builder| builder.prefix("p/q")).await;
     put(rig.store(), "p/q/a", "a").await;
     put(rig.store(), "p/q/s/b", "b").await;

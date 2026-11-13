@@ -9,7 +9,9 @@ use tokio::sync::Notify;
 
 use super::fixture::{OLD, foreground, pattern, put};
 use super::proxy::{Fault, Reply};
-use super::share::{Rig, filetime, heads, is_data_read, open_handle, put_with, reads, requests};
+use super::share::{
+    Rig, filetime, heads, is_data_read, open_handle, put_with, reads, requests, wait_until,
+};
 use crate::Handle;
 use crate::ntstatus::{
     STATUS_END_OF_FILE, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_UNEXPECTED_IO_ERROR,
@@ -52,17 +54,6 @@ fn ranges(rig: &Rig) -> Vec<String> {
         .filter(|seen| is_data_read(seen))
         .filter_map(|seen| seen.header("range").map(str::to_owned))
         .collect()
-}
-
-/// Waits until `done` holds.
-async fn until(what: &str, done: impl Fn() -> bool) {
-    for _ in 0..500 {
-        if done() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!("timed out waiting for {what}");
 }
 
 /// Makes the store answer the next `times` requests for chunk 0 of the object
@@ -631,12 +622,12 @@ async fn a_reader_waiting_for_a_dropped_fetch_fetches_the_chunk_itself() {
         let handle = Arc::clone(&handle);
         async move { handle.read(0, 10).await }
     });
-    until("the stalled read", || reads(&rig.proxy) == 1).await;
+    wait_until("the stalled read", || reads(&rig.proxy) == 1).await;
     let follower = tokio::spawn({
         let handle = Arc::clone(&handle);
         async move { handle.read(20, 10).await }
     });
-    until("the follower to wait", || {
+    wait_until("the follower to wait", || {
         rig.backend.read_chunk_waiters() == 1
     })
     .await;
@@ -661,7 +652,7 @@ async fn a_reader_waiting_for_a_fetch_that_runs_out_of_time_fetches_the_chunk_it
         let handle = Arc::clone(&handle);
         async move { handle.read(0, 10).await }
     });
-    until("the stalled read", || reads(&rig.proxy) == 1).await;
+    wait_until("the stalled read", || reads(&rig.proxy) == 1).await;
     // The follower starts two seconds after the leader, so its own deadline
     // is two seconds after the leader's.
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -669,7 +660,7 @@ async fn a_reader_waiting_for_a_fetch_that_runs_out_of_time_fetches_the_chunk_it
         let handle = Arc::clone(&handle);
         async move { handle.read(20, 10).await }
     });
-    until("the follower to wait", || {
+    wait_until("the follower to wait", || {
         rig.backend.read_chunk_waiters() == 1
     })
     .await;
@@ -699,12 +690,12 @@ async fn a_reader_waiting_for_a_fetch_that_ends_on_a_transient_error_fetches_the
         let handle = Arc::clone(&handle);
         async move { handle.read(0, 10).await }
     });
-    until("the fifth attempt", || reads(&rig.proxy) == 5).await;
+    wait_until("the fifth attempt", || reads(&rig.proxy) == 5).await;
     let follower = tokio::spawn({
         let handle = Arc::clone(&handle);
         async move { handle.read(20, 10).await }
     });
-    until("the follower to wait", || {
+    wait_until("the follower to wait", || {
         rig.backend.read_chunk_waiters() == 1
     })
     .await;
@@ -730,7 +721,7 @@ async fn reads_of_one_missing_chunk_at_the_same_time_make_one_request() {
         let offset = 100 * u64::try_from(n).unwrap();
         running.push(tokio::spawn(async move { handle.read(offset, 50).await }));
     }
-    until("three readers to wait", || {
+    wait_until("three readers to wait", || {
         rig.backend.read_chunk_waiters() == 3
     })
     .await;

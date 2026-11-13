@@ -101,11 +101,7 @@ async fn a_file_written_through_the_share_reads_back_with_its_size_and_times() {
     assert!(again.times[2] >= file.times[2]);
     assert_eq!(again.times[2], again.times[3]);
     assert_eq!(changes(&rig), 0, "nothing reaches the bucket");
-    assert!(
-        rig.proxy
-            .count(|seen| seen.method == "GET" && !seen.has_param("list-type"))
-            == 0
-    );
+    assert_eq!(reads(&rig.proxy), 0);
 }
 
 #[tokio::test]

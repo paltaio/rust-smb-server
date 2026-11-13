@@ -338,8 +338,8 @@ pub(super) fn requests(proxy: &Proxy) -> usize {
     proxy.seen().len()
 }
 
-/// Waits until `ready` holds. Panics with `what` if it does not within about
-/// 5 s.
+/// Waits until `ready` holds. Panics with "timed out: " and `what` if it does
+/// not within about 5 s.
 pub(super) async fn wait_until(what: &str, ready: impl Fn() -> bool) {
     wait_until_async(what, async || ready()).await;
 }
@@ -352,7 +352,7 @@ pub(super) async fn wait_until_async(what: &str, ready: impl AsyncFn() -> bool) 
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    panic!("{what}");
+    panic!("timed out: {what}");
 }
 
 /// Runs the scenario `make` returns on a runtime of its own, on a thread of

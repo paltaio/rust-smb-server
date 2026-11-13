@@ -17,7 +17,7 @@ use super::uploads::{
     fill, held, is_complete, is_create_of, is_get_of, is_head_of, is_put_of, left, stored, sync,
     uploading,
 };
-use super::writes::{create_dir, create_file, open_rw};
+use super::writes::{changes, create_dir, create_file, open_rw};
 use crate::ntstatus::{
     STATUS_ACCESS_DENIED, STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_NOT_FOUND,
     STATUS_OBJECT_PATH_NOT_FOUND,
@@ -579,18 +579,12 @@ async fn a_read_over_local_data_whose_object_the_job_moved_gets_the_bytes_of_the
 async fn a_rename_makes_no_store_request_beyond_the_lookups() {
     let rig = Rig::writable_with(held).await;
     put(rig.store(), "a.bin", b"x").await;
-    let before = rig
-        .proxy
-        .count(|s| !matches!(s.method.as_str(), "GET" | "HEAD"));
+    let before = changes(&rig);
     rig.backend
         .rename(&path("a.bin"), &path("b.bin"), false)
         .await
         .unwrap();
-    assert_eq!(
-        rig.proxy
-            .count(|s| !matches!(s.method.as_str(), "GET" | "HEAD")),
-        before
-    );
+    assert_eq!(changes(&rig), before);
 }
 
 #[tokio::test]
@@ -944,24 +938,9 @@ async fn a_crash_between_the_copy_and_the_delete_is_finished_by_the_next_backend
     assert_eq!(remote(&rig, "new.txt").await.unwrap(), b"survives");
     assert_eq!(remote(&rig, "old.txt").await.unwrap(), b"survives");
 
-    let Rig {
-        bucket,
-        proxy,
-        backend,
-        mut smb,
-        cache,
-    } = rig;
-    smb.close_all().await;
-    drop(smb);
-    let mut exited = backend.worker_exited();
-    drop(backend);
-    resume.notify_one();
-    tokio::time::timeout(Duration::from_secs(10), exited.wait_for(|exited| *exited))
-        .await
-        .expect("the worker ends")
-        .unwrap();
+    let (bucket, proxy, cache) = crash(rig, resume).await;
 
-    let mut rig = Rig::start(bucket, proxy, cache.unwrap(), uploading).await;
+    let mut rig = Rig::start(bucket, proxy, cache, uploading).await;
     assert_eq!(rig.smb.contents("new.txt", 100).await, b"survives");
     assert!(!exists(&mut rig, "old.txt").await);
     sync(&rig.backend).await.unwrap();

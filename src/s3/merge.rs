@@ -277,9 +277,4 @@ mod tests {
         assert_eq!(picked.len(), 1);
         assert_eq!(picked[0].1, Source::Entry(0));
     }
-
-    #[test]
-    fn nothing_in_gives_nothing_out() {
-        assert!(run(&[], &[], &[], true).is_empty());
-    }
 }

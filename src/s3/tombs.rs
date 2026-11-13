@@ -382,7 +382,7 @@ pub(super) async fn delete(shared: Arc<Shared>, claim: Deleting) {
             code = error.code(),
             request_id = error.request_id(),
             key,
-            "an object could not be deleted from the bucket, and is tried again when the next backend is built"
+            "an object could not be deleted from the bucket, and the delete is tried again when the next backend is built"
         );
     }
     if let Some(local) = shared.local.clone() {

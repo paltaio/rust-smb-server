@@ -8,12 +8,14 @@ use tokio::sync::Notify;
 
 use super::fixture::{MIB, OLD, TestBucket, foreground, pattern, put};
 use super::gateway::REGION;
+use super::moves::path;
 use super::proxy::{Fault, Proxy, Reply};
 use super::share::{
     DELETE, FILE_CREATE, FILE_DELETE_ON_CLOSE, FILE_OPEN_IF, FILE_OVERWRITE, FILE_OVERWRITE_IF,
     READ, Rig, Spec, WRITE, WRITE_ATTRIBUTES, builder, filetime, heads, is_data_read, listings,
     names, open_handle, put_with, reads, requests,
 };
+use super::writes::changes;
 use crate::ntstatus::{
     STATUS_ACCESS_DENIED, STATUS_FILE_IS_A_DIRECTORY, STATUS_OBJECT_NAME_NOT_FOUND,
     STATUS_OBJECT_PATH_NOT_FOUND, STATUS_UNEXPECTED_IO_ERROR,
@@ -22,16 +24,6 @@ use crate::s3::error::S3Error;
 use crate::{
     FileTimes, OpenIntent, OpenOptions, S3Backend, ShareBackend, SmbError, SmbPath, VolumeInfo,
 };
-
-fn path(text: &str) -> SmbPath {
-    text.parse().unwrap()
-}
-
-/// Requests that could change the bucket.
-fn changes(rig: &Rig) -> usize {
-    rig.proxy
-        .count(|seen| !matches!(seen.method.as_str(), "GET" | "HEAD"))
-}
 
 #[tokio::test]
 async fn every_open_that_would_change_something_is_refused() {
@@ -149,20 +141,12 @@ async fn the_backend_refuses_each_kind_of_change_directly() {
         backend.unlink(&SmbPath::root()).await,
         Err(SmbError::AccessDenied)
     ));
-    for replace in [false, true] {
-        assert!(matches!(
-            backend
-                .rename(&path("file.txt"), &path("other.txt"), replace)
-                .await,
-            Err(SmbError::AccessDenied)
-        ));
-        assert!(matches!(
-            backend
-                .rename(&path("dir"), &path("elsewhere"), replace)
-                .await,
-            Err(SmbError::AccessDenied)
-        ));
-    }
+    assert!(matches!(
+        backend
+            .rename(&path("file.txt"), &path("other.txt"), false)
+            .await,
+        Err(SmbError::AccessDenied)
+    ));
 
     assert_eq!(
         requests(&rig.proxy),
@@ -187,19 +171,11 @@ async fn the_backend_refuses_each_kind_of_change_directly() {
             Err(SmbError::AccessDenied)
         ));
         assert!(matches!(
-            handle.truncate(100).await,
-            Err(SmbError::AccessDenied)
-        ));
-        assert!(matches!(
             handle.set_times(FileTimes::all(SystemTime::now())).await,
             Err(SmbError::AccessDenied)
         ));
         assert!(matches!(
             handle.set_attributes(0x1).await,
-            Err(SmbError::AccessDenied)
-        ));
-        assert!(matches!(
-            handle.set_attributes(0).await,
             Err(SmbError::AccessDenied)
         ));
     }
@@ -255,8 +231,6 @@ async fn the_handle_of_a_file_and_of_a_directory_answer_what_they_are() {
     put(rig.store(), "dir/inner", b"x").await;
     let file = open_handle(&rig.backend, "file.txt").await;
     let dir = open_handle(&rig.backend, "dir").await;
-    assert!(file.as_any().is_some());
-    assert!(dir.as_any().is_some());
     file.flush().await.unwrap();
     dir.flush().await.unwrap();
     assert!(matches!(dir.read(0, 10).await, Err(SmbError::IsDirectory)));

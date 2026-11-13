@@ -274,8 +274,8 @@ async fn a_key_over_the_limit_is_an_invalid_name_and_costs_no_request() {
     // A key of exactly 1024 bytes is looked up, but no key below it can exist,
     // so only the key itself is asked for.
     let parts = vec!["z".repeat(204); 5];
-    // Paths this long are past what the file system under some gateways takes,
-    // so the proxy says there are no such keys.
+    // Paths this long are past what the gateway's file system takes, so the
+    // proxy says there are no such keys.
     for depth in 1..=5 {
         rig.hide(&parts[..depth].join("/"));
     }

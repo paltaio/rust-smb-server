@@ -184,7 +184,7 @@ async fn retries_what_trying_again_can_fix_and_nothing_else() {
 }
 
 #[tokio::test]
-async fn a_foreground_call_gives_up_after_five_attempts() {
+async fn a_foreground_call_stops_at_its_attempt_limit() {
     let (bucket, proxy) = through_a_proxy().await;
     proxy.inject(
         |seen| seen.method == "GET",
@@ -205,7 +205,7 @@ async fn a_foreground_call_gives_up_after_five_attempts() {
 }
 
 #[tokio::test]
-async fn a_background_call_keeps_trying_past_five_attempts() {
+async fn a_background_call_keeps_trying_past_the_foreground_attempt_limit() {
     let (bucket, proxy) = through_a_proxy().await;
     put(&bucket.client, KEY, pattern(0, 10)).await;
     proxy.inject(

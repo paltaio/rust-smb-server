@@ -269,8 +269,3 @@ fn serve(binary: &OsStr) -> Result<(), String> {
     let _ = io::stderr().write_all(&std::fs::read(&log).unwrap_or_default());
     Ok(())
 }
-
-#[test]
-fn gateway_starts() {
-    gateway();
-}

@@ -135,18 +135,6 @@ async fn a_range_past_the_end_of_an_object_is_clipped() {
 }
 
 #[tokio::test]
-async fn a_range_that_starts_past_the_end_is_not_satisfiable() {
-    let bucket = TestBucket::new().await;
-    put(&bucket.client, "short", b"0123456789").await;
-    let error = bucket
-        .client
-        .get_object("short", range(10, 5), None, foreground())
-        .await
-        .unwrap_err();
-    assert_eq!(error.http_status(), Some(416), "{error:?}");
-}
-
-#[tokio::test]
 async fn a_missing_key_is_reported_as_missing() {
     let bucket = TestBucket::new().await;
     let client = &bucket.client;

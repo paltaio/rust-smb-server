@@ -3,7 +3,8 @@
 //!
 //! ```text
 //! lock          held while a backend uses the directory
-//! identity      the endpoint, bucket and prefix the directory belongs to
+//! identity      the endpoint, bucket, prefix and case setting the directory
+//!               belongs to
 //! data/<id>     the local data of an entry
 //! records/<id>  the record of an entry or tombstone
 //! conflicts/    records and data files that could not be used
@@ -936,7 +937,7 @@ mod tests {
     }
 
     #[test]
-    fn a_record_is_whole_or_absent_and_replaces_the_one_before() {
+    fn a_record_replaces_the_one_before_leaves_no_temp_file_and_can_be_removed_twice() {
         let temp = tempfile::tempdir().unwrap();
         let dir = CacheDir::open(temp.path(), &who()).unwrap();
         let id = new_id().unwrap();

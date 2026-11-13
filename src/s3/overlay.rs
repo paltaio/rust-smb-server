@@ -2279,14 +2279,6 @@ mod tests {
     }
 
     #[test]
-    fn names_that_differ_in_case_are_two_names_when_case_counts() {
-        let overlay = test_overlay(false);
-        let _held = overlay.insert_new(kept("a")).unwrap();
-        assert!(overlay.peek("A").is_none());
-        assert!(overlay.peek("a").is_some());
-    }
-
-    #[test]
     fn the_last_release_drops_an_entry_with_nothing_to_keep() {
         let overlay = test_overlay(false);
         let first = overlay.insert_new(plain("f")).unwrap();

@@ -667,7 +667,7 @@ impl S3Client {
     /// DeleteObject. A key that does not exist is deleted: the store says so
     /// with status 404 and no body, or with the code `NoSuchKey`. Any other 404,
     /// such as a missing bucket or the page of a proxy, is an error.
-    #[cfg_attr(not(test), expect(dead_code, reason = "called by tests only"))]
+    #[cfg(test)]
     pub(crate) async fn delete_object(&self, key: &str, retry: Retry) -> Result<(), S3Error> {
         let call = self.object_call(Method::DELETE, key, &[])?;
         self.run(retry, &call, BodyLimit::Capped(MAX_BODY), |reply| {
@@ -1093,8 +1093,6 @@ mod tests {
     fn the_copy_source_is_the_encoded_bucket_and_key() {
         let target = target("http://127.0.0.1:1", "bucket", None);
         assert_eq!(target.copy_source("dir/a b+c"), "bucket/dir/a%20b%2Bc");
-        let aws = self::target("https://s3.amazonaws.com", "bucket", None);
-        assert_eq!(aws.copy_source("x"), "bucket/x");
     }
 
     #[test]

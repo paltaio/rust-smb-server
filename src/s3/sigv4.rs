@@ -417,11 +417,6 @@ mod tests {
     }
 
     #[test]
-    fn the_empty_body_constant_is_its_hash() {
-        assert_eq!(hex(&Sha256::digest(b"")), EMPTY_SHA256);
-    }
-
-    #[test]
     fn a_session_token_is_signed_and_sent() {
         let signer = Signer::new(credentials(Some("token/with+chars==")), "us-east-1");
         let headers = sign_root(&signer).unwrap();

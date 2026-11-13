@@ -585,10 +585,8 @@ async fn a_directory_create_whose_request_is_dropped_still_finishes() {
         rig.store().head_object("held/", foreground()).await.is_ok()
     })
     .await;
-    wait_until("the record to go", || {
+    wait_until("the record to go, as the marker carries the times", || {
         records(&rig).is_empty() && rig.backend.overlay_len() == 0
     })
     .await;
-    assert!(records(&rig).is_empty(), "the marker carries the times");
-    assert_eq!(rig.backend.overlay_len(), 0);
 }

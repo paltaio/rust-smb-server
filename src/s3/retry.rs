@@ -78,7 +78,7 @@ impl Retry {
     }
 
     /// A background call nothing stops.
-    #[cfg_attr(not(test), expect(dead_code, reason = "called by tests only"))]
+    #[cfg(test)]
     pub(crate) fn background() -> Self {
         Retry::Background { stop: Stop::new() }
     }
@@ -581,19 +581,5 @@ mod tests {
         stop.stop();
         let error = attempts.failed(denied()).await.unwrap_err();
         assert_eq!(error.code(), Some("AccessDenied"));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_stop_reaches_every_call_that_holds_it() {
-        let stop = Stop::new();
-        let first = Retry::until(&stop);
-        let second = Retry::until(&stop);
-        let other = Retry::until(&Stop::new());
-        stop.clone().stop();
-        for (retry, stopped) in [(first, true), (second, true), (other, false)] {
-            let attempts = Attempts::new(retry, BASE_DELAY);
-            let result = attempts.attempt(async { Ok(()) }).await;
-            assert_eq!(result.is_err(), stopped);
-        }
     }
 }

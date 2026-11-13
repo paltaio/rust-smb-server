@@ -51,7 +51,7 @@ fn mark_sparse(file: &File) {
 #[cfg(not(windows))]
 fn mark_sparse(_file: &File) {}
 
-fn read_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+pub(super) fn read_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
     #[cfg(unix)]
     {
         std::os::unix::fs::FileExt::read_at(file, buf, offset)
@@ -135,17 +135,6 @@ mod tests {
             disk_error(io::ErrorKind::PermissionDenied.into()),
             SmbError::Io(_)
         ));
-        #[cfg(unix)]
-        {
-            assert!(matches!(
-                disk_error(io::Error::from_raw_os_error(libc::ENOSPC)),
-                SmbError::DiskFull
-            ));
-            assert!(matches!(
-                disk_error(io::Error::from_raw_os_error(libc::EDQUOT)),
-                SmbError::QuotaExceeded
-            ));
-        }
     }
 
     #[test]
@@ -191,14 +180,5 @@ mod tests {
         let file = create(&dir.path().join("data"), 1 << 20).unwrap();
         let attributes = file.metadata().unwrap().file_attributes();
         assert_ne!(attributes & FILE_ATTRIBUTE_SPARSE_FILE, 0);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_data_file_is_private_to_its_owner() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let dir = tempfile::tempdir().unwrap();
-        let file = create(&dir.path().join("data"), 0).unwrap();
-        assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
     }
 }

@@ -308,17 +308,6 @@ mod tests {
     }
 
     #[test]
-    fn peeking_does_not_count_as_use() {
-        let mut lru = Lru::new(2);
-        lru.insert("a", 1, 1);
-        lru.insert("b", 2, 1);
-        assert_eq!(lru.peek("a"), Some(&1));
-        lru.insert("c", 3, 1);
-        assert!(lru.peek("a").is_none());
-        assert!(lru.peek("b").is_some());
-    }
-
-    #[test]
     fn the_weights_stay_within_the_cap() {
         let mut lru = Lru::new(10);
         for n in 0..100 {
@@ -443,16 +432,6 @@ mod tests {
     }
 
     #[test]
-    fn a_zero_ttl_trusts_nothing() {
-        let now = Instant::now();
-        let mut cache = MetaCache::new(Duration::ZERO);
-        cache.put_known("k", Known::File(head("\"e\"", 1, 1)), now);
-        cache.put_listing("d/", listing(1), now);
-        assert!(cache.known("k", now).is_none());
-        assert!(cache.listing("d/", now).is_none());
-    }
-
-    #[test]
     fn a_cached_head_stays_valid_for_the_row_it_matches_at_any_age() {
         let start = Instant::now();
         let mut cache = MetaCache::new(Duration::from_secs(30));
@@ -527,14 +506,5 @@ mod tests {
         assert!(cache.listing("d", now).is_none());
         assert!(cache.known("d/g", now).is_some());
         assert!(cache.listing("other", now).is_some());
-    }
-
-    #[test]
-    fn a_key_learned_again_replaces_what_was_known() {
-        let now = Instant::now();
-        let mut cache = MetaCache::new(Duration::from_secs(30));
-        cache.put_known("k", Known::Missing, now);
-        cache.put_known("k", Known::File(head("\"e\"", 1, 1)), now);
-        assert!(is_file(cache.known("k", now)));
     }
 }

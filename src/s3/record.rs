@@ -212,7 +212,7 @@ impl Record {
     }
 
     /// The text of the record.
-    #[cfg_attr(not(test), expect(dead_code, reason = "called by tests only"))]
+    #[cfg(test)]
     pub(crate) fn encode(&self) -> String {
         match self {
             Record::Entry(entry) => entry.encode(),
@@ -777,14 +777,10 @@ mod tests {
         }
     }
 
-    fn encoded(record: &EntryRecord) -> String {
-        record.encode()
-    }
-
     #[test]
     fn an_entry_record_reads_back_as_written() {
         let record = entry();
-        let text = encoded(&record);
+        let text = record.encode();
         assert_eq!(
             Record::decode(text.as_bytes()).unwrap(),
             Record::Entry(Box::new(record))
@@ -811,7 +807,7 @@ mod tests {
             meta_pending: false,
             marker_pending: true,
         };
-        let text = encoded(&record);
+        let text = record.encode();
         for optional in ["local", "present", "upload", "base-key", "gone"] {
             assert!(
                 !text.lines().any(|l| l.starts_with(&format!("{optional} "))),
@@ -926,7 +922,7 @@ mod tests {
     fn the_keys_an_entry_deletes_are_gone_lines() {
         let mut record = entry();
         record.gone = vec!["pre/a b.txt".into(), "pre/c.txt".into()];
-        let text = encoded(&record);
+        let text = record.encode();
         assert!(
             text.contains("\ngone pre/a%20b.txt\ngone pre/c.txt\n"),
             "{text}"
@@ -952,7 +948,7 @@ mod tests {
 
     #[test]
     fn a_bad_or_repeated_gone_key_is_refused() {
-        let text = encoded(&entry());
+        let text = entry().encode();
         for bad in [
             "gone ",
             "gone a b",
@@ -990,7 +986,7 @@ mod tests {
             marker_pending: false,
         };
         assert_eq!(
-            encoded(&record),
+            record.encode(),
             "smb-s3-record 1\n\
              kind entry\n\
              id 0123456789abcdef0123456789abcdef\n\
@@ -1050,7 +1046,8 @@ mod tests {
 
     /// The sample record with the value of line `name` replaced.
     fn with_value(name: &str, value: &str) -> String {
-        encoded(&entry())
+        entry()
+            .encode()
             .lines()
             .map(|l| match l.split_once(' ') {
                 Some((n, _)) if n == name => format!("{name} {value}"),
@@ -1062,7 +1059,8 @@ mod tests {
     }
 
     fn without_line(name: &str) -> String {
-        encoded(&entry())
+        entry()
+            .encode()
             .lines()
             .filter(|l| l.split(' ').next() != Some(name))
             .collect::<Vec<_>>()
@@ -1172,7 +1170,7 @@ mod tests {
 
     #[test]
     fn a_bad_metadata_line_is_refused() {
-        let text = encoded(&entry());
+        let text = entry().encode();
         for (line, bad) in [
             ("base-user mtime 1700000000.5", "base-user mtime"),
             ("base-user mtime 1700000000.5", "base-user  1"),
@@ -1250,7 +1248,7 @@ mod tests {
             "base-size",
             "base-modified",
         ] {
-            let text = encoded(&entry());
+            let text = entry().encode();
             let at = text.find(&format!("\n{field} ")).unwrap() + 1;
             let end = at + text[at..].find('\n').unwrap() + 1;
             let twice = format!("{}{}{}", &text[..end], &text[at..end], &text[end..]);
@@ -1260,13 +1258,13 @@ mod tests {
 
     #[test]
     fn a_line_that_belongs_to_nothing_is_refused() {
-        let text = encoded(&entry()).replace("end\n", "surprise 1\nend\n");
+        let text = entry().encode().replace("end\n", "surprise 1\nend\n");
         assert_eq!(fails_on(&text), "field");
         let mut no_base = entry();
         no_base.base = None;
-        let text = encoded(&no_base).replace("end\n", "base-size 5\nend\n");
+        let text = no_base.encode().replace("end\n", "base-size 5\nend\n");
         assert_eq!(fails_on(&text), "field");
-        let text = encoded(&no_base).replace("end\n", "base-user a b\nend\n");
+        let text = no_base.encode().replace("end\n", "base-user a b\nend\n");
         assert_eq!(fails_on(&text), "field");
     }
 
@@ -1274,16 +1272,16 @@ mod tests {
     fn fields_that_contradict_each_other_are_refused() {
         let mut dir = entry();
         dir.is_dir = true;
-        assert_eq!(fails_on(&encoded(&dir)), "present");
+        assert_eq!(fails_on(&dir.encode()), "present");
         let mut file = entry();
         file.marker_pending = true;
-        assert_eq!(fails_on(&encoded(&file)), "pending-marker");
-        let text = encoded(&entry()).replace("local 100\n", "");
+        assert_eq!(fails_on(&file.encode()), "pending-marker");
+        let text = entry().encode().replace("local 100\n", "");
         assert_eq!(fails_on(&text), "present");
         let mut with_upload = dir_record();
         with_upload.upload_id = Some("u".into());
         with_upload.upload_key = Some("k".into());
-        assert_eq!(fails_on(&encoded(&with_upload)), "upload");
+        assert_eq!(fails_on(&with_upload.encode()), "upload");
         let with_entry_field = Record::Tombstone(TombstoneRecord {
             id: id(ID),
             keys: vec!["k".into()],
@@ -1308,14 +1306,14 @@ mod tests {
         let mut record = entry();
         record.times = [i64::MAX as u64, 0, 1, i64::MAX as u64];
         assert_eq!(
-            Record::decode(encoded(&record).as_bytes()).unwrap(),
+            Record::decode(record.encode().as_bytes()).unwrap(),
             Record::Entry(Box::new(record))
         );
     }
 
     #[test]
     fn a_wrong_version_or_ending_is_refused() {
-        let text = encoded(&entry());
+        let text = entry().encode();
         assert_eq!(fails_on(&text.replace("record 1", "record 2")), "version");
         assert_eq!(fails_on(&text.replace("smb-s3-record", "x")), "version");
         assert_eq!(fails_on(text.strip_suffix("end\n").unwrap()), "end");
@@ -1328,7 +1326,7 @@ mod tests {
 
     #[test]
     fn text_that_is_not_utf8_is_refused() {
-        let mut bytes = encoded(&entry()).into_bytes();
+        let mut bytes = entry().encode().into_bytes();
         bytes[20] = 0xff;
         assert_eq!(Record::decode(&bytes), Err(Malformed("encoding")));
         assert_eq!(
@@ -1339,7 +1337,7 @@ mod tests {
 
     #[test]
     fn every_cut_of_a_record_is_refused() {
-        let text = encoded(&entry());
+        let text = entry().encode();
         for cut in 0..text.len() {
             let Some(head) = text.get(..cut) else {
                 continue;
@@ -1350,7 +1348,7 @@ mod tests {
 
     #[test]
     fn scrambled_records_never_panic() {
-        let text = encoded(&entry()).into_bytes();
+        let text = entry().encode().into_bytes();
         let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
         let mut next = || {
             seed ^= seed << 13;
@@ -1387,7 +1385,7 @@ mod tests {
         }
         let mut old = entry();
         old.base.as_mut().unwrap().head.last_modified = UNIX_EPOCH - Duration::new(86_400, 7);
-        let text = encoded(&old);
+        let text = old.encode();
         assert_eq!(
             Record::decode(text.as_bytes()).unwrap(),
             Record::Entry(Box::new(old))

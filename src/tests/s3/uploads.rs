@@ -11,6 +11,7 @@ use sha2::{Digest as _, Sha256};
 use tokio::sync::Notify;
 
 use super::fixture::{MIB, foreground, is_missing, pattern, put, range};
+use super::moves::crash;
 use super::proxy::{Fault, Proxy, Reply, Seen};
 use super::share::{
     FILE_OVERWRITE_IF, Rig, Smb, filetime, is_data_read, wait_for_requests, wait_until_async,
@@ -1059,24 +1060,9 @@ async fn a_crash_after_the_object_lands_leaves_a_record_the_next_backend_can_use
     let (reached, resume) = rig.backend.pause_after_store();
     rig.backend.hold_uploads(false);
     reached.notified().await;
-    let Rig {
-        bucket,
-        proxy,
-        backend,
-        mut smb,
-        cache,
-    } = rig;
-    smb.close_all().await;
-    drop(smb);
-    let mut exited = backend.worker_exited();
-    drop(backend);
-    resume.notify_one();
-    tokio::time::timeout(Duration::from_secs(10), exited.wait_for(|exited| *exited))
-        .await
-        .expect("the worker ends")
-        .unwrap();
+    let (bucket, proxy, cache) = crash(rig, resume).await;
 
-    let mut rig = Rig::start(bucket, proxy, cache.unwrap(), uploading).await;
+    let mut rig = Rig::start(bucket, proxy, cache, uploading).await;
     sync(&rig.backend).await.unwrap();
 
     let mut expected = base.to_vec();
