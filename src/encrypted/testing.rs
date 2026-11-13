@@ -22,3 +22,14 @@ pub(super) fn other_key_schedule() -> KeySchedule {
 pub(super) fn file_id() -> [u8; 16] {
     std::array::from_fn(|i| 0xa0 + i as u8)
 }
+
+/// A xorshift64 generator; `seed` must not be zero.
+pub(super) fn xorshift(seed: u64) -> impl FnMut() -> u64 {
+    let mut state = seed;
+    move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    }
+}

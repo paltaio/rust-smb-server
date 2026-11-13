@@ -19,6 +19,8 @@ pub(crate) const OVERHEAD: usize = NONCE_LEN + TAG_LEN;
 pub(crate) const MARKER_NAME: &str = ".smb-encryption";
 pub(crate) const MARKER_LEN: usize = 60;
 pub(crate) const SHARE_ID_LEN: usize = 16;
+/// Shortest long-name threshold of a share that encrypts names.
+pub(crate) const MIN_LONG_NAME_THRESHOLD: u8 = 62;
 
 /// Largest stored file size, `2^63 - 1`.
 pub(crate) const MAX_STORED_SIZE: u64 = i64::MAX as u64;

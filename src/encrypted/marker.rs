@@ -4,7 +4,9 @@
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
-use super::format::{BlockShift, FORMAT_VERSION, MARKER_LEN, SHARE_ID_LEN};
+use super::format::{
+    BlockShift, FORMAT_VERSION, MARKER_LEN, MIN_LONG_NAME_THRESHOLD, SHARE_ID_LEN,
+};
 use super::keys::KeySchedule;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -13,7 +15,6 @@ const MAGIC: &[u8; 8] = b"smbencmk";
 const NAMES_ENCRYPTED: u8 = 1;
 /// Bytes the MAC covers.
 const BODY_LEN: usize = MARKER_LEN - 32;
-const MIN_LONG_NAME_THRESHOLD: u8 = 62;
 
 /// Settings a share keeps for its whole life.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
