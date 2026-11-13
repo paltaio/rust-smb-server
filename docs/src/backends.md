@@ -27,7 +27,7 @@ Feature `s3`, off by default. Serves a bucket, or the keys below a prefix, as a 
 Changes land in a cache directory on the host and reach the bucket in the background. Reads fetch byte ranges of the object. The write time of a file is its `mtime` metadata, else `src_last_modified_millis`, else the time the store last modified the object.
 
 ```toml
-smb-server = { version = "0.10", features = ["s3"] }
+smb-server = { version = "0.11", features = ["s3"] }
 ```
 
 ```rust
