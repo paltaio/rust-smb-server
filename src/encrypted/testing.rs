@@ -1,13 +1,16 @@
 //! Fixtures shared by the unit tests.
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use zeroize::Zeroizing;
 
-use super::backend::EncryptedBackend;
+use super::backend::{EncryptedBackend, Settings};
 use super::block::FileCipher;
 use super::builder::EncryptedBackendBuilder;
 use super::error::EncryptionError;
 use super::format::{BlockShift, HEADER_LEN, MARKER_NAME, NONCE_LEN, OVERHEAD};
+use super::handle::EncryptedHandle;
 use super::header::Header;
 use super::keys::KeySchedule;
 use super::marker::{MarkerSettings, parse_marker};
@@ -17,6 +20,7 @@ use crate::backend::{
 use crate::error::{SmbError, SmbResult};
 use crate::path::SmbPath;
 use crate::tests::memfs::MemFsBackend;
+use crate::tests::util::{dir_opts, opts, path};
 
 pub(super) fn unhex(s: &str) -> Vec<u8> {
     hex::decode(s).unwrap()
@@ -72,6 +76,65 @@ pub(super) async fn build(
         .await;
     assert_eq!(files.open_handles(), 0, "build closed every handle");
     built
+}
+
+/// Builds a backend over `inner` that stores names as clients spell them.
+pub(super) async fn clear_over<B: ShareBackend>(inner: B) -> EncryptedBackend<B> {
+    EncryptedBackend::builder(inner, key())
+        .encrypt_names(false)
+        .build()
+        .await
+        .expect("a backend with names in the clear")
+}
+
+/// The settings of a backend with names in the clear.
+pub(super) fn clear_settings() -> Settings {
+    Settings {
+        encrypt_names: false,
+        case_insensitive: false,
+        block_shift: BlockShift::DEFAULT,
+        long_name_threshold: 0,
+        name_cache_ttl: Duration::from_secs(30),
+    }
+}
+
+/// Opens `name` in `layer` with write access and `intent`.
+pub(super) async fn open<B: ShareBackend>(
+    layer: &EncryptedBackend<B>,
+    name: &str,
+    intent: OpenIntent,
+) -> (EncryptedHandle<B>, OpenAction) {
+    layer
+        .open_handle(&path(name), opts(intent))
+        .await
+        .unwrap_or_else(|error| panic!("open {name} {intent:?}: {error:?}"))
+}
+
+/// Opens the existing file `name` in `layer`.
+pub(super) async fn open_file<B: ShareBackend>(
+    layer: &EncryptedBackend<B>,
+    name: &str,
+) -> EncryptedHandle<B> {
+    open(layer, name, OpenIntent::Open).await.0
+}
+
+/// Opens the existing directory `name` in `layer`.
+pub(super) async fn open_dir<B: ShareBackend>(
+    layer: &EncryptedBackend<B>,
+    name: &str,
+) -> EncryptedHandle<B> {
+    layer
+        .open_handle(&path(name), dir_opts(OpenIntent::Open))
+        .await
+        .unwrap_or_else(|error| panic!("open directory {name}: {error:?}"))
+        .0
+}
+
+/// Lets every task that can make progress run until it waits.
+pub(super) async fn settle() {
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
 }
 
 /// The stored bytes of a file whose first and only block holds `plain`: its
@@ -136,6 +199,15 @@ pub(super) fn assert_key_mismatch(error: &EncryptionError) {
         matches!(error, EncryptionError::KeyMismatch),
         "expected a key mismatch, got {error:?}"
     );
+}
+
+/// `files` as an inner backend that reports case-sensitive names.
+pub(super) fn exact_names(files: &MemFsBackend) -> Reporting<MemFsBackend> {
+    let caps = BackendCapabilities {
+        case_sensitive: true,
+        ..files.capabilities()
+    };
+    Reporting::new(files.clone(), caps)
 }
 
 /// Wraps `inner` and reports `caps` and `volume` in place of its own. When

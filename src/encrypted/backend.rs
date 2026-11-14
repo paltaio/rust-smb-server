@@ -8,10 +8,12 @@ use async_trait::async_trait;
 
 use super::format::BlockShift;
 use super::keys::KeySchedule;
+use super::locks::Locks;
+use super::node::{NameMatch, NodeTable};
 use crate::backend::{
     BackendCapabilities, Handle, OpenAction, OpenOptions, ShareBackend, VolumeInfo,
 };
-use crate::error::{SmbError, SmbResult};
+use crate::error::SmbResult;
 use crate::path::SmbPath;
 
 /// Longest name a client can give, in characters.
@@ -37,7 +39,7 @@ const MAX_CLIENT_NAME_LEN: u32 = 255;
 /// The backend reports no named streams and no extended attributes, and
 /// answers [`copy_range`](ShareBackend::copy_range) and
 /// [`clone_range`](ShareBackend::clone_range) with
-/// [`NotSupported`](SmbError::NotSupported).
+/// [`NotSupported`](crate::SmbError::NotSupported).
 ///
 /// Clones share all state, so several shares can serve one encrypted tree
 /// through clones of one backend. Two backends built separately over one
@@ -66,6 +68,20 @@ pub(super) struct Shared<B> {
     #[cfg_attr(not(test), expect(dead_code, reason = "only tests call it"))]
     pub(super) keys: KeySchedule,
     pub(super) settings: Settings,
+    /// The files and directories that handles have open.
+    pub(super) nodes: Arc<NodeTable>,
+    pub(super) locks: Locks,
+}
+
+impl<B: ShareBackend> Shared<B> {
+    /// How the inner backend compares names.
+    pub(super) fn name_match(&self) -> NameMatch {
+        if self.inner.capabilities().case_sensitive {
+            NameMatch::Exact
+        } else {
+            NameMatch::Folded
+        }
+    }
 }
 
 /// The settings in force.
@@ -88,8 +104,15 @@ impl<B> EncryptedBackend<B> {
                 inner,
                 keys,
                 settings,
+                nodes: NodeTable::new(),
+                locks: Locks::new(),
             }),
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn node_count(&self) -> usize {
+        self.shared.nodes.len()
     }
 }
 
@@ -118,23 +141,19 @@ impl<B> fmt::Debug for EncryptedBackend<B> {
 impl<B: ShareBackend> ShareBackend for EncryptedBackend<B> {
     async fn open(
         &self,
-        _path: &SmbPath,
-        _opts: OpenOptions,
+        path: &SmbPath,
+        opts: OpenOptions,
     ) -> SmbResult<(Box<dyn Handle>, OpenAction)> {
-        Err(SmbError::NotSupported)
+        let (handle, action) = self.open_handle(path, opts).await?;
+        Ok((Box::new(handle), action))
     }
 
-    async fn unlink(&self, _path: &SmbPath) -> SmbResult<()> {
-        Err(SmbError::NotSupported)
+    async fn unlink(&self, path: &SmbPath) -> SmbResult<()> {
+        self.unlink_path(path).await
     }
 
-    async fn rename(
-        &self,
-        _from: &SmbPath,
-        _to: &SmbPath,
-        _replace_if_exists: bool,
-    ) -> SmbResult<()> {
-        Err(SmbError::NotSupported)
+    async fn rename(&self, from: &SmbPath, to: &SmbPath, replace_if_exists: bool) -> SmbResult<()> {
+        self.rename_path(from, to, replace_if_exists).await
     }
 
     fn capabilities(&self) -> BackendCapabilities {
@@ -168,6 +187,7 @@ mod tests {
     use super::super::testing::{Reporting, build, key, key_schedule, read_only};
     use super::*;
     use crate::backend::OpenIntent;
+    use crate::error::SmbError;
     use crate::tests::memfs::MemFsBackend;
     use crate::tests::util::{dir_opts, opts, path};
 
@@ -310,23 +330,69 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_unlink_and_rename_answer_not_supported() {
+    async fn encrypted_names_open_only_the_root_and_answer_not_supported_elsewhere() {
         let files = MemFsBackend::new();
         let backend = built(&files).await;
         files.clone().with_file("f", b"abc");
-        assert!(matches!(
-            backend.open(&path("f"), opts(OpenIntent::Open)).await,
-            Err(SmbError::NotSupported)
-        ));
+        for intent in [
+            OpenIntent::Open,
+            OpenIntent::Create,
+            OpenIntent::OpenOrCreate,
+            OpenIntent::OverwriteOrCreate,
+            OpenIntent::Truncate,
+        ] {
+            assert!(
+                matches!(
+                    backend.open(&path("f"), opts(intent)).await,
+                    Err(SmbError::NotSupported)
+                ),
+                "{intent:?}"
+            );
+        }
         assert!(matches!(
             backend.unlink(&path("f")).await,
             Err(SmbError::NotSupported)
         ));
         assert!(matches!(
+            backend.unlink(&SmbPath::root()).await,
+            Err(SmbError::AccessDenied)
+        ));
+        assert!(matches!(
             backend.rename(&path("f"), &path("g"), false).await,
             Err(SmbError::NotSupported)
         ));
+        assert!(matches!(
+            backend.rename(&SmbPath::root(), &path("g"), false).await,
+            Err(SmbError::AccessDenied)
+        ));
+        assert!(matches!(
+            backend.rename(&path("f"), &SmbPath::root(), false).await,
+            Err(SmbError::AccessDenied)
+        ));
         assert_eq!(files.contents("f").unwrap(), b"abc");
+
+        let (root, action) = backend
+            .open(&SmbPath::root(), dir_opts(OpenIntent::Open))
+            .await
+            .unwrap();
+        assert_eq!(action, OpenAction::Opened);
+        assert!(root.stat().await.unwrap().is_directory);
+        assert!(matches!(
+            root.list_dir(None).await,
+            Err(SmbError::NotSupported)
+        ));
+        assert!(matches!(
+            root.list_dir_sized(None, true).await,
+            Err(SmbError::NotSupported)
+        ));
+        assert!(matches!(
+            root.dir_is_empty().await,
+            Err(SmbError::NotSupported)
+        ));
+        assert!(matches!(root.watch().await, Err(SmbError::NotSupported)));
+        assert!(root.as_any().is_none());
+        root.close().await.unwrap();
+        assert_eq!(files.open_handles(), 0);
     }
 
     #[tokio::test]

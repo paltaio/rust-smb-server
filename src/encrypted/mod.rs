@@ -4,13 +4,17 @@ mod backend;
 mod base32;
 mod block;
 mod builder;
+mod clear;
 mod error;
 mod format;
+mod handle;
 mod header;
 mod inner;
 mod keys;
+mod locks;
 mod marker;
 mod names;
+mod node;
 #[cfg_attr(not(test), expect(dead_code, reason = "only tests call it"))]
 mod random;
 mod restore;
