@@ -237,7 +237,8 @@ mod tests {
     use tokio::task::JoinHandle;
 
     use super::super::testing::{
-        clear_over, clear_settings, exact_names, key_schedule, marker_bytes, open, open_dir, settle,
+        clear_over, clear_settings, exact_names, key_schedule, marker_bytes, open, open_dir,
+        open_file, settle,
     };
     use super::*;
     use crate::tests::file_ids::FileIds;
@@ -793,6 +794,252 @@ mod tests {
         layer.unlink(&path("Report")).await.unwrap();
         assert!(upper.node().is_detached());
         assert!(!lower.node().is_detached());
+    }
+
+    #[tokio::test]
+    async fn case_variants_of_an_open_file_share_one_file_lock() {
+        let files = MemFsBackend::new();
+        let layer = clear_over(Folding::new(files.clone())).await;
+        let (upper, _) = open(&layer, "Report.docx", OpenIntent::Create).await;
+        let lower = Arc::new(open_file(&layer, "report.docx").await);
+        assert!(shares_node(&upper, &lower));
+        assert_eq!(layer.node_count(), 1);
+
+        let writer = upper.node().file().expect("a file node").write().await;
+        let reading = tokio::spawn({
+            let lower = Arc::clone(&lower);
+            async move { lower.stat().await }
+        });
+        settle().await;
+        assert!(!reading.is_finished(), "the other spelling waits");
+
+        drop(writer);
+        reading.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_overwriting_open_through_another_spelling_resets_the_header_for_every_handle() {
+        let files = MemFsBackend::new();
+        let layer = clear_over(Folding::new(files.clone())).await;
+        files
+            .clone()
+            .with_file("report.docx", b"abc")
+            .with_file("memo.txt", b"abc");
+        for (first, second, intent) in [
+            ("Report.docx", "REPORT.DOCX", OpenIntent::Truncate),
+            ("Memo.txt", "memo.TXT", OpenIntent::OverwriteOrCreate),
+        ] {
+            let (held, _) = open(&layer, first, OpenIntent::Open).await;
+            assert_eq!(held.node().header().await, Some(HeaderState::Unknown));
+
+            let (overwriting, action) = open(&layer, second, intent).await;
+            assert_eq!(action, OpenAction::Overwritten, "{second} {intent:?}");
+            assert!(shares_node(&held, &overwriting), "{second} {intent:?}");
+            assert_eq!(held.node().header().await, Some(HeaderState::Absent));
+            assert_eq!(files.contents(&first.to_lowercase()), Some(Vec::new()));
+            assert_eq!(layer.node_count(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unlink_through_another_spelling_detaches_the_node_and_a_create_starts_a_new_one() {
+        let files = MemFsBackend::new();
+        let layer = clear_over(Folding::new(files.clone())).await;
+        let (first, _) = open(&layer, "Report.docx", OpenIntent::Create).await;
+
+        layer.unlink(&path("report.docx")).await.unwrap();
+        assert!(first.node().is_detached());
+        assert_eq!(layer.node_count(), 0);
+
+        let (second, action) = open(&layer, "Report.docx", OpenIntent::Create).await;
+        assert_eq!(action, OpenAction::Created);
+        assert!(!shares_node(&first, &second));
+        assert!(!second.node().is_detached());
+
+        layer.unlink(&path("REPORT.DOCX")).await.unwrap();
+        assert!(second.node().is_detached());
+        let (third, action) = open(&layer, "report.docx", OpenIntent::Create).await;
+        assert_eq!(action, OpenAction::Created);
+        assert!(!shares_node(&second, &third));
+        assert!(!shares_node(&first, &third));
+        assert!(!third.node().is_detached());
+        assert_eq!(third.node().header().await, Some(HeaderState::Absent));
+        assert_eq!(layer.node_count(), 1);
+
+        let (found, _) = open(&layer, "REPORT.docx", OpenIntent::Open).await;
+        assert!(shares_node(&third, &found));
+    }
+
+    #[tokio::test]
+    async fn a_rename_through_another_spelling_moves_the_node_of_an_open_file() {
+        let files = MemFsBackend::new();
+        let layer = clear_over(Folding::new(files.clone())).await;
+        let (held, _) = open(&layer, "Report.docx", OpenIntent::Create).await;
+
+        layer
+            .rename(&path("REPORT.DOCX"), &path("Final.docx"), false)
+            .await
+            .unwrap();
+        assert_eq!(held.node().path(), path("Final.docx"));
+        assert_eq!(files.contents("report.docx"), None);
+        assert!(files.contents("final.docx").is_some());
+        let (moved, _) = open(&layer, "final.docx", OpenIntent::Open).await;
+        assert!(shares_node(&held, &moved));
+        assert!(matches!(
+            layer
+                .open_handle(&path("Report.docx"), opts(OpenIntent::Open))
+                .await,
+            Err(SmbError::NotFound)
+        ));
+
+        layer
+            .rename(&path("fINAL.DOCX"), &path("Done.docx"), false)
+            .await
+            .unwrap();
+        let (again, _) = open(&layer, "DONE.docx", OpenIntent::Open).await;
+        assert!(shares_node(&held, &again));
+        assert!(!held.node().is_detached());
+        assert_eq!(layer.node_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_rename_over_a_case_variant_of_an_open_file_detaches_its_node() {
+        let files = MemFsBackend::new();
+        let layer = clear_over(Folding::new(files.clone())).await;
+        files
+            .clone()
+            .with_file("a.txt", b"")
+            .with_file("b.txt", b"");
+        let (source, _) = open(&layer, "A.txt", OpenIntent::Open).await;
+        let (target, _) = open(&layer, "B.txt", OpenIntent::Open).await;
+        assert!(!shares_node(&source, &target));
+
+        layer
+            .rename(&path("a.TXT"), &path("b.txt"), true)
+            .await
+            .unwrap();
+        assert!(target.node().is_detached());
+        assert!(!source.node().is_detached());
+        assert_eq!(source.node().path(), path("b.txt"));
+        let (at_target, _) = open(&layer, "B.TXT", OpenIntent::Open).await;
+        assert!(shares_node(&source, &at_target));
+        assert_eq!(layer.node_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_directory_rename_through_another_spelling_moves_the_nodes_below_it() {
+        let files = MemFsBackend::new();
+        let layer = clear_over(Folding::new(files.clone())).await;
+        files
+            .clone()
+            .with_dir("dir")
+            .with_dir("dir\\sub")
+            .with_file("dir\\f", b"")
+            .with_file("dir\\sub\\g", b"");
+        let (file, _) = open(&layer, "dir\\f", OpenIntent::Open).await;
+        let (deep, _) = open(&layer, "Dir\\Sub\\g", OpenIntent::Open).await;
+        let dir = open_dir(&layer, "Dir").await;
+
+        layer
+            .rename(&path("DIR"), &path("Moved"), false)
+            .await
+            .unwrap();
+        assert_eq!(file.node().path(), path("Moved\\f"));
+        assert_eq!(deep.node().path(), path("Moved\\Sub\\g"));
+        assert_eq!(dir.node().path(), path("Moved"));
+        let (file_again, _) = open(&layer, "MOVED\\F", OpenIntent::Open).await;
+        let (deep_again, _) = open(&layer, "moved\\SUB\\G", OpenIntent::Open).await;
+        assert!(shares_node(&file, &file_again));
+        assert!(shares_node(&deep, &deep_again));
+        let dir_again = open_dir(&layer, "moved").await;
+        assert!(shares_node(&dir, &dir_again));
+        assert!(matches!(
+            layer
+                .open_handle(&path("dir\\f"), opts(OpenIntent::Open))
+                .await,
+            Err(SmbError::PathNotFound)
+        ));
+        assert_eq!(layer.node_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn an_open_waits_for_a_create_in_its_directory_spelled_another_way() {
+        let files = MemFsBackend::new();
+        let gated = Gated::new(Folding::new(files.clone()));
+        let layer = clear_over(gated.clone()).await;
+        files.clone().with_dir("dir");
+        let gate = gated.arm_after_at(Op::Open, "Dir\\x");
+        let creating = spawn_open(&layer, "Dir\\x", OpenIntent::Create);
+        gate.reached().await;
+        assert_eq!(files.contents("dir\\x"), Some(Vec::new()));
+        assert_eq!(layer.node_count(), 0, "the create has no node yet");
+
+        let opening = spawn_open(&layer, "dir\\x", OpenIntent::Open);
+        settle().await;
+        assert!(!opening.is_finished());
+        assert_eq!(layer.node_count(), 0);
+
+        gate.release();
+        let (created, action) = creating.await.unwrap().unwrap();
+        assert_eq!(action, OpenAction::Created);
+        let (opened, action) = opening.await.unwrap().unwrap();
+        assert_eq!(action, OpenAction::Opened);
+        assert!(shares_node(&created, &opened));
+        assert_eq!(created.node().header().await, Some(HeaderState::Absent));
+        assert_eq!(layer.node_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn creates_in_one_directory_spelled_two_ways_run_one_at_a_time() {
+        let files = MemFsBackend::new();
+        let gated = Gated::new(Folding::new(files.clone()));
+        let layer = clear_over(gated.clone()).await;
+        files.clone().with_dir("dir");
+        let gate = gated.arm_at(Op::Open, "Dir\\x");
+        let first = spawn_open(&layer, "Dir\\x", OpenIntent::Create);
+        gate.reached().await;
+
+        let second = spawn_open(&layer, "dir\\y", OpenIntent::Create);
+        settle().await;
+        assert!(!second.is_finished());
+        assert_eq!(files.contents("dir\\y"), None);
+        assert_eq!(layer.shared.locks.directory_count(), 1);
+
+        gate.release();
+        let (x, action) = first.await.unwrap().unwrap();
+        assert_eq!(action, OpenAction::Created);
+        let (y, action) = second.await.unwrap().unwrap();
+        assert_eq!(action, OpenAction::Created);
+        assert!(!shares_node(&x, &y));
+        assert_eq!(files.contents("dir\\x"), Some(Vec::new()));
+        assert_eq!(files.contents("dir\\y"), Some(Vec::new()));
+        assert_eq!(layer.node_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_unlink_waits_for_a_create_in_its_directory_spelled_another_way() {
+        let files = MemFsBackend::new();
+        let gated = Gated::new(Folding::new(files.clone()));
+        let layer = clear_over(gated.clone()).await;
+        files.clone().with_dir("dir").with_file("dir\\y", b"");
+        let gate = gated.arm_at(Op::Open, "Dir\\x");
+        let creating = spawn_open(&layer, "Dir\\x", OpenIntent::Create);
+        gate.reached().await;
+
+        let unlinking = tokio::spawn({
+            let layer = layer.clone();
+            async move { layer.unlink(&path("DIR\\y")).await }
+        });
+        settle().await;
+        assert!(!unlinking.is_finished());
+        assert!(files.contents("dir\\y").is_some());
+
+        gate.release();
+        let (_, action) = creating.await.unwrap().unwrap();
+        assert_eq!(action, OpenAction::Created);
+        unlinking.await.unwrap().unwrap();
+        assert_eq!(files.contents("dir\\y"), None);
+        assert!(files.contents("dir\\x").is_some());
     }
 
     #[tokio::test]
