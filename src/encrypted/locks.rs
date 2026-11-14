@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::ptr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -41,10 +42,17 @@ struct DirTable {
 
 /// The lock of one directory. An open that creates an entry and an unlink
 /// hold it exclusively; an open of an existing entry holds it shared.
+///
+/// It also counts the changes made to the names of the directory. The count
+/// lives as long as the entry does, and the entry lives as long as someone
+/// holds the `Arc` the table gave out. A build of the directory's names that
+/// holds the `Arc` while it lists sees every change that lands meanwhile, and
+/// the count does not start over under it.
 pub(super) struct DirLock {
     key: String,
     table: Arc<DirTable>,
     lock: RwLock<()>,
+    changes: AtomicU64,
 }
 
 /// A directory lock, held until dropped.
@@ -73,6 +81,7 @@ impl Locks {
             key: key.clone(),
             table: Arc::clone(&self.directories),
             lock: RwLock::new(()),
+            changes: AtomicU64::new(0),
         });
         entries.insert(key, Arc::downgrade(&dir));
         dir
@@ -97,6 +106,16 @@ impl DirLock {
                 _held: self.lock.read().await,
             }
         }
+    }
+
+    /// The number of changes counted.
+    pub(super) fn changes(&self) -> u64 {
+        self.changes.load(Ordering::Acquire)
+    }
+
+    /// Counts a change to the names of the directory.
+    pub(super) fn count_change(&self) {
+        self.changes.fetch_add(1, Ordering::AcqRel);
     }
 
     /// No one holds the lock.
@@ -148,6 +167,24 @@ mod tests {
         assert_eq!(locks.directory_count(), 1);
         drop(again);
         assert_eq!(locks.directory_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_count_of_changes_lives_as_long_as_the_entry() {
+        let locks = Locks::new();
+        let held = locks.directory("a".to_string());
+        assert_eq!(held.changes(), 0);
+        held.count_change();
+        locks.directory("a".to_string()).count_change();
+        assert_eq!(held.changes(), 2, "one entry while it is held");
+        assert_eq!(locks.directory("b".to_string()).changes(), 0);
+
+        drop(held);
+        assert_eq!(
+            locks.directory("a".to_string()).changes(),
+            0,
+            "an entry nobody holds starts over"
+        );
     }
 
     #[tokio::test]

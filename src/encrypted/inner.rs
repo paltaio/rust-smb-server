@@ -4,8 +4,10 @@
 use std::io;
 
 use super::format::{BlockShift, HEADER_LEN};
-use crate::backend::Handle;
+use super::names::MAX_SIDE_OBJECT_LEN;
+use crate::backend::{Handle, OpenOptions, ShareBackend};
 use crate::error::{SmbError, SmbResult};
+use crate::path::SmbPath;
 
 /// Most bytes one inner read or write of stored blocks moves, before it is
 /// cut down to whole blocks.
@@ -15,6 +17,45 @@ const MAX_CALL: u64 = 4 << 20;
 /// nothing there, so its error is dropped.
 pub(super) async fn close_after_reading(handle: Box<dyn Handle>) {
     let _ = handle.close().await;
+}
+
+/// The error says the entry is not there.
+pub(super) fn is_missing(error: &SmbError) -> bool {
+    matches!(
+        error,
+        SmbError::NotFound | SmbError::PathNotFound | SmbError::NotADirectory
+    )
+}
+
+/// The content of the side object at `path`. `None` when it is missing, a
+/// directory, or longer than `MAX_SIDE_OBJECT_LEN`, which is then not read.
+pub(super) async fn read_side_object<B: ShareBackend>(
+    inner: &B,
+    path: &SmbPath,
+) -> SmbResult<Option<Vec<u8>>> {
+    let opts = OpenOptions {
+        non_directory: true,
+        ..OpenOptions::default()
+    };
+    let handle = match inner.open(path, opts).await {
+        Ok((handle, _)) => handle,
+        Err(error) if is_missing(&error) || matches!(error, SmbError::IsDirectory) => {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let content = side_object_content(handle.as_ref()).await;
+    close_after_reading(handle).await;
+    content
+}
+
+async fn side_object_content(handle: &dyn Handle) -> SmbResult<Option<Vec<u8>>> {
+    let info = handle.stat().await?;
+    if info.is_directory || info.end_of_file > MAX_SIDE_OBJECT_LEN as u64 {
+        return Ok(None);
+    }
+    let len = usize::try_from(info.end_of_file).expect("a side object is at most 1024 bytes");
+    read_full(handle, 0, len).await.map(Some)
 }
 
 /// Appends `len` bytes read at `offset` to `out`, asking again for what a
@@ -172,6 +213,36 @@ mod tests {
             .await
             .unwrap()
             .0
+    }
+
+    #[tokio::test]
+    async fn a_side_object_is_read_up_to_1024_bytes_and_no_further() {
+        let files = MemFsBackend::new()
+            .with_file("exact", &[7; 1024])
+            .with_file("over", &[7; 1025])
+            .with_dir("dir");
+        let faulty = Faulty::new(files.clone());
+
+        let read = read_side_object(&faulty, &path("exact")).await.unwrap();
+        assert_eq!(read, Some(vec![7; 1024]));
+        assert_eq!(faulty.reads(), [(0, 1024)]);
+
+        assert_eq!(
+            read_side_object(&faulty, &path("over")).await.unwrap(),
+            None
+        );
+        assert_eq!(faulty.reads().len(), 1, "an object over 1024 is not read");
+        for none in ["dir", "missing", "exact\\below"] {
+            let read = read_side_object(&faulty, &path(none)).await.unwrap();
+            assert_eq!(read, None, "{none}");
+        }
+
+        faulty.fail_open(1, |_, _| true, SmbError::Io(io::Error::other("injected")));
+        assert!(matches!(
+            read_side_object(&faulty, &path("exact")).await,
+            Err(SmbError::Io(_))
+        ));
+        assert_eq!(files.open_handles(), 0);
     }
 
     #[tokio::test]

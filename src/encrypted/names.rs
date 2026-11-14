@@ -23,8 +23,8 @@ const MAX_NAME_BYTES: usize = 3 * 255;
 const MAX_SEALED_LEN: usize = SIV_LEN + MAX_NAME_BYTES;
 /// Longest stored name, in characters.
 const MAX_STORED_NAME_LEN: usize = 255;
-/// Longest side object. A caller reads at most one byte more, which is enough
-/// to see that an object is too long; `decode_long` refuses it.
+/// Longest side object. A caller takes the size of an object first and reads
+/// none of one that is longer; `decode_long` refuses it too.
 pub(crate) const MAX_SIDE_OBJECT_LEN: usize = 1024;
 /// Bytes of the SHA-256 digest that name a long entry.
 const HASH_BYTES: usize = 20;
@@ -140,7 +140,6 @@ fn hash_part<'a>(name: &'a str, suffix: &str) -> Option<&'a str> {
 /// `threshold` (62 to 255): the spelling of its AES-SIV output when that has
 /// at most `threshold` characters, else a long entry and its side object.
 /// `None` when `name` is not a valid path component.
-#[cfg_attr(not(test), expect(dead_code, reason = "only tests call it"))]
 pub(crate) fn encode_name(keys: &KeySchedule, name: &str, threshold: u8) -> Option<StoredName> {
     if !is_valid_component(name) {
         return None;

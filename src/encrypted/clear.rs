@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use super::backend::EncryptedBackend;
 use super::format::MARKER_NAME;
-use super::handle::EncryptedHandle;
+use super::handle::{EncryptedHandle, OpenResult};
 use super::inner::close_after_reading;
 use super::locks::acquire_some;
 use super::node::{Found, HeaderState, NameMatch, Node, Origin, path_key};
@@ -55,16 +55,15 @@ fn inner_options(opts: OpenOptions) -> OpenOptions {
 }
 
 impl<B: ShareBackend> EncryptedBackend<B> {
-    /// Opens `path`. With encrypted names only the share root can be
-    /// opened.
-    pub(super) async fn open_handle(
-        &self,
-        path: &SmbPath,
-        opts: OpenOptions,
-    ) -> SmbResult<(EncryptedHandle<B>, OpenAction)> {
+    /// Opens `path`. With encrypted names, only the share root and existing
+    /// entries can be opened.
+    pub(super) async fn open_handle(&self, path: &SmbPath, opts: OpenOptions) -> OpenResult<B> {
         let encrypt_names = self.shared.settings.encrypt_names;
-        if encrypt_names && !path.is_root() {
-            return Err(SmbError::NotSupported);
+        if encrypt_names && let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
+            if creates(opts.intent) {
+                return Err(SmbError::NotSupported);
+            }
+            return self.open_existing(&parent, name, opts).await;
         }
         let names = self.shared.name_match();
         if !encrypt_names && is_marker(path, names) {
@@ -78,6 +77,17 @@ impl<B: ShareBackend> EncryptedBackend<B> {
             .parent()
             .map(|parent| self.shared.locks.directory(path_key(&parent, names)));
         let _held = acquire_some(dir.as_deref(), |dir| dir.acquire(creates(opts.intent))).await;
+        self.open_at(path, opts, names).await
+    }
+
+    /// Opens the entry at the stored path `path`, whose directory lock the
+    /// caller holds.
+    pub(super) async fn open_at(
+        &self,
+        path: &SmbPath,
+        opts: OpenOptions,
+        names: NameMatch,
+    ) -> OpenResult<B> {
         if !path.is_root() && truncates(opts.intent) {
             return self.overwrite(path, opts, names).await;
         }
@@ -95,7 +105,7 @@ impl<B: ShareBackend> EncryptedBackend<B> {
         path: &SmbPath,
         opts: OpenOptions,
         names: NameMatch,
-    ) -> SmbResult<(EncryptedHandle<B>, OpenAction)> {
+    ) -> OpenResult<B> {
         let inner = &self.shared.inner;
         let existing = OpenOptions {
             directory: opts.directory,
@@ -234,12 +244,10 @@ impl<B: ShareBackend> EncryptedBackend<B> {
 
 #[cfg(test)]
 mod tests {
-    use tokio::task::JoinHandle;
-
     use super::super::node::HeaderKind;
     use super::super::testing::{
         clear_over, clear_settings, exact_names, key_schedule, marker_bytes, open, open_dir,
-        open_file, settle,
+        open_file, settle, shares_node, spawn_open,
     };
     use super::*;
     use crate::tests::file_ids::FileIds;
@@ -248,22 +256,6 @@ mod tests {
     use crate::tests::memfs::MemFsBackend;
     use crate::tests::recorder::Recorder;
     use crate::tests::util::{dir_opts, opts, path};
-
-    type OpenResult<B> = SmbResult<(EncryptedHandle<B>, OpenAction)>;
-
-    fn spawn_open<B: ShareBackend>(
-        layer: &EncryptedBackend<B>,
-        name: &str,
-        intent: OpenIntent,
-    ) -> JoinHandle<OpenResult<B>> {
-        let layer = layer.clone();
-        let name = path(name);
-        tokio::spawn(async move { layer.open_handle(&name, opts(intent)).await })
-    }
-
-    fn shares_node<B: ShareBackend>(a: &EncryptedHandle<B>, b: &EncryptedHandle<B>) -> bool {
-        Arc::ptr_eq(a.node(), b.node())
-    }
 
     /// Waits until a request for the exclusive lock of the file of `node`
     /// is queued behind the holders of the lock.

@@ -3,21 +3,26 @@
 use std::fmt::Debug;
 use std::io;
 use std::mem;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use tokio::task::JoinHandle;
+use tokio::time::Instant;
 use zeroize::Zeroizing;
 
 use super::backend::{EncryptedBackend, Settings};
 use super::block::FileCipher;
 use super::builder::EncryptedBackendBuilder;
+use super::cache::{Entry, NameCache, Snapshot};
 use super::change::Random;
 use super::error::EncryptionError;
 use super::format::{BlockShift, FILE_ID_LEN, HEADER_LEN, MARKER_NAME, NONCE_LEN, OVERHEAD};
-use super::handle::EncryptedHandle;
+use super::handle::{EncryptedHandle, OpenResult};
 use super::header::Header;
 use super::keys::KeySchedule;
 use super::marker::{MarkerSettings, parse_marker};
+use super::names::{StoredName, encode_name};
 use super::random::{random_file_id, random_nonces};
 use super::size::stored_size;
 use crate::backend::{
@@ -119,6 +124,133 @@ pub(super) fn clear_settings() -> Settings {
         long_name_threshold: 0,
         name_cache_ttl: Duration::from_secs(30),
     }
+}
+
+/// The settings of a backend that encrypts names, with the defaults of the
+/// builder.
+pub(super) fn names_settings() -> Settings {
+    Settings {
+        encrypt_names: true,
+        case_insensitive: true,
+        long_name_threshold: 255,
+        ..clear_settings()
+    }
+}
+
+/// Builds a backend that encrypts names over `inner`.
+pub(super) async fn names_over<B: ShareBackend>(inner: B) -> EncryptedBackend<B> {
+    names_with(inner, |builder| builder).await
+}
+
+/// Builds a backend that encrypts names over `inner`, with the builder that
+/// `setup` returns.
+pub(super) async fn names_with<B: ShareBackend>(
+    inner: B,
+    setup: impl FnOnce(EncryptedBackendBuilder<B>) -> EncryptedBackendBuilder<B>,
+) -> EncryptedBackend<B> {
+    setup(EncryptedBackend::builder(inner, key()))
+        .build()
+        .await
+        .expect("a backend that encrypts names")
+}
+
+/// A snapshot of `count` entries that are not directories.
+pub(super) fn many_names(count: usize) -> Arc<Snapshot> {
+    let entries = (0..count)
+        .map(|n| Entry {
+            plain: format!("n{n}"),
+            stored: format!("s{n}"),
+            directory: false,
+        })
+        .collect();
+    Arc::new(Snapshot::new(entries, Instant::now()))
+}
+
+/// `layer` with a directory name cache that holds at most `limit` names. No
+/// clone of `layer` may exist.
+pub(super) fn with_name_limit<B>(
+    mut layer: EncryptedBackend<B>,
+    limit: usize,
+) -> EncryptedBackend<B> {
+    let shared = Arc::get_mut(&mut layer.shared).expect("a backend nobody cloned");
+    shared.names = NameCache::new(shared.settings.name_cache_ttl, limit);
+    layer
+}
+
+/// The stored form of `name` under the test key, for a share with the
+/// default threshold.
+pub(super) fn stored_form(name: &str) -> StoredName {
+    encode_name(&key_schedule(), name, 255).expect("a valid name")
+}
+
+/// The name an inner backend stores `name` under.
+pub(super) fn stored_name(name: &str) -> String {
+    stored_form(name).entry
+}
+
+/// The path, backslash separated, that an inner backend stores the client
+/// path `plain` under.
+pub(super) fn stored_at(plain: &str) -> String {
+    plain
+        .split('\\')
+        .filter(|name| !name.is_empty())
+        .map(stored_name)
+        .collect::<Vec<_>>()
+        .join("\\")
+}
+
+/// Adds the file or directory `plain`, and the directories above it, to the
+/// store of `files` under encrypted names. The long names among them get
+/// their side objects. A file holds `contents`; `None` makes a directory.
+fn seed(files: &MemFsBackend, plain: &str, contents: Option<&[u8]>) {
+    let names: Vec<_> = plain.split('\\').collect();
+    let mut dir = String::new();
+    for (index, name) in names.iter().enumerate() {
+        let stored = stored_form(name);
+        let beside = |name: &str| {
+            if dir.is_empty() {
+                name.to_string()
+            } else {
+                format!("{dir}\\{name}")
+            }
+        };
+        let at = beside(&stored.entry);
+        match contents {
+            Some(bytes) if index + 1 == names.len() => files.clone().with_file(&at, bytes),
+            _ => files.clone().with_dir(&at),
+        };
+        if let Some(side) = &stored.side_object {
+            files.clone().with_file(&beside(&side.name), &side.content);
+        }
+        dir = at;
+    }
+}
+
+/// Adds the directory `plain` to the store of `files` under encrypted names.
+pub(super) fn seed_dir(files: &MemFsBackend, plain: &str) {
+    seed(files, plain, None);
+}
+
+/// Adds the file `plain` to the store of `files` under encrypted names, with
+/// the stored bytes `bytes`.
+pub(super) fn seed_file(files: &MemFsBackend, plain: &str, bytes: &[u8]) {
+    seed(files, plain, Some(bytes));
+}
+
+/// Opens `name` in `layer` in a task, with write access and `intent`.
+pub(super) fn spawn_open<B: ShareBackend>(
+    layer: &EncryptedBackend<B>,
+    name: &str,
+    intent: OpenIntent,
+) -> JoinHandle<OpenResult<B>> {
+    let layer = layer.clone();
+    let name = path(name);
+    tokio::spawn(async move { layer.open_handle(&name, opts(intent)).await })
+}
+
+/// The two handles hold one node.
+pub(super) fn shares_node<B: ShareBackend>(a: &EncryptedHandle<B>, b: &EncryptedHandle<B>) -> bool {
+    Arc::ptr_eq(a.node(), b.node())
 }
 
 /// Opens `name` in `layer` with write access and `intent`.

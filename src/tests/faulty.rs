@@ -1,5 +1,6 @@
 //! A backend wrapper that fails or cuts short the opens, unlinks, renames,
-//! writes, flushes, truncates, closes and reads that pass through it.
+//! writes, flushes, truncates, closes, listings and reads that pass through
+//! it.
 
 use std::any::Any;
 use std::sync::{Arc, Mutex};
@@ -17,15 +18,16 @@ use crate::path::SmbPath;
 use crate::stream::{StreamInfo, StreamName};
 
 /// Wraps `inner` and fails chosen opens, unlinks, renames, writes, flushes,
-/// truncates and closes, and cuts reads and writes short.
+/// truncates, closes and listings, and cuts reads and writes short.
 ///
 /// A fault hits the nth call from the moment it is set and then clears. A
 /// call it hits fails without reaching the inner backend; a torn write
 /// applies its first bytes there first, and a failed close closes the handle
-/// all the same. `write` and `write_owned` count as
-/// writes. `open_stream` is neither counted nor faulted. Short reads, short
-/// writes, a reported file size, the offset from which writes are dropped and
-/// the length from which truncates are dropped stay in force until changed.
+/// all the same. `write` and `write_owned` count as writes; `list_dir` and
+/// `list_dir_sized` count as listings. `open_stream` is neither counted nor
+/// faulted. Short reads, short writes, a reported file size, the offset from
+/// which writes are dropped and the length from which truncates are dropped
+/// stay in force until changed.
 /// The counters count every call that reaches this backend, a clone of it or
 /// one of their handles, faulted or not. Reads, writes and truncates are
 /// logged as asked for, before a short-read or short-write limit cuts them.
@@ -55,6 +57,7 @@ struct State {
     flush_fault: Option<Fault>,
     truncate_fault: Option<Fault>,
     close_fault: Option<Fault>,
+    list_fault: Option<Fault>,
     max_read: Option<u32>,
     max_write: Option<usize>,
     size: Option<u64>,
@@ -218,6 +221,11 @@ impl<B: ShareBackend> Faulty<B> {
     /// handle is closed in the inner backend first.
     pub(crate) fn fail_close(&self, nth: usize, error: SmbError) {
         self.state.lock().unwrap().close_fault = Some(Fault::new(nth, error));
+    }
+
+    /// Fails the `nth` listing from now (1 is the next one) with `error`.
+    pub(crate) fn fail_listing(&self, nth: usize, error: SmbError) {
+        self.state.lock().unwrap().list_fault = Some(Fault::new(nth, error));
     }
 
     /// Makes every read return at most `max` bytes, or lifts the limit.
@@ -497,7 +505,11 @@ impl Handle for FaultyHandle {
     }
 
     async fn list_dir(&self, pattern: Option<&str>) -> SmbResult<Vec<DirEntry>> {
-        self.inner.list_dir(pattern).await
+        let fault = due(&mut self.state.lock().unwrap().list_fault);
+        match fault {
+            Some(fault) => Err(fault.error),
+            None => self.inner.list_dir(pattern).await,
+        }
     }
 
     async fn list_dir_sized(
@@ -505,7 +517,11 @@ impl Handle for FaultyHandle {
         pattern: Option<&str>,
         ea_size: bool,
     ) -> SmbResult<Vec<DirEntry>> {
-        self.inner.list_dir_sized(pattern, ea_size).await
+        let fault = due(&mut self.state.lock().unwrap().list_fault);
+        match fault {
+            Some(fault) => Err(fault.error),
+            None => self.inner.list_dir_sized(pattern, ea_size).await,
+        }
     }
 
     async fn close(self: Box<Self>) -> SmbResult<()> {
@@ -559,7 +575,7 @@ mod tests {
     use crate::backend::OpenIntent;
     use crate::tests::memfs::MemFsBackend;
     use crate::tests::recorder::{INDEX, Recorder, call_everything, forwarded_calls};
-    use crate::tests::util::{opts, path};
+    use crate::tests::util::{dir_opts, opts, path};
 
     /// A writable handle on the file `f`, seeded with `data`, behind a
     /// faulty backend.
@@ -748,6 +764,26 @@ mod tests {
         handle.truncate(4).await.unwrap();
         assert_eq!(files.contents("f"), Some(b"abcd".to_vec()));
         assert_eq!(faulty.truncates(), 5);
+    }
+
+    #[tokio::test]
+    async fn fails_the_nth_listing_with_the_chosen_error() {
+        let files = MemFsBackend::new().with_dir("d").with_file("d\\a", b"");
+        let faulty = Faulty::new(files);
+        let (dir, _) = faulty
+            .open(&path("d"), dir_opts(OpenIntent::Open))
+            .await
+            .unwrap();
+        dir.list_dir(None).await.unwrap();
+        faulty.fail_listing(2, SmbError::DiskFull);
+        dir.list_dir_sized(None, false).await.unwrap();
+        assert!(matches!(
+            dir.list_dir_sized(None, false).await,
+            Err(SmbError::DiskFull)
+        ));
+        faulty.fail_listing(1, io_error());
+        assert!(matches!(dir.list_dir(None).await, Err(SmbError::Io(_))));
+        assert_eq!(dir.list_dir(None).await.unwrap().len(), 1);
     }
 
     #[tokio::test]

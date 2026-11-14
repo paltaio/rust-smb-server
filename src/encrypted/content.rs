@@ -184,11 +184,13 @@ impl<B: ShareBackend> EncryptedHandle<B> {
         Ok(Opened::Data(Bytes::from(plain).slice(skip..skip + take)))
     }
 
-    /// The path the client used and the path the file is stored under, which
-    /// are one path while names are stored as the client spells them.
+    /// The path of the file as its names are spelled, and the path it is
+    /// stored under, which are one path while names are stored as the client
+    /// spells them.
     fn paths(&self) -> (SmbPath, SmbPath) {
-        let path = self.node.path();
-        (path.clone(), path)
+        let stored = self.node.path();
+        let path = self.plain.clone().unwrap_or_else(|| stored.clone());
+        (path, stored)
     }
 
     /// Logs a block that does not open and returns the error that fails the

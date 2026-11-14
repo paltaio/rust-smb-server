@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
+use super::cache::{LongNames, MAX_CACHED_NAMES, MAX_LONG_NAMES, NameCache};
 use super::format::BlockShift;
 use super::keys::KeySchedule;
 use super::locks::Locks;
@@ -70,12 +71,16 @@ pub(super) struct Shared<B> {
     /// The files and directories that handles have open.
     pub(super) nodes: Arc<NodeTable>,
     pub(super) locks: Locks,
+    /// The decoded names of directories, when names are encrypted.
+    pub(super) names: NameCache,
+    pub(super) long_names: LongNames,
 }
 
 impl<B: ShareBackend> Shared<B> {
-    /// How the inner backend compares names.
+    /// How stored paths compare: as they are when names are encrypted, else
+    /// the way the inner backend compares names.
     pub(super) fn name_match(&self) -> NameMatch {
-        if self.inner.capabilities().case_sensitive {
+        if self.settings.encrypt_names || self.inner.capabilities().case_sensitive {
             NameMatch::Exact
         } else {
             NameMatch::Folded
@@ -105,6 +110,8 @@ impl<B> EncryptedBackend<B> {
                 settings,
                 nodes: NodeTable::new(),
                 locks: Locks::new(),
+                names: NameCache::new(settings.name_cache_ttl, MAX_CACHED_NAMES),
+                long_names: LongNames::new(MAX_LONG_NAMES),
             }),
         }
     }
@@ -183,7 +190,9 @@ impl<B: ShareBackend> ShareBackend for EncryptedBackend<B> {
 #[cfg(test)]
 mod tests {
     use super::super::names::encode_name;
-    use super::super::testing::{Reporting, build, key, key_schedule, read_only};
+    use super::super::testing::{
+        Reporting, build, key, key_schedule, many_names, names_settings, read_only,
+    };
     use super::*;
     use crate::backend::OpenIntent;
     use crate::error::SmbError;
@@ -194,24 +203,33 @@ mod tests {
         build(files, |builder| builder).await.unwrap()
     }
 
-    fn settings() -> Settings {
-        Settings {
-            encrypt_names: true,
-            case_insensitive: true,
-            block_shift: BlockShift::DEFAULT,
-            long_name_threshold: 255,
-            name_cache_ttl: Duration::from_secs(30),
-        }
-    }
-
     #[test]
     fn clones_share_one_state_whether_or_not_the_inner_backend_clones() {
         struct NotClone;
         fn assert_send_sync<T: Send + Sync + 'static>() {}
         assert_send_sync::<EncryptedBackend<NotClone>>();
-        let backend = EncryptedBackend::new(NotClone, key_schedule(), settings());
+        let backend = EncryptedBackend::new(NotClone, key_schedule(), names_settings());
         let clone = backend.clone();
         assert!(Arc::ptr_eq(&backend.shared, &clone.shared));
+    }
+
+    #[tokio::test]
+    async fn the_name_caches_are_bounded() {
+        let backend = built(&MemFsBackend::new()).await;
+        let long = &backend.shared.long_names;
+        for n in 0..10_001 {
+            long.insert(format!("h{n}.l"), "name");
+        }
+        assert_eq!(long.len(), 10_000);
+        assert_eq!(long.get("h0.l"), None);
+
+        let names = &backend.shared.names;
+        for key in ["a", "b"] {
+            names.install_if(key.to_string(), many_names(60_000), || true);
+        }
+        assert_eq!(names.keys(), ["b"]);
+        names.install_if("big".to_string(), many_names(100_001), || true);
+        assert_eq!(names.keys(), ["big"]);
     }
 
     #[tokio::test]
@@ -329,16 +347,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn encrypted_names_open_only_the_root_and_answer_not_supported_elsewhere() {
+    async fn encrypted_names_open_existing_entries_and_answer_not_supported_elsewhere() {
         let files = MemFsBackend::new();
         let backend = built(&files).await;
         files.clone().with_file("f", b"abc");
+        for intent in [OpenIntent::Open, OpenIntent::Truncate] {
+            assert!(
+                matches!(
+                    backend.open(&path("f"), opts(intent)).await,
+                    Err(SmbError::NotFound)
+                ),
+                "{intent:?}: `f` is no name of the share"
+            );
+        }
         for intent in [
-            OpenIntent::Open,
             OpenIntent::Create,
             OpenIntent::OpenOrCreate,
             OpenIntent::OverwriteOrCreate,
-            OpenIntent::Truncate,
         ] {
             assert!(
                 matches!(

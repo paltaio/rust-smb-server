@@ -7,15 +7,13 @@ use super::block::FileCipher;
 use super::error::EncryptionError;
 use super::format::{BlockShift, HEADER_LEN, OVERHEAD};
 use super::header::Header;
-use super::inner::{close_after_reading, read_full};
+use super::inner::{close_after_reading, is_missing, read_full, read_side_object};
 use super::keys::KeySchedule;
 use super::marker::MarkerSettings;
-use super::names::{
-    MAX_SIDE_OBJECT_LEN, StoredKind, classify, decode_long, decode_short, side_object_name,
-};
+use super::names::{StoredKind, classify, decode_long, decode_short, side_object_name};
 use super::size::logical_size;
 use crate::backend::{DirEntry, Handle, OpenOptions, ShareBackend};
-use crate::error::{SmbError, SmbResult};
+use crate::error::SmbError;
 use crate::path::SmbPath;
 
 /// Most entries the search for a file to check looks at.
@@ -91,40 +89,13 @@ async fn long_name_decodes<B: ShareBackend>(
     let Ok(path) = dir.join(&side_object) else {
         return Ok(false);
     };
-    let Some(content) = read_side_object(inner, &path).await? else {
+    let Some(content) = read_side_object(inner, &path)
+        .await
+        .map_err(EncryptionError::Backend)?
+    else {
         return Ok(false);
     };
     Ok(decode_long(keys, entry, &content).is_ok())
-}
-
-/// The first `MAX_SIDE_OBJECT_LEN + 1` bytes of the file `path`, enough to
-/// tell that it is too long. `None` when it is missing or not a file.
-async fn read_side_object<B: ShareBackend>(
-    inner: &B,
-    path: &SmbPath,
-) -> Result<Option<Vec<u8>>, EncryptionError> {
-    let opts = OpenOptions {
-        non_directory: true,
-        ..OpenOptions::default()
-    };
-    let handle = match inner.open(path, opts).await {
-        Ok((handle, _)) => handle,
-        Err(SmbError::NotFound | SmbError::IsDirectory) => return Ok(None),
-        Err(error) => return Err(EncryptionError::Backend(error)),
-    };
-    let content = side_object_prefix(handle.as_ref()).await;
-    close_after_reading(handle).await;
-    content.map_err(EncryptionError::Backend)
-}
-
-async fn side_object_prefix(handle: &dyn Handle) -> SmbResult<Option<Vec<u8>>> {
-    let info = handle.stat().await?;
-    if info.is_directory {
-        return Ok(None);
-    }
-    let len = info.end_of_file.min(MAX_SIDE_OBJECT_LEN as u64 + 1);
-    let len = usize::try_from(len).expect("a side object prefix is at most 1025 bytes");
-    read_full(handle, 0, len).await.map(Some)
 }
 
 /// Whether the search passes over the entry.
@@ -202,9 +173,7 @@ async fn list_below<B: ShareBackend>(
     };
     let handle = match inner.open(dir, opts).await {
         Ok((handle, _)) => handle,
-        Err(SmbError::NotFound | SmbError::PathNotFound | SmbError::NotADirectory) => {
-            return Ok(Vec::new());
-        }
+        Err(error) if is_missing(&error) => return Ok(Vec::new()),
         Err(error) => return Err(EncryptionError::Backend(error)),
     };
     let listing = handle.list_dir(None).await;

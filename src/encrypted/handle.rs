@@ -11,15 +11,24 @@ use super::locks::acquire_some;
 use super::node::{NameMatch, Node};
 use super::size::logical_size;
 use crate::backend::{
-    DirChange, DirChangeKind, DirEntry, DirWatch, FileInfo, FileTimes, Handle, ShareBackend,
+    DirChange, DirChangeKind, DirEntry, DirWatch, FileInfo, FileTimes, Handle, OpenAction,
+    ShareBackend,
 };
 use crate::error::{SmbError, SmbResult};
+use crate::path::SmbPath;
+
+/// What an open of the backend gives.
+pub(super) type OpenResult<B> = SmbResult<(EncryptedHandle<B>, OpenAction)>;
 
 /// A handle of the backend: an inner handle and the node of its file.
 pub(super) struct EncryptedHandle<B> {
     pub(super) inner: Box<dyn Handle>,
     pub(super) node: Arc<Node>,
     pub(super) shared: Arc<Shared<B>>,
+    /// With encrypted names, the path of the entry as its names are spelled
+    /// in plaintext, as found when the handle was opened. The node holds the
+    /// stored path.
+    pub(super) plain: Option<SmbPath>,
 }
 
 impl<B: ShareBackend> EncryptedHandle<B> {
@@ -28,7 +37,15 @@ impl<B: ShareBackend> EncryptedHandle<B> {
             inner,
             node,
             shared,
+            plain: None,
         }
+    }
+
+    /// The handle of an entry whose names are encrypted, found at the
+    /// plaintext path `plain`.
+    pub(super) fn with_plaintext(mut self, plain: SmbPath) -> Self {
+        self.plain = Some(plain);
+        self
     }
 
     #[cfg(test)]
@@ -90,6 +107,9 @@ impl<B: ShareBackend> Handle for EncryptedHandle<B> {
         let _file = acquire_some(self.node.file(), |file| file.read()).await;
         let mut info = self.inner.stat().await?;
         self.report(&mut info);
+        if let Some(name) = self.plain.as_ref().and_then(SmbPath::file_name) {
+            info.name = name.to_string();
+        }
         Ok(info)
     }
 
