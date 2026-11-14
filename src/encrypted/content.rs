@@ -19,7 +19,7 @@ use crate::error::{SmbError, SmbResult};
 use crate::path::SmbPath;
 
 /// What opening the blocks of a read gave.
-enum Opened {
+pub(super) enum Opened {
     Data(Bytes),
     /// The index of the first block that does not open.
     Corrupt(u64),
@@ -64,16 +64,12 @@ impl<B: ShareBackend> EncryptedHandle<B> {
                 reloaded = true;
                 continue;
             }
-            self.warn_corrupt(block);
-            return Err(io_error(
-                io::ErrorKind::InvalidData,
-                "block fails authentication",
-            ));
+            return Err(self.block_error(block));
         }
     }
 
     /// The size of the stored file.
-    async fn stored_size(&self) -> SmbResult<u64> {
+    pub(super) async fn stored_size(&self) -> SmbResult<u64> {
         Ok(self.inner.stat().await?.end_of_file)
     }
 
@@ -99,25 +95,34 @@ impl<B: ShareBackend> EncryptedHandle<B> {
     }
 
     /// Reads the header of the stored file, which has `stored` bytes, into
-    /// `meta`. A file of no more than a header has none. A header that is
-    /// not valid leaves the state unknown and fails with `Io`.
-    async fn load_header(&self, meta: &mut FileMeta, stored: u64) -> SmbResult<()> {
+    /// `meta`. A file of no more than a header has none. A header that
+    /// cannot be read or is not valid leaves the state unknown and fails with
+    /// `Io`.
+    pub(super) async fn load_header(&self, meta: &mut FileMeta, stored: u64) -> SmbResult<()> {
         if stored <= HEADER_LEN as u64 {
             meta.header = HeaderState::Absent;
             return Ok(());
         }
-        let bytes = read_full(&*self.inner, 0, HEADER_LEN).await?;
-        match Header::parse(&bytes, self.shared.settings.block_shift) {
-            Ok(header) => {
-                let cipher = FileCipher::new(&self.shared.keys, header);
-                meta.header = HeaderState::Present(header, Box::new(cipher));
+        match self.read_header().await {
+            Ok((header, cipher)) => {
+                meta.header = HeaderState::Present(header, cipher);
                 Ok(())
             }
             Err(error) => {
                 meta.header = HeaderState::Unknown;
-                Err(self.header_error(error))
+                Err(error)
             }
         }
+    }
+
+    /// Reads the header at the start of the stored file and builds the cipher
+    /// of its key. A header that is not valid fails with `Io`.
+    pub(super) async fn read_header(&self) -> SmbResult<(Header, Box<FileCipher>)> {
+        let bytes = read_full(&*self.inner, 0, HEADER_LEN).await?;
+        let header = Header::parse(&bytes, self.shared.settings.block_shift)
+            .map_err(|error| self.header_error(error))?;
+        let cipher = FileCipher::new(&self.shared.keys, header);
+        Ok((header, Box::new(cipher)))
     }
 
     /// Reads the header again after a block of the file with id `used` did
@@ -128,8 +133,17 @@ impl<B: ShareBackend> EncryptedHandle<B> {
         used: [u8; FILE_ID_LEN],
     ) -> SmbResult<bool> {
         let mut meta = file.write().await;
+        self.reload(&mut meta, used).await
+    }
+
+    /// `reload_header` for a caller that holds the lock of the file.
+    pub(super) async fn reload(
+        &self,
+        meta: &mut FileMeta,
+        used: [u8; FILE_ID_LEN],
+    ) -> SmbResult<bool> {
         let stored = self.stored_size().await?;
-        self.load_header(&mut meta, stored).await?;
+        self.load_header(meta, stored).await?;
         Ok(match &meta.header {
             HeaderState::Present(now, _) => now.file_id() != used,
             HeaderState::Unknown | HeaderState::Absent => true,
@@ -139,7 +153,7 @@ impl<B: ShareBackend> EncryptedHandle<B> {
     /// Reads and opens the blocks that hold the `len` bytes at `offset` of a
     /// file of `logical` bytes, and returns those bytes. `offset` is inside
     /// the file and `len` is not 0.
-    async fn read_range(
+    pub(super) async fn read_range(
         &self,
         cipher: &FileCipher,
         logical: u64,
@@ -177,10 +191,12 @@ impl<B: ShareBackend> EncryptedHandle<B> {
         (path.clone(), path)
     }
 
-    /// Logs a block that does not open.
-    fn warn_corrupt(&self, block: u64) {
+    /// Logs a block that does not open and returns the error that fails the
+    /// call.
+    pub(super) fn block_error(&self, block: u64) -> SmbError {
         let (path, stored) = self.paths();
         warn!(path = %path, stored = %stored, block, "block fails authentication");
+        io_error(io::ErrorKind::InvalidData, "block fails authentication")
     }
 
     /// Logs an unusable header and returns the error that fails the call.
@@ -209,7 +225,8 @@ mod tests {
     use super::super::node::HeaderKind;
     use super::super::size::stored_size;
     use super::super::testing::{
-        clear_blocks, file_id, key_schedule, open, open_dir, open_file, other_file_id, settle,
+        B, H, assert_io, block_reads, clear_blocks, faulty_file, file_id, header_reads,
+        key_schedule, layer_over, open, open_dir, open_file, other_file_id, settle, shift, stored,
         stored_file, stored_file_with_id,
     };
     use super::*;
@@ -220,23 +237,9 @@ mod tests {
     use crate::tests::logs::Logs;
     use crate::tests::memfs::MemFsBackend;
 
-    const BITS: u8 = 13;
-    /// Plaintext bytes of a block.
-    const B: usize = 1 << BITS;
-    const H: usize = HEADER_LEN;
-
-    fn shift() -> BlockShift {
-        BlockShift::new(BITS).unwrap()
-    }
-
     /// Bytes that are never zero and change from block to block.
     fn pattern(len: usize) -> Vec<u8> {
         (0..len).map(|i| (i % 251 + 1) as u8).collect()
-    }
-
-    /// The stored bytes of a file that holds `plain`.
-    fn stored(plain: &[u8]) -> Vec<u8> {
-        stored_file(&key_schedule(), shift(), plain)
     }
 
     /// The stored bytes of block `index` of a file of `logical` bytes.
@@ -246,42 +249,11 @@ mod tests {
         start..start + range.stored_len as usize
     }
 
-    /// A backend with blocks of `B` bytes over `inner`.
-    async fn layer_over<I: ShareBackend>(inner: I) -> EncryptedBackend<I> {
-        clear_blocks(inner, shift()).await
-    }
-
     /// The bytes a read of `len` bytes at `offset` of `plain` returns.
     fn expected(plain: &[u8], offset: usize, len: u32) -> &[u8] {
         let start = offset.min(plain.len());
         let end = offset.saturating_add(len as usize).min(plain.len());
         &plain[start..end]
-    }
-
-    #[track_caller]
-    fn assert_io(result: SmbResult<Bytes>, kind: io::ErrorKind) {
-        match result {
-            Err(SmbError::Io(error)) => assert_eq!(error.kind(), kind),
-            other => panic!("expected an Io error of kind {kind:?}, got {other:?}"),
-        }
-    }
-
-    /// Reads that asked for the header.
-    fn header_reads<I: ShareBackend>(faulty: &Faulty<I>) -> usize {
-        faulty
-            .reads()
-            .iter()
-            .filter(|&&(offset, _)| offset == 0)
-            .count()
-    }
-
-    /// Reads that asked for blocks.
-    fn block_reads<I: ShareBackend>(faulty: &Faulty<I>) -> Vec<(u64, u32)> {
-        faulty
-            .reads()
-            .into_iter()
-            .filter(|&(offset, _)| offset != 0)
-            .collect()
     }
 
     /// A backend over a store that holds the file `f` with the stored bytes
@@ -291,21 +263,6 @@ mod tests {
         let layer = layer_over(files.clone()).await;
         files.clone().with_file("f", bytes);
         (files, layer)
-    }
-
-    /// `layer_with` over a faulty backend.
-    async fn faulty_file(
-        bytes: &[u8],
-    ) -> (
-        MemFsBackend,
-        Faulty<MemFsBackend>,
-        EncryptedBackend<Faulty<MemFsBackend>>,
-    ) {
-        let files = MemFsBackend::new();
-        let faulty = Faulty::new(files.clone());
-        let layer = layer_over(faulty.clone()).await;
-        files.clone().with_file("f", bytes);
-        (files, faulty, layer)
     }
 
     #[tokio::test]

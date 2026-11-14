@@ -27,7 +27,6 @@ pub(crate) struct LogicalSize {
 
 /// Stored size of a file of `logical` bytes. `None` when it would pass
 /// `MAX_STORED_SIZE`.
-#[cfg_attr(not(test), expect(dead_code, reason = "only tests call it"))]
 pub(crate) fn stored_size(shift: BlockShift, logical: u64) -> Option<u64> {
     if logical == 0 {
         return Some(0);

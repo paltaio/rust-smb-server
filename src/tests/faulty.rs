@@ -24,10 +24,12 @@ use crate::stream::{StreamInfo, StreamName};
 /// applies its first bytes there first, and a failed close closes the handle
 /// all the same. `write` and `write_owned` count as
 /// writes. `open_stream` is neither counted nor faulted. Short reads, short
-/// writes and a reported file size stay in force until changed. The counters count every call
+/// writes, a reported file size and the offset from which writes are dropped
+/// stay in force until changed. The counters count every call
 /// that reaches this backend, a clone of it or one of their handles,
-/// faulted or not. Reads are logged as asked for, before a short-read limit
-/// cuts them. Clones share the faults, the counters and the log.
+/// faulted or not. Reads and writes are logged as asked for, before a
+/// short-read or short-write limit cuts them. Clones share the faults, the
+/// counters and the logs.
 ///
 /// Handles it returns have no `as_any`.
 #[derive(Clone)]
@@ -44,6 +46,7 @@ struct State {
     writes: usize,
     truncates: usize,
     reads: Vec<(u64, u32)>,
+    write_log: Vec<(u64, usize)>,
     open_fault: Option<OpenFault>,
     unlink_fault: Option<Fault>,
     rename_fault: Option<Fault>,
@@ -54,6 +57,7 @@ struct State {
     max_read: Option<u32>,
     max_write: Option<usize>,
     size: Option<u64>,
+    sink_from: Option<u64>,
 }
 
 struct Fault {
@@ -112,11 +116,16 @@ impl State {
         due(&mut self.rename_fault).map(|fault| fault.error)
     }
 
-    /// What the next write does, given the bytes it carries.
-    fn next_write(&mut self, len: usize) -> Plan {
+    /// What the next write does, given where it goes and the bytes it
+    /// carries.
+    fn next_write(&mut self, offset: u64, len: usize) -> Plan {
         self.writes += 1;
+        self.write_log.push((offset, len));
         if let Some(fault) = due(&mut self.write_fault) {
             return Plan::Fail(fault.applied.min(len), fault.error);
+        }
+        if self.sink_from.is_some_and(|from| offset >= from) {
+            return Plan::Sink;
         }
         match self.max_write {
             Some(max) if max < len => Plan::Short(max),
@@ -141,6 +150,8 @@ enum Plan {
     Fail(usize, SmbError),
     /// Apply and report that many bytes.
     Short(usize),
+    /// Report every byte written and apply none.
+    Sink,
 }
 
 impl<B: ShareBackend> Faulty<B> {
@@ -224,6 +235,13 @@ impl<B: ShareBackend> Faulty<B> {
         self.state.lock().unwrap().size = size;
     }
 
+    /// Makes every write at or past `offset` report all its bytes written
+    /// without reaching the inner backend, or lifts the override. Faults
+    /// still take precedence.
+    pub(crate) fn sink_writes_from(&self, offset: Option<u64>) {
+        self.state.lock().unwrap().sink_from = offset;
+    }
+
     /// Opens seen so far.
     pub(crate) fn opens(&self) -> usize {
         self.state.lock().unwrap().opens
@@ -252,6 +270,11 @@ impl<B: ShareBackend> Faulty<B> {
     /// The offset and length of each read seen so far, as asked for.
     pub(crate) fn reads(&self) -> Vec<(u64, u32)> {
         self.state.lock().unwrap().reads.clone()
+    }
+
+    /// The offset and length of each write seen so far, as asked for.
+    pub(crate) fn write_calls(&self) -> Vec<(u64, usize)> {
+        self.state.lock().unwrap().write_log.clone()
     }
 
     fn wrap(&self, handle: Box<dyn Handle>) -> Box<dyn Handle> {
@@ -382,7 +405,7 @@ impl Handle for FaultyHandle {
     }
 
     async fn write(&self, offset: u64, data: &[u8]) -> SmbResult<u32> {
-        let plan = self.state.lock().unwrap().next_write(data.len());
+        let plan = self.state.lock().unwrap().next_write(offset, data.len());
         match plan {
             Plan::Pass => self.inner.write(offset, data).await,
             Plan::Fail(applied, error) => {
@@ -393,11 +416,12 @@ impl Handle for FaultyHandle {
             }
             Plan::Short(0) => Ok(0),
             Plan::Short(max) => self.inner.write(offset, &data[..max]).await,
+            Plan::Sink => Ok(data.len() as u32),
         }
     }
 
     async fn write_owned(&self, offset: u64, mut data: Vec<u8>) -> SmbResult<u32> {
-        let plan = self.state.lock().unwrap().next_write(data.len());
+        let plan = self.state.lock().unwrap().next_write(offset, data.len());
         match plan {
             Plan::Pass => self.inner.write_owned(offset, data).await,
             Plan::Fail(applied, error) => {
@@ -412,6 +436,7 @@ impl Handle for FaultyHandle {
                 data.truncate(max);
                 self.inner.write_owned(offset, data).await
             }
+            Plan::Sink => Ok(data.len() as u32),
         }
     }
 
@@ -783,6 +808,33 @@ mod tests {
 
         faulty.short_writes(None);
         assert_eq!(handle.write(20, b"zz").await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn logs_each_write_as_asked_for_and_drops_the_writes_past_the_sink_offset() {
+        let (files, faulty, handle) = faulty_file(b"").await;
+        faulty.short_writes(Some(2));
+        assert_eq!(handle.write(0, b"abcd").await.unwrap(), 2);
+        faulty.short_writes(None);
+        faulty.sink_writes_from(Some(10));
+        assert_eq!(handle.write(8, b"ef").await.unwrap(), 2);
+        assert_eq!(handle.write_owned(10, b"gh".to_vec()).await.unwrap(), 2);
+        assert_eq!(handle.write(1 << 40, b"xyz").await.unwrap(), 3);
+        assert_eq!(
+            faulty.write_calls(),
+            [(0, 4), (8, 2), (10, 2), (1 << 40, 3)]
+        );
+        assert_eq!(files.contents("f"), Some(b"ab\0\0\0\0\0\0ef".to_vec()));
+
+        faulty.fail_write(1, SmbError::DiskFull);
+        assert!(matches!(
+            handle.write(12, b"ij").await,
+            Err(SmbError::DiskFull)
+        ));
+        faulty.sink_writes_from(None);
+        assert_eq!(handle.write(10, b"kl").await.unwrap(), 2);
+        assert_eq!(files.contents("f"), Some(b"ab\0\0\0\0\0\0efkl".to_vec()));
+        assert_eq!(faulty.writes(), 6);
     }
 
     #[tokio::test]

@@ -1,5 +1,8 @@
 //! Fixtures shared by the unit tests.
 
+use std::fmt::Debug;
+use std::io;
+use std::mem;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -19,6 +22,7 @@ use crate::backend::{
 };
 use crate::error::{SmbError, SmbResult};
 use crate::path::SmbPath;
+use crate::tests::faulty::Faulty;
 use crate::tests::memfs::MemFsBackend;
 use crate::tests::util::{dir_opts, opts, path};
 
@@ -186,6 +190,90 @@ pub(super) fn stored_hole(shift: BlockShift, len: usize) -> Vec<u8> {
     let mut stored = header.as_bytes().to_vec();
     stored.resize(HEADER_LEN + len + OVERHEAD, 0);
     stored
+}
+
+/// Blocks of `1 << BITS` bytes, which the tests of file contents use.
+pub(super) const BITS: u8 = 13;
+/// Plaintext bytes of a full block.
+pub(super) const B: usize = 1 << BITS;
+pub(super) const H: usize = HEADER_LEN;
+
+/// The block size of `BITS`.
+pub(super) fn shift() -> BlockShift {
+    BlockShift::new(BITS).unwrap()
+}
+
+/// The stored bytes of a file that holds `plain`, in blocks of `B` bytes.
+pub(super) fn stored(plain: &[u8]) -> Vec<u8> {
+    stored_file(&key_schedule(), shift(), plain)
+}
+
+/// A backend with blocks of `B` bytes over `inner`.
+pub(super) async fn layer_over<I: ShareBackend>(inner: I) -> EncryptedBackend<I> {
+    clear_blocks(inner, shift()).await
+}
+
+/// A backend over a store that holds the file `f` with the stored bytes
+/// `bytes`, behind `Faulty`.
+pub(super) async fn faulty_file(
+    bytes: &[u8],
+) -> (
+    MemFsBackend,
+    Faulty<MemFsBackend>,
+    EncryptedBackend<Faulty<MemFsBackend>>,
+) {
+    faulty_file_in(shift(), bytes).await
+}
+
+/// `faulty_file` with blocks of `shift`.
+pub(super) async fn faulty_file_in(
+    shift: BlockShift,
+    bytes: &[u8],
+) -> (
+    MemFsBackend,
+    Faulty<MemFsBackend>,
+    EncryptedBackend<Faulty<MemFsBackend>>,
+) {
+    let files = MemFsBackend::new();
+    let faulty = Faulty::new(files.clone());
+    let layer = clear_blocks(faulty.clone(), shift).await;
+    files.clone().with_file("f", bytes);
+    (files, faulty, layer)
+}
+
+/// Reads that asked for the header.
+pub(super) fn header_reads<I: ShareBackend>(faulty: &Faulty<I>) -> usize {
+    faulty
+        .reads()
+        .iter()
+        .filter(|&&(offset, _)| offset == 0)
+        .count()
+}
+
+/// Reads that asked for blocks.
+pub(super) fn block_reads<I: ShareBackend>(faulty: &Faulty<I>) -> Vec<(u64, u32)> {
+    faulty
+        .reads()
+        .into_iter()
+        .filter(|&(offset, _)| offset != 0)
+        .collect()
+}
+
+#[track_caller]
+pub(super) fn assert_io<T: Debug>(result: SmbResult<T>, kind: io::ErrorKind) {
+    match result {
+        Err(SmbError::Io(error)) => assert_eq!(error.kind(), kind),
+        other => panic!("expected an Io error of kind {kind:?}, got {other:?}"),
+    }
+}
+
+/// `result` is an error of the same variant as `expected`.
+#[track_caller]
+pub(super) fn assert_err<T: Debug>(result: SmbResult<T>, expected: SmbError) {
+    match result {
+        Err(error) if mem::discriminant(&error) == mem::discriminant(&expected) => {}
+        other => panic!("expected {expected:?}, got {other:?}"),
+    }
 }
 
 /// The stored marker of `files`.

@@ -87,7 +87,6 @@ impl FileCipher {
     /// Seals `plain`, the bytes of block `index`, into `out` as nonce,
     /// ciphertext and tag. `plain` is 1 byte up to one full block long and
     /// `out` is `OVERHEAD` bytes longer. `nonce` is fresh and not all zero.
-    #[cfg_attr(not(test), expect(dead_code, reason = "only tests call it"))]
     pub(crate) fn seal_block(
         &self,
         index: u64,

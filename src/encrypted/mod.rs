@@ -16,13 +16,13 @@ mod locks;
 mod marker;
 mod names;
 mod node;
-#[cfg_attr(not(test), expect(dead_code, reason = "only tests call it"))]
 mod random;
 mod restore;
 mod setup;
 mod size;
 #[cfg(test)]
 mod testing;
+mod write;
 #[cfg(test)]
 mod wycheproof_gcm;
 #[cfg(test)]

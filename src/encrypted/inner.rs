@@ -3,12 +3,12 @@
 
 use std::io;
 
-use super::format::BlockShift;
+use super::format::{BlockShift, HEADER_LEN};
 use crate::backend::Handle;
 use crate::error::{SmbError, SmbResult};
 
-/// Most bytes one inner read of stored blocks asks for, before it is cut
-/// down to whole blocks.
+/// Most bytes one inner read or write of stored blocks moves, before it is
+/// cut down to whole blocks.
 const MAX_CALL: u64 = 4 << 20;
 
 /// Closes a handle that was only read from. A close that fails changes
@@ -100,6 +100,59 @@ pub(super) async fn write_full(handle: &dyn Handle, offset: u64, data: &[u8]) ->
             .min(data.len() - done);
     }
     Ok(())
+}
+
+/// Writes all of `data` at `offset`, in inner calls of at most `call_len`
+/// bytes. Every call but the last ends where a stored block ends. Short
+/// writes are continued as in `write_full`.
+pub(super) async fn write_blocks(
+    handle: &dyn Handle,
+    shift: BlockShift,
+    offset: u64,
+    data: &[u8],
+) -> SmbResult<()> {
+    let call = call_len(shift) as u64;
+    let block = shift.stored_block_size();
+    let header = HEADER_LEN as u64;
+    let mut done = 0;
+    while done < data.len() {
+        let at = offset
+            .checked_add(done as u64)
+            .ok_or(SmbError::InvalidParameter)?;
+        let reach = at.checked_add(call).ok_or(SmbError::InvalidParameter)?;
+        // A call is a block or more, so the last boundary within reach is
+        // past `at`.
+        let boundary = header + (reach - header) / block * block;
+        let take = usize::try_from(boundary - at)
+            .unwrap_or(usize::MAX)
+            .min(data.len() - done);
+        write_full(handle, at, &data[done..done + take]).await?;
+        done += take;
+    }
+    Ok(())
+}
+
+/// Checks the inner calls `calls`, as offset and length: they follow each
+/// other from `from` to `to`, hold at most `MAX_CALL` bytes, and each ends at
+/// `to` or where a stored block of `block` bytes ends. `context` names the
+/// case in a failure.
+#[cfg(test)]
+#[track_caller]
+pub(super) fn assert_calls(calls: &[(u64, usize)], block: u64, from: u64, to: u64, context: &str) {
+    let mut next = from;
+    for &(at, count) in calls {
+        assert_eq!(at, next, "{context}: calls follow each other");
+        next = at + count as u64;
+        assert!(
+            count as u64 <= MAX_CALL,
+            "{context}: {count} bytes in one call"
+        );
+        assert!(
+            next == to || (next - HEADER_LEN as u64).is_multiple_of(block),
+            "{context}: a call ends at {next}, inside a block"
+        );
+    }
+    assert_eq!(next, to, "{context}");
 }
 
 #[cfg(test)]
@@ -204,6 +257,90 @@ mod tests {
             panic!("a read that returns nothing fails");
         };
         assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[tokio::test]
+    async fn blocks_are_written_in_calls_that_end_on_block_boundaries() {
+        let shift = BlockShift::new(13).unwrap();
+        let data: Vec<u8> = (0..9_000_024u32).map(|i| (i % 251) as u8).collect();
+        let files = MemFsBackend::new();
+        let faulty = Faulty::new(files.clone());
+        let (handle, _) = faulty
+            .open(&path("f"), opts(OpenIntent::Create))
+            .await
+            .unwrap();
+
+        write_blocks(&*handle, shift, 0, &data).await.unwrap();
+        assert_eq!(
+            faulty.write_calls(),
+            [(0, 4_184_004), (4_184_004, 4_192_200), (8_376_204, 623_820)]
+        );
+        assert_eq!(files.contents("f").unwrap(), data);
+
+        write_blocks(&*handle, shift, 0, b"").await.unwrap();
+        assert_eq!(faulty.write_calls().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_call_of_any_run_ends_on_a_block_boundary_and_holds_at_most_4_mib() {
+        for bits in [13, 16, 20] {
+            let shift = BlockShift::new(bits).unwrap();
+            let block = shift.stored_block_size();
+            let len = 9 * (1 << 20) + 17;
+            let data = vec![1u8; len];
+            let header = HEADER_LEN as u64;
+            for offset in [
+                0,
+                5,
+                header,
+                header + block - 1,
+                header + block,
+                header + 3 * block + 9,
+            ] {
+                let files = MemFsBackend::new();
+                let faulty = Faulty::new(files.clone());
+                faulty.sink_writes_from(Some(0));
+                let (handle, _) = faulty
+                    .open(&path("f"), opts(OpenIntent::Create))
+                    .await
+                    .unwrap();
+                write_blocks(&*handle, shift, offset, &data).await.unwrap();
+
+                assert_calls(
+                    &faulty.write_calls(),
+                    block,
+                    offset,
+                    offset + len as u64,
+                    &format!("shift {bits}, offset {offset}"),
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn short_writes_of_blocks_continue_inside_their_call() {
+        let shift = BlockShift::new(13).unwrap();
+        let data: Vec<u8> = (0..19_976u32).map(|i| (i % 251) as u8).collect();
+        let files = MemFsBackend::new();
+        let faulty = Faulty::new(files.clone());
+        faulty.short_writes(Some(7_000));
+        let (handle, _) = faulty
+            .open(&path("f"), opts(OpenIntent::Create))
+            .await
+            .unwrap();
+
+        write_blocks(&*handle, shift, 24, &data).await.unwrap();
+        assert_eq!(
+            faulty.write_calls(),
+            [(24, 19_976), (7_024, 12_976), (14_024, 5_976)]
+        );
+        assert_eq!(files.contents("f").unwrap()[24..], data[..]);
+
+        faulty.short_writes(Some(0));
+        let Err(SmbError::Io(error)) = write_blocks(&*handle, shift, 24, b"x").await else {
+            panic!("a write that takes nothing fails");
+        };
+        assert_eq!(error.kind(), io::ErrorKind::WriteZero);
     }
 
     #[tokio::test]

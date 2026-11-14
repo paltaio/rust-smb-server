@@ -41,8 +41,8 @@ impl<B: ShareBackend> EncryptedHandle<B> {
         self.node.path().is_root()
     }
 
-    /// The inner handle of a directory; writes and truncates of a file are
-    /// not supported.
+    /// The inner handle of a directory; truncates of a file are not
+    /// supported.
     fn directory(&self) -> SmbResult<&dyn Handle> {
         if self.node.is_directory() {
             Ok(&*self.inner)
@@ -86,7 +86,10 @@ impl<B: ShareBackend> Handle for EncryptedHandle<B> {
     }
 
     async fn write(&self, offset: u64, data: &[u8]) -> SmbResult<u32> {
-        self.directory()?.write(offset, data).await
+        match self.node.file() {
+            Some(file) => self.write_file(file, offset, data).await,
+            None => self.inner.write(offset, data).await,
+        }
     }
 
     async fn flush(&self) -> SmbResult<()> {
@@ -338,19 +341,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn writes_and_truncates_of_a_file_are_not_supported() {
+    async fn a_truncate_of_a_file_is_not_supported() {
         let files = MemFsBackend::new();
         let layer = clear_over(files.clone()).await;
         files.clone().with_file("f", b"abc");
         let handle = open_file(&layer, "f").await;
-        assert!(matches!(
-            handle.write(0, b"x").await,
-            Err(SmbError::NotSupported)
-        ));
-        assert!(matches!(
-            handle.write_owned(0, b"x".to_vec()).await,
-            Err(SmbError::NotSupported)
-        ));
         assert!(matches!(
             handle.truncate(0).await,
             Err(SmbError::NotSupported)
