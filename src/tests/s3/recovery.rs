@@ -12,12 +12,13 @@ use super::fixture::{TestBucket, foreground, pattern, put};
 use super::gateway::REGION;
 use super::proxy::{Fault, Reply};
 use super::share::{
-    Listed, Logs, READ, Rig, Smb, Spec, WRITE_ATTRIBUTES, filetime, names, wait_for_requests,
-    wait_until, wait_until_async, writable_builder,
+    Listed, READ, Rig, Smb, Spec, WRITE_ATTRIBUTES, filetime, names, wait_for_requests, wait_until,
+    wait_until_async, writable_builder,
 };
 use super::writes::{changes, create_dir, create_file, open_rw, records};
 use crate::ntstatus::STATUS_OBJECT_NAME_NOT_FOUND;
 use crate::s3::record::{Record, RecordId, TombstoneRecord};
+use crate::tests::logs::Logs;
 use crate::{OpenIntent, OpenOptions, S3Backend, S3Error, ShareBackend, SmbPath};
 
 /// What a directory listing and the files in it say, for comparing.
@@ -336,7 +337,7 @@ async fn records_and_data_that_cannot_be_used_move_to_conflicts_and_the_rest_com
 async fn a_move_to_conflicts_is_logged_at_error_level() {
     let temp = tempfile::tempdir().unwrap();
     let junk = "2".repeat(32);
-    let logs = Logs::capture();
+    let logs = Logs::new();
     let dir = crate::s3::cachedir::CacheDir::open(temp.path(), "identity").unwrap();
     fs::write(temp.path().join("records").join(&junk), b"junk").unwrap();
     dir.recover("", false).unwrap();

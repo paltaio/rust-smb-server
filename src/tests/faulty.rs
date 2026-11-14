@@ -23,10 +23,11 @@ use crate::stream::{StreamInfo, StreamName};
 /// call it hits fails without reaching the inner backend; a torn write
 /// applies its first bytes there first, and a failed close closes the handle
 /// all the same. `write` and `write_owned` count as
-/// writes. `open_stream` is neither counted nor faulted. Short reads and
-/// short writes stay in force until changed. The counters count every call
+/// writes. `open_stream` is neither counted nor faulted. Short reads, short
+/// writes and a reported file size stay in force until changed. The counters count every call
 /// that reaches this backend, a clone of it or one of their handles,
-/// faulted or not. Clones share the faults and the counters.
+/// faulted or not. Reads are logged as asked for, before a short-read limit
+/// cuts them. Clones share the faults, the counters and the log.
 ///
 /// Handles it returns have no `as_any`.
 #[derive(Clone)]
@@ -42,6 +43,7 @@ struct State {
     renames: usize,
     writes: usize,
     truncates: usize,
+    reads: Vec<(u64, u32)>,
     open_fault: Option<OpenFault>,
     unlink_fault: Option<Fault>,
     rename_fault: Option<Fault>,
@@ -51,6 +53,7 @@ struct State {
     close_fault: Option<Fault>,
     max_read: Option<u32>,
     max_write: Option<usize>,
+    size: Option<u64>,
 }
 
 struct Fault {
@@ -215,6 +218,12 @@ impl<B: ShareBackend> Faulty<B> {
         self.state.lock().unwrap().max_write = max;
     }
 
+    /// Makes `stat` of a file handle report `size` as its size, or lifts the
+    /// override. Reads and writes are unaffected.
+    pub(crate) fn report_size(&self, size: Option<u64>) {
+        self.state.lock().unwrap().size = size;
+    }
+
     /// Opens seen so far.
     pub(crate) fn opens(&self) -> usize {
         self.state.lock().unwrap().opens
@@ -238,6 +247,11 @@ impl<B: ShareBackend> Faulty<B> {
     /// Truncates seen so far.
     pub(crate) fn truncates(&self) -> usize {
         self.state.lock().unwrap().truncates
+    }
+
+    /// The offset and length of each read seen so far, as asked for.
+    pub(crate) fn reads(&self) -> Vec<(u64, u32)> {
+        self.state.lock().unwrap().reads.clone()
     }
 
     fn wrap(&self, handle: Box<dyn Handle>) -> Box<dyn Handle> {
@@ -355,7 +369,11 @@ struct FaultyHandle {
 #[async_trait]
 impl Handle for FaultyHandle {
     async fn read(&self, offset: u64, len: u32) -> SmbResult<Bytes> {
-        let max = self.state.lock().unwrap().max_read;
+        let max = {
+            let mut state = self.state.lock().unwrap();
+            state.reads.push((offset, len));
+            state.max_read
+        };
         match max {
             Some(0) if len > 0 => Ok(Bytes::new()),
             Some(max) if max < len => self.inner.read(offset, max).await,
@@ -406,7 +424,14 @@ impl Handle for FaultyHandle {
     }
 
     async fn stat(&self) -> SmbResult<FileInfo> {
-        self.inner.stat().await
+        let mut info = self.inner.stat().await?;
+        if let Some(size) = self.state.lock().unwrap().size
+            && !info.is_directory
+        {
+            info.end_of_file = size;
+            info.allocation_size = size;
+        }
+        Ok(info)
     }
 
     async fn set_times(&self, times: FileTimes) -> SmbResult<()> {
@@ -709,6 +734,33 @@ mod tests {
         assert!(handle.read(0, 100).await.unwrap().is_empty());
         faulty.short_reads(None);
         assert_eq!(handle.read(0, 100).await.unwrap(), data);
+    }
+
+    #[tokio::test]
+    async fn logs_each_read_as_asked_for() {
+        let data: Vec<u8> = (0..100).collect();
+        let (_, faulty, handle) = faulty_file(&data).await;
+        assert!(faulty.reads().is_empty());
+        faulty.short_reads(Some(30));
+        handle.read(0, 100).await.unwrap();
+        handle.read(90, 5).await.unwrap();
+        faulty.short_reads(None);
+        handle.read(10, 20).await.unwrap();
+        assert_eq!(faulty.reads(), [(0, 100), (90, 5), (10, 20)]);
+    }
+
+    #[tokio::test]
+    async fn reports_the_size_it_is_given_for_files_and_reads_and_writes_are_unaffected() {
+        let (files, faulty, handle) = faulty_file(b"abc").await;
+        assert_eq!(handle.stat().await.unwrap().end_of_file, 3);
+        faulty.report_size(Some(1 << 40));
+        let info = handle.stat().await.unwrap();
+        assert_eq!((info.end_of_file, info.allocation_size), (1 << 40, 1 << 40));
+        assert_eq!(handle.read(0, 10).await.unwrap(), b"abc"[..]);
+        handle.write(3, b"d").await.unwrap();
+        assert_eq!(files.contents("f"), Some(b"abcd".to_vec()));
+        faulty.report_size(None);
+        assert_eq!(handle.stat().await.unwrap().end_of_file, 4);
     }
 
     #[tokio::test]

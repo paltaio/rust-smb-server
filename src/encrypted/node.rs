@@ -9,6 +9,8 @@ use std::sync::{Arc, Mutex, Weak};
 
 use tokio::sync::RwLock;
 
+use super::block::FileCipher;
+use super::header::Header;
 use super::locks::lock;
 use crate::path::{SmbPath, rebase, same_path};
 
@@ -52,12 +54,33 @@ pub(super) fn path_key(path: &SmbPath, names: NameMatch) -> String {
 }
 
 /// What the layer knows of the header of a stored file.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum HeaderState {
     /// The file may have a header that is not read yet.
     Unknown,
     /// The file has no header: it is new or truncated to zero.
     Absent,
+    /// The header read from the file, and the cipher of its key.
+    Present(Header, Box<FileCipher>),
+}
+
+/// Which state a header is in.
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum HeaderKind {
+    Unknown,
+    Absent,
+    Present,
+}
+
+#[cfg(test)]
+impl HeaderState {
+    pub(super) fn kind(&self) -> HeaderKind {
+        match self {
+            Self::Unknown => HeaderKind::Unknown,
+            Self::Absent => HeaderKind::Absent,
+            Self::Present(..) => HeaderKind::Present,
+        }
+    }
 }
 
 /// The state of a file behind its lock.
@@ -280,8 +303,8 @@ impl Node {
 
     /// The header state of a file; `None` for a directory.
     #[cfg(test)]
-    pub(super) async fn header(&self) -> Option<HeaderState> {
-        Some(self.file()?.read().await.header)
+    pub(super) async fn header(&self) -> Option<HeaderKind> {
+        Some(self.file()?.read().await.header.kind())
     }
 }
 
@@ -358,12 +381,12 @@ mod tests {
         let table = NodeTable::new();
         let at = path("f");
         let opened = table.attach(&found(&at, 0));
-        assert_eq!(opened.header().await, Some(HeaderState::Unknown));
+        assert_eq!(opened.header().await, Some(HeaderKind::Unknown));
         let created = table.attach(&Found {
             origin: Origin::Created,
             ..found(&at, 0)
         });
-        assert_eq!(created.header().await, Some(HeaderState::Absent));
+        assert_eq!(created.header().await, Some(HeaderKind::Absent));
         let dir = table.attach(&Found {
             directory: true,
             ..found(&path("d"), 0)

@@ -5,6 +5,7 @@ mod base32;
 mod block;
 mod builder;
 mod clear;
+mod content;
 mod error;
 mod format;
 mod handle;

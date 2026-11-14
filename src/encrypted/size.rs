@@ -63,6 +63,45 @@ pub(crate) fn logical_size(shift: BlockShift, stored: u64) -> LogicalSize {
     LogicalSize { size, kind }
 }
 
+/// Where a run of blocks sits in the stored file and how many bytes it holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BlockRange {
+    /// Offset of the first block in the stored file.
+    pub(crate) offset: u64,
+    /// Stored bytes of the run, overhead included.
+    pub(crate) stored_len: u64,
+    /// Plaintext bytes of the run.
+    pub(crate) plain_len: u64,
+}
+
+/// The blocks `first..=last` of a file of `logical` bytes. `None` when
+/// `first` is after `last`, when `last` starts at or past the end of the
+/// file, or when an offset does not fit in 64 bits.
+pub(crate) fn block_range(
+    shift: BlockShift,
+    logical: u64,
+    first: u64,
+    last: u64,
+) -> Option<BlockRange> {
+    let block = shift.block_size();
+    let last_start = last.checked_mul(block)?;
+    if first > last || last_start >= logical {
+        return None;
+    }
+    let count = last - first + 1;
+    let tail = (logical - last_start).min(block);
+    let plain_len = (count - 1) * block + tail;
+    let stored_len = plain_len.checked_add(count.checked_mul(BLOCK_OVERHEAD)?)?;
+    let offset = first
+        .checked_mul(shift.stored_block_size())?
+        .checked_add(HEADER)?;
+    Some(BlockRange {
+        offset,
+        stored_len,
+        plain_len,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,6 +237,76 @@ mod tests {
                     assert_eq!(info.size, logical);
                     assert_eq!(info.kind, StoredKind::Normal);
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn a_run_of_blocks_sits_at_its_stored_offsets() {
+        let s = shift(16);
+        let logical = 3 * 65536 + 100;
+        let range = |offset, stored_len, plain_len| {
+            Some(BlockRange {
+                offset,
+                stored_len,
+                plain_len,
+            })
+        };
+        assert_eq!(block_range(s, logical, 0, 0), range(24, 65564, 65536));
+        assert_eq!(
+            block_range(s, logical, 1, 2),
+            range(24 + 65564, 2 * 65564, 2 * 65536)
+        );
+        assert_eq!(
+            block_range(s, logical, 3, 3),
+            range(24 + 3 * 65564, 128, 100)
+        );
+        assert_eq!(
+            block_range(s, logical, 2, 3),
+            range(24 + 2 * 65564, 65564 + 128, 65536 + 100)
+        );
+        let whole = block_range(s, logical, 0, 3).unwrap();
+        assert_eq!(whole.offset, 24);
+        assert_eq!(
+            Some(whole.offset + whole.stored_len),
+            stored_size(s, logical)
+        );
+        assert_eq!(whole.plain_len, logical);
+    }
+
+    #[test]
+    fn blocks_the_file_does_not_hold_have_no_range() {
+        let s = shift(16);
+        assert_eq!(block_range(s, 65536, 1, 1), None, "starts at the end");
+        assert_eq!(block_range(s, 65537, 1, 0), None, "first after last");
+        assert_eq!(block_range(s, 0, 0, 0), None, "empty file");
+        assert_eq!(block_range(s, u64::MAX, u64::MAX, u64::MAX), None);
+        assert_eq!(block_range(s, u64::MAX, 0, u64::MAX >> 16), None);
+        assert!(block_range(s, 65537, 1, 1).is_some());
+    }
+
+    #[test]
+    fn a_range_of_any_stored_size_ends_inside_the_stored_file() {
+        let ends_inside = |s: BlockShift, stored: u64| {
+            let logical = logical_size(s, stored).size;
+            if logical == 0 {
+                return;
+            }
+            let last = (logical - 1) >> s.get();
+            for first in [0, last / 2, last] {
+                let range = block_range(s, logical, first, last).unwrap();
+                let end = u128::from(range.offset) + u128::from(range.stored_len);
+                assert!(end <= u128::from(stored), "shift {s:?}, stored {stored}");
+                assert!(range.plain_len <= logical);
+            }
+        };
+        for bits in SHIFTS {
+            let s = shift(bits);
+            for stored in 0..=3 * s.stored_block_size() + 24 {
+                ends_inside(s, stored);
+            }
+            for stored in samples(bits) {
+                ends_inside(s, stored);
             }
         }
     }

@@ -3,7 +3,7 @@
 
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -421,47 +421,6 @@ pub(super) struct Listed {
 impl Listed {
     pub(super) fn is_dir(&self) -> bool {
         self.attributes & FILE_ATTRIBUTE_DIRECTORY != 0
-    }
-}
-
-/// Collects the tracing events of the thread that made it, while it lives.
-/// A test on a runtime of one thread sees the events of its tasks.
-pub(super) struct Logs {
-    text: Arc<Mutex<Vec<u8>>>,
-    _guard: tracing::subscriber::DefaultGuard,
-}
-
-impl Logs {
-    pub(super) fn capture() -> Logs {
-        #[derive(Clone)]
-        struct Sink(Arc<Mutex<Vec<u8>>>);
-        impl std::io::Write for Sink {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .write(buf)
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let text = Arc::new(Mutex::new(Vec::new()));
-        let sink = Sink(Arc::clone(&text));
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(move || sink.clone())
-            .with_ansi(false)
-            .finish();
-        Logs {
-            text,
-            _guard: tracing::subscriber::set_default(subscriber),
-        }
-    }
-
-    /// Everything written so far.
-    pub(super) fn text(&self) -> String {
-        let text = self.text.lock().unwrap_or_else(PoisonError::into_inner);
-        String::from_utf8_lossy(&text).into_owned()
     }
 }
 

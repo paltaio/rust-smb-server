@@ -51,6 +51,11 @@ pub(super) fn file_id() -> [u8; 16] {
     std::array::from_fn(|i| 0xa0 + i as u8)
 }
 
+/// File id 0xb0..=0xbf.
+pub(super) fn other_file_id() -> [u8; 16] {
+    std::array::from_fn(|i| 0xb0 + i as u8)
+}
+
 /// A xorshift64 generator; `seed` must not be zero.
 pub(super) fn xorshift(seed: u64) -> impl FnMut() -> u64 {
     let mut state = seed;
@@ -80,8 +85,18 @@ pub(super) async fn build(
 
 /// Builds a backend over `inner` that stores names as clients spell them.
 pub(super) async fn clear_over<B: ShareBackend>(inner: B) -> EncryptedBackend<B> {
+    clear_blocks(inner, BlockShift::DEFAULT).await
+}
+
+/// Builds a backend over `inner` that stores names as clients spell them,
+/// with blocks of `1 << shift` bytes.
+pub(super) async fn clear_blocks<B: ShareBackend>(
+    inner: B,
+    shift: BlockShift,
+) -> EncryptedBackend<B> {
     EncryptedBackend::builder(inner, key())
         .encrypt_names(false)
+        .block_size(u32::try_from(shift.block_size()).expect("a block size fits in 32 bits"))
         .build()
         .await
         .expect("a backend with names in the clear")
@@ -137,16 +152,31 @@ pub(super) async fn settle() {
     }
 }
 
-/// The stored bytes of a file whose first and only block holds `plain`: its
-/// header for `shift` and the file id of `file_id`, then the sealed block.
+/// The stored bytes of a file that holds `plain`: its header for `shift` and
+/// the file id of `file_id`, then the sealed blocks. Block `i` has a nonce of
+/// 12 bytes, each equal to `i % 255 + 1`.
 pub(super) fn stored_file(keys: &KeySchedule, shift: BlockShift, plain: &[u8]) -> Vec<u8> {
-    let header = Header::new(shift, file_id()).unwrap();
+    stored_file_with_id(keys, shift, file_id(), plain)
+}
+
+/// `stored_file` for the file id `id`.
+pub(super) fn stored_file_with_id(
+    keys: &KeySchedule,
+    shift: BlockShift,
+    id: [u8; 16],
+    plain: &[u8],
+) -> Vec<u8> {
+    let header = Header::new(shift, id).unwrap();
+    let cipher = FileCipher::new(keys, header);
     let mut stored = header.as_bytes().to_vec();
-    let mut block = vec![0u8; plain.len() + OVERHEAD];
-    FileCipher::new(keys, header)
-        .seal_block(0, &[1; NONCE_LEN], plain, &mut block)
-        .unwrap();
-    stored.extend_from_slice(&block);
+    for (index, block) in plain.chunks(shift.block_len()).enumerate() {
+        let nonce = [u8::try_from(index % 255 + 1).unwrap(); NONCE_LEN];
+        let at = stored.len();
+        stored.resize(at + block.len() + OVERHEAD, 0);
+        cipher
+            .seal_block(index as u64, &nonce, block, &mut stored[at..])
+            .unwrap();
+    }
     stored
 }
 

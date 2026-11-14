@@ -3,8 +3,13 @@
 
 use std::io;
 
+use super::format::BlockShift;
 use crate::backend::Handle;
 use crate::error::{SmbError, SmbResult};
+
+/// Most bytes one inner read of stored blocks asks for, before it is cut
+/// down to whole blocks.
+const MAX_CALL: u64 = 4 << 20;
 
 /// Closes a handle that was only read from. A close that fails changes
 /// nothing there, so its error is dropped.
@@ -12,15 +17,21 @@ pub(super) async fn close_after_reading(handle: Box<dyn Handle>) {
     let _ = handle.close().await;
 }
 
-/// Reads exactly `len` bytes at `offset`, asking again for what a short read
-/// left. A read that returns nothing before `len` bytes are in fails with
-/// `Io`.
-pub(super) async fn read_full(handle: &dyn Handle, offset: u64, len: usize) -> SmbResult<Vec<u8>> {
-    let mut out = Vec::with_capacity(len);
-    while out.len() < len {
-        let missing = len - out.len();
+/// Appends `len` bytes read at `offset` to `out`, asking again for what a
+/// short read left. A read that returns nothing before all `len` bytes are
+/// in fails with `Io`.
+async fn read_append(
+    handle: &dyn Handle,
+    offset: u64,
+    out: &mut Vec<u8>,
+    len: usize,
+) -> SmbResult<()> {
+    let start = out.len();
+    while out.len() - start < len {
+        let done = out.len() - start;
+        let missing = len - done;
         let at = offset
-            .checked_add(out.len() as u64)
+            .checked_add(done as u64)
             .ok_or(SmbError::InvalidParameter)?;
         let got = handle
             .read(at, u32::try_from(missing).unwrap_or(u32::MAX))
@@ -29,6 +40,45 @@ pub(super) async fn read_full(handle: &dyn Handle, offset: u64, len: usize) -> S
             return Err(SmbError::Io(io::ErrorKind::UnexpectedEof.into()));
         }
         out.extend_from_slice(&got[..got.len().min(missing)]);
+    }
+    Ok(())
+}
+
+/// Reads exactly `len` bytes at `offset`, asking again for what a short read
+/// left. A read that returns nothing before all `len` bytes are in fails with
+/// `Io`.
+pub(super) async fn read_full(handle: &dyn Handle, offset: u64, len: usize) -> SmbResult<Vec<u8>> {
+    let mut out = Vec::with_capacity(len);
+    read_append(handle, offset, &mut out, len).await?;
+    Ok(out)
+}
+
+/// The most stored bytes of one inner call: 4 MiB cut down to whole stored
+/// blocks, and at least one block.
+fn call_len(shift: BlockShift) -> usize {
+    let block = shift.stored_block_size();
+    let len = (MAX_CALL / block * block).max(block);
+    usize::try_from(len).expect("a call of a few MiB fits in memory")
+}
+
+/// Reads `len` stored bytes at `offset`, where a block starts, and the run
+/// ends where a block ends. Each inner call asks for whole blocks, at most
+/// `call_len`, and so ends on a block boundary. Short reads are continued as
+/// in `read_full`.
+pub(super) async fn read_blocks(
+    handle: &dyn Handle,
+    shift: BlockShift,
+    offset: u64,
+    len: usize,
+) -> SmbResult<Vec<u8>> {
+    let call = call_len(shift);
+    let mut out = Vec::with_capacity(len);
+    while out.len() < len {
+        let at = offset
+            .checked_add(out.len() as u64)
+            .ok_or(SmbError::InvalidParameter)?;
+        let chunk = (len - out.len()).min(call);
+        read_append(handle, at, &mut out, chunk).await?;
     }
     Ok(out)
 }
@@ -85,6 +135,73 @@ mod tests {
         let handle = file(&files, "f").await;
         let Err(SmbError::Io(error)) = read_full(&*handle, 2, 5).await else {
             panic!("a short file is not read in full");
+        };
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn a_call_holds_whole_blocks_and_at_most_4_mib() {
+        for (bits, blocks) in [(13, 510), (16, 63), (20, 3)] {
+            let shift = BlockShift::new(bits).unwrap();
+            let block = usize::try_from(shift.stored_block_size()).unwrap();
+            assert_eq!(call_len(shift), blocks * block, "shift {bits}");
+            assert!(call_len(shift) <= 4 << 20);
+            assert!(call_len(shift) + block > 4 << 20);
+        }
+    }
+
+    #[tokio::test]
+    async fn blocks_are_read_in_calls_that_end_on_block_boundaries() {
+        let shift = BlockShift::new(13).unwrap();
+        let data: Vec<u8> = (0..9_000_024u32).map(|i| (i % 251) as u8).collect();
+        let files = MemFsBackend::new().with_file("f", &data);
+        let faulty = Faulty::new(files);
+        let (handle, _) = faulty
+            .open(&path("f"), opts(OpenIntent::Open))
+            .await
+            .unwrap();
+
+        let got = read_blocks(&*handle, shift, 24, 9_000_000).await.unwrap();
+        assert_eq!(got, data[24..]);
+        assert_eq!(
+            faulty.reads(),
+            [
+                (24, 4_192_200),
+                (24 + 4_192_200, 4_192_200),
+                (24 + 8_384_400, 615_600)
+            ]
+        );
+        assert!(
+            read_blocks(&*handle, shift, 24, 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(faulty.reads().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn short_reads_of_blocks_continue_inside_their_call() {
+        let shift = BlockShift::new(13).unwrap();
+        let data: Vec<u8> = (0..20_000u32).map(|i| (i % 251) as u8).collect();
+        let files = MemFsBackend::new().with_file("f", &data);
+        let faulty = Faulty::new(files);
+        faulty.short_reads(Some(7_000));
+        let (handle, _) = faulty
+            .open(&path("f"), opts(OpenIntent::Open))
+            .await
+            .unwrap();
+
+        let got = read_blocks(&*handle, shift, 24, 19_976).await.unwrap();
+        assert_eq!(got, data[24..]);
+        assert_eq!(
+            faulty.reads(),
+            [(24, 19_976), (7_024, 12_976), (14_024, 5_976)]
+        );
+
+        faulty.short_reads(Some(0));
+        let Err(SmbError::Io(error)) = read_blocks(&*handle, shift, 24, 100).await else {
+            panic!("a read that returns nothing fails");
         };
         assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
     }

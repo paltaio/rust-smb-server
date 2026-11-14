@@ -65,7 +65,6 @@ pub struct EncryptedBackend<B> {
 /// What the clones of a backend share.
 pub(super) struct Shared<B> {
     pub(super) inner: B,
-    #[cfg_attr(not(test), expect(dead_code, reason = "only tests call it"))]
     pub(super) keys: KeySchedule,
     pub(super) settings: Settings,
     /// The files and directories that handles have open.

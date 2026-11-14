@@ -236,6 +236,7 @@ impl<B: ShareBackend> EncryptedBackend<B> {
 mod tests {
     use tokio::task::JoinHandle;
 
+    use super::super::node::HeaderKind;
     use super::super::testing::{
         clear_over, clear_settings, exact_names, key_schedule, marker_bytes, open, open_dir,
         open_file, settle,
@@ -304,7 +305,7 @@ mod tests {
         files.clone().with_file("f", b"abc");
         let (reader, _) = open(layer, "f", OpenIntent::Open).await;
         let node = Arc::clone(reader.node());
-        assert_eq!(node.header().await, Some(HeaderState::Unknown));
+        assert_eq!(node.header().await, Some(HeaderKind::Unknown));
 
         let in_flight = node.file().expect("a file node").read().await;
         let truncating = spawn_open(layer, "f", OpenIntent::Truncate);
@@ -317,7 +318,7 @@ mod tests {
         assert_eq!(action, OpenAction::Overwritten);
         assert_eq!(files.contents("f"), Some(Vec::new()));
         assert!(shares_node(&reader, &truncated));
-        assert_eq!(node.header().await, Some(HeaderState::Absent));
+        assert_eq!(node.header().await, Some(HeaderKind::Absent));
         assert!(!node.is_detached());
     }
 
@@ -335,8 +336,8 @@ mod tests {
         assert_eq!(action, OpenAction::Created);
         assert!(!shares_node(&old, &new));
         assert!(!new.node().is_detached());
-        assert_eq!(old.node().header().await, Some(HeaderState::Unknown));
-        assert_eq!(new.node().header().await, Some(HeaderState::Absent));
+        assert_eq!(old.node().header().await, Some(HeaderKind::Unknown));
+        assert_eq!(new.node().header().await, Some(HeaderKind::Absent));
         assert_eq!(layer.node_count(), 1);
     }
 
@@ -441,10 +442,10 @@ mod tests {
         files.clone().with_file("old", b"abc");
         let (made, action) = open(layer, "new", OpenIntent::OpenOrCreate).await;
         assert_eq!(action, OpenAction::Created);
-        assert_eq!(made.node().header().await, Some(HeaderState::Absent));
+        assert_eq!(made.node().header().await, Some(HeaderKind::Absent));
         let (found, action) = open(layer, "old", OpenIntent::OpenOrCreate).await;
         assert_eq!(action, OpenAction::Opened);
-        assert_eq!(found.node().header().await, Some(HeaderState::Unknown));
+        assert_eq!(found.node().header().await, Some(HeaderKind::Unknown));
         let (again, action) = open(layer, "new", OpenIntent::OpenOrCreate).await;
         assert_eq!(action, OpenAction::Opened);
         assert!(shares_node(&made, &again));
@@ -462,7 +463,7 @@ mod tests {
             let (handle, action) = open(layer, name, intent).await;
             assert_eq!(action, OpenAction::Overwritten, "{intent:?}");
             assert_eq!(files.contents(name), Some(Vec::new()));
-            assert_eq!(handle.node().header().await, Some(HeaderState::Absent));
+            assert_eq!(handle.node().header().await, Some(HeaderKind::Absent));
         }
         assert_eq!(files.open_handles(), 2, "the check open is closed");
     }
@@ -474,7 +475,7 @@ mod tests {
         let (made, action) = open(layer, "n", OpenIntent::OverwriteOrCreate).await;
         assert_eq!(action, OpenAction::Created);
         assert_eq!(files.contents("n"), Some(Vec::new()));
-        assert_eq!(made.node().header().await, Some(HeaderState::Absent));
+        assert_eq!(made.node().header().await, Some(HeaderKind::Absent));
 
         assert!(matches!(
             layer
@@ -534,8 +535,8 @@ mod tests {
                 );
             }
         }
-        assert_eq!(opened.node().header().await, Some(HeaderState::Unknown));
-        assert_eq!(made.node().header().await, Some(HeaderState::Absent));
+        assert_eq!(opened.node().header().await, Some(HeaderKind::Unknown));
+        assert_eq!(made.node().header().await, Some(HeaderKind::Absent));
         assert_eq!(files.contents("f"), Some(b"abc".to_vec()));
         assert_eq!(files.open_handles(), 2, "the check open is closed");
         assert!(opened.node().file().unwrap().try_write().is_ok());
@@ -596,7 +597,7 @@ mod tests {
         assert_eq!(action, OpenAction::Created);
         assert!(!shares_node(&old, &new));
         assert!(old.node().is_detached());
-        assert_eq!(new.node().header().await, Some(HeaderState::Absent));
+        assert_eq!(new.node().header().await, Some(HeaderKind::Absent));
         assert_eq!(layer.node_count(), 1);
         drop(old);
         assert_eq!(layer.node_count(), 1);
@@ -616,7 +617,7 @@ mod tests {
         let (handle, action) = opening.await.unwrap().unwrap();
         assert_eq!(action, OpenAction::Overwritten);
         assert_eq!(files.contents("f"), Some(Vec::new()));
-        assert_eq!(handle.node().header().await, Some(HeaderState::Absent));
+        assert_eq!(handle.node().header().await, Some(HeaderKind::Absent));
     }
 
     #[tokio::test]
@@ -830,12 +831,12 @@ mod tests {
             ("Memo.txt", "memo.TXT", OpenIntent::OverwriteOrCreate),
         ] {
             let (held, _) = open(&layer, first, OpenIntent::Open).await;
-            assert_eq!(held.node().header().await, Some(HeaderState::Unknown));
+            assert_eq!(held.node().header().await, Some(HeaderKind::Unknown));
 
             let (overwriting, action) = open(&layer, second, intent).await;
             assert_eq!(action, OpenAction::Overwritten, "{second} {intent:?}");
             assert!(shares_node(&held, &overwriting), "{second} {intent:?}");
-            assert_eq!(held.node().header().await, Some(HeaderState::Absent));
+            assert_eq!(held.node().header().await, Some(HeaderKind::Absent));
             assert_eq!(files.contents(&first.to_lowercase()), Some(Vec::new()));
             assert_eq!(layer.node_count(), 1);
         }
@@ -863,7 +864,7 @@ mod tests {
         assert!(!shares_node(&second, &third));
         assert!(!shares_node(&first, &third));
         assert!(!third.node().is_detached());
-        assert_eq!(third.node().header().await, Some(HeaderState::Absent));
+        assert_eq!(third.node().header().await, Some(HeaderKind::Absent));
         assert_eq!(layer.node_count(), 1);
 
         let (found, _) = open(&layer, "REPORT.docx", OpenIntent::Open).await;
@@ -985,7 +986,7 @@ mod tests {
         let (opened, action) = opening.await.unwrap().unwrap();
         assert_eq!(action, OpenAction::Opened);
         assert!(shares_node(&created, &opened));
-        assert_eq!(created.node().header().await, Some(HeaderState::Absent));
+        assert_eq!(created.node().header().await, Some(HeaderKind::Absent));
         assert_eq!(layer.node_count(), 1);
     }
 
@@ -1125,7 +1126,7 @@ mod tests {
         let (opened, action) = opening.await.unwrap().unwrap();
         assert_eq!(action, OpenAction::Opened);
         assert!(shares_node(&created, &opened));
-        assert_eq!(created.node().header().await, Some(HeaderState::Absent));
+        assert_eq!(created.node().header().await, Some(HeaderKind::Absent));
         assert_eq!(layer.node_count(), 1);
         assert!(directory.is_free());
     }
@@ -1213,8 +1214,8 @@ mod tests {
         assert_eq!(action, OpenAction::Created);
         assert!(old.node().is_detached());
         assert!(!shares_node(&old, &new));
-        assert_eq!(old.node().header().await, Some(HeaderState::Unknown));
-        assert_eq!(new.node().header().await, Some(HeaderState::Absent));
+        assert_eq!(old.node().header().await, Some(HeaderKind::Unknown));
+        assert_eq!(new.node().header().await, Some(HeaderKind::Absent));
         assert_eq!(layer.node_count(), 1);
     }
 

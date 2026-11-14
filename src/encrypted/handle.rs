@@ -17,9 +17,9 @@ use crate::error::{SmbError, SmbResult};
 
 /// A handle of the backend: an inner handle and the node of its file.
 pub(super) struct EncryptedHandle<B> {
-    inner: Box<dyn Handle>,
-    node: Arc<Node>,
-    shared: Arc<Shared<B>>,
+    pub(super) inner: Box<dyn Handle>,
+    pub(super) node: Arc<Node>,
+    pub(super) shared: Arc<Shared<B>>,
 }
 
 impl<B: ShareBackend> EncryptedHandle<B> {
@@ -41,8 +41,8 @@ impl<B: ShareBackend> EncryptedHandle<B> {
         self.node.path().is_root()
     }
 
-    /// The inner handle of a directory; data calls on a file are not
-    /// supported.
+    /// The inner handle of a directory; writes and truncates of a file are
+    /// not supported.
     fn directory(&self) -> SmbResult<&dyn Handle> {
         if self.node.is_directory() {
             Ok(&*self.inner)
@@ -79,7 +79,10 @@ impl<B: ShareBackend> EncryptedHandle<B> {
 #[async_trait]
 impl<B: ShareBackend> Handle for EncryptedHandle<B> {
     async fn read(&self, offset: u64, len: u32) -> SmbResult<Bytes> {
-        self.directory()?.read(offset, len).await
+        match self.node.file() {
+            Some(file) => self.read_file(file, offset, len).await,
+            None => self.inner.read(offset, len).await,
+        }
     }
 
     async fn write(&self, offset: u64, data: &[u8]) -> SmbResult<u32> {
@@ -335,15 +338,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reads_writes_and_truncates_of_a_file_are_not_supported() {
+    async fn writes_and_truncates_of_a_file_are_not_supported() {
         let files = MemFsBackend::new();
         let layer = clear_over(files.clone()).await;
         files.clone().with_file("f", b"abc");
         let handle = open_file(&layer, "f").await;
-        assert!(matches!(
-            handle.read(0, 3).await,
-            Err(SmbError::NotSupported)
-        ));
         assert!(matches!(
             handle.write(0, b"x").await,
             Err(SmbError::NotSupported)

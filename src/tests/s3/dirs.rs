@@ -15,7 +15,7 @@ use super::moves::{
 };
 use super::proxy::{Fault, Reply, Seen};
 use super::share::{
-    DELETE, Logs, READ, Rig, Spec, filetime, listing_reply, names, put_all, put_with, run_bounded,
+    DELETE, READ, Rig, Spec, filetime, listing_reply, names, put_all, put_with, run_bounded,
     wait_for_requests, wait_until, wait_until_async,
 };
 use super::uploads::{fill, held, is_create_of, is_head_of, is_put_of, left, sync, uploading};
@@ -29,6 +29,7 @@ use crate::s3::client::ListRequest;
 use crate::s3::encode::uri_encode;
 use crate::s3::object::Metadata;
 use crate::s3::record::{Record, RecordId};
+use crate::tests::logs::Logs;
 use crate::{OpenOptions, S3Error, ShareBackend, SmbError, SmbPath};
 
 /// Every key in the bucket, in order.
@@ -2551,7 +2552,7 @@ async fn a_panic_while_the_records_of_a_moved_directory_are_written_fails_them_a
 
 #[tokio::test]
 async fn a_panic_while_the_times_of_a_moved_object_are_read_is_logged_at_error_level() {
-    let logs = Logs::capture();
+    let logs = Logs::new();
     let rig = Rig::writable_with(held).await;
     put(rig.store(), "d/a.txt", b"a").await;
     rig.backend.panic_read_base();

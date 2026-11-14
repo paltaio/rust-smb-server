@@ -453,6 +453,8 @@ mod tests {
     pub(crate) mod filesystems;
     pub(crate) mod folding;
     pub(crate) mod gated;
+    #[cfg(any(feature = "s3", feature = "encryption"))]
+    pub(crate) mod logs;
     pub(crate) mod memfs;
     mod notify;
     pub(crate) mod peer;
