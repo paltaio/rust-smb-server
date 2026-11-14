@@ -10,7 +10,7 @@ use tracing::debug;
 use crate::backend::DirEntry;
 use crate::error::{SmbError, SmbResult};
 use crate::path::is_valid_component;
-use crate::wildcard::Pattern;
+use crate::wildcard::{Pattern, has_wildcard, without_match_all};
 
 use super::backend::Shared;
 use super::cache::Known;
@@ -20,11 +20,6 @@ use super::merge::{Direct, Picked, Source, merge};
 use super::meta;
 use super::object::ObjectHead;
 use super::retry::{Retry, deadline_after};
-
-/// Whether `pattern` has a character that matches more than itself.
-fn has_wildcard(pattern: &str) -> bool {
-    pattern.contains(['*', '?', '<', '>', '"'])
-}
 
 /// An entry whose times a HEAD request may supply.
 struct Fetch {
@@ -43,7 +38,7 @@ pub(super) async fn list_entries(
 ) -> SmbResult<Vec<DirEntry>> {
     let deadline = deadline_after(shared.request_timeout);
     let retry = Retry::Foreground { deadline };
-    let pattern = pattern.filter(|p| !matches!(*p, "" | "*" | "*.*"));
+    let pattern = without_match_all(pattern);
     if let Some(name) = pattern.filter(|p| !has_wildcard(p)) {
         return single(shared, dir, name, &retry).await;
     }
@@ -238,20 +233,5 @@ impl Shared {
             self.cache().put_known(key, known, Instant::now());
         }
         head
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn only_wildcard_characters_make_a_pattern_a_search() {
-        for pattern in ["*", "a*", "?x", "<.txt", "a>", "\"x", "a.b?"] {
-            assert!(has_wildcard(pattern), "{pattern}");
-        }
-        for pattern in ["a.txt", "name with spaces", "\u{e9}", "a-b_c", "..", "."] {
-            assert!(!has_wildcard(pattern), "{pattern}");
-        }
     }
 }

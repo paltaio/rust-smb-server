@@ -29,9 +29,9 @@ use crate::stream::{StreamInfo, StreamName};
 /// which writes are dropped and the length from which truncates are dropped
 /// stay in force until changed.
 /// The counters count every call that reaches this backend, a clone of it or
-/// one of their handles, faulted or not. Opens, reads, writes and truncates
-/// are logged as asked for, before a short-read or short-write limit cuts
-/// them.
+/// one of their handles, faulted or not. Opens, listings, reads, writes and
+/// truncates are logged as asked for, before a short-read or short-write
+/// limit cuts them.
 /// Clones share the faults, the counters and the logs.
 ///
 /// Handles it returns have no `as_any`.
@@ -49,6 +49,7 @@ struct State {
     writes: usize,
     truncates: usize,
     open_log: Vec<(String, OpenIntent)>,
+    list_log: Vec<(Option<String>, bool)>,
     reads: Vec<(u64, u32)>,
     write_log: Vec<(u64, usize)>,
     truncate_log: Vec<u64>,
@@ -111,6 +112,12 @@ impl State {
             return None;
         }
         self.open_fault.take().map(|slot| slot.fault.error)
+    }
+
+    /// The error the next listing fails with, if any.
+    fn next_listing(&mut self, pattern: Option<&str>, ea_size: bool) -> Option<SmbError> {
+        self.list_log.push((pattern.map(str::to_string), ea_size));
+        due(&mut self.list_fault).map(|fault| fault.error)
     }
 
     /// The error the next unlink fails with, if any.
@@ -297,6 +304,12 @@ impl<B: ShareBackend> Faulty<B> {
     /// The path and intent of each open seen so far.
     pub(crate) fn open_calls(&self) -> Vec<(String, OpenIntent)> {
         self.state.lock().unwrap().open_log.clone()
+    }
+
+    /// The pattern and the EA flag of each listing seen so far, as asked
+    /// for. `list_dir` counts as a listing without the flag.
+    pub(crate) fn list_calls(&self) -> Vec<(Option<String>, bool)> {
+        self.state.lock().unwrap().list_log.clone()
     }
 
     /// The offset and length of each read seen so far, as asked for.
@@ -524,9 +537,9 @@ impl Handle for FaultyHandle {
     }
 
     async fn list_dir(&self, pattern: Option<&str>) -> SmbResult<Vec<DirEntry>> {
-        let fault = due(&mut self.state.lock().unwrap().list_fault);
+        let fault = self.state.lock().unwrap().next_listing(pattern, false);
         match fault {
-            Some(fault) => Err(fault.error),
+            Some(error) => Err(error),
             None => self.inner.list_dir(pattern).await,
         }
     }
@@ -536,9 +549,9 @@ impl Handle for FaultyHandle {
         pattern: Option<&str>,
         ea_size: bool,
     ) -> SmbResult<Vec<DirEntry>> {
-        let fault = due(&mut self.state.lock().unwrap().list_fault);
+        let fault = self.state.lock().unwrap().next_listing(pattern, ea_size);
         match fault {
-            Some(fault) => Err(fault.error),
+            Some(error) => Err(error),
             None => self.inner.list_dir_sized(pattern, ea_size).await,
         }
     }
@@ -806,6 +819,29 @@ mod tests {
         faulty.fail_listing(1, io_error());
         assert!(matches!(dir.list_dir(None).await, Err(SmbError::Io(_))));
         assert_eq!(dir.list_dir(None).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn logs_each_listing_as_asked_for() {
+        let files = MemFsBackend::new().with_dir("d").with_file("d\\a", b"");
+        let faulty = Faulty::new(files);
+        let (dir, _) = faulty
+            .open(&path("d"), dir_opts(OpenIntent::Open))
+            .await
+            .unwrap();
+        assert!(faulty.list_calls().is_empty());
+        dir.list_dir(Some("a*")).await.unwrap();
+        dir.list_dir_sized(None, true).await.unwrap();
+        faulty.fail_listing(1, io_error());
+        assert!(dir.list_dir_sized(Some("b"), false).await.is_err());
+        assert_eq!(
+            faulty.list_calls(),
+            [
+                (Some("a*".to_string()), false),
+                (None, true),
+                (Some("b".to_string()), false)
+            ]
+        );
     }
 
     #[tokio::test]

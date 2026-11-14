@@ -14,7 +14,7 @@ use crate::backend::{
     DirChange, DirChangeKind, DirEntry, DirWatch, FileInfo, FileTimes, Handle, OpenAction,
     ShareBackend,
 };
-use crate::error::{SmbError, SmbResult};
+use crate::error::SmbResult;
 use crate::path::SmbPath;
 
 /// What an open of the backend gives.
@@ -54,14 +54,14 @@ impl<B: ShareBackend> EncryptedHandle<B> {
     }
 
     /// The handle is on the share root.
-    fn on_root(&self) -> bool {
+    pub(super) fn on_root(&self) -> bool {
         self.node.path().is_root()
     }
 
     /// Turns what the inner backend reports into what the share reports: the
     /// size of a file is its size before encryption, and there are no
     /// extended attributes.
-    fn report(&self, info: &mut FileInfo) {
+    pub(super) fn report(&self, info: &mut FileInfo) {
         info.ea_size = 0;
         if !info.is_directory {
             let size = logical_size(self.shared.settings.block_shift, info.end_of_file).size;
@@ -130,7 +130,7 @@ impl<B: ShareBackend> Handle for EncryptedHandle<B> {
 
     async fn list_dir(&self, pattern: Option<&str>) -> SmbResult<Vec<DirEntry>> {
         if self.shared.settings.encrypt_names {
-            return Err(SmbError::NotSupported);
+            return self.list_names(pattern).await;
         }
         Ok(self.list_entries(self.inner.list_dir_sized(pattern, false).await?))
     }
@@ -145,7 +145,7 @@ impl<B: ShareBackend> Handle for EncryptedHandle<B> {
 
     async fn dir_is_empty(&self) -> SmbResult<bool> {
         if self.shared.settings.encrypt_names {
-            return Err(SmbError::NotSupported);
+            return self.names_dir_is_empty().await;
         }
         if self.inner.dir_is_empty().await? {
             return Ok(true);
@@ -163,7 +163,7 @@ impl<B: ShareBackend> Handle for EncryptedHandle<B> {
 
     async fn watch(&self) -> SmbResult<Option<Box<dyn DirWatch>>> {
         if self.shared.settings.encrypt_names {
-            return Err(SmbError::NotSupported);
+            return self.names_watch().await;
         }
         let Some(inner) = self.inner.watch().await? else {
             return Ok(None);
@@ -188,8 +188,8 @@ impl RootWatch {
     /// `change` as the share sees it: `None` when it only concerns the
     /// marker, and a rename from or to the marker as the other name
     /// appearing or going away.
-    fn visible(&self, change: DirChange) -> Option<DirChange> {
-        let is_marker = |name: &str| is_marker_name(name, self.names);
+    fn visible(names: NameMatch, change: DirChange) -> Option<DirChange> {
+        let is_marker = |name: &str| is_marker_name(name, names);
         let DirChangeKind::Renamed { from } = &change.kind else {
             return (!is_marker(&change.name)).then_some(change);
         };
@@ -213,22 +213,33 @@ impl RootWatch {
 #[async_trait]
 impl DirWatch for RootWatch {
     async fn next(&mut self) -> Option<Vec<DirChange>> {
-        loop {
-            let batch = self.inner.next().await?;
-            let visible: Vec<_> = batch
+        let names = self.names;
+        next_mapped(&mut *self.inner, |batch| {
+            batch
                 .into_iter()
-                .filter_map(|change| self.visible(change))
-                .collect();
-            if !visible.is_empty() {
-                return Some(visible);
-            }
+                .filter_map(|change| Self::visible(names, change))
+                .collect()
+        })
+        .await
+    }
+}
+
+/// The next batch of `inner` that `map` leaves with a change in it. `map` does
+/// not wait, so a call dropped before `inner` answers loses nothing.
+pub(super) async fn next_mapped(
+    inner: &mut dyn DirWatch,
+    map: impl Fn(Vec<DirChange>) -> Vec<DirChange>,
+) -> Option<Vec<DirChange>> {
+    loop {
+        let mapped = map(inner.next().await?);
+        if !mapped.is_empty() {
+            return Some(mapped);
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
     use std::io;
 
     use tokio::sync::Notify;
@@ -237,12 +248,13 @@ mod tests {
     use super::super::format::{BlockShift, MARKER_NAME};
     use super::super::node::{Found, Origin};
     use super::super::testing::{
-        clear_over, clear_settings, exact_names, key_schedule, open_dir, open_file, settle,
-        stored_file, stored_hole,
+        Hiding, Parked, Script, change, clear_over, clear_settings, exact_names, key_schedule,
+        names, open_dir, open_file, renamed, settle, stored_file, stored_hole, summary,
     };
     use super::*;
     use crate::backend::{OpenAction, OpenOptions};
     use crate::ea::Ea;
+    use crate::error::SmbError;
     use crate::path::SmbPath;
     use crate::tests::faulty::Faulty;
     use crate::tests::file_ids::FileIds;
@@ -255,12 +267,6 @@ mod tests {
     /// The stored bytes of a file that holds `plain`.
     fn stored(plain: &[u8]) -> Vec<u8> {
         stored_file(&key_schedule(), SHIFT, plain)
-    }
-
-    fn names(entries: Vec<DirEntry>) -> Vec<String> {
-        let mut names: Vec<_> = entries.into_iter().map(|entry| entry.info.name).collect();
-        names.sort();
-        names
     }
 
     #[tokio::test]
@@ -377,24 +383,6 @@ mod tests {
         ));
     }
 
-    /// Name, end of file, allocation size and EA size of each entry, by name.
-    fn summary(entries: &[DirEntry]) -> Vec<(String, u64, u64, u32)> {
-        let mut summary: Vec<_> = entries
-            .iter()
-            .map(|entry| {
-                let info = &entry.info;
-                (
-                    info.name.clone(),
-                    info.end_of_file,
-                    info.allocation_size,
-                    info.ea_size,
-                )
-            })
-            .collect();
-        summary.sort();
-        summary
-    }
-
     #[tokio::test]
     async fn a_listing_maps_sizes_and_leaves_out_the_marker_in_the_root_only() {
         let files = MemFsBackend::new();
@@ -439,11 +427,11 @@ mod tests {
         let folded = clear_over(files.clone()).await;
         files.clone().with_file(".SMB-ENCRYPTION", b"");
         let listed = open_dir(&folded, "").await.list_dir(None).await.unwrap();
-        assert!(names(listed).is_empty());
+        assert!(names(&listed).is_empty());
 
         let exact = clear_over(exact_names(&files)).await;
         let listed = open_dir(&exact, "").await.list_dir(None).await.unwrap();
-        assert_eq!(names(listed), [".SMB-ENCRYPTION"]);
+        assert_eq!(names(&listed), [".SMB-ENCRYPTION"]);
     }
 
     #[tokio::test]
@@ -467,7 +455,7 @@ mod tests {
         assert_eq!(handle.link_count().await.unwrap(), 3);
         assert!(handle.dir_is_empty().await.unwrap());
         let listed = handle.list_dir(Some("*.TXT")).await.unwrap();
-        assert_eq!(names(listed), ["x"]);
+        assert_eq!(names(&listed), ["x"]);
         handle.list_dir_sized(Some("a*"), true).await.unwrap();
         let mut watch = handle.watch().await.unwrap().expect("the inner watch");
         assert_eq!(
@@ -530,53 +518,6 @@ mod tests {
         assert!(!root.dir_is_empty().await.unwrap());
     }
 
-    /// A directory handle that reports entries and lists none, as an inner
-    /// backend does when it hides some.
-    struct Hiding;
-
-    #[async_trait]
-    impl Handle for Hiding {
-        async fn read(&self, _offset: u64, _len: u32) -> SmbResult<Bytes> {
-            Err(SmbError::NotSupported)
-        }
-
-        async fn write(&self, _offset: u64, _data: &[u8]) -> SmbResult<u32> {
-            Err(SmbError::NotSupported)
-        }
-
-        async fn flush(&self) -> SmbResult<()> {
-            Ok(())
-        }
-
-        async fn stat(&self) -> SmbResult<FileInfo> {
-            Ok(FileInfo::new(""))
-        }
-
-        async fn set_times(&self, _times: FileTimes) -> SmbResult<()> {
-            Ok(())
-        }
-
-        async fn set_attributes(&self, _attributes: u32) -> SmbResult<()> {
-            Ok(())
-        }
-
-        async fn truncate(&self, _len: u64) -> SmbResult<()> {
-            Err(SmbError::NotSupported)
-        }
-
-        async fn list_dir(&self, _pattern: Option<&str>) -> SmbResult<Vec<DirEntry>> {
-            Ok(Vec::new())
-        }
-
-        async fn close(self: Box<Self>) -> SmbResult<()> {
-            Ok(())
-        }
-
-        async fn dir_is_empty(&self) -> SmbResult<bool> {
-            Ok(false)
-        }
-    }
-
     #[tokio::test]
     async fn a_root_with_entries_that_the_inner_listing_hides_is_not_empty() {
         let layer = clear_over(MemFsBackend::new()).await;
@@ -612,38 +553,11 @@ mod tests {
         assert_eq!((layer.node_count(), files.open_handles()), (0, 0));
     }
 
-    /// A watch that returns what it was given and then stops.
-    struct Script {
-        batches: VecDeque<Vec<DirChange>>,
-    }
-
-    #[async_trait]
-    impl DirWatch for Script {
-        async fn next(&mut self) -> Option<Vec<DirChange>> {
-            self.batches.pop_front()
-        }
-    }
-
     fn root_watch(batches: Vec<Vec<DirChange>>, names: NameMatch) -> RootWatch {
         RootWatch {
-            inner: Box::new(Script {
-                batches: batches.into(),
-            }),
+            inner: Box::new(Script::new(batches)),
             names,
         }
-    }
-
-    fn change(name: &str, kind: DirChangeKind) -> DirChange {
-        DirChange::new(name, kind, false)
-    }
-
-    fn renamed(from: &str, to: &str) -> DirChange {
-        change(
-            to,
-            DirChangeKind::Renamed {
-                from: from.to_string(),
-            },
-        )
     }
 
     #[tokio::test]
@@ -718,29 +632,12 @@ mod tests {
         assert_eq!(watch.next().await, Some(batch));
     }
 
-    /// A watch that has its batch only once the test opens its gate.
-    struct Parked {
-        gate: Arc<Notify>,
-        batch: Option<Vec<DirChange>>,
-    }
-
-    #[async_trait]
-    impl DirWatch for Parked {
-        async fn next(&mut self) -> Option<Vec<DirChange>> {
-            self.gate.notified().await;
-            self.batch.take()
-        }
-    }
-
     #[tokio::test]
     async fn a_dropped_wait_for_the_next_changes_loses_none() {
         let gate = Arc::new(Notify::new());
         let batch = vec![change("a", DirChangeKind::Added)];
         let mut watch = RootWatch {
-            inner: Box::new(Parked {
-                gate: Arc::clone(&gate),
-                batch: Some(batch.clone()),
-            }),
+            inner: Box::new(Parked::new(Arc::clone(&gate), batch.clone())),
             names: NameMatch::Folded,
         };
         tokio::select! {

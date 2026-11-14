@@ -1,6 +1,6 @@
 //! Fixtures shared by the unit tests.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Debug;
 use std::io;
 use std::mem;
@@ -8,6 +8,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use bytes::Bytes;
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use zeroize::Zeroizing;
@@ -23,16 +25,17 @@ use super::handle::{EncryptedHandle, OpenResult};
 use super::header::Header;
 use super::keys::KeySchedule;
 use super::marker::{MarkerSettings, parse_marker};
-use super::names::{StoredName, encode_name};
+use super::names::{StoredName, encode_name, encode_unchecked};
 use super::random::{random_file_id, random_nonces};
 use super::size::stored_size;
 use crate::backend::{
-    BackendCapabilities, Handle, OpenAction, OpenIntent, OpenOptions, ShareBackend, VolumeInfo,
+    BackendCapabilities, DirChange, DirChangeKind, DirEntry, DirWatch, FileInfo, FileTimes, Handle,
+    OpenAction, OpenIntent, OpenOptions, ShareBackend, VolumeInfo,
 };
 use crate::error::{SmbError, SmbResult};
 use crate::path::SmbPath;
 use crate::tests::faulty::Faulty;
-use crate::tests::gated::{Gate, Gated};
+use crate::tests::gated::{Gate, Gated, Op};
 use crate::tests::memfs::MemFsBackend;
 use crate::tests::util::{dir_opts, opts, path};
 
@@ -243,6 +246,42 @@ pub(super) fn seed_dir(files: &MemFsBackend, plain: &str) {
 /// the stored bytes `bytes`.
 pub(super) fn seed_file(files: &MemFsBackend, plain: &str, bytes: &[u8]) {
     seed(files, plain, Some(bytes));
+}
+
+/// A word in the plaintext of each name that `sealed_invalid_names` makes.
+/// Nothing a listing or a watch logs holds it.
+pub(super) const PRIVATE_WORD: &str = "secret";
+
+/// Stored names sealed under the key of the share whose plaintexts are not
+/// valid names.
+pub(super) fn sealed_invalid_names() -> Vec<String> {
+    ["slash/secret", "bell\u{7}secret"]
+        .map(|plain| encode_unchecked(&key_schedule(), plain))
+        .to_vec()
+}
+
+/// Puts into the root of `files` the stored names that no listing shows, besides
+/// the marker: the side object of a long name that has no entry, and names that
+/// are not the share's. Returns the names that are not the share's.
+pub(super) fn seed_hidden_names(files: &MemFsBackend) -> Vec<String> {
+    let orphan = "o".repeat(150);
+    seed_file(files, &orphan, b"");
+    files.remove(&stored_form(&orphan).entry);
+    let other_key = encode_name(&other_key_schedule(), "other", 255)
+        .expect("a valid name")
+        .entry;
+    let mut foreign = vec![
+        "junk".to_string(),
+        "UPPER-case.txt".to_string(),
+        "a".repeat(28),
+        format!("{}.n.n", "a".repeat(32)),
+        other_key,
+    ];
+    foreign.extend(sealed_invalid_names());
+    for name in &foreign {
+        files.clone().with_file(name, b"");
+    }
+    foreign
 }
 
 /// Opens `name` in `layer` in a task, with write access and `intent`.
@@ -686,6 +725,153 @@ impl<B: ShareBackend> ShareBackend for Reporting<B> {
             Some(volume) => Ok(volume.clone()),
             None => self.inner.volume_info().await,
         }
+    }
+}
+
+/// A directory handle that reports entries and lists none, as an inner
+/// backend does when it hides some.
+pub(super) struct Hiding;
+
+#[async_trait]
+impl Handle for Hiding {
+    async fn read(&self, _offset: u64, _len: u32) -> SmbResult<Bytes> {
+        Err(SmbError::NotSupported)
+    }
+
+    async fn write(&self, _offset: u64, _data: &[u8]) -> SmbResult<u32> {
+        Err(SmbError::NotSupported)
+    }
+
+    async fn flush(&self) -> SmbResult<()> {
+        Ok(())
+    }
+
+    async fn stat(&self) -> SmbResult<FileInfo> {
+        Ok(FileInfo::new(""))
+    }
+
+    async fn set_times(&self, _times: FileTimes) -> SmbResult<()> {
+        Ok(())
+    }
+
+    async fn set_attributes(&self, _attributes: u32) -> SmbResult<()> {
+        Ok(())
+    }
+
+    async fn truncate(&self, _len: u64) -> SmbResult<()> {
+        Err(SmbError::NotSupported)
+    }
+
+    async fn list_dir(&self, _pattern: Option<&str>) -> SmbResult<Vec<DirEntry>> {
+        Ok(Vec::new())
+    }
+
+    async fn close(self: Box<Self>) -> SmbResult<()> {
+        Ok(())
+    }
+
+    async fn dir_is_empty(&self) -> SmbResult<bool> {
+        Ok(false)
+    }
+}
+
+/// The names of `entries`, sorted.
+pub(super) fn names(entries: &[DirEntry]) -> Vec<String> {
+    let mut names: Vec<_> = entries
+        .iter()
+        .map(|entry| entry.info.name.clone())
+        .collect();
+    names.sort();
+    names
+}
+
+/// Name, end of file, allocation size and EA size of each entry, sorted.
+pub(super) fn summary(entries: &[DirEntry]) -> Vec<(String, u64, u64, u32)> {
+    let mut summary: Vec<_> = entries
+        .iter()
+        .map(|entry| {
+            let info = &entry.info;
+            (
+                info.name.clone(),
+                info.end_of_file,
+                info.allocation_size,
+                info.ea_size,
+            )
+        })
+        .collect();
+    summary.sort();
+    summary
+}
+
+/// A backend over a store that parks listings, as `parked` makes one.
+pub(super) type GatedLayer = EncryptedBackend<Gated<MemFsBackend>>;
+
+/// A store with `a.txt` in the root, a backend over it that parks the next
+/// listing of the root once the inner backend has answered, and the gate.
+pub(super) async fn parked() -> (MemFsBackend, GatedLayer, Gate) {
+    let files = MemFsBackend::new();
+    let gated = Gated::new(files.clone());
+    let layer = names_over(gated.clone()).await;
+    seed_file(&files, "a.txt", b"");
+    let gate = gated.arm_after_at(Op::ListDir, "");
+    (files, layer, gate)
+}
+
+/// A change of `kind` to the entry `name`, which is not a directory.
+pub(super) fn change(name: &str, kind: DirChangeKind) -> DirChange {
+    DirChange::new(name, kind, false)
+}
+
+/// The rename of `from` to `to`.
+pub(super) fn renamed(from: &str, to: &str) -> DirChange {
+    change(
+        to,
+        DirChangeKind::Renamed {
+            from: from.to_string(),
+        },
+    )
+}
+
+/// A watch that returns the batches it was given and then stops.
+pub(super) struct Script {
+    batches: VecDeque<Vec<DirChange>>,
+}
+
+impl Script {
+    pub(super) fn new(batches: Vec<Vec<DirChange>>) -> Self {
+        Self {
+            batches: batches.into(),
+        }
+    }
+}
+
+#[async_trait]
+impl DirWatch for Script {
+    async fn next(&mut self) -> Option<Vec<DirChange>> {
+        self.batches.pop_front()
+    }
+}
+
+/// A watch that has its batch only once the test opens its gate.
+pub(super) struct Parked {
+    gate: Arc<Notify>,
+    batch: Option<Vec<DirChange>>,
+}
+
+impl Parked {
+    pub(super) fn new(gate: Arc<Notify>, batch: Vec<DirChange>) -> Self {
+        Self {
+            gate,
+            batch: Some(batch),
+        }
+    }
+}
+
+#[async_trait]
+impl DirWatch for Parked {
+    async fn next(&mut self) -> Option<Vec<DirChange>> {
+        self.gate.notified().await;
+        self.batch.take()
     }
 }
 

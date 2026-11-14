@@ -347,7 +347,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn encrypted_names_open_and_create_entries_and_answer_not_supported_elsewhere() {
+    async fn encrypted_names_open_create_and_list_but_do_not_unlink_or_rename() {
         let files = MemFsBackend::new();
         let backend = built(&files).await;
         files.clone().with_file("f", b"abc");
@@ -394,19 +394,15 @@ mod tests {
             .unwrap();
         assert_eq!(action, OpenAction::Opened);
         assert!(root.stat().await.unwrap().is_directory);
-        assert!(matches!(
-            root.list_dir(None).await,
-            Err(SmbError::NotSupported)
-        ));
-        assert!(matches!(
-            root.list_dir_sized(None, true).await,
-            Err(SmbError::NotSupported)
-        ));
-        assert!(matches!(
-            root.dir_is_empty().await,
-            Err(SmbError::NotSupported)
-        ));
-        assert!(matches!(root.watch().await, Err(SmbError::NotSupported)));
+        for listed in [
+            root.list_dir(None).await.unwrap(),
+            root.list_dir_sized(None, true).await.unwrap(),
+        ] {
+            let names: Vec<_> = listed.iter().map(|entry| &entry.info.name).collect();
+            assert_eq!(names, ["new"]);
+        }
+        assert!(!root.dir_is_empty().await.unwrap());
+        assert!(root.watch().await.unwrap().is_none());
         assert!(root.as_any().is_none());
         root.close().await.unwrap();
         assert_eq!(files.open_handles(), 0);

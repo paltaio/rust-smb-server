@@ -162,6 +162,18 @@ impl Pattern {
     }
 }
 
+/// Whether `pattern` has a character that matches more than itself.
+#[cfg(any(feature = "s3", feature = "encryption"))]
+pub(crate) fn has_wildcard(pattern: &str) -> bool {
+    pattern.contains(['*', '?', '<', '>', '"'])
+}
+
+/// `pattern`, or `None` when it matches every name: `""`, `*` and `*.*`.
+#[cfg(any(feature = "s3", feature = "encryption"))]
+pub(crate) fn without_match_all(pattern: Option<&str>) -> Option<&str> {
+    pattern.filter(|p| !matches!(*p, "" | "*" | "*.*"))
+}
+
 fn set(bits: &mut [u64], i: usize) {
     bits[i / 64] |= 1 << (i % 64);
 }
@@ -192,6 +204,17 @@ mod tests {
 
     fn m(pattern: &str, name: &str) -> bool {
         Pattern::new(pattern, true).matches(name)
+    }
+
+    #[cfg(any(feature = "s3", feature = "encryption"))]
+    #[test]
+    fn only_wildcard_characters_make_a_pattern_a_search() {
+        for pattern in ["*", "a*", "?x", "<.txt", "a>", "\"x", "a.b?"] {
+            assert!(has_wildcard(pattern), "{pattern}");
+        }
+        for pattern in ["a.txt", "name with spaces", "\u{e9}", "a-b_c", "..", "."] {
+            assert!(!has_wildcard(pattern), "{pattern}");
+        }
     }
 
     #[test]

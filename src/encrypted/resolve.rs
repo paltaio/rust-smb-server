@@ -988,20 +988,4 @@ mod tests {
         let _ = layer.rename(&path("a"), &path("b"), false).await;
         assert_eq!(recorder.calls(), Vec::<String>::new());
     }
-
-    #[tokio::test]
-    async fn a_directory_below_the_root_answers_listings_and_watches_with_not_supported() {
-        let (files, layer) = layer().await;
-        seed_dir(&files, "Docs");
-        let dir = open_dir(&layer, "docs").await;
-        assert!(matches!(
-            dir.list_dir(None).await,
-            Err(SmbError::NotSupported)
-        ));
-        assert!(matches!(
-            dir.dir_is_empty().await,
-            Err(SmbError::NotSupported)
-        ));
-        assert!(matches!(dir.watch().await, Err(SmbError::NotSupported)));
-    }
 }

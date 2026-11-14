@@ -17,6 +17,7 @@ mod handle;
 mod header;
 mod inner;
 mod keys;
+mod list;
 mod locks;
 mod lru;
 mod marker;

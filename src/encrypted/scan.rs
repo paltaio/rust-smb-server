@@ -1,4 +1,4 @@
-//! Lists a stored directory and decodes the names in it, for the name cache.
+//! Lists a stored directory and decodes the names in it.
 
 use std::io;
 use std::sync::Arc;
@@ -7,17 +7,81 @@ use tokio::task::JoinSet;
 use tokio::time::Instant;
 use tracing::{debug, warn};
 
-use super::backend::EncryptedBackend;
+use super::backend::{EncryptedBackend, Shared};
 use super::cache::{Entry, Snapshot};
 use super::inner::{close_after_reading, is_missing, read_side_object};
+use super::locks::DirLock;
 use super::names::{StoredKind, classify, decode_long, decode_short, side_object_name};
 use super::node::{NameMatch, path_key};
-use crate::backend::{DirEntry, OpenOptions, ShareBackend};
+use crate::backend::{DirEntry, FileInfo, OpenOptions, ShareBackend};
 use crate::error::{SmbError, SmbResult};
 use crate::path::SmbPath;
 
 /// Side objects read at once.
 const SIDE_READS_IN_FLIGHT: usize = 8;
+
+/// A name of a listing, decoded, with what the inner backend listed for its
+/// entry.
+pub(super) struct Decoded {
+    pub(super) entry: Entry,
+    /// The info the inner listing gave; its `name` is the stored name.
+    pub(super) info: FileInfo,
+}
+
+impl Decoded {
+    fn new(plain: String, info: FileInfo) -> Self {
+        Self {
+            entry: Entry {
+                plain,
+                stored: info.name.clone(),
+                directory: info.is_directory,
+            },
+            info,
+        }
+    }
+}
+
+/// The names of a listing, decoded.
+pub(super) struct Listing {
+    pub(super) names: Vec<Decoded>,
+    /// False when an entry is left out because its side object could not be
+    /// read.
+    pub(super) complete: bool,
+}
+
+/// What a stored name is, judged without reading anything.
+pub(super) enum Name {
+    /// An entry of the share, under this name.
+    Plain(String),
+    /// A long entry that the long-name cache does not hold. Its side object
+    /// says what it is called.
+    Long,
+    /// The marker, a side object, or a name that is not one of the share's.
+    Hidden,
+}
+
+impl<B> Shared<B> {
+    /// What the stored name `stored` is. `in_root` is true in the root of the
+    /// inner backend, the only place of the marker. A name that is not one of
+    /// the share's is logged, by its stored name only.
+    pub(super) fn read_name(&self, stored: &str, in_root: bool) -> Name {
+        let plain = match classify(stored, in_root) {
+            StoredKind::Marker | StoredKind::SideObject => return Name::Hidden,
+            StoredKind::LongEntry => {
+                return self.long_names.get(stored).map_or(Name::Long, Name::Plain);
+            }
+            StoredKind::ShortCandidate => decode_short(&self.keys, stored).ok(),
+            StoredKind::Foreign => None,
+        };
+        match plain {
+            Some(plain) => Name::Plain(plain),
+            None => {
+                debug!(stored = ?stored, "not an encrypted name");
+                Name::Hidden
+            }
+        }
+    }
+}
 
 /// What the caller of a build holds.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -31,10 +95,54 @@ pub(super) enum Hold {
     Nothing,
 }
 
+/// The time and the count of changes of a directory when a listing of it
+/// began.
+#[derive(Clone, Copy)]
+pub(super) struct Began {
+    built: Instant,
+    changes: u64,
+}
+
+impl Began {
+    /// Read before the listing, from the lock entry the listing holds.
+    pub(super) fn of(lock: &DirLock) -> Self {
+        Self {
+            built: Instant::now(),
+            changes: lock.changes(),
+        }
+    }
+}
+
+impl<B> Shared<B> {
+    /// The snapshot of `entries`, the names of the directory of `lock` as a
+    /// listing that `began` read them. The name cache keeps it, unless an
+    /// entry was left out for want of its side object (`complete` is false),
+    /// or `hold` is `Nothing` and a change was counted since the listing
+    /// began.
+    pub(super) fn keep_names(
+        &self,
+        lock: &DirLock,
+        began: Began,
+        hold: Hold,
+        complete: bool,
+        entries: impl Iterator<Item = Entry>,
+    ) -> Arc<Snapshot> {
+        let names = Arc::new(Snapshot::new(entries.collect(), began.built));
+        if complete {
+            let key = lock.key().to_string();
+            self.names.install_if(key, Arc::clone(&names), || {
+                hold == Hold::Lock || lock.changes() == began.changes
+            });
+        }
+        names
+    }
+}
+
 impl<B: ShareBackend> EncryptedBackend<B> {
     /// The names of the stored directory `dir`: the cached ones while they
-    /// are fresh, else a new listing, which the cache keeps as `hold` says.
-    /// `None` when the inner backend has no such directory.
+    /// are fresh, else a new listing, which the cache keeps as `hold` says
+    /// when every side object was read. `None` when the inner backend has no
+    /// such directory.
     pub(super) async fn names_of(
         &self,
         dir: &SmbPath,
@@ -46,17 +154,16 @@ impl<B: ShareBackend> EncryptedBackend<B> {
         }
         // The entry stays in the lock table while this call holds it, so its
         // count of changes does not start over during the listing.
-        let lock = self.shared.locks.directory(key.clone());
-        let changes = lock.changes();
-        let built = Instant::now();
+        let lock = self.shared.locks.directory(key);
+        let began = Began::of(&lock);
         let Some(listed) = self.list_stored(dir).await? else {
             return Ok(None);
         };
-        let entries = self.decode(dir, listed).await?;
-        let names = Arc::new(Snapshot::new(entries, built));
-        self.shared.names.install_if(key, Arc::clone(&names), || {
-            hold == Hold::Lock || lock.changes() == changes
-        });
+        let listing = self.decode(dir, listed).await?;
+        let entries = listing.names.into_iter().map(|decoded| decoded.entry);
+        let names = self
+            .shared
+            .keep_names(&lock, began, hold, listing.complete, entries);
         Ok(Some(names))
     }
 
@@ -89,89 +196,72 @@ impl<B: ShareBackend> EncryptedBackend<B> {
         }
     }
 
-    /// The names in a listing of the stored directory `dir`. The marker, side
-    /// objects and names that do not decode are left out.
-    async fn decode(&self, dir: &SmbPath, listed: Vec<DirEntry>) -> SmbResult<Vec<Entry>> {
+    /// The names in a listing of the stored directory `dir`, each with the
+    /// info its entry came with. The marker, side objects and names that do
+    /// not decode are left out. Long entries come after the others.
+    pub(super) async fn decode(&self, dir: &SmbPath, listed: Vec<DirEntry>) -> SmbResult<Listing> {
         let in_root = dir.is_root();
-        let mut entries = Vec::with_capacity(listed.len());
+        let mut names = Vec::with_capacity(listed.len());
         let mut long = Vec::new();
         for DirEntry { info } in listed {
-            let directory = info.is_directory;
-            let stored = info.name;
-            let plain = match classify(&stored, in_root) {
-                StoredKind::Marker | StoredKind::SideObject => continue,
-                StoredKind::ShortCandidate => decode_short(&self.shared.keys, &stored).ok(),
-                StoredKind::Foreign => None,
-                StoredKind::LongEntry => {
-                    let Some(plain) = self.shared.long_names.get(&stored) else {
-                        long.push((stored, directory));
-                        continue;
-                    };
-                    Some(plain)
-                }
-            };
-            match plain {
-                Some(plain) => entries.push(Entry {
-                    plain,
-                    stored,
-                    directory,
-                }),
-                None => debug!(stored = ?stored, "not an encrypted name"),
+            match self.shared.read_name(&info.name, in_root) {
+                Name::Plain(plain) => names.push(Decoded::new(plain, info)),
+                Name::Long => long.push(info),
+                Name::Hidden => {}
             }
         }
-        self.decode_long_entries(dir, long, &mut entries).await?;
-        Ok(entries)
+        let complete = self.decode_long_entries(dir, long, &mut names).await?;
+        Ok(Listing { names, complete })
     }
 
     /// Reads the side objects of the long entries `pending` of the stored
     /// directory `dir`, a few at a time, and adds the entries that decode to
-    /// `entries`. An entry whose side object is missing, invalid or cannot be
-    /// read is left out.
+    /// `decoded`. An entry whose side object is missing or invalid is left
+    /// out. So is one whose side object cannot be read, and then the result
+    /// is false.
     async fn decode_long_entries(
         &self,
         dir: &SmbPath,
-        mut pending: Vec<(String, bool)>,
-        entries: &mut Vec<Entry>,
-    ) -> SmbResult<()> {
+        mut pending: Vec<FileInfo>,
+        decoded: &mut Vec<Decoded>,
+    ) -> SmbResult<bool> {
+        let mut complete = true;
         let mut reads = JoinSet::new();
         loop {
             while reads.len() < SIDE_READS_IN_FLIGHT
-                && let Some((stored, directory)) = pending.pop()
+                && let Some(info) = pending.pop()
             {
-                let name = side_object_name(&stored).expect("a long entry has a side object name");
+                let name =
+                    side_object_name(&info.name).expect("a long entry has a side object name");
                 let Ok(side) = dir.join(&name) else {
-                    warn!(dir = %dir, stored = ?stored, "long entry has no valid side object");
+                    warn!(dir = %dir, stored = ?info.name, "long entry has no valid side object");
                     continue;
                 };
                 let shared = Arc::clone(&self.shared);
                 reads.spawn(async move {
                     let content = read_side_object(&shared.inner, &side).await;
-                    (stored, directory, content)
+                    (info, content)
                 });
             }
             let Some(joined) = reads.join_next().await else {
-                return Ok(());
+                return Ok(complete);
             };
-            let (stored, directory, content) =
-                joined.map_err(|error| SmbError::Io(io::Error::other(error)))?;
+            let (info, content) = joined.map_err(|error| SmbError::Io(io::Error::other(error)))?;
             let plain = match content {
                 Ok(content) => content
-                    .and_then(|content| decode_long(&self.shared.keys, &stored, &content).ok()),
+                    .and_then(|content| decode_long(&self.shared.keys, &info.name, &content).ok()),
                 Err(error) => {
-                    warn!(dir = %dir, stored = ?stored, error = ?error, "side object of a long entry cannot be read");
+                    warn!(dir = %dir, stored = ?info.name, error = ?error, "side object of a long entry cannot be read");
+                    complete = false;
                     continue;
                 }
             };
             let Some(plain) = plain else {
-                warn!(dir = %dir, stored = ?stored, "long entry has no valid side object");
+                warn!(dir = %dir, stored = ?info.name, "long entry has no valid side object");
                 continue;
             };
-            self.shared.long_names.insert(stored.clone(), &plain);
-            entries.push(Entry {
-                plain,
-                stored,
-                directory,
-            });
+            self.shared.long_names.insert(info.name.clone(), &plain);
+            decoded.push(Decoded::new(plain, info));
         }
     }
 }
@@ -184,39 +274,25 @@ mod tests {
     use async_trait::async_trait;
 
     use super::super::format::MARKER_NAME;
-    use super::super::names::encode_name;
     use super::super::testing::{
-        names_over, names_with, open_file, other_key_schedule, seed_dir, seed_file, spawn_open,
-        stored_at, stored_form, stored_name,
+        GatedLayer, names_over, names_with, open_file, parked, seed_dir, seed_file,
+        seed_hidden_names, spawn_open, stored_at, stored_form, stored_name,
     };
     use super::*;
     use crate::backend::{BackendCapabilities, Handle, OpenAction, OpenIntent};
     use crate::tests::faulty::Faulty;
-    use crate::tests::gated::{Gate, Gated, Op};
+    use crate::tests::gated::{Gated, Op};
     use crate::tests::logs::Logs;
     use crate::tests::memfs::MemFsBackend;
-
-    type Layer = EncryptedBackend<Gated<MemFsBackend>>;
 
     fn root() -> SmbPath {
         SmbPath::root()
     }
 
-    /// A store with `a.txt` in the root, and a backend over it that parks the
-    /// listing of the root once the inner backend has answered.
-    async fn parked() -> (MemFsBackend, Layer, Gate) {
-        let files = MemFsBackend::new();
-        let gated = Gated::new(files.clone());
-        let layer = names_over(gated.clone()).await;
-        seed_file(&files, "a.txt", b"");
-        let gate = gated.arm_after_at(Op::ListDir, "");
-        (files, layer, gate)
-    }
-
     /// The names of the root, built in a task. The task parks after the
     /// listing, until the gate is released.
     fn build(
-        layer: &Layer,
+        layer: &GatedLayer,
         hold: Hold,
     ) -> tokio::task::JoinHandle<SmbResult<Option<Arc<Snapshot>>>> {
         let layer = layer.clone();
@@ -367,31 +443,16 @@ mod tests {
         let files = MemFsBackend::new();
         let layer = names_over(files.clone()).await;
         let long = "l".repeat(150);
-        let orphan = "o".repeat(150);
         seed_dir(&files, "Docs");
         seed_file(&files, "a.txt", b"");
         seed_file(&files, &long, b"");
-        seed_file(&files, &orphan, b"");
-        files.remove(&stored_form(&orphan).entry);
-        let other_key = encode_name(&other_key_schedule(), "other", 255)
-            .unwrap()
-            .entry;
-        for foreign in [
-            "junk",
-            "UPPER-case.txt",
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.n.n",
-            &other_key,
-        ] {
-            files.clone().with_file(foreign, b"");
-        }
+        seed_hidden_names(&files);
         assert!(files.contents(MARKER_NAME).is_some());
 
         let names = layer.names_of(&root(), Hold::Lock).await.unwrap().unwrap();
         assert_eq!(names.len(), 3);
         assert!(names.directory("docs", &stored_name("docs")).is_some());
         assert!(lists(&names, "a.txt") && lists(&names, &long));
-        assert!(!lists(&names, &orphan));
         assert!(logs.warnings().is_empty(), "{:?}", logs.warnings());
     }
 
@@ -503,7 +564,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_side_object_that_cannot_be_read_leaves_out_its_entry_only() {
+    async fn a_side_object_that_cannot_be_read_leaves_out_its_entry_and_the_names_are_not_kept() {
         let logs = Logs::new();
         let files = MemFsBackend::new();
         let faulty = Faulty::new(files.clone());
@@ -526,11 +587,14 @@ mod tests {
         let warnings = logs.warnings();
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains(&stored_form(&broken).entry));
-        assert!(
-            layer.shared.names.fresh("").is_some(),
-            "the listing is kept"
-        );
+        assert!(layer.shared.names.fresh("").is_none());
         assert_eq!(files.open_handles(), 0);
+
+        let names = layer.names_of(&root(), Hold::Lock).await.unwrap().unwrap();
+        assert_eq!(names.len(), 3);
+        assert!(lists(&names, &broken));
+        let kept = layer.shared.names.fresh("").expect("the listing is kept");
+        assert!(Arc::ptr_eq(&kept, &names));
     }
 
     #[tokio::test]

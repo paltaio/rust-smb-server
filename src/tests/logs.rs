@@ -11,7 +11,13 @@ pub(crate) struct Logs {
 }
 
 impl Logs {
+    /// Collects the events at info level and above.
     pub(crate) fn new() -> Self {
+        Self::at(tracing::Level::INFO)
+    }
+
+    /// Collects the events at `level` and above.
+    pub(crate) fn at(level: tracing::Level) -> Self {
         // With one dispatcher registered, tracing decides whether a callsite
         // is enabled by asking the dispatcher of the thread that reaches it
         // first. A test thread without a subscriber then disables the
@@ -42,6 +48,7 @@ impl Logs {
         let text = Arc::new(Mutex::new(Vec::new()));
         let sink = Sink(Arc::clone(&text));
         let subscriber = tracing_subscriber::fmt()
+            .with_max_level(level)
             .with_writer(move || sink.clone())
             .with_ansi(false)
             .finish();
@@ -60,9 +67,21 @@ impl Logs {
     /// The lines at warn level so far.
     #[cfg(feature = "encryption")]
     pub(crate) fn warnings(&self) -> Vec<String> {
+        self.lines_of_level("WARN")
+    }
+
+    /// The lines at debug level so far.
+    #[cfg(feature = "encryption")]
+    pub(crate) fn debugs(&self) -> Vec<String> {
+        self.lines_of_level("DEBUG")
+    }
+
+    #[cfg(feature = "encryption")]
+    fn lines_of_level(&self, level: &str) -> Vec<String> {
+        let marker = format!(" {level} ");
         self.text()
             .lines()
-            .filter(|line| line.contains(" WARN "))
+            .filter(|line| line.contains(&marker))
             .map(str::to_string)
             .collect()
     }

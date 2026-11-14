@@ -161,6 +161,13 @@ pub(crate) fn encode_name(keys: &KeySchedule, name: &str, threshold: u8) -> Opti
     })
 }
 
+/// The short stored form of `plaintext` as `encode_name` makes it, without the
+/// check that the plaintext is a valid path component.
+#[cfg(test)]
+pub(super) fn encode_unchecked(keys: &KeySchedule, plaintext: &str) -> String {
+    base32::encode(&seal_siv(keys.name_key(), NAME_AD, plaintext.as_bytes()))
+}
+
 /// The name in an AES-SIV output: 17 to 781 bytes, a SIV that authenticates,
 /// and a plaintext that is UTF-8 and a valid path component. The plaintext is
 /// used only after the SIV authenticated.
