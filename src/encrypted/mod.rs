@@ -7,6 +7,8 @@ mod builder;
 mod change;
 mod clear;
 mod content;
+#[cfg(test)]
+mod disk_full;
 mod error;
 mod format;
 mod handle;

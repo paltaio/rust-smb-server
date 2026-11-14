@@ -821,53 +821,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_disk_full_while_padding_the_last_block_cuts_back_only_above_the_old_end() {
-        let plain = pattern(B + 100, 1);
-        let bytes = stored(&plain);
-        let old_end = at(1) + 100 + OVERHEAD;
-        let len = B + 300;
-        let pad_end = at(1) + 300 + OVERHEAD;
-        let expected = [
-            (old_end as u64, pad_end - old_end),
-            (at(1) as u64, old_end - at(1)),
-        ];
-
-        // The part from the old end on fails, after a few of its bytes: the
-        // stored file is cut back to its old size.
-        let (files, faulty, layer) = faulty_file(&bytes).await;
-        let handle = open_file(&layer, "f").await;
-        faulty.tear_write(1, 20, SmbError::DiskFull);
-        assert_err(handle.truncate(len as u64).await, SmbError::DiskFull);
-        assert_eq!(writes_since(&faulty, 1), expected[..1]);
-        assert_eq!(faulty.truncate_calls(), [old_end as u64]);
-        assert_eq!(files.contents("f").unwrap(), bytes);
-        assert_eq!(read_all(&handle).await, plain);
-        handle.truncate(len as u64).await.unwrap();
-        assert_eq!(read_all(&handle).await, resized(&plain, len));
-
-        // The part below the old end fails, with none of it applied or after
-        // a prefix: nothing is cut, and the block it was to rewrite is torn.
-        for applied in [0, 30] {
-            let (files, faulty, layer) = faulty_file(&bytes).await;
-            let handle = open_file(&layer, "f").await;
-            faulty.tear_write(2, applied, SmbError::DiskFull);
-            assert_err(handle.truncate(len as u64).await, SmbError::DiskFull);
-            assert_eq!(writes_since(&faulty, 1), expected, "applied {applied}");
-            assert_eq!(faulty.truncates(), 0, "applied {applied}");
-            let after = files.contents("f").unwrap();
-            assert_eq!(after.len(), pad_end, "applied {applied}");
-            assert_eq!(after[..at(1)], bytes[..at(1)], "applied {applied}");
-            assert_eq!(
-                after[at(1)..at(1) + applied] == bytes[at(1)..at(1) + applied],
-                applied == 0,
-                "applied {applied}: the prefix is in the stored file"
-            );
-            assert_eq!(handle.read(0, B as u32).await.unwrap(), plain[..B]);
-            assert_io(handle.read(B as u64, 1).await, io::ErrorKind::InvalidData);
-        }
-    }
-
-    #[tokio::test]
     async fn a_failed_extension_after_the_padded_block_is_whole_keeps_the_padded_block() {
         let plain = pattern(B + 100, 1);
         let bytes = stored(&plain);
