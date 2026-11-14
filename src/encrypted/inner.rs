@@ -5,7 +5,7 @@ use std::io;
 
 use super::format::{BlockShift, HEADER_LEN};
 use super::names::MAX_SIDE_OBJECT_LEN;
-use crate::backend::{Handle, OpenOptions, ShareBackend};
+use crate::backend::{Handle, OpenAction, OpenIntent, OpenOptions, ShareBackend};
 use crate::error::{SmbError, SmbResult};
 use crate::path::SmbPath;
 
@@ -56,6 +56,54 @@ async fn side_object_content(handle: &dyn Handle) -> SmbResult<Option<Vec<u8>>> 
     }
     let len = usize::try_from(info.end_of_file).expect("a side object is at most 1024 bytes");
     read_full(handle, 0, len).await.map(Some)
+}
+
+/// Makes the side object at `path` hold `content`. A new object gets the
+/// content. An object that is there already is read and left alone when it
+/// holds the same bytes, and rewritten otherwise.
+pub(super) async fn write_side_object<B: ShareBackend>(
+    inner: &B,
+    path: &SmbPath,
+    content: &[u8],
+) -> SmbResult<()> {
+    let opts = OpenOptions {
+        write: true,
+        non_directory: true,
+        intent: OpenIntent::OpenOrCreate,
+        ..OpenOptions::default()
+    };
+    let (handle, action) = inner.open(path, opts).await?;
+    match fill_side_object(handle.as_ref(), action, content).await {
+        Ok(true) => handle.close().await,
+        Ok(false) => {
+            close_after_reading(handle).await;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = handle.close().await;
+            Err(error)
+        }
+    }
+}
+
+/// Writes `content` to the side object on `handle`. `action` says whether the
+/// object is new. Returns false, writing nothing, when the object already
+/// held `content`.
+async fn fill_side_object(
+    handle: &dyn Handle,
+    action: OpenAction,
+    content: &[u8],
+) -> SmbResult<bool> {
+    if action != OpenAction::Created {
+        let held = handle.stat().await?.end_of_file == content.len() as u64
+            && read_full(handle, 0, content.len()).await? == content;
+        if held {
+            return Ok(false);
+        }
+        handle.truncate(0).await?;
+    }
+    write_full(handle, 0, content).await?;
+    Ok(true)
 }
 
 /// Appends `len` bytes read at `offset` to `out`, asking again for what a

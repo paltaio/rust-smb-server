@@ -35,13 +35,18 @@ impl<V: Clone> Lru<V> {
 
     /// The value at `key`, which becomes the most recently used entry.
     pub(super) fn get(&mut self, key: &str) -> Option<V> {
+        self.touch(key).map(|slot| slot.value.clone())
+    }
+
+    /// The slot at `key`, which becomes the most recently used entry.
+    fn touch(&mut self, key: &str) -> Option<&mut Slot<V>> {
         let slot = self.slots.get_mut(key)?;
         self.clock += 1;
         if let Some(key) = self.order.remove(&slot.used) {
             self.order.insert(self.clock, key);
         }
         slot.used = self.clock;
-        Some(slot.value.clone())
+        Some(slot)
     }
 
     /// Stores `value` at `key` as the most recently used entry, replacing
@@ -59,6 +64,27 @@ impl<V: Clone> Lru<V> {
                 used: self.clock,
             },
         );
+        self.evict();
+    }
+
+    /// Changes the value at `key` in place. `change` returns the entry's new
+    /// weight. The entry becomes the most recently used one, and older entries
+    /// go as for an insert. Returns false when `key` holds nothing.
+    pub(super) fn modify(&mut self, key: &str, change: impl FnOnce(&mut V) -> usize) -> bool {
+        let Some(slot) = self.touch(key) else {
+            return false;
+        };
+        let weight = change(&mut slot.value);
+        let before = slot.weight;
+        slot.weight = weight;
+        self.weight = self.weight - before + weight;
+        self.evict();
+        true
+    }
+
+    /// Drops the least recently used entries until the total fits, or one
+    /// entry is left.
+    fn evict(&mut self) {
         while self.weight > self.limit && self.order.len() > 1 {
             let (_, oldest) = self.order.pop_first().expect("more than one key is held");
             let slot = self.slots.remove(&oldest).expect("every key has a slot");
@@ -134,6 +160,39 @@ mod tests {
         cache.insert("c".to_string(), 4, 1);
         assert_eq!(cache.keys(), ["c"], "the next entry pushes it out");
         assert_eq!(cache.weight(), 1);
+    }
+
+    #[test]
+    fn a_change_in_place_updates_the_value_the_weight_and_the_recency() {
+        let mut cache = lru(10);
+        cache.insert("a".to_string(), 1, 4);
+        cache.insert("b".to_string(), 2, 4);
+        assert!(cache.modify("a", |value| {
+            *value = 7;
+            5
+        }));
+        assert_eq!(cache.get("a"), Some(7));
+        assert_eq!((cache.len(), cache.weight()), (2, 9));
+        assert_eq!(cache.keys(), ["b", "a"], "a change is a use");
+        assert!(!cache.modify("missing", |_| 1));
+        assert_eq!(cache.weight(), 9);
+    }
+
+    #[test]
+    fn a_change_that_overflows_the_limit_drops_older_entries_and_never_the_changed_one() {
+        let mut cache = lru(10);
+        cache.insert("a".to_string(), 1, 4);
+        cache.insert("b".to_string(), 2, 4);
+        cache.insert("c".to_string(), 3, 2);
+        cache.modify("b", |_| 5);
+        assert_eq!(cache.keys(), ["c", "b"]);
+        assert_eq!(cache.weight(), 7);
+
+        cache.modify("b", |_| 25);
+        assert_eq!(cache.keys(), ["b"], "kept alone over the limit");
+        assert_eq!(cache.weight(), 25);
+        cache.modify("b", |_| 3);
+        assert_eq!(cache.weight(), 3);
     }
 
     #[test]

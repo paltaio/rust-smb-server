@@ -347,7 +347,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn encrypted_names_open_existing_entries_and_answer_not_supported_elsewhere() {
+    async fn encrypted_names_open_and_create_entries_and_answer_not_supported_elsewhere() {
         let files = MemFsBackend::new();
         let backend = built(&files).await;
         files.clone().with_file("f", b"abc");
@@ -360,19 +360,12 @@ mod tests {
                 "{intent:?}: `f` is no name of the share"
             );
         }
-        for intent in [
-            OpenIntent::Create,
-            OpenIntent::OpenOrCreate,
-            OpenIntent::OverwriteOrCreate,
-        ] {
-            assert!(
-                matches!(
-                    backend.open(&path("f"), opts(intent)).await,
-                    Err(SmbError::NotSupported)
-                ),
-                "{intent:?}"
-            );
-        }
+        let (handle, action) = backend
+            .open(&path("new"), opts(OpenIntent::Create))
+            .await
+            .unwrap();
+        assert_eq!(action, OpenAction::Created);
+        handle.close().await.unwrap();
         assert!(matches!(
             backend.unlink(&path("f")).await,
             Err(SmbError::NotSupported)

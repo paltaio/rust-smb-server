@@ -30,7 +30,7 @@ fn is_marker(path: &SmbPath, names: NameMatch) -> bool {
 }
 
 /// The intent creates an entry that may not exist yet.
-fn creates(intent: OpenIntent) -> bool {
+pub(super) fn creates(intent: OpenIntent) -> bool {
     matches!(
         intent,
         OpenIntent::Create | OpenIntent::OpenOrCreate | OpenIntent::OverwriteOrCreate
@@ -55,15 +55,13 @@ fn inner_options(opts: OpenOptions) -> OpenOptions {
 }
 
 impl<B: ShareBackend> EncryptedBackend<B> {
-    /// Opens `path`. With encrypted names, only the share root and existing
-    /// entries can be opened.
+    /// Opens or creates `path`. The call holds the tree lock shared from here
+    /// to the end, and nothing below it takes the lock again.
     pub(super) async fn open_handle(&self, path: &SmbPath, opts: OpenOptions) -> OpenResult<B> {
         let encrypt_names = self.shared.settings.encrypt_names;
         if encrypt_names && let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
-            if creates(opts.intent) {
-                return Err(SmbError::NotSupported);
-            }
-            return self.open_existing(&parent, name, opts).await;
+            let _tree = self.shared.locks.tree.read().await;
+            return self.open_entry(&parent, name, opts).await;
         }
         let names = self.shared.name_match();
         if !encrypt_names && is_marker(path, names) {
@@ -91,6 +89,17 @@ impl<B: ShareBackend> EncryptedBackend<B> {
         if !path.is_root() && truncates(opts.intent) {
             return self.overwrite(path, opts, names).await;
         }
+        self.open_new(path, opts, names).await
+    }
+
+    /// Opens the entry at the stored path `path` in the inner backend as
+    /// `opts` say, which may create it, and wraps the handle.
+    pub(super) async fn open_new(
+        &self,
+        path: &SmbPath,
+        opts: OpenOptions,
+        names: NameMatch,
+    ) -> OpenResult<B> {
         let (inner, action) = self.shared.inner.open(path, inner_options(opts)).await?;
         let handle = self.wrap(inner, path, action, names).await?;
         Ok((handle, action))
@@ -115,8 +124,7 @@ impl<B: ShareBackend> EncryptedBackend<B> {
         let check = match inner.open(path, existing).await {
             Ok((check, _)) => check,
             Err(SmbError::NotFound) if opts.intent == OpenIntent::OverwriteOrCreate => {
-                let (handle, action) = inner.open(path, inner_options(opts)).await?;
-                return Ok((self.wrap(handle, path, action, names).await?, action));
+                return self.open_new(path, opts, names).await;
             }
             Err(error) => return Err(error),
         };

@@ -95,6 +95,12 @@ impl Locks {
 }
 
 impl DirLock {
+    /// The key of the directory: its stored path, which is also its key in
+    /// the name cache.
+    pub(super) fn key(&self) -> &str {
+        &self.key
+    }
+
     /// Waits for the lock, exclusive when `exclusive`.
     pub(super) async fn acquire(&self, exclusive: bool) -> DirGuard<'_> {
         if exclusive {

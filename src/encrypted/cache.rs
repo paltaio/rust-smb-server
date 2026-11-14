@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
-use super::locks::lock;
+use super::locks::{DirLock, lock};
 use super::lru::Lru;
 
 /// Most names the directory caches hold, counted across directories.
@@ -26,6 +26,7 @@ pub(super) struct Entry {
 }
 
 /// The names of one directory as the inner backend listed them.
+#[derive(Clone)]
 pub(super) struct Snapshot {
     built: Instant,
     len: usize,
@@ -51,8 +52,26 @@ impl Snapshot {
         Self { built, len, groups }
     }
 
+    #[cfg(test)]
     pub(super) fn len(&self) -> usize {
         self.len
+    }
+
+    /// What the snapshot weighs in the cache: its names, and at least one.
+    fn weight(&self) -> usize {
+        self.len.max(1)
+    }
+
+    /// Adds `entry`, replacing the one with the same stored name.
+    fn put(&mut self, entry: Entry) {
+        let group = self.groups.entry(entry.plain.to_lowercase()).or_default();
+        match group.binary_search_by(|held| held.stored.cmp(&entry.stored)) {
+            Ok(at) => group[at] = entry,
+            Err(at) => {
+                group.insert(at, entry);
+                self.len += 1;
+            }
+        }
     }
 
     /// The entry that `name` stands for: the one stored as `canonical`, else
@@ -126,7 +145,7 @@ impl NameCache {
         if self.ttl.is_zero() {
             return;
         }
-        let weight = snapshot.len().max(1);
+        let weight = snapshot.weight();
         let mut directories = lock(&self.directories);
         if !wanted() {
             return;
@@ -138,6 +157,22 @@ impl NameCache {
             return;
         }
         directories.insert(key, snapshot, weight);
+    }
+
+    /// Records that a create gave the directory `dir` the entry `entry`. The
+    /// caller holds the lock of the directory and has made the change in the
+    /// inner backend. The change count goes up and the snapshot held, if any,
+    /// gains the entry, both while the cache is locked, so a listing that began
+    /// before the change is not kept over it. The snapshot is changed in place
+    /// unless a reader still holds it, and its weight follows its names.
+    pub(super) fn patch(&self, dir: &DirLock, entry: Entry) {
+        let mut directories = lock(&self.directories);
+        dir.count_change();
+        directories.modify(dir.key(), |names| {
+            let names = Arc::make_mut(names);
+            names.put(entry);
+            names.weight()
+        });
     }
 
     /// Drops the snapshot of the directory `key`.
@@ -187,6 +222,7 @@ impl LongNames {
 
 #[cfg(test)]
 mod tests {
+    use super::super::locks::Locks;
     use super::super::testing::many_names;
     use super::*;
 
@@ -202,7 +238,7 @@ mod tests {
         Snapshot::new(entries, Instant::now())
     }
 
-    fn put(cache: &NameCache, key: &str, names: Arc<Snapshot>) {
+    fn install(cache: &NameCache, key: &str, names: Arc<Snapshot>) {
         cache.install_if(key.to_string(), names, || true);
     }
 
@@ -258,11 +294,106 @@ mod tests {
         assert!(dotted.entry("i", "s9").is_none());
     }
 
+    #[test]
+    fn a_put_entry_is_found_in_any_case_and_replaces_its_stored_twin() {
+        let mut names = snapshot(vec![entry("a", "s2", false)]);
+        names.put(entry("A", "s1", false));
+        names.put(entry("B", "s3", false));
+        assert_eq!(names.len(), 3);
+        assert_eq!(names.entry("a", "s9").unwrap().stored, "s2");
+        assert_eq!(names.entry("Ab", "s9"), None);
+        assert_eq!(names.entry("b", "s9").unwrap().plain, "B");
+        assert_eq!(names.entry("A", "s1").unwrap().stored, "s1");
+
+        names.put(entry("a", "s2", true));
+        assert_eq!(names.len(), 3, "the same stored name is one entry");
+        assert!(names.directory("a", "s2").unwrap().directory);
+    }
+
+    #[test]
+    fn a_put_entry_keeps_its_group_in_the_order_of_stored_names() {
+        let mut names = snapshot(vec![entry("a", "s2", false), entry("A", "s4", false)]);
+        names.put(entry("a", "s3", false));
+        names.put(entry("A", "s1", false));
+        assert_eq!(names.entry("a", "s9").unwrap().stored, "s2");
+        assert_eq!(names.entry("A", "s9").unwrap().stored, "s1");
+        assert_eq!(names.entry("aa", "s9"), None);
+        assert_eq!(names.entry("a", "s3").unwrap().stored, "s3");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_patch_adds_the_entry_counts_a_change_and_weighs_the_new_name() {
+        let cache = NameCache::new(Duration::from_secs(30), 100);
+        let locks = Locks::new();
+        let dir = locks.directory("d".to_string());
+        install(&cache, "d", many_names(3));
+
+        cache.patch(&dir, entry("New", "sn", false));
+        assert_eq!(dir.changes(), 1);
+        assert_eq!(cache.weight(), 4);
+        let names = cache.fresh("d").unwrap();
+        assert_eq!(names.len(), 4);
+        assert_eq!(names.entry("new", "s9").unwrap().stored, "sn");
+
+        cache.patch(&dir, entry("New", "sn", true));
+        assert_eq!(dir.changes(), 2);
+        assert_eq!(cache.weight(), 4, "a stored name already there is replaced");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_patch_of_a_directory_nobody_cached_counts_a_change_and_holds_nothing() {
+        let cache = NameCache::new(Duration::from_secs(30), 100);
+        let dir = Locks::new().directory("d".to_string());
+        cache.patch(&dir, entry("a", "s1", false));
+        assert_eq!(dir.changes(), 1);
+        assert!(cache.keys().is_empty());
+        assert_eq!(cache.weight(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reader_keeps_the_snapshot_it_holds_through_a_patch() {
+        let cache = NameCache::new(Duration::from_secs(30), 100);
+        let dir = Locks::new().directory("d".to_string());
+        install(&cache, "d", many_names(2));
+        let held = cache.fresh("d").unwrap();
+
+        cache.patch(&dir, entry("a", "s1", false));
+        assert_eq!(held.len(), 2);
+        assert_eq!(cache.fresh("d").unwrap().len(), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_patch_does_not_extend_the_time_to_live() {
+        let ttl = Duration::from_secs(30);
+        let cache = NameCache::new(ttl, 100);
+        let dir = Locks::new().directory("d".to_string());
+        install(&cache, "d", many_names(1));
+        tokio::time::advance(Duration::from_secs(20)).await;
+        cache.patch(&dir, entry("a", "s1", false));
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert!(cache.fresh("d").is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_patch_that_passes_the_cap_drops_the_older_directories() {
+        let cache = NameCache::new(Duration::from_secs(30), 10);
+        let locks = Locks::new();
+        let dir = locks.directory("b".to_string());
+        install(&cache, "a", many_names(6));
+        install(&cache, "b", many_names(4));
+        assert_eq!(cache.keys(), ["a", "b"]);
+        assert_eq!(cache.weight(), 10);
+
+        cache.patch(&dir, entry("x", "sx", false));
+        assert_eq!(cache.keys(), ["b"]);
+        assert_eq!(cache.weight(), 5);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_snapshot_is_fresh_for_the_time_to_live() {
         let ttl = Duration::from_secs(30);
         let cache = NameCache::new(ttl, 100);
-        put(&cache, "d", many_names(2));
+        install(&cache, "d", many_names(2));
         assert!(cache.fresh("d").is_some());
         tokio::time::advance(ttl - Duration::from_nanos(1)).await;
         assert!(cache.fresh("d").is_some());
@@ -278,7 +409,7 @@ mod tests {
         let cache = NameCache::new(ttl, 100);
         let began = Instant::now();
         tokio::time::advance(Duration::from_secs(20)).await;
-        put(&cache, "d", Arc::new(Snapshot::new(Vec::new(), began)));
+        install(&cache, "d", Arc::new(Snapshot::new(Vec::new(), began)));
         assert!(cache.fresh("d").is_some());
         tokio::time::advance(Duration::from_secs(10)).await;
         assert!(cache.fresh("d").is_none());
@@ -289,7 +420,7 @@ mod tests {
         let cache = NameCache::new(Duration::from_secs(30), 100);
         cache.install_if("a".to_string(), many_names(2), || false);
         assert!(cache.fresh("a").is_none());
-        put(&cache, "a", many_names(2));
+        install(&cache, "a", many_names(2));
         cache.install_if("a".to_string(), many_names(5), || false);
         assert_eq!(cache.weight(), 2);
         assert_eq!(cache.fresh("a").unwrap().len(), 2);
@@ -298,8 +429,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn forgetting_a_directory_drops_it() {
         let cache = NameCache::new(Duration::from_secs(30), 100);
-        put(&cache, "a", many_names(2));
-        put(&cache, "b", many_names(3));
+        install(&cache, "a", many_names(2));
+        install(&cache, "b", many_names(3));
         cache.forget("a");
         cache.forget("zz");
         assert!(cache.fresh("a").is_none());
@@ -310,22 +441,22 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn an_empty_directory_weighs_one_name() {
         let cache = NameCache::new(Duration::from_secs(30), 100);
-        put(&cache, "a", many_names(0));
+        install(&cache, "a", many_names(0));
         assert_eq!(cache.weight(), 1);
     }
 
     #[tokio::test(start_paused = true)]
     async fn the_least_recently_used_directory_goes_first_at_the_cap() {
         let cache = NameCache::new(Duration::from_secs(30), 1_000);
-        put(&cache, "a", many_names(400));
-        put(&cache, "b", many_names(400));
+        install(&cache, "a", many_names(400));
+        install(&cache, "b", many_names(400));
         assert!(cache.fresh("a").is_some(), "a is the more recent now");
-        put(&cache, "c", many_names(300));
+        install(&cache, "c", many_names(300));
         assert_eq!(cache.keys(), ["a", "c"]);
         assert_eq!(cache.weight(), 700);
         assert!(cache.fresh("b").is_none());
 
-        put(&cache, "d", many_names(500));
+        install(&cache, "d", many_names(500));
         assert_eq!(cache.keys(), ["c", "d"], "only a, the oldest, goes");
         assert_eq!(cache.weight(), 800);
     }
@@ -333,13 +464,13 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_directory_over_the_cap_is_kept_alone() {
         let cache = NameCache::new(Duration::from_secs(30), 1_000);
-        put(&cache, "a", many_names(10));
-        put(&cache, "b", many_names(10));
-        put(&cache, "huge", many_names(1_500));
+        install(&cache, "a", many_names(10));
+        install(&cache, "b", many_names(10));
+        install(&cache, "huge", many_names(1_500));
         assert_eq!(cache.keys(), ["huge"]);
         assert!(cache.fresh("huge").is_some(), "built, not dropped");
 
-        put(&cache, "small", many_names(5));
+        install(&cache, "small", many_names(5));
         assert_eq!(cache.keys(), ["small"], "the next one makes room");
     }
 }

@@ -1,4 +1,4 @@
-//! Opens of existing entries in a share with encrypted names.
+//! Opens and creates entries in a share with encrypted names.
 //!
 //! A client's name is encrypted and opened as it stands. When the inner
 //! backend has no entry of that name, the names of the directory are searched
@@ -6,26 +6,29 @@
 //! missing, the path is walked from the root the same way.
 
 use super::backend::EncryptedBackend;
+use super::clear::creates;
 use super::handle::OpenResult;
-use super::names::encode_name;
+use super::locks::DirLock;
+use super::names::{StoredName, encode_name};
 use super::node::{NameMatch, path_key};
 use super::scan::Hold;
-use crate::backend::{OpenOptions, ShareBackend};
+use crate::backend::{OpenIntent, OpenOptions, ShareBackend};
 use crate::error::{SmbError, SmbResult};
 use crate::path::SmbPath;
 
 /// A directory: the path it is stored under and the path as its names are
 /// spelled in plaintext.
-struct Dir {
-    stored: SmbPath,
-    plain: SmbPath,
+pub(super) struct Dir {
+    pub(super) stored: SmbPath,
+    pub(super) plain: SmbPath,
 }
 
 impl<B: ShareBackend> EncryptedBackend<B> {
-    /// Opens the existing entry `name` of the directory `parent`, whose names
-    /// are as the client spells them. The open holds the tree lock and the
-    /// lock of the stored directory it finds the entry in, shared, until the
-    /// handle has its node.
+    /// Opens the entry `name` of the directory `parent`, whose names are as
+    /// the client spells them, and creates it when the intent allows. The
+    /// caller holds the tree lock shared. The open holds the lock of the
+    /// stored directory it finds the entry in until the handle has its node:
+    /// shared to open an existing entry, exclusive to create one.
     ///
     /// The entry is looked up under the stored name `name` encrypts to. When
     /// the inner backend has none, the names of the directory give an entry
@@ -38,13 +41,12 @@ impl<B: ShareBackend> EncryptedBackend<B> {
     /// caches of the directories above it, and the path is walked once more.
     /// A second miss fails with `Sharing`, unless the walk ends in the
     /// directory the exact name was tried in: that one is missing.
-    pub(super) async fn open_existing(
+    pub(super) async fn open_entry(
         &self,
         parent: &SmbPath,
         name: &str,
         opts: OpenOptions,
     ) -> OpenResult<B> {
-        let _tree = self.shared.locks.tree.read().await;
         let dir = Dir {
             stored: self.stored_path(parent)?,
             plain: parent.clone(),
@@ -79,14 +81,16 @@ impl<B: ShareBackend> EncryptedBackend<B> {
         }
     }
 
-    /// Opens `name` in the directory `dir`, holding its lock shared.
-    ///
-    /// A name that the cache holds and the inner backend does not have drops
-    /// the cache, which is built again and asked once more. A second such
-    /// answer fails with `Sharing`.
+    /// Opens `name` in the directory `dir`. An intent that creates goes to
+    /// `create_in`; the others hold the lock of `dir` shared.
     async fn open_in(&self, dir: &Dir, name: &str, opts: OpenOptions) -> OpenResult<B> {
-        let key = path_key(&dir.stored, NameMatch::Exact);
-        let lock = self.shared.locks.directory(key.clone());
+        if creates(opts.intent) {
+            return self.create_in(dir, name, opts).await;
+        }
+        let lock = self
+            .shared
+            .locks
+            .directory(path_key(&dir.stored, NameMatch::Exact));
         let _held = lock.acquire(false).await;
         let exact = self.stored_name(name)?;
         let at = dir.stored.join(&exact)?;
@@ -94,26 +98,59 @@ impl<B: ShareBackend> EncryptedBackend<B> {
             Err(SmbError::NotFound) if self.shared.settings.case_insensitive => {}
             opened => return opened,
         }
+        self.open_listed(dir, &lock, name, &exact, opts)
+            .await
+            .unwrap_or(Err(SmbError::NotFound))
+    }
+
+    /// Opens the entry of the directory `dir` that the cached names give for
+    /// `name`, which encrypts to the stored name `canonical`. The caller holds
+    /// `lock`, the lock of `dir`. The names are built when the cache has none
+    /// that is fresh. `None` when they have no such entry.
+    ///
+    /// `OpenOrCreate` opens the entry as `Open` does and `OverwriteOrCreate`
+    /// as `Truncate` does. `Create` fails with `Exists`.
+    ///
+    /// A name that the cache holds and the inner backend does not have drops
+    /// the cache, which is built again and asked once more. A second such
+    /// answer fails with `Sharing`. No snapshot is held while the entry opens,
+    /// so a create that follows changes the cached one in place.
+    pub(super) async fn open_listed(
+        &self,
+        dir: &Dir,
+        lock: &DirLock,
+        name: &str,
+        canonical: &str,
+        opts: OpenOptions,
+    ) -> Option<OpenResult<B>> {
         let mut contradicted = false;
         loop {
-            let Some(names) = self.names_of(&dir.stored, Hold::Lock).await? else {
-                return Err(SmbError::PathNotFound);
+            let found = match self.names_of(&dir.stored, Hold::Lock).await {
+                Ok(Some(names)) => names.entry(name, canonical)?,
+                Ok(None) => return Some(Err(SmbError::PathNotFound)),
+                Err(error) => return Some(Err(error)),
             };
-            let Some(found) = names.entry(name, &exact) else {
-                return Err(SmbError::NotFound);
+            let intent = match opts.intent {
+                OpenIntent::Create => return Some(Err(SmbError::Exists)),
+                OpenIntent::OpenOrCreate => OpenIntent::Open,
+                OpenIntent::OverwriteOrCreate => OpenIntent::Truncate,
+                intent => intent,
             };
-            let at = dir.stored.join(&found.stored)?;
-            let plain = dir.plain.join(&found.plain)?;
-            match self.open_stored(&at, &plain, opts).await {
-                Err(SmbError::NotFound) => {
-                    self.invalidate(&key);
-                    if contradicted {
-                        return Err(SmbError::Sharing);
-                    }
-                    contradicted = true;
-                }
-                opened => return opened,
+            let opened = async {
+                let at = dir.stored.join(&found.stored)?;
+                let plain = dir.plain.join(&found.plain)?;
+                self.open_stored(&at, &plain, OpenOptions { intent, ..opts })
+                    .await
             }
+            .await;
+            if !matches!(opened, Err(SmbError::NotFound)) {
+                return Some(opened);
+            }
+            self.invalidate(lock.key());
+            if contradicted {
+                return Some(Err(SmbError::Sharing));
+            }
+            contradicted = true;
         }
     }
 
@@ -156,7 +193,7 @@ impl<B: ShareBackend> EncryptedBackend<B> {
 
     /// Opens the entry at the stored path `stored`, which clients know by the
     /// path `plain`.
-    async fn open_stored(
+    pub(super) async fn open_stored(
         &self,
         stored: &SmbPath,
         plain: &SmbPath,
@@ -167,12 +204,16 @@ impl<B: ShareBackend> EncryptedBackend<B> {
         Ok((handle.with_plaintext(plain.clone()), action))
     }
 
+    /// The name the inner backend stores `name` under, and the side object of
+    /// a long name.
+    pub(super) fn stored_form(&self, name: &str) -> SmbResult<StoredName> {
+        let threshold = self.shared.settings.long_name_threshold;
+        encode_name(&self.shared.keys, name, threshold).ok_or(SmbError::NameInvalid)
+    }
+
     /// The name the inner backend stores `name` under.
     fn stored_name(&self, name: &str) -> SmbResult<String> {
-        let threshold = self.shared.settings.long_name_threshold;
-        encode_name(&self.shared.keys, name, threshold)
-            .map(|stored| stored.entry)
-            .ok_or(SmbError::NameInvalid)
+        self.stored_form(name).map(|stored| stored.entry)
     }
 
     /// The path the inner backend stores `path` under.
@@ -187,21 +228,17 @@ impl<B: ShareBackend> EncryptedBackend<B> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use async_trait::async_trait;
-
-    use super::super::format::{BlockShift, HEADER_LEN, NONCE_LEN};
+    use super::super::format::{HEADER_LEN, NONCE_LEN};
     use super::super::node::{HeaderKind, NameMatch};
     use super::super::testing::{
-        key_schedule, names_over, names_settings, names_with, open, open_dir, open_file, read_all,
-        seed_dir, seed_file, settle, shares_node, spawn_open, stored_at, stored_file, stored_form,
-        stored_name, with_name_limit,
+        Hidden, key_schedule, layer, names_over, names_settings, names_with, open, open_dir,
+        open_file, read_all, refused, seed_dir, seed_file, settle, shares_node, spawn_open,
+        stored_at, stored_bytes, stored_form, stored_name, with_name_limit,
     };
     use super::*;
-    use crate::backend::{BackendCapabilities, Handle, OpenAction, OpenIntent, ShareBackend};
+    use crate::backend::{Handle, OpenAction, OpenIntent, ShareBackend};
     use crate::tests::faulty::Faulty;
     use crate::tests::file_ids::FileIds;
     use crate::tests::folding::Folding;
@@ -209,31 +246,7 @@ mod tests {
     use crate::tests::logs::Logs;
     use crate::tests::memfs::MemFsBackend;
     use crate::tests::recorder::Recorder;
-    use crate::tests::util::{dir_opts, opts, path};
-
-    /// The stored bytes of a file that holds `plain`.
-    fn stored_bytes(plain: &[u8]) -> Vec<u8> {
-        stored_file(&key_schedule(), BlockShift::DEFAULT, plain)
-    }
-
-    /// A store and a backend that encrypts names over it.
-    async fn layer() -> (MemFsBackend, EncryptedBackend<MemFsBackend>) {
-        let files = MemFsBackend::new();
-        let layer = names_over(files.clone()).await;
-        (files, layer)
-    }
-
-    /// The error of the open of `name` in `layer`.
-    async fn refused<B: ShareBackend>(
-        layer: &EncryptedBackend<B>,
-        name: &str,
-        intent: OpenIntent,
-    ) -> SmbError {
-        match layer.open_handle(&path(name), opts(intent)).await {
-            Err(error) => error,
-            Ok(_) => panic!("open {name} {intent:?} succeeded"),
-        }
-    }
+    use crate::tests::util::{dir_opts, path};
 
     #[tokio::test]
     async fn an_exact_name_opens_with_one_inner_open_and_no_listing() {
@@ -559,74 +572,6 @@ mod tests {
         assert!(layer.shared.names.keys().is_empty());
     }
 
-    /// What an open of a hidden path answers.
-    #[derive(Clone, Copy)]
-    enum Answer {
-        NotFound,
-        PathNotFound,
-    }
-
-    /// An inner backend whose opens of chosen paths fail while its listings
-    /// still show them.
-    #[derive(Clone)]
-    struct Hidden {
-        inner: MemFsBackend,
-        paths: Arc<Mutex<HashMap<String, Answer>>>,
-    }
-
-    impl Hidden {
-        /// Opens of `stored` answer `NotFound`.
-        fn hide(&self, stored: &str) {
-            let mut paths = self.paths.lock().unwrap();
-            paths.insert(stored.to_string(), Answer::NotFound);
-        }
-
-        /// Opens of `stored` answer `PathNotFound`, as if a directory above it
-        /// were gone.
-        fn cut_off(&self, stored: &str) {
-            let mut paths = self.paths.lock().unwrap();
-            paths.insert(stored.to_string(), Answer::PathNotFound);
-        }
-
-        fn show(&self, stored: &str) {
-            self.paths.lock().unwrap().remove(stored);
-        }
-    }
-
-    #[async_trait]
-    impl ShareBackend for Hidden {
-        async fn open(
-            &self,
-            at: &SmbPath,
-            opts: OpenOptions,
-        ) -> SmbResult<(Box<dyn Handle>, OpenAction)> {
-            let answer = self
-                .paths
-                .lock()
-                .unwrap()
-                .get(&at.display_backslash())
-                .copied();
-            match answer {
-                Some(Answer::NotFound) => return Err(SmbError::NotFound),
-                Some(Answer::PathNotFound) => return Err(SmbError::PathNotFound),
-                None => {}
-            }
-            self.inner.open(at, opts).await
-        }
-
-        async fn unlink(&self, at: &SmbPath) -> SmbResult<()> {
-            self.inner.unlink(at).await
-        }
-
-        async fn rename(&self, from: &SmbPath, to: &SmbPath, replace: bool) -> SmbResult<()> {
-            self.inner.rename(from, to, replace).await
-        }
-
-        fn capabilities(&self) -> BackendCapabilities {
-            self.inner.capabilities()
-        }
-    }
-
     #[tokio::test]
     async fn a_cached_name_the_inner_backend_lacks_is_dropped_and_listed_again() {
         let files = MemFsBackend::new();
@@ -677,10 +622,7 @@ mod tests {
     #[tokio::test]
     async fn a_name_the_inner_backend_denies_twice_is_a_sharing_violation() {
         let files = MemFsBackend::new();
-        let hidden = Hidden {
-            inner: files.clone(),
-            paths: Arc::default(),
-        };
+        let hidden = Hidden::new(files.clone());
         let faulty = Faulty::new(hidden.clone());
         let layer = names_over(faulty.clone()).await;
         seed_file(&files, "Foo", &stored_bytes(b"data"));
@@ -749,10 +691,7 @@ mod tests {
     #[tokio::test]
     async fn a_walked_directory_the_inner_backend_denies_twice_is_a_sharing_violation() {
         let files = MemFsBackend::new();
-        let hidden = Hidden {
-            inner: files.clone(),
-            paths: Arc::default(),
-        };
+        let hidden = Hidden::new(files.clone());
         let faulty = Faulty::new(hidden.clone());
         let layer = names_over(faulty.clone()).await;
         seed_file(&files, "Docs\\a.txt", &stored_bytes(b"data"));
@@ -775,10 +714,7 @@ mod tests {
     #[tokio::test]
     async fn a_directory_that_cannot_be_listed_is_a_missing_directory() {
         let files = MemFsBackend::new();
-        let hidden = Hidden {
-            inner: files.clone(),
-            paths: Arc::default(),
-        };
+        let hidden = Hidden::new(files.clone());
         let faulty = Faulty::new(hidden.clone());
         let layer = names_over(faulty.clone()).await;
         seed_file(&files, "Docs\\a.txt", &stored_bytes(b"x"));
@@ -1045,16 +981,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn creates_unlinks_and_renames_do_not_reach_the_inner_backend() {
+    async fn unlinks_and_renames_do_not_reach_the_inner_backend() {
         let recorder = Recorder::default();
         let layer = EncryptedBackend::new(recorder.clone(), key_schedule(), names_settings());
-        for intent in [
-            OpenIntent::Create,
-            OpenIntent::OpenOrCreate,
-            OpenIntent::OverwriteOrCreate,
-        ] {
-            refused(&layer, "Dir\\File.TXT", intent).await;
-        }
         let _ = layer.unlink(&path("Dir\\File.TXT")).await;
         let _ = layer.rename(&path("a"), &path("b"), false).await;
         assert_eq!(recorder.calls(), Vec::<String>::new());

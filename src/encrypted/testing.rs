@@ -1,9 +1,10 @@
 //! Fixtures shared by the unit tests.
 
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::io;
 use std::mem;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -154,6 +155,13 @@ pub(super) async fn names_with<B: ShareBackend>(
         .expect("a backend that encrypts names")
 }
 
+/// A store and a backend that encrypts names over it.
+pub(super) async fn layer() -> (MemFsBackend, EncryptedBackend<MemFsBackend>) {
+    let files = MemFsBackend::new();
+    let layer = names_over(files.clone()).await;
+    (files, layer)
+}
+
 /// A snapshot of `count` entries that are not directories.
 pub(super) fn many_names(count: usize) -> Arc<Snapshot> {
     let entries = (0..count)
@@ -278,11 +286,43 @@ pub(super) async fn open_dir<B: ShareBackend>(
     layer: &EncryptedBackend<B>,
     name: &str,
 ) -> EncryptedHandle<B> {
+    open_dir_as(layer, name, OpenIntent::Open).await.0
+}
+
+/// Opens the directory `name` in `layer` with `intent`.
+pub(super) async fn open_dir_as<B: ShareBackend>(
+    layer: &EncryptedBackend<B>,
+    name: &str,
+    intent: OpenIntent,
+) -> (EncryptedHandle<B>, OpenAction) {
     layer
-        .open_handle(&path(name), dir_opts(OpenIntent::Open))
+        .open_handle(&path(name), dir_opts(intent))
         .await
-        .unwrap_or_else(|error| panic!("open directory {name}: {error:?}"))
-        .0
+        .unwrap_or_else(|error| panic!("open directory {name} {intent:?}: {error:?}"))
+}
+
+/// The error of the open of the file `name` with `intent`.
+pub(super) async fn refused<B: ShareBackend>(
+    layer: &EncryptedBackend<B>,
+    name: &str,
+    intent: OpenIntent,
+) -> SmbError {
+    match layer.open_handle(&path(name), opts(intent)).await {
+        Err(error) => error,
+        Ok(_) => panic!("open {name} {intent:?} succeeded"),
+    }
+}
+
+/// The error of the open of the directory `name` with `intent`.
+pub(super) async fn refused_dir<B: ShareBackend>(
+    layer: &EncryptedBackend<B>,
+    name: &str,
+    intent: OpenIntent,
+) -> SmbError {
+    match layer.open_handle(&path(name), dir_opts(intent)).await {
+        Err(error) => error,
+        Ok(_) => panic!("open directory {name} {intent:?} succeeded"),
+    }
 }
 
 /// Lets every task that can make progress run until it waits.
@@ -297,6 +337,12 @@ pub(super) async fn settle() {
 /// 12 bytes, each equal to `i % 255 + 1`.
 pub(super) fn stored_file(keys: &KeySchedule, shift: BlockShift, plain: &[u8]) -> Vec<u8> {
     stored_file_with_id(keys, shift, file_id(), plain)
+}
+
+/// The stored bytes of a file that holds `plain`, in blocks of the default
+/// size.
+pub(super) fn stored_bytes(plain: &[u8]) -> Vec<u8> {
+    stored_file(&key_schedule(), BlockShift::DEFAULT, plain)
 }
 
 /// `stored_file` for the file id `id`.
@@ -640,5 +686,80 @@ impl<B: ShareBackend> ShareBackend for Reporting<B> {
             Some(volume) => Ok(volume.clone()),
             None => self.inner.volume_info().await,
         }
+    }
+}
+
+/// What an open of a hidden path answers.
+#[derive(Clone, Copy)]
+enum Answer {
+    NotFound,
+    PathNotFound,
+}
+
+/// An inner backend whose opens of chosen paths fail while its listings
+/// still show them.
+#[derive(Clone)]
+pub(super) struct Hidden {
+    inner: MemFsBackend,
+    paths: Arc<Mutex<HashMap<String, Answer>>>,
+}
+
+impl Hidden {
+    pub(super) fn new(inner: MemFsBackend) -> Self {
+        Self {
+            inner,
+            paths: Arc::default(),
+        }
+    }
+
+    /// Opens of `stored` answer `NotFound`.
+    pub(super) fn hide(&self, stored: &str) {
+        let mut paths = self.paths.lock().unwrap();
+        paths.insert(stored.to_string(), Answer::NotFound);
+    }
+
+    /// Opens of `stored` answer `PathNotFound`, as if a directory above it
+    /// were gone.
+    pub(super) fn cut_off(&self, stored: &str) {
+        let mut paths = self.paths.lock().unwrap();
+        paths.insert(stored.to_string(), Answer::PathNotFound);
+    }
+
+    pub(super) fn show(&self, stored: &str) {
+        self.paths.lock().unwrap().remove(stored);
+    }
+}
+
+#[async_trait]
+impl ShareBackend for Hidden {
+    async fn open(
+        &self,
+        at: &SmbPath,
+        opts: OpenOptions,
+    ) -> SmbResult<(Box<dyn Handle>, OpenAction)> {
+        let answer = self
+            .paths
+            .lock()
+            .unwrap()
+            .get(&at.display_backslash())
+            .copied();
+        match answer {
+            Some(Answer::NotFound) => return Err(SmbError::NotFound),
+            Some(Answer::PathNotFound) => return Err(SmbError::PathNotFound),
+            None => {}
+        }
+        self.inner.open(at, opts).await
+    }
+
+    async fn unlink(&self, at: &SmbPath) -> SmbResult<()> {
+        self.inner.unlink(at).await
+    }
+
+    async fn rename(&self, from: &SmbPath, to: &SmbPath, replace: bool) -> SmbResult<()> {
+        self.inner.rename(from, to, replace).await
+    }
+
+    fn capabilities(&self) -> BackendCapabilities {
+        self.inner.capabilities()
     }
 }

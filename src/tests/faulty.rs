@@ -1,6 +1,6 @@
 //! A backend wrapper that fails or cuts short the opens, unlinks, renames,
-//! writes, flushes, truncates, closes, listings and reads that pass through
-//! it.
+//! writes, flushes, truncates, closes, listings, stats and reads that pass
+//! through it.
 
 use std::any::Any;
 use std::sync::{Arc, Mutex};
@@ -9,8 +9,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 
 use crate::backend::{
-    BackendCapabilities, DirEntry, DirWatch, FileInfo, FileTimes, Handle, OpenAction, OpenOptions,
-    ShareBackend, VolumeInfo,
+    BackendCapabilities, DirEntry, DirWatch, FileInfo, FileTimes, Handle, OpenAction, OpenIntent,
+    OpenOptions, ShareBackend, VolumeInfo,
 };
 use crate::ea::Ea;
 use crate::error::{SmbError, SmbResult};
@@ -18,7 +18,7 @@ use crate::path::SmbPath;
 use crate::stream::{StreamInfo, StreamName};
 
 /// Wraps `inner` and fails chosen opens, unlinks, renames, writes, flushes,
-/// truncates, closes and listings, and cuts reads and writes short.
+/// truncates, closes, listings and stats, and cuts reads and writes short.
 ///
 /// A fault hits the nth call from the moment it is set and then clears. A
 /// call it hits fails without reaching the inner backend; a torn write
@@ -29,8 +29,9 @@ use crate::stream::{StreamInfo, StreamName};
 /// which writes are dropped and the length from which truncates are dropped
 /// stay in force until changed.
 /// The counters count every call that reaches this backend, a clone of it or
-/// one of their handles, faulted or not. Reads, writes and truncates are
-/// logged as asked for, before a short-read or short-write limit cuts them.
+/// one of their handles, faulted or not. Opens, reads, writes and truncates
+/// are logged as asked for, before a short-read or short-write limit cuts
+/// them.
 /// Clones share the faults, the counters and the logs.
 ///
 /// Handles it returns have no `as_any`.
@@ -47,6 +48,7 @@ struct State {
     renames: usize,
     writes: usize,
     truncates: usize,
+    open_log: Vec<(String, OpenIntent)>,
     reads: Vec<(u64, u32)>,
     write_log: Vec<(u64, usize)>,
     truncate_log: Vec<u64>,
@@ -58,6 +60,7 @@ struct State {
     truncate_fault: Option<Fault>,
     close_fault: Option<Fault>,
     list_fault: Option<Fault>,
+    stat_fault: Option<Fault>,
     max_read: Option<u32>,
     max_write: Option<usize>,
     size: Option<u64>,
@@ -102,6 +105,7 @@ impl State {
     /// The error the next open fails with, if any.
     fn next_open(&mut self, path: &SmbPath, opts: &OpenOptions) -> Option<SmbError> {
         self.opens += 1;
+        self.open_log.push((path.display_backslash(), opts.intent));
         let slot = self.open_fault.as_mut()?;
         if !(slot.when)(path, opts) || !slot.fault.hit() {
             return None;
@@ -228,6 +232,12 @@ impl<B: ShareBackend> Faulty<B> {
         self.state.lock().unwrap().list_fault = Some(Fault::new(nth, error));
     }
 
+    /// Fails the `nth` `stat` of a handle from now (1 is the next one) with
+    /// `error`.
+    pub(crate) fn fail_stat(&self, nth: usize, error: SmbError) {
+        self.state.lock().unwrap().stat_fault = Some(Fault::new(nth, error));
+    }
+
     /// Makes every read return at most `max` bytes, or lifts the limit.
     pub(crate) fn short_reads(&self, max: Option<u32>) {
         self.state.lock().unwrap().max_read = max;
@@ -282,6 +292,11 @@ impl<B: ShareBackend> Faulty<B> {
     /// Truncates seen so far.
     pub(crate) fn truncates(&self) -> usize {
         self.state.lock().unwrap().truncates
+    }
+
+    /// The path and intent of each open seen so far.
+    pub(crate) fn open_calls(&self) -> Vec<(String, OpenIntent)> {
+        self.state.lock().unwrap().open_log.clone()
     }
 
     /// The offset and length of each read seen so far, as asked for.
@@ -471,6 +486,10 @@ impl Handle for FaultyHandle {
     }
 
     async fn stat(&self) -> SmbResult<FileInfo> {
+        let fault = due(&mut self.state.lock().unwrap().stat_fault);
+        if let Some(fault) = fault {
+            return Err(fault.error);
+        }
         let mut info = self.inner.stat().await?;
         if let Some(size) = self.state.lock().unwrap().size
             && !info.is_directory
@@ -572,7 +591,6 @@ impl Handle for FaultyHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::OpenIntent;
     use crate::tests::memfs::MemFsBackend;
     use crate::tests::recorder::{INDEX, Recorder, call_everything, forwarded_calls};
     use crate::tests::util::{dir_opts, opts, path};
@@ -627,6 +645,10 @@ mod tests {
             .unwrap();
         assert_eq!(files.contents("d\\b"), Some(Vec::new()));
         assert_eq!(faulty.opens(), 5);
+        assert_eq!(
+            faulty.open_calls().last(),
+            Some(&("d\\b".to_string(), OpenIntent::Create))
+        );
     }
 
     #[tokio::test]
@@ -784,6 +806,15 @@ mod tests {
         faulty.fail_listing(1, io_error());
         assert!(matches!(dir.list_dir(None).await, Err(SmbError::Io(_))));
         assert_eq!(dir.list_dir(None).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn fails_the_nth_stat_with_the_chosen_error() {
+        let (_, faulty, handle) = faulty_file(b"abc").await;
+        faulty.fail_stat(2, SmbError::DiskFull);
+        handle.stat().await.unwrap();
+        assert!(matches!(handle.stat().await, Err(SmbError::DiskFull)));
+        assert_eq!(handle.stat().await.unwrap().end_of_file, 3);
     }
 
     #[tokio::test]

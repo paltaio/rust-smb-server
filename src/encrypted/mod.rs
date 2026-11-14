@@ -8,6 +8,7 @@ mod cache;
 mod change;
 mod clear;
 mod content;
+mod create;
 #[cfg(test)]
 mod disk_full;
 mod error;
