@@ -126,7 +126,7 @@ impl<B: ShareBackend> EncryptedHandle<B> {
     }
 
     /// Reads the header again after a block of the file with id `used` did
-    /// not open. True when the stored file has another id now, or none.
+    /// not open. True when the stored file has a different file id, or none.
     async fn reload_header(
         &self,
         file: &RwLock<FileMeta>,
@@ -225,15 +225,15 @@ mod tests {
     use super::super::node::HeaderKind;
     use super::super::size::stored_size;
     use super::super::testing::{
-        B, H, assert_io, block_reads, clear_blocks, faulty_file, file_id, header_reads,
-        key_schedule, layer_over, open, open_dir, open_file, other_file_id, settle, shift, stored,
-        stored_file, stored_file_with_id,
+        B, H, assert_io, block_reads, clear_blocks, drop_at, faulty_file, file_id, gated_file,
+        header_reads, key_schedule, layer_over, open, open_dir, open_file, other_file_id, settle,
+        shift, stored, stored_file, stored_file_with_id,
     };
     use super::*;
     use crate::backend::{Handle, OpenAction, OpenIntent};
     use crate::ntstatus::STATUS_UNEXPECTED_IO_ERROR;
     use crate::tests::faulty::Faulty;
-    use crate::tests::gated::{Gate, Gated, Op};
+    use crate::tests::gated::{Gated, Op};
     use crate::tests::logs::Logs;
     use crate::tests::memfs::MemFsBackend;
 
@@ -671,10 +671,7 @@ mod tests {
         let len = 2 * B + 10;
         let plain = pattern(len);
         let bytes = stored(&plain);
-        let files = MemFsBackend::new();
-        let gated = Gated::new(files.clone());
-        let layer = layer_over(gated.clone()).await;
-        files.clone().with_file("f", &bytes);
+        let (files, gated, layer) = gated_file(&bytes).await;
         let handle = Arc::new(open_file(&layer, "f").await);
         assert_eq!(handle.read(0, 10).await.unwrap(), plain[..10]);
 
@@ -894,33 +891,10 @@ mod tests {
         }
     }
 
-    /// Polls `read` until a call is parked at `gate`, then drops it.
-    async fn drop_at(gate: &Gate, read: impl Future<Output = SmbResult<Bytes>>) {
-        let mut read = Box::pin(read);
-        tokio::select! {
-            biased;
-            _ = &mut read => panic!("the read ended before it reached the gate"),
-            () = gate.reached() => {}
-        }
-    }
-
-    /// A file `f` of two blocks and a bit, behind a gate.
-    async fn gated_file() -> (
-        Gated<MemFsBackend>,
-        EncryptedBackend<Gated<MemFsBackend>>,
-        Vec<u8>,
-    ) {
-        let plain = pattern(2 * B + 10);
-        let files = MemFsBackend::new();
-        let gated = Gated::new(files.clone());
-        let layer = layer_over(gated.clone()).await;
-        files.clone().with_file("f", &stored(&plain));
-        (gated, layer, plain)
-    }
-
     #[tokio::test]
     async fn a_read_dropped_while_the_header_loads_leaves_the_file_readable() {
-        let (gated, layer, plain) = gated_file().await;
+        let plain = pattern(2 * B + 10);
+        let (_, gated, layer) = gated_file(&stored(&plain)).await;
         let handle = open_file(&layer, "f").await;
         let file = handle.node().file().unwrap();
 
@@ -935,7 +909,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_read_dropped_while_the_size_is_read_for_the_header_load_leaves_the_file_readable() {
-        let (gated, layer, plain) = gated_file().await;
+        let plain = pattern(2 * B + 10);
+        let (_, gated, layer) = gated_file(&stored(&plain)).await;
         let handle = open_file(&layer, "f").await;
         let file = handle.node().file().unwrap();
 
@@ -964,7 +939,8 @@ mod tests {
     #[tokio::test]
     async fn a_read_dropped_while_the_blocks_are_read_leaves_the_header_and_the_file_as_they_were()
     {
-        let (gated, layer, plain) = gated_file().await;
+        let plain = pattern(2 * B + 10);
+        let (_, gated, layer) = gated_file(&stored(&plain)).await;
         let handle = open_file(&layer, "f").await;
         assert_eq!(handle.read(0, 10).await.unwrap(), plain[..10]);
         let file = handle.node().file().unwrap();

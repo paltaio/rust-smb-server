@@ -41,16 +41,6 @@ impl<B: ShareBackend> EncryptedHandle<B> {
         self.node.path().is_root()
     }
 
-    /// The inner handle of a directory; truncates of a file are not
-    /// supported.
-    fn directory(&self) -> SmbResult<&dyn Handle> {
-        if self.node.is_directory() {
-            Ok(&*self.inner)
-        } else {
-            Err(SmbError::NotSupported)
-        }
-    }
-
     /// Turns what the inner backend reports into what the share reports: the
     /// size of a file is its size before encryption, and there are no
     /// extended attributes.
@@ -112,7 +102,10 @@ impl<B: ShareBackend> Handle for EncryptedHandle<B> {
     }
 
     async fn truncate(&self, len: u64) -> SmbResult<()> {
-        self.directory()?.truncate(len).await
+        match self.node.file() {
+            Some(file) => self.truncate_file(file, len).await,
+            None => self.inner.truncate(len).await,
+        }
     }
 
     async fn list_dir(&self, pattern: Option<&str>) -> SmbResult<Vec<DirEntry>> {
@@ -338,19 +331,6 @@ mod tests {
         assert!(!stat.is_finished());
         drop(writing);
         assert_eq!(stat.await.unwrap().unwrap().end_of_file, 3);
-    }
-
-    #[tokio::test]
-    async fn a_truncate_of_a_file_is_not_supported() {
-        let files = MemFsBackend::new();
-        let layer = clear_over(files.clone()).await;
-        files.clone().with_file("f", b"abc");
-        let handle = open_file(&layer, "f").await;
-        assert!(matches!(
-            handle.truncate(0).await,
-            Err(SmbError::NotSupported)
-        ));
-        assert_eq!(files.contents("f"), Some(b"abc".to_vec()));
     }
 
     #[tokio::test]

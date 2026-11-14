@@ -11,18 +11,22 @@ use zeroize::Zeroizing;
 use super::backend::{EncryptedBackend, Settings};
 use super::block::FileCipher;
 use super::builder::EncryptedBackendBuilder;
+use super::change::Random;
 use super::error::EncryptionError;
-use super::format::{BlockShift, HEADER_LEN, MARKER_NAME, NONCE_LEN, OVERHEAD};
+use super::format::{BlockShift, FILE_ID_LEN, HEADER_LEN, MARKER_NAME, NONCE_LEN, OVERHEAD};
 use super::handle::EncryptedHandle;
 use super::header::Header;
 use super::keys::KeySchedule;
 use super::marker::{MarkerSettings, parse_marker};
+use super::random::{random_file_id, random_nonces};
+use super::size::stored_size;
 use crate::backend::{
     BackendCapabilities, Handle, OpenAction, OpenIntent, OpenOptions, ShareBackend, VolumeInfo,
 };
 use crate::error::{SmbError, SmbResult};
 use crate::path::SmbPath;
 use crate::tests::faulty::Faulty;
+use crate::tests::gated::{Gate, Gated};
 use crate::tests::memfs::MemFsBackend;
 use crate::tests::util::{dir_opts, opts, path};
 
@@ -239,6 +243,126 @@ pub(super) async fn faulty_file_in(
     let layer = clear_blocks(faulty.clone(), shift).await;
     files.clone().with_file("f", bytes);
     (files, faulty, layer)
+}
+
+/// Draws from the OS and counts the draws.
+#[derive(Default)]
+pub(super) struct Counting {
+    /// Number of nonces in each draw.
+    pub(super) draws: Vec<usize>,
+    /// The file ids drawn.
+    pub(super) ids: usize,
+}
+
+impl Random for Counting {
+    fn nonces(&mut self, nonces: &mut [[u8; NONCE_LEN]]) -> Result<(), getrandom::Error> {
+        self.draws.push(nonces.len());
+        random_nonces(nonces)
+    }
+
+    fn file_id(&mut self) -> Result<[u8; FILE_ID_LEN], getrandom::Error> {
+        self.ids += 1;
+        random_file_id()
+    }
+}
+
+/// A generator that does not answer.
+pub(super) struct Down;
+
+impl Random for Down {
+    fn nonces(&mut self, _: &mut [[u8; NONCE_LEN]]) -> Result<(), getrandom::Error> {
+        Err(getrandom::Error::UNEXPECTED)
+    }
+
+    fn file_id(&mut self) -> Result<[u8; FILE_ID_LEN], getrandom::Error> {
+        Err(getrandom::Error::UNEXPECTED)
+    }
+}
+
+/// Stored bytes of a full block of `B` bytes.
+pub(super) const C: usize = B + OVERHEAD;
+
+/// Where block `index` starts in the stored file.
+pub(super) fn at(index: usize) -> usize {
+    H + index * C
+}
+
+/// `model` after `data` is written at `offset`.
+pub(super) fn apply(model: &mut Vec<u8>, offset: usize, data: &[u8]) {
+    if model.len() < offset + data.len() {
+        model.resize(offset + data.len(), 0);
+    }
+    model[offset..offset + data.len()].copy_from_slice(data);
+}
+
+/// The stored size of a file of `logical` bytes.
+pub(super) fn stored_len(logical: usize) -> usize {
+    usize::try_from(stored_size(shift(), logical as u64).unwrap()).unwrap()
+}
+
+/// A new file `f` in a backend behind `Faulty`.
+pub(super) async fn new_file() -> (
+    MemFsBackend,
+    Faulty<MemFsBackend>,
+    EncryptedHandle<Faulty<MemFsBackend>>,
+) {
+    let files = MemFsBackend::new();
+    let faulty = Faulty::new(files.clone());
+    let layer = layer_over(faulty.clone()).await;
+    let (handle, action) = open(&layer, "f", OpenIntent::Create).await;
+    assert_eq!(action, OpenAction::Created);
+    (files, faulty, handle)
+}
+
+/// Everything `handle` reads from the start.
+pub(super) async fn read_all<H: Handle>(handle: &H) -> Vec<u8> {
+    handle.read(0, u32::MAX).await.unwrap().to_vec()
+}
+
+/// The output of `call`, which ends without waiting for the lock of the
+/// file.
+pub(super) async fn assert_no_wait<T>(call: impl Future<Output = T>) -> T {
+    tokio::select! {
+        biased;
+        output = call => output,
+        () = std::future::ready(()) => panic!("the call waited for the lock"),
+    }
+}
+
+/// Polls `call` until a call is parked at `gate`, then drops it.
+pub(super) async fn drop_at<T>(gate: &Gate, call: impl Future<Output = SmbResult<T>>) {
+    let mut call = Box::pin(call);
+    tokio::select! {
+        biased;
+        _ = &mut call => panic!("the call ended before it reached the gate"),
+        () = gate.reached() => {}
+    }
+}
+
+/// The inner writes made since `from`.
+pub(super) fn writes_since(faulty: &Faulty<MemFsBackend>, from: usize) -> Vec<(u64, usize)> {
+    faulty.write_calls().split_off(from)
+}
+
+/// The nonce of the block that starts at `start` in `bytes`.
+pub(super) fn nonce_at(bytes: &[u8], start: usize) -> [u8; NONCE_LEN] {
+    bytes[start..start + NONCE_LEN].try_into().unwrap()
+}
+
+/// A backend over a store that holds the file `f` with the stored bytes
+/// `bytes`, behind `Gated`.
+pub(super) async fn gated_file(
+    bytes: &[u8],
+) -> (
+    MemFsBackend,
+    Gated<MemFsBackend>,
+    EncryptedBackend<Gated<MemFsBackend>>,
+) {
+    let files = MemFsBackend::new();
+    let gated = Gated::new(files.clone());
+    let layer = layer_over(gated.clone()).await;
+    files.clone().with_file("f", bytes);
+    (files, gated, layer)
 }
 
 /// Reads that asked for the header.

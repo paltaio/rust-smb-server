@@ -2,56 +2,22 @@
 //! under fresh nonces. A block the data covers only in part is read first; a
 //! failure there stores nothing.
 
-use std::io;
-use std::mem;
 use std::ops::Range;
 
 use bytes::Bytes;
 use tokio::sync::RwLock;
 
 use super::block::FileCipher;
+use super::change::{Attempt, Change, Normal, OsRandom, Random, random_error};
 use super::content::Opened;
 use super::format::{BlockShift, FILE_ID_LEN, HEADER_LEN, NONCE_LEN, OVERHEAD};
 use super::handle::EncryptedHandle;
 use super::header::Header;
 use super::inner::write_blocks;
-use super::node::{FileMeta, HeaderState};
-use super::random::{random_file_id, random_nonces};
-use super::size::{block_range, logical_size, stored_size};
+use super::node::FileMeta;
+use super::size::{BlockRange, block_range, stored_size};
 use crate::backend::ShareBackend;
 use crate::error::{SmbError, SmbResult};
-
-/// Where a write draws its random bytes.
-trait Random: Send {
-    /// One nonce for each of `nonces`, none of them all zero.
-    fn nonces(&mut self, nonces: &mut [[u8; NONCE_LEN]]) -> Result<(), getrandom::Error>;
-
-    /// A file id that is not all zero.
-    fn file_id(&mut self) -> Result<[u8; FILE_ID_LEN], getrandom::Error>;
-}
-
-/// The OS generator.
-struct OsRandom;
-
-impl Random for OsRandom {
-    fn nonces(&mut self, nonces: &mut [[u8; NONCE_LEN]]) -> Result<(), getrandom::Error> {
-        random_nonces(nonces)
-    }
-
-    fn file_id(&mut self) -> Result<[u8; FILE_ID_LEN], getrandom::Error> {
-        random_file_id()
-    }
-}
-
-/// How one try at a write ended.
-enum Written {
-    Done,
-    /// The block with that index, in the file with that id, does not open.
-    Corrupt {
-        block: u64,
-        used: [u8; FILE_ID_LEN],
-    },
-}
 
 /// What reading the old blocks of a write gave.
 enum Gathered {
@@ -151,10 +117,10 @@ impl<'a> Span<'a> {
     }
 }
 
-/// The stored bytes of a write: a lead, which is the header of a new file or
+/// The stored bytes of a change: a lead, which is the header of a new file or
 /// the padded last block of the old one, and then the run of blocks the data
 /// touches.
-struct Sealed {
+pub(super) struct Sealed {
     bytes: Vec<u8>,
     /// Bytes of `bytes` before the run.
     lead: usize,
@@ -174,6 +140,20 @@ struct Step {
 }
 
 impl Sealed {
+    /// `bytes` as one piece stored at `at`: a header, or a block. `pad_end`
+    /// is where the block ends when it is the padded last block of the old
+    /// file.
+    pub(super) fn alone(bytes: Vec<u8>, at: u64, pad_end: Option<u64>) -> Self {
+        let lead = bytes.len();
+        Self {
+            bytes,
+            lead,
+            lead_at: at,
+            run_at: at + lead as u64,
+            pad_end,
+        }
+    }
+
     /// The inner writes that store the bytes, in order: the lead, then the
     /// run, as one write when they are next to each other. A write that
     /// crosses `stored_end`, the end of the stored file before the write, is
@@ -214,7 +194,7 @@ impl Sealed {
     }
 }
 
-/// The plaintext of a block of `len` bytes: `old`, then zeros.
+/// The plaintext of a block of `len` bytes: `old`, cut or followed by zeros.
 fn padded(old: Option<Bytes>, len: usize) -> Vec<u8> {
     let mut plain = Vec::with_capacity(len);
     if let Some(old) = old {
@@ -224,9 +204,37 @@ fn padded(old: Option<Bytes>, len: usize) -> Vec<u8> {
     plain
 }
 
-/// The generator failed.
-fn random_error(error: getrandom::Error) -> SmbError {
-    SmbError::Io(io::Error::other(error))
+/// Seals block `index` into `slot`: `old`, cut or followed by zeros to the
+/// plaintext length the slot holds.
+fn seal_padded(
+    cipher: &FileCipher,
+    index: u64,
+    nonce: &[u8; NONCE_LEN],
+    old: Option<Bytes>,
+    slot: &mut [u8],
+) {
+    let plain = padded(old, slot.len() - OVERHEAD);
+    cipher
+        .seal_block(index, nonce, &plain, slot)
+        .expect("slots are sized by the caller");
+}
+
+/// The stored bytes of block `index`, which is where `range` says: `old`, cut
+/// or followed by zeros to the length of the block, under a nonce drawn from
+/// `random`.
+pub(super) fn seal_alone(
+    cipher: &FileCipher,
+    index: u64,
+    old: Bytes,
+    range: &BlockRange,
+    random: &mut dyn Random,
+) -> SmbResult<Vec<u8>> {
+    let len = usize::try_from(range.stored_len).map_err(|_| SmbError::InvalidParameter)?;
+    let mut nonce = [[0u8; NONCE_LEN]];
+    random.nonces(&mut nonce).map_err(random_error)?;
+    let mut bytes = vec![0u8; len];
+    seal_padded(cipher, index, &nonce[0], Some(old), &mut bytes);
+    Ok(bytes)
 }
 
 /// Seals the blocks `span` touches into one buffer, after `header` when the
@@ -281,10 +289,7 @@ fn seal(
         lead_bytes.copy_from_slice(header.as_bytes());
     }
     if let (Some((index, _)), [nonce]) = (&pad, pad_nonce) {
-        let plain = padded(take_old(*index), shift.block_len());
-        cipher
-            .seal_block(*index, nonce, &plain, lead_bytes)
-            .expect("slots are sized by the span");
+        seal_padded(cipher, *index, nonce, take_old(*index), lead_bytes);
     }
     for ((slot, nonce), index) in run_bytes
         .chunks_mut(stored_block)
@@ -339,76 +344,44 @@ impl<B: ShareBackend> EncryptedHandle<B> {
             return Ok(0);
         }
         let shift = self.shared.settings.block_shift;
-        let taken = u32::try_from(data.len()).map_err(|_| SmbError::InvalidParameter)?;
+        let accepted = u32::try_from(data.len()).map_err(|_| SmbError::InvalidParameter)?;
         if offset
-            .checked_add(u64::from(taken))
+            .checked_add(u64::from(accepted))
             .is_none_or(|end| stored_size(shift, end).is_none())
         {
             return Err(SmbError::InvalidParameter);
         }
-        let mut meta = file.write().await;
-        let mut reloaded = false;
-        loop {
-            match self
-                .write_once(&mut meta, offset, data, &mut *random)
-                .await?
-            {
-                Written::Done => return Ok(taken),
-                Written::Corrupt { block, used } => {
-                    if !reloaded && self.reload(&mut meta, used).await? {
-                        reloaded = true;
-                        continue;
-                    }
-                    return Err(self.block_error(block));
-                }
-            }
-        }
+        self.change_file(file, Change::Write { offset, data }, random)
+            .await?;
+        Ok(accepted)
     }
 
-    /// One try at a write, under the lock of the file. First the stored file
-    /// is cut to the size its logical size gives: a torn header, a header
-    /// alone or a fragment after the last block does not stay in the file.
-    async fn write_once(
+    /// One try at a write, under the lock of the file. The stored file is
+    /// normalized first.
+    pub(super) async fn write_once(
         &self,
         meta: &mut FileMeta,
         offset: u64,
         data: &[u8],
         random: &mut dyn Random,
-    ) -> SmbResult<Written> {
-        let shift = self.shared.settings.block_shift;
-        let stored = self.stored_size().await?;
-        let logical = logical_size(shift, stored).size;
-        let stored_end = stored_size(shift, logical).ok_or(SmbError::InvalidParameter)?;
-        if stored_end != stored {
-            self.inner.truncate(stored_end).await?;
-        }
-
-        // A file without data gets a header with a new file id, which is
-        // cached once the write is stored. The header of a file with data is
-        // taken out of `meta` while the write runs; a write that is dropped
-        // leaves it to be read again.
-        let fresh = stored_end == 0;
-        let (header, cipher) = if fresh {
-            meta.header = HeaderState::Absent;
-            let id = random.file_id().map_err(random_error)?;
-            let header = Header::new(shift, id).expect("the generator returns a non-zero file id");
-            (header, Box::new(FileCipher::new(&self.shared.keys, header)))
-        } else {
-            match mem::replace(&mut meta.header, HeaderState::Unknown) {
-                HeaderState::Present(header, cipher) => (header, cipher),
-                HeaderState::Unknown | HeaderState::Absent => self.read_header().await?,
-            }
-        };
-
-        let span = Span::new(shift, logical, offset, data);
-        let lead = fresh.then_some(&header);
-        let written = self
-            .rewrite(&span, lead, header.file_id(), &cipher, stored_end, random)
+    ) -> SmbResult<Attempt> {
+        let Normal { logical, end } = self.normalize().await?;
+        let taken = self.take_header(meta, end, random).await?;
+        let span = Span::new(self.shared.settings.block_shift, logical, offset, data);
+        let lead = taken.fresh.then_some(&taken.header);
+        let attempt = self
+            .rewrite(
+                &span,
+                lead,
+                taken.header.file_id(),
+                &taken.cipher,
+                end,
+                random,
+            )
             .await;
-        if !fresh || matches!(written, Ok(Written::Done)) {
-            meta.header = HeaderState::Present(header, cipher);
-        }
-        written
+        let done = matches!(attempt, Ok(Attempt::Done));
+        taken.put_back(meta, done);
+        attempt
     }
 
     /// Reads the old blocks `span` keeps bytes of, seals the new ones and
@@ -423,14 +396,14 @@ impl<B: ShareBackend> EncryptedHandle<B> {
         cipher: &FileCipher,
         stored_end: u64,
         random: &mut dyn Random,
-    ) -> SmbResult<Written> {
+    ) -> SmbResult<Attempt> {
         let old = match self.gather(cipher, span).await? {
             Gathered::Old(old) => old,
-            Gathered::Corrupt(block) => return Ok(Written::Corrupt { block, used }),
+            Gathered::Corrupt(block) => return Ok(Attempt::Corrupt { block, used }),
         };
         let sealed = seal(cipher, lead, span, old, random)?;
         self.store(&sealed, stored_end).await?;
-        Ok(Written::Done)
+        Ok(Attempt::Done)
     }
 
     /// Reads and opens the old blocks `span` keeps bytes of.
@@ -459,7 +432,7 @@ impl<B: ShareBackend> EncryptedHandle<B> {
     /// padded block once that block is whole; no block that held data is cut.
     /// A write that fails below the old end cuts nothing, and the blocks it
     /// overwrites can be torn.
-    async fn store(&self, sealed: &Sealed, stored_end: u64) -> SmbResult<()> {
+    pub(super) async fn store(&self, sealed: &Sealed, stored_end: u64) -> SmbResult<()> {
         let shift = self.shared.settings.block_shift;
         let mut safe_end = stored_end;
         for step in sealed.steps(stored_end) {
@@ -482,83 +455,27 @@ impl<B: ShareBackend> EncryptedHandle<B> {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
-    use std::future::ready;
+    use std::io;
     use std::sync::Arc;
 
     use super::super::format::MAX_STORED_SIZE;
     use super::super::inner::assert_calls;
     use super::super::node::HeaderKind;
+    use super::super::size::logical_size;
     use super::super::testing::{
-        B, BITS, H, assert_err, assert_io, block_reads, clear_blocks, faulty_file, faulty_file_in,
-        file_id, header_reads, key_schedule, layer_over, open, open_file, other_file_id, settle,
-        shift, stored, stored_file, stored_file_with_id,
+        B, BITS, C, Counting, Down, H, apply, assert_err, assert_io, assert_no_wait, at,
+        block_reads, clear_blocks, drop_at, faulty_file, faulty_file_in, file_id, gated_file,
+        header_reads, key_schedule, layer_over, new_file, nonce_at, open, open_file, other_file_id,
+        read_all, settle, shift, stored, stored_file, stored_file_with_id, stored_len,
+        writes_since,
     };
     use super::*;
     use crate::backend::{Handle, OpenAction, OpenIntent};
     use crate::tests::data::pattern;
     use crate::tests::faulty::Faulty;
-    use crate::tests::gated::{Gate, Gated, Op};
+    use crate::tests::gated::{Gated, Op};
     use crate::tests::logs::Logs;
     use crate::tests::memfs::MemFsBackend;
-
-    /// Stored bytes of a full block.
-    const C: usize = B + OVERHEAD;
-
-    /// Where block `index` starts in the stored file.
-    fn at(index: usize) -> usize {
-        H + index * C
-    }
-
-    /// `model` after `data` is written at `offset`.
-    fn apply(model: &mut Vec<u8>, offset: usize, data: &[u8]) {
-        if model.len() < offset + data.len() {
-            model.resize(offset + data.len(), 0);
-        }
-        model[offset..offset + data.len()].copy_from_slice(data);
-    }
-
-    /// The stored size of a file of `logical` bytes.
-    fn stored_len(logical: usize) -> usize {
-        usize::try_from(stored_size(shift(), logical as u64).unwrap()).unwrap()
-    }
-
-    /// A new file `f` in a backend behind `Faulty`.
-    async fn new_file() -> (
-        MemFsBackend,
-        Faulty<MemFsBackend>,
-        EncryptedHandle<Faulty<MemFsBackend>>,
-    ) {
-        let files = MemFsBackend::new();
-        let faulty = Faulty::new(files.clone());
-        let layer = layer_over(faulty.clone()).await;
-        let (handle, action) = open(&layer, "f", OpenIntent::Create).await;
-        assert_eq!(action, OpenAction::Created);
-        (files, faulty, handle)
-    }
-
-    async fn read_all<H: Handle>(handle: &H) -> Vec<u8> {
-        handle.read(0, u32::MAX).await.unwrap().to_vec()
-    }
-
-    /// The output of `call`, which ends without waiting for the lock of the
-    /// file.
-    async fn assert_no_wait<T>(call: impl Future<Output = T>) -> T {
-        tokio::select! {
-            biased;
-            output = call => output,
-            () = ready(()) => panic!("the call waited for the lock"),
-        }
-    }
-
-    /// The inner writes made since `from`.
-    fn writes_since(faulty: &Faulty<MemFsBackend>, from: usize) -> Vec<(u64, usize)> {
-        faulty.write_calls().split_off(from)
-    }
-
-    /// The nonce of the block that starts at `start` in `bytes`.
-    fn nonce_at(bytes: &[u8], start: usize) -> [u8; NONCE_LEN] {
-        bytes[start..start + NONCE_LEN].try_into().unwrap()
-    }
 
     #[tokio::test]
     async fn data_written_at_the_block_edges_reads_back_and_leaves_the_stored_size_of_its_length() {
@@ -686,38 +603,6 @@ mod tests {
         let before = faulty.write_calls().len();
         handle.write(FAR + 5, &data).await.unwrap();
         assert_eq!(writes_since(&faulty, before), [(run_at, run_len)]);
-    }
-
-    /// Draws from the OS and counts the draws.
-    #[derive(Default)]
-    struct Counting {
-        draws: Vec<usize>,
-        ids: usize,
-    }
-
-    impl Random for Counting {
-        fn nonces(&mut self, nonces: &mut [[u8; NONCE_LEN]]) -> Result<(), getrandom::Error> {
-            self.draws.push(nonces.len());
-            random_nonces(nonces)
-        }
-
-        fn file_id(&mut self) -> Result<[u8; FILE_ID_LEN], getrandom::Error> {
-            self.ids += 1;
-            random_file_id()
-        }
-    }
-
-    /// A generator that does not answer.
-    struct Down;
-
-    impl Random for Down {
-        fn nonces(&mut self, _: &mut [[u8; NONCE_LEN]]) -> Result<(), getrandom::Error> {
-            Err(getrandom::Error::UNEXPECTED)
-        }
-
-        fn file_id(&mut self) -> Result<[u8; FILE_ID_LEN], getrandom::Error> {
-            Err(getrandom::Error::UNEXPECTED)
-        }
     }
 
     #[tokio::test]
@@ -880,10 +765,7 @@ mod tests {
     #[tokio::test]
     async fn two_handles_writing_different_bytes_of_one_block_both_land() {
         let plain = pattern(3 * B + 100, 1);
-        let files = MemFsBackend::new();
-        let gated = Gated::new(files.clone());
-        let layer = layer_over(gated.clone()).await;
-        files.clone().with_file("f", &stored(&plain));
+        let (_, gated, layer) = gated_file(&stored(&plain)).await;
         let a = Arc::new(open_file(&layer, "f").await);
         let b = Arc::new(open_file(&layer, "f").await);
         assert!(Arc::ptr_eq(a.node(), b.node()));
@@ -1601,24 +1483,11 @@ mod tests {
         }
     }
 
-    /// Polls `write` until a call is parked at `gate`, then drops it.
-    async fn drop_at(gate: &Gate, write: impl Future<Output = SmbResult<u32>>) {
-        let mut write = Box::pin(write);
-        tokio::select! {
-            biased;
-            _ = &mut write => panic!("the write ended before it reached the gate"),
-            () = gate.reached() => {}
-        }
-    }
-
     #[tokio::test]
     async fn a_dropped_write_frees_the_lock_and_drops_the_cached_header() {
         let plain = pattern(2 * B + 10, 1);
         let bytes = stored(&plain);
-        let files = MemFsBackend::new();
-        let gated = Gated::new(files.clone());
-        let layer = layer_over(gated.clone()).await;
-        files.clone().with_file("f", &bytes);
+        let (files, gated, layer) = gated_file(&bytes).await;
         let handle = open_file(&layer, "f").await;
         assert_eq!(handle.read(0, 10).await.unwrap(), plain[..10]);
         assert_eq!(handle.node().header().await, Some(HeaderKind::Present));
@@ -1643,10 +1512,7 @@ mod tests {
         let plain = pattern(B + 100, 1);
         let bytes = stored(&plain);
         let old_end = at(1) + 100 + OVERHEAD;
-        let files = MemFsBackend::new();
-        let gated = Gated::new(files.clone());
-        let layer = layer_over(gated.clone()).await;
-        files.clone().with_file("f", &bytes);
+        let (files, gated, layer) = gated_file(&bytes).await;
         let handle = open_file(&layer, "f").await;
         let file = handle.node().file().unwrap();
         let data = pattern(10, 2);

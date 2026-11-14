@@ -24,12 +24,12 @@ use crate::stream::{StreamInfo, StreamName};
 /// applies its first bytes there first, and a failed close closes the handle
 /// all the same. `write` and `write_owned` count as
 /// writes. `open_stream` is neither counted nor faulted. Short reads, short
-/// writes, a reported file size and the offset from which writes are dropped
-/// stay in force until changed. The counters count every call
-/// that reaches this backend, a clone of it or one of their handles,
-/// faulted or not. Reads and writes are logged as asked for, before a
-/// short-read or short-write limit cuts them. Clones share the faults, the
-/// counters and the logs.
+/// writes, a reported file size, the offset from which writes are dropped and
+/// the length from which truncates are dropped stay in force until changed.
+/// The counters count every call that reaches this backend, a clone of it or
+/// one of their handles, faulted or not. Reads, writes and truncates are
+/// logged as asked for, before a short-read or short-write limit cuts them.
+/// Clones share the faults, the counters and the logs.
 ///
 /// Handles it returns have no `as_any`.
 #[derive(Clone)]
@@ -47,6 +47,7 @@ struct State {
     truncates: usize,
     reads: Vec<(u64, u32)>,
     write_log: Vec<(u64, usize)>,
+    truncate_log: Vec<u64>,
     open_fault: Option<OpenFault>,
     unlink_fault: Option<Fault>,
     rename_fault: Option<Fault>,
@@ -58,6 +59,7 @@ struct State {
     max_write: Option<usize>,
     size: Option<u64>,
     sink_from: Option<u64>,
+    sink_truncate_from: Option<u64>,
 }
 
 struct Fault {
@@ -242,6 +244,13 @@ impl<B: ShareBackend> Faulty<B> {
         self.state.lock().unwrap().sink_from = offset;
     }
 
+    /// Makes every truncate to `len` bytes or more report success without
+    /// reaching the inner backend, or lifts the override. Faults still take
+    /// precedence.
+    pub(crate) fn sink_truncates_from(&self, len: Option<u64>) {
+        self.state.lock().unwrap().sink_truncate_from = len;
+    }
+
     /// Opens seen so far.
     pub(crate) fn opens(&self) -> usize {
         self.state.lock().unwrap().opens
@@ -275,6 +284,11 @@ impl<B: ShareBackend> Faulty<B> {
     /// The offset and length of each write seen so far, as asked for.
     pub(crate) fn write_calls(&self) -> Vec<(u64, usize)> {
         self.state.lock().unwrap().write_log.clone()
+    }
+
+    /// The length of each truncate seen so far, as asked for.
+    pub(crate) fn truncate_calls(&self) -> Vec<u64> {
+        self.state.lock().unwrap().truncate_log.clone()
     }
 
     fn wrap(&self, handle: Box<dyn Handle>) -> Box<dyn Handle> {
@@ -468,13 +482,16 @@ impl Handle for FaultyHandle {
     }
 
     async fn truncate(&self, len: u64) -> SmbResult<()> {
-        let fault = {
+        let (fault, sunk) = {
             let mut state = self.state.lock().unwrap();
             state.truncates += 1;
-            due(&mut state.truncate_fault)
+            state.truncate_log.push(len);
+            let sunk = state.sink_truncate_from.is_some_and(|from| len >= from);
+            (due(&mut state.truncate_fault), sunk)
         };
         match fault {
             Some(fault) => Err(fault.error),
+            None if sunk => Ok(()),
             None => self.inner.truncate(len).await,
         }
     }
@@ -713,6 +730,24 @@ mod tests {
         assert_eq!(files.contents("f"), Some(b"ab".to_vec()));
         assert_eq!(faulty.truncates(), 3);
         assert_eq!(faulty.writes(), 0);
+    }
+
+    #[tokio::test]
+    async fn logs_each_truncate_and_drops_the_ones_from_the_sink_length() {
+        let (files, faulty, handle) = faulty_file(b"abcdef").await;
+        faulty.sink_truncates_from(Some(10));
+        handle.truncate(8).await.unwrap();
+        handle.truncate(10).await.unwrap();
+        handle.truncate(1 << 40).await.unwrap();
+        assert_eq!(faulty.truncate_calls(), [8, 10, 1 << 40]);
+        assert_eq!(files.contents("f"), Some(b"abcdef\0\0".to_vec()));
+
+        faulty.fail_truncate(1, SmbError::DiskFull);
+        assert!(matches!(handle.truncate(20).await, Err(SmbError::DiskFull)));
+        faulty.sink_truncates_from(None);
+        handle.truncate(4).await.unwrap();
+        assert_eq!(files.contents("f"), Some(b"abcd".to_vec()));
+        assert_eq!(faulty.truncates(), 5);
     }
 
     #[tokio::test]

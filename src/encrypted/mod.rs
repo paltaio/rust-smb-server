@@ -4,6 +4,7 @@ mod backend;
 mod base32;
 mod block;
 mod builder;
+mod change;
 mod clear;
 mod content;
 mod error;
@@ -22,6 +23,7 @@ mod setup;
 mod size;
 #[cfg(test)]
 mod testing;
+mod truncate;
 mod write;
 #[cfg(test)]
 mod wycheproof_gcm;
