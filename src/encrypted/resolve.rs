@@ -1,11 +1,16 @@
-//! Opens and creates entries in a share with encrypted names.
+//! Finds and opens the entries of a share with encrypted names, and creates
+//! them.
 //!
 //! A client's name is encrypted and opened as it stands. When the inner
 //! backend has no entry of that name, the names of the directory are searched
 //! for one that differs only in case, and when a directory on the way is
-//! missing, the path is walked from the root the same way.
+//! missing, the path is walked from the root the same way. Unlinks and renames
+//! find their entries and directories the same way.
+
+use std::pin::Pin;
 
 use super::backend::EncryptedBackend;
+use super::cache::Entry;
 use super::clear::creates;
 use super::handle::OpenResult;
 use super::locks::DirLock;
@@ -18,10 +23,14 @@ use crate::path::SmbPath;
 
 /// A directory: the path it is stored under and the path as its names are
 /// spelled in plaintext.
+#[derive(Clone)]
 pub(super) struct Dir {
     pub(super) stored: SmbPath,
     pub(super) plain: SmbPath,
 }
+
+/// The boxed future of an operation on a directory.
+pub(super) type DirFuture<'a, T> = Pin<Box<dyn Future<Output = SmbResult<T>> + Send + 'a>>;
 
 impl<B: ShareBackend> EncryptedBackend<B> {
     /// Opens the entry `name` of the directory `parent`, whose names are as
@@ -32,28 +41,43 @@ impl<B: ShareBackend> EncryptedBackend<B> {
     ///
     /// The entry is looked up under the stored name `name` encrypts to. When
     /// the inner backend has none, the names of the directory give an entry
-    /// that differs in case, and when the directory is missing the path is
-    /// walked from the root. A name that matches exactly comes before names
+    /// that differs in case. A name that matches exactly comes before names
     /// that differ in case, and of those the first by stored name wins. With
     /// `case_insensitive` off only the exact stored name is tried.
-    ///
-    /// A directory that the walk found and the inner backend lacks drops the
-    /// caches of the directories above it, and the path is walked once more.
-    /// A second miss fails with `Sharing`, unless the walk ends in the
-    /// directory the exact name was tried in: that one is missing.
     pub(super) async fn open_entry(
         &self,
         parent: &SmbPath,
         name: &str,
         opts: OpenOptions,
     ) -> OpenResult<B> {
+        self.in_parent(parent, &|dir| {
+            Box::pin(async move { self.open_in(&dir, name, opts).await })
+        })
+        .await
+    }
+
+    /// Runs `op` on the stored directory that `parent` stands for. `op`
+    /// answers `PathNotFound` when the directory is missing.
+    ///
+    /// The directory is first the one the names of `parent` encrypt to. When
+    /// `op` finds it missing and names match without regard to case, the path
+    /// is walked from the root, and `op` runs on the directory the walk finds.
+    /// A directory that the walk found and the inner backend lacks drops the
+    /// caches of the directories above it, and the path is walked once more.
+    /// A second miss fails with `Sharing`, unless the walk ends in the
+    /// directory `op` first found missing: that one is missing.
+    pub(super) async fn in_parent<'a, T>(
+        &self,
+        parent: &SmbPath,
+        op: &(dyn Fn(Dir) -> DirFuture<'a, T> + Sync + 'a),
+    ) -> SmbResult<T> {
         let dir = Dir {
             stored: self.stored_path(parent)?,
             plain: parent.clone(),
         };
-        match self.open_in(&dir, name, opts).await {
+        match op(dir.clone()).await {
             Err(SmbError::PathNotFound) if self.shared.settings.case_insensitive => {}
-            opened => return opened,
+            done => return done,
         }
         let mut contradicted = false;
         loop {
@@ -64,7 +88,7 @@ impl<B: ShareBackend> EncryptedBackend<B> {
             let answer = if tried {
                 Err(SmbError::PathNotFound)
             } else {
-                self.open_in(&found, name, opts).await
+                op(found.clone()).await
             };
             if !matches!(answer, Err(SmbError::PathNotFound)) {
                 return answer;
@@ -78,6 +102,36 @@ impl<B: ShareBackend> EncryptedBackend<B> {
             }
             contradicted = true;
             self.forget_above(&found.stored);
+        }
+    }
+
+    /// The entry of the stored directory `dir` that `name` stands for, which
+    /// encrypts to the stored name `canonical`. The caller holds the lock of
+    /// `dir`, or the tree lock exclusively, so the names built here are kept.
+    ///
+    /// Cached names that lack the entry may be out of date, since another
+    /// writer can add entries. They are built again once, and what that
+    /// listing lacks is absent. `PathNotFound` when the directory is missing
+    /// and `NotFound` when it has no such entry.
+    pub(super) async fn find_entry(
+        &self,
+        dir: &SmbPath,
+        name: &str,
+        canonical: &str,
+    ) -> SmbResult<Entry> {
+        let mut rebuilt = false;
+        loop {
+            let Some(names) = self.lookup_names(dir, Hold::Lock).await? else {
+                return Err(SmbError::PathNotFound);
+            };
+            if let Some(entry) = names.snapshot.entry(name, canonical) {
+                return Ok(entry);
+            }
+            if names.built || rebuilt {
+                return Err(SmbError::NotFound);
+            }
+            self.invalidate(&path_key(dir, NameMatch::Exact));
+            rebuilt = true;
         }
     }
 
@@ -212,12 +266,12 @@ impl<B: ShareBackend> EncryptedBackend<B> {
     }
 
     /// The name the inner backend stores `name` under.
-    fn stored_name(&self, name: &str) -> SmbResult<String> {
+    pub(super) fn stored_name(&self, name: &str) -> SmbResult<String> {
         self.stored_form(name).map(|stored| stored.entry)
     }
 
     /// The path the inner backend stores `path` under.
-    fn stored_path(&self, path: &SmbPath) -> SmbResult<SmbPath> {
+    pub(super) fn stored_path(&self, path: &SmbPath) -> SmbResult<SmbPath> {
         path.components()
             .iter()
             .try_fold(SmbPath::root(), |stored, name| {
@@ -233,9 +287,9 @@ mod tests {
     use super::super::format::{HEADER_LEN, NONCE_LEN};
     use super::super::node::{HeaderKind, NameMatch};
     use super::super::testing::{
-        Hidden, key_schedule, layer, names_over, names_settings, names_with, open, open_dir,
-        open_file, read_all, refused, seed_dir, seed_file, settle, shares_node, spawn_open,
-        stored_at, stored_bytes, stored_form, stored_name, with_name_limit,
+        Hidden, assert_err, layer, names_over, names_with, open, open_dir, open_file, read_all,
+        refused, seed_dir, seed_file, settle, shares_node, spawn_open, stored_at, stored_bytes,
+        stored_form, stored_name, with_name_limit,
     };
     use super::*;
     use crate::backend::{Handle, OpenAction, OpenIntent, ShareBackend};
@@ -245,8 +299,7 @@ mod tests {
     use crate::tests::gated::{Gated, Op};
     use crate::tests::logs::Logs;
     use crate::tests::memfs::MemFsBackend;
-    use crate::tests::recorder::Recorder;
-    use crate::tests::util::{dir_opts, path};
+    use crate::tests::util::{dir_opts, opts, path};
 
     #[tokio::test]
     async fn an_exact_name_opens_with_one_inner_open_and_no_listing() {
@@ -342,23 +395,18 @@ mod tests {
 
         for intent in [OpenIntent::Open, OpenIntent::Truncate] {
             for (asked, expected) in [
-                ("Docs\\missing", "NotFound"),
-                ("docs\\MISSING", "NotFound"),
-                ("missing", "NotFound"),
-                ("nodocs\\a.txt", "PathNotFound"),
-                ("Docs\\nope\\a.txt", "PathNotFound"),
-                ("docs\\nope\\a.txt", "PathNotFound"),
-                ("docs\\a.txt\\x", "PathNotFound"),
-                ("docs\\sub\\missing", "NotFound"),
-                ("docs\\sub\\deeper\\missing", "PathNotFound"),
+                ("Docs\\missing", SmbError::NotFound),
+                ("docs\\MISSING", SmbError::NotFound),
+                ("missing", SmbError::NotFound),
+                ("nodocs\\a.txt", SmbError::PathNotFound),
+                ("Docs\\nope\\a.txt", SmbError::PathNotFound),
+                ("docs\\nope\\a.txt", SmbError::PathNotFound),
+                ("docs\\a.txt\\x", SmbError::PathNotFound),
+                ("docs\\sub\\missing", SmbError::NotFound),
+                ("docs\\sub\\deeper\\missing", SmbError::PathNotFound),
             ] {
-                let error = refused(&layer, asked, intent).await;
-                let got = match error {
-                    SmbError::NotFound => "NotFound",
-                    SmbError::PathNotFound => "PathNotFound",
-                    other => panic!("{asked}: {other:?}"),
-                };
-                assert_eq!(got, expected, "{asked} {intent:?}");
+                let opened = layer.open_handle(&path(asked), opts(intent)).await;
+                assert_err(opened.map(drop), expected);
             }
         }
         assert_eq!(layer.node_count(), 0);
@@ -489,17 +537,15 @@ mod tests {
         let exact = open_file(&layer, "Docs\\Report.txt").await;
         assert_eq!(exact.stat().await.unwrap().name, "Report.txt");
         for (asked, expected) in [
-            ("Docs\\report.txt", "NotFound"),
-            ("docs\\Report.txt", "PathNotFound"),
-            ("DOCS\\REPORT.TXT", "PathNotFound"),
-            ("Docs\\Report", "NotFound"),
+            ("Docs\\report.txt", SmbError::NotFound),
+            ("docs\\Report.txt", SmbError::PathNotFound),
+            ("DOCS\\REPORT.TXT", SmbError::PathNotFound),
+            ("Docs\\Report", SmbError::NotFound),
         ] {
-            let got = match refused(&layer, asked, OpenIntent::Open).await {
-                SmbError::NotFound => "NotFound",
-                SmbError::PathNotFound => "PathNotFound",
-                other => panic!("{asked}: {other:?}"),
-            };
-            assert_eq!(got, expected, "{asked}");
+            let opened = layer
+                .open_handle(&path(asked), opts(OpenIntent::Open))
+                .await;
+            assert_err(opened.map(drop), expected);
         }
         assert_eq!(
             faulty.opens() - before,
@@ -978,14 +1024,5 @@ mod tests {
         assert_eq!(miss("D").await, 1, "and used");
         assert_eq!(miss("A").await, 2);
         assert_eq!(cached(), [a], "the next one pushes it out");
-    }
-
-    #[tokio::test]
-    async fn unlinks_and_renames_do_not_reach_the_inner_backend() {
-        let recorder = Recorder::default();
-        let layer = EncryptedBackend::new(recorder.clone(), key_schedule(), names_settings());
-        let _ = layer.unlink(&path("Dir\\File.TXT")).await;
-        let _ = layer.rename(&path("a"), &path("b"), false).await;
-        assert_eq!(recorder.calls(), Vec::<String>::new());
     }
 }

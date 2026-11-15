@@ -240,16 +240,15 @@ pub(super) async fn next_mapped(
 
 #[cfg(test)]
 mod tests {
-    use std::io;
-
     use tokio::sync::Notify;
 
     use super::super::backend::EncryptedBackend;
     use super::super::format::{BlockShift, MARKER_NAME};
     use super::super::node::{Found, Origin};
     use super::super::testing::{
-        Hiding, Parked, Script, change, clear_over, clear_settings, exact_names, key_schedule,
-        names, open_dir, open_file, renamed, settle, stored_file, stored_hole, summary,
+        Hiding, Parked, Script, change, clear_over, clear_settings, exact_names, injected,
+        key_schedule, names, open_dir, open_file, renamed, settle, stored_file, stored_hole,
+        summary,
     };
     use super::*;
     use crate::backend::{OpenAction, OpenOptions};
@@ -541,7 +540,7 @@ mod tests {
         let handle = open_file(&layer, "f").await;
         assert_eq!((layer.node_count(), files.open_handles()), (1, 1));
 
-        faulty.fail_close(1, SmbError::Io(io::Error::other("injected")));
+        faulty.fail_close(1, injected());
         assert!(matches!(
             Box::new(handle).close().await,
             Err(SmbError::Io(_))

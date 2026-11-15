@@ -246,6 +246,7 @@ pub(super) fn assert_calls(calls: &[(u64, usize)], block: u64, from: u64, to: u6
 
 #[cfg(test)]
 mod tests {
+    use super::super::testing::injected;
     use super::*;
     use crate::backend::{OpenIntent, ShareBackend};
     use crate::tests::faulty::Faulty;
@@ -285,7 +286,7 @@ mod tests {
             assert_eq!(read, None, "{none}");
         }
 
-        faulty.fail_open(1, |_, _| true, SmbError::Io(io::Error::other("injected")));
+        faulty.fail_open(1, |_, _| true, injected());
         assert!(matches!(
             read_side_object(&faulty, &path("exact")).await,
             Err(SmbError::Io(_))

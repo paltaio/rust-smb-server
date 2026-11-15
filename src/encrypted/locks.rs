@@ -11,6 +11,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
+use super::node::is_at_or_below;
+
 /// Locks `m`, whether or not a thread panicked while holding it.
 pub(super) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
@@ -85,6 +87,16 @@ impl Locks {
         });
         entries.insert(key, Arc::downgrade(&dir));
         dir
+    }
+
+    /// The lock entries in use of the directory `key` and the directories
+    /// below it. A directory nobody holds an entry of has no count to change.
+    pub(super) fn directories_below(&self, key: &str) -> Vec<Arc<DirLock>> {
+        lock(&self.directories.entries)
+            .iter()
+            .filter(|(held, _)| is_at_or_below(held, key))
+            .filter_map(|(_, entry)| entry.upgrade())
+            .collect()
     }
 
     /// Directory locks in use.
@@ -191,6 +203,32 @@ mod tests {
             0,
             "an entry nobody holds starts over"
         );
+    }
+
+    #[tokio::test]
+    async fn the_entries_at_and_below_a_directory_are_found_without_its_siblings() {
+        let locks = Locks::new();
+        let held: Vec<_> = ["a", "a\\b", "a\\b\\c", "ab", "b", "b\\a"]
+            .map(|key| locks.directory(key.to_string()))
+            .into();
+        let keys = |below: &str| {
+            let mut keys: Vec<_> = locks
+                .directories_below(below)
+                .iter()
+                .map(|dir| dir.key().to_string())
+                .collect();
+            keys.sort();
+            keys
+        };
+        assert_eq!(keys("a"), ["a", "a\\b", "a\\b\\c"]);
+        assert_eq!(keys("a\\b"), ["a\\b", "a\\b\\c"]);
+        assert_eq!(keys("b"), ["b", "b\\a"]);
+        assert_eq!(keys("zz"), Vec::<String>::new());
+        assert_eq!(keys("").len(), 6);
+
+        drop(held);
+        assert!(locks.directories_below("a").is_empty());
+        assert_eq!(locks.directory_count(), 0);
     }
 
     #[tokio::test]

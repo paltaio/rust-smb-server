@@ -24,6 +24,7 @@ mod marker;
 mod names;
 mod node;
 mod random;
+mod rename;
 mod resolve;
 mod restore;
 mod scan;
@@ -32,6 +33,7 @@ mod size;
 #[cfg(test)]
 mod testing;
 mod truncate;
+mod unlink;
 mod write;
 #[cfg(test)]
 mod wycheproof_gcm;

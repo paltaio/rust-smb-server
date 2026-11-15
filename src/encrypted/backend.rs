@@ -347,7 +347,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn encrypted_names_open_create_and_list_but_do_not_unlink_or_rename() {
+    async fn a_stored_name_that_is_not_the_shares_cannot_be_opened_unlinked_or_renamed() {
         let files = MemFsBackend::new();
         let backend = built(&files).await;
         files.clone().with_file("f", b"abc");
@@ -368,7 +368,7 @@ mod tests {
         handle.close().await.unwrap();
         assert!(matches!(
             backend.unlink(&path("f")).await,
-            Err(SmbError::NotSupported)
+            Err(SmbError::NotFound)
         ));
         assert!(matches!(
             backend.unlink(&SmbPath::root()).await,
@@ -376,7 +376,7 @@ mod tests {
         ));
         assert!(matches!(
             backend.rename(&path("f"), &path("g"), false).await,
-            Err(SmbError::NotSupported)
+            Err(SmbError::NotFound)
         ));
         assert!(matches!(
             backend.rename(&SmbPath::root(), &path("g"), false).await,

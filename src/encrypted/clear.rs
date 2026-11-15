@@ -201,13 +201,16 @@ impl<B: ShareBackend> EncryptedBackend<B> {
         })
     }
 
-    /// Deletes the file or empty directory at `path`.
+    /// Deletes the file or empty directory at `path`. The call holds the tree
+    /// lock shared from here to the end, and nothing below it takes the lock
+    /// again.
     pub(super) async fn unlink_path(&self, path: &SmbPath) -> SmbResult<()> {
-        let Some(parent) = path.parent() else {
+        let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
             return Err(SmbError::AccessDenied);
         };
         if self.shared.settings.encrypt_names {
-            return Err(SmbError::NotSupported);
+            let _tree = self.shared.locks.tree.read().await;
+            return self.unlink_entry(&parent, name).await;
         }
         let names = self.shared.name_match();
         if is_marker(path, names) {
@@ -221,17 +224,30 @@ impl<B: ShareBackend> EncryptedBackend<B> {
         Ok(())
     }
 
+    /// Renames `from` to `to`. The call holds the tree lock exclusively from
+    /// here to the end, and nothing below it takes the lock again.
     pub(super) async fn rename_path(
         &self,
         from: &SmbPath,
         to: &SmbPath,
         replace_if_exists: bool,
     ) -> SmbResult<()> {
-        if from.is_root() || to.is_root() {
+        let (Some(from_parent), Some(from_name), Some(to_parent), Some(to_name)) =
+            (from.parent(), from.file_name(), to.parent(), to.file_name())
+        else {
             return Err(SmbError::AccessDenied);
-        }
+        };
         if self.shared.settings.encrypt_names {
-            return Err(SmbError::NotSupported);
+            let _tree = self.shared.locks.tree.write().await;
+            return self
+                .rename_entry(
+                    &from_parent,
+                    from_name,
+                    &to_parent,
+                    to_name,
+                    replace_if_exists,
+                )
+                .await;
         }
         let names = self.shared.name_match();
         if is_marker(from, names) {

@@ -99,6 +99,19 @@ impl<V: Clone> Lru<V> {
         }
     }
 
+    /// Drops the entries whose key `matches` accepts.
+    pub(super) fn remove_where(&mut self, matches: impl Fn(&str) -> bool) {
+        let keys: Vec<String> = self
+            .slots
+            .keys()
+            .filter(|key| matches(key))
+            .cloned()
+            .collect();
+        for key in keys {
+            self.remove(&key);
+        }
+    }
+
     #[cfg(test)]
     pub(super) fn len(&self) -> usize {
         self.slots.len()
@@ -205,5 +218,18 @@ mod tests {
         assert_eq!((cache.len(), cache.weight()), (1, 4));
         cache.insert("c".to_string(), 3, 6);
         assert_eq!(cache.keys(), ["b", "c"]);
+    }
+
+    #[test]
+    fn entries_that_match_are_dropped_with_their_weight() {
+        let mut cache = lru(100);
+        for (key, weight) in [("a", 1), ("ab", 2), ("b", 4), ("abc", 8)] {
+            cache.insert(key.to_string(), 0, weight);
+        }
+        cache.remove_where(|key| key.starts_with('a'));
+        assert_eq!(cache.keys(), ["b"]);
+        assert_eq!((cache.len(), cache.weight()), (1, 4));
+        cache.remove_where(|_| false);
+        assert_eq!(cache.len(), 1);
     }
 }

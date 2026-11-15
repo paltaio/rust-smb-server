@@ -14,6 +14,8 @@ use super::names::StoredName;
 use super::node::{NameMatch, path_key};
 use super::resolve::Dir;
 use crate::backend::{OpenAction, OpenOptions, ShareBackend};
+use crate::error::SmbResult;
+use crate::path::SmbPath;
 
 /// Drops the cached names of the directory `key` when it goes out of scope
 /// armed. A create holds one from before the inner create until the cached
@@ -96,11 +98,7 @@ impl<B: ShareBackend> EncryptedBackend<B> {
     ) -> OpenResult<B> {
         let at = dir.stored.join(&stored.entry)?;
         let plain = dir.plain.join(name)?;
-        if let Some(side) = &stored.side_object {
-            let side_at = dir.stored.join(&side.name)?;
-            write_side_object(&self.shared.inner, &side_at, &side.content).await?;
-            self.shared.long_names.insert(stored.entry.clone(), name);
-        }
+        self.write_long_name(&dir.stored, name, stored).await?;
         let names = self.shared.name_match();
         let listed = self.shared.settings.case_insensitive;
         let mut stale = DropNames {
@@ -119,26 +117,42 @@ impl<B: ShareBackend> EncryptedBackend<B> {
                 stored: stored.entry.clone(),
                 directory: handle.node.is_directory(),
             };
-            self.shared.names.patch(lock, entry);
+            self.shared.names.patch(lock, None, Some(entry));
         } else if listed {
             self.invalidate(lock.key());
         }
         stale.disarm();
         Ok((handle.with_plaintext(plain), action))
     }
+
+    /// Makes the side object of the long name `name`, stored as `stored`, in
+    /// the stored directory `dir`, and gives the long-name cache the entry. A
+    /// name that is not long has neither.
+    pub(super) async fn write_long_name(
+        &self,
+        dir: &SmbPath,
+        name: &str,
+        stored: &StoredName,
+    ) -> SmbResult<()> {
+        if let Some(side) = &stored.side_object {
+            let side_at = dir.join(&side.name)?;
+            write_side_object(&self.shared.inner, &side_at, &side.content).await?;
+            self.shared.long_names.insert(stored.entry.clone(), name);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::io;
     use std::time::Duration;
 
     use super::super::node::HeaderKind;
     use super::super::scan::Hold;
     use super::super::testing::{
-        Hidden, drop_at, layer, names_over, names_with, open, open_dir, open_dir_as, open_file,
-        read_all, refused, refused_dir, seed_dir, seed_file, settle, shares_node, spawn_open,
-        stored_at, stored_bytes, stored_form, stored_name, writes_since,
+        Hidden, drop_at, injected, layer, names_over, names_with, open, open_dir, open_dir_as,
+        open_file, read_all, refused, refused_dir, seed_dir, seed_file, settle, shares_node,
+        spawn_open, stored_at, stored_bytes, stored_form, stored_name, writes_since,
     };
     use super::*;
     use crate::backend::{Handle, OpenIntent};
@@ -461,7 +475,7 @@ mod tests {
         faulty.fail_open(
             1,
             move |at, _| at.file_name() == Some(side_name.as_str()),
-            SmbError::Io(io::Error::other("injected")),
+            injected(),
         );
         let error = refused(&layer, &long, OpenIntent::Create).await;
         assert!(matches!(error, SmbError::Io(_)), "{error:?}");
@@ -861,7 +875,7 @@ mod tests {
         let files = MemFsBackend::new();
         let faulty = Faulty::new(files.clone());
         let layer = names_over(faulty.clone()).await;
-        faulty.fail_stat(1, SmbError::Io(io::Error::other("injected")));
+        faulty.fail_stat(1, injected());
 
         let error = refused(&layer, "Foo", OpenIntent::Create).await;
         assert!(matches!(error, SmbError::Io(_)), "{error:?}");

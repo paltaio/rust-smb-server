@@ -53,6 +53,15 @@ pub(super) fn path_key(path: &SmbPath, names: NameMatch) -> String {
     }
 }
 
+/// True if the directory with the key `key` is the one with the key `dir` or
+/// lies below it. Keys are made by `path_key` with exact names.
+pub(super) fn is_at_or_below(key: &str, dir: &str) -> bool {
+    dir.is_empty()
+        || key
+            .strip_prefix(dir)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('\\'))
+}
+
 /// What the layer knows of the header of a stored file.
 pub(super) enum HeaderState {
     /// The file may have a header that is not read yet.

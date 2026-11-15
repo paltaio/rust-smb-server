@@ -138,6 +138,66 @@ impl<B> Shared<B> {
     }
 }
 
+/// The names of a stored directory, and where they came from.
+pub(super) struct Names {
+    pub(super) snapshot: Arc<Snapshot>,
+    /// The call built the names by listing the directory. Otherwise they were
+    /// cached, and may lack entries that were added from outside.
+    pub(super) built: bool,
+}
+
+/// Drops the cached names of the directories it was made for when it goes out
+/// of scope armed. An unlink or a rename holds one while the inner call runs,
+/// so a call that is dropped meanwhile never leaves cached names that disagree
+/// with the inner backend. Nodes keep their paths: a dropped call does not say
+/// whether the inner call landed.
+pub(super) struct DropChange<'a, B: ShareBackend> {
+    layer: &'a EncryptedBackend<B>,
+    keys: Vec<String>,
+    below: Option<SmbPath>,
+    armed: bool,
+}
+
+impl<'a, B: ShareBackend> DropChange<'a, B> {
+    /// A guard for the stored directories `dirs`, and for the directories at
+    /// and below `below`, the old path of a directory that is renamed or
+    /// removed.
+    pub(super) fn arm(
+        layer: &'a EncryptedBackend<B>,
+        dirs: &[&SmbPath],
+        below: Option<&SmbPath>,
+    ) -> Self {
+        Self {
+            layer,
+            keys: dirs
+                .iter()
+                .map(|dir| path_key(dir, NameMatch::Exact))
+                .collect(),
+            below: below.cloned(),
+            armed: true,
+        }
+    }
+
+    /// The inner call has returned.
+    pub(super) fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl<B: ShareBackend> Drop for DropChange<'_, B> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        for key in &self.keys {
+            self.layer.invalidate(key);
+        }
+        if let Some(dir) = &self.below {
+            self.layer.forget_below(dir);
+        }
+    }
+}
+
 impl<B: ShareBackend> EncryptedBackend<B> {
     /// The names of the stored directory `dir`: the cached ones while they
     /// are fresh, else a new listing, which the cache keeps as `hold` says
@@ -148,9 +208,20 @@ impl<B: ShareBackend> EncryptedBackend<B> {
         dir: &SmbPath,
         hold: Hold,
     ) -> SmbResult<Option<Arc<Snapshot>>> {
+        Ok(self
+            .lookup_names(dir, hold)
+            .await?
+            .map(|names| names.snapshot))
+    }
+
+    /// `names_of`, with whether this call built the names.
+    pub(super) async fn lookup_names(&self, dir: &SmbPath, hold: Hold) -> SmbResult<Option<Names>> {
         let key = path_key(dir, NameMatch::Exact);
-        if let Some(names) = self.shared.names.fresh(&key) {
-            return Ok(Some(names));
+        if let Some(snapshot) = self.shared.names.fresh(&key) {
+            return Ok(Some(Names {
+                snapshot,
+                built: false,
+            }));
         }
         // The entry stays in the lock table while this call holds it, so its
         // count of changes does not start over during the listing.
@@ -161,10 +232,13 @@ impl<B: ShareBackend> EncryptedBackend<B> {
         };
         let listing = self.decode(dir, listed).await?;
         let entries = listing.names.into_iter().map(|decoded| decoded.entry);
-        let names = self
+        let snapshot = self
             .shared
             .keep_names(&lock, began, hold, listing.complete, entries);
-        Ok(Some(names))
+        Ok(Some(Names {
+            snapshot,
+            built: true,
+        }))
     }
 
     /// Drops the cached names of the directory with `key`. A listing that
@@ -174,9 +248,20 @@ impl<B: ShareBackend> EncryptedBackend<B> {
         self.shared.names.forget(key);
     }
 
+    /// Drops the cached names of the stored directory `dir` and of the
+    /// directories below it. Called once the inner backend has renamed or
+    /// removed the directory. Every directory of those that a listing holds
+    /// the lock entry of counts a change, so a listing that began earlier is
+    /// not kept.
+    pub(super) fn forget_below(&self, dir: &SmbPath) {
+        let key = path_key(dir, NameMatch::Exact);
+        let held = self.shared.locks.directories_below(&key);
+        self.shared.names.forget_below(&key, &held);
+    }
+
     /// The entries of the stored directory `dir`, or `None` when the inner
     /// backend has no such directory.
-    async fn list_stored(&self, dir: &SmbPath) -> SmbResult<Option<Vec<DirEntry>>> {
+    pub(super) async fn list_stored(&self, dir: &SmbPath) -> SmbResult<Option<Vec<DirEntry>>> {
         let opts = OpenOptions {
             read: true,
             directory: true,
@@ -275,7 +360,7 @@ mod tests {
 
     use super::super::format::MARKER_NAME;
     use super::super::testing::{
-        GatedLayer, names_over, names_with, open_file, parked, seed_dir, seed_file,
+        GatedLayer, has, injected, names_over, names_with, open_file, parked, seed_dir, seed_file,
         seed_hidden_names, spawn_open, stored_at, stored_form, stored_name,
     };
     use super::*;
@@ -299,10 +384,6 @@ mod tests {
         tokio::spawn(async move { layer.names_of(&root(), hold).await })
     }
 
-    fn lists(names: &Snapshot, name: &str) -> bool {
-        names.entry(name, &stored_name(name)).is_some()
-    }
-
     #[tokio::test]
     async fn a_listing_made_under_the_lock_is_kept_whatever_changed_meanwhile() {
         let (files, layer, gate) = parked().await;
@@ -313,7 +394,7 @@ mod tests {
         gate.release();
 
         let names = building.await.unwrap().unwrap().unwrap();
-        assert!(lists(&names, "a.txt") && !lists(&names, "late.txt"));
+        assert!(has(&names, "a.txt") && !has(&names, "late.txt"));
         let kept = layer.shared.names.fresh("").expect("the listing is kept");
         assert!(Arc::ptr_eq(&kept, &names));
     }
@@ -340,7 +421,7 @@ mod tests {
         gate.release();
 
         let names = building.await.unwrap().unwrap().unwrap();
-        assert!(lists(&names, "a.txt"), "the caller still gets its listing");
+        assert!(has(&names, "a.txt"), "the caller still gets its listing");
         assert!(layer.shared.names.fresh("").is_none());
     }
 
@@ -367,11 +448,11 @@ mod tests {
         tokio::time::advance(Duration::from_secs(1)).await;
         seed_file(&files, "late.txt", b"");
         let fast = layer.names_of(&root(), Hold::Lock).await.unwrap().unwrap();
-        assert!(lists(&fast, "late.txt"));
+        assert!(has(&fast, "late.txt"));
         gate.release();
 
         let old = slow.await.unwrap().unwrap().unwrap();
-        assert!(!lists(&old, "late.txt"), "the caller gets what it listed");
+        assert!(!has(&old, "late.txt"), "the caller gets what it listed");
         let kept = layer
             .shared
             .names
@@ -452,7 +533,7 @@ mod tests {
         let names = layer.names_of(&root(), Hold::Lock).await.unwrap().unwrap();
         assert_eq!(names.len(), 3);
         assert!(names.directory("docs", &stored_name("docs")).is_some());
-        assert!(lists(&names, "a.txt") && lists(&names, &long));
+        assert!(has(&names, "a.txt") && has(&names, &long));
         assert!(logs.warnings().is_empty(), "{:?}", logs.warnings());
     }
 
@@ -532,7 +613,7 @@ mod tests {
 
         let listed = layer.names_of(&root(), Hold::Lock).await.unwrap().unwrap();
         assert_eq!(listed.len(), 20);
-        assert!(names.iter().all(|name| lists(&listed, name)));
+        assert!(names.iter().all(|name| has(&listed, name)));
         assert_eq!(watching.most.load(Ordering::SeqCst), 8);
         assert_eq!(layer.shared.long_names.len(), 20);
         assert_eq!(files.open_handles(), 0, "every side object is closed");
@@ -544,7 +625,6 @@ mod tests {
         let faulty = Faulty::new(files.clone());
         let layer = names_over(faulty.clone()).await;
         seed_file(&files, "a.txt", b"");
-        let injected = || SmbError::Io(io::Error::other("injected"));
 
         faulty.fail_open(1, |_, opts| opts.directory, injected());
         assert!(matches!(
@@ -560,7 +640,7 @@ mod tests {
         assert_eq!(files.open_handles(), 0, "the directory is closed");
 
         let names = layer.names_of(&root(), Hold::Lock).await.unwrap().unwrap();
-        assert!(lists(&names, "a.txt"));
+        assert!(has(&names, "a.txt"));
     }
 
     #[tokio::test]
@@ -577,13 +657,13 @@ mod tests {
         faulty.fail_open(
             1,
             move |at, _| at.file_name() == Some(side.as_str()),
-            SmbError::Io(io::Error::other("injected")),
+            injected(),
         );
 
         let names = layer.names_of(&root(), Hold::Lock).await.unwrap().unwrap();
         assert_eq!(names.len(), 2);
-        assert!(lists(&names, "a.txt") && lists(&names, &sound));
-        assert!(!lists(&names, &broken));
+        assert!(has(&names, "a.txt") && has(&names, &sound));
+        assert!(!has(&names, &broken));
         let warnings = logs.warnings();
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains(&stored_form(&broken).entry));
@@ -592,7 +672,7 @@ mod tests {
 
         let names = layer.names_of(&root(), Hold::Lock).await.unwrap().unwrap();
         assert_eq!(names.len(), 3);
-        assert!(lists(&names, &broken));
+        assert!(has(&names, &broken));
         let kept = layer.shared.names.fresh("").expect("the listing is kept");
         assert!(Arc::ptr_eq(&kept, &names));
     }

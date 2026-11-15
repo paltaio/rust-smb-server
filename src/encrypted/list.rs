@@ -45,23 +45,46 @@ impl<B: ShareBackend> EncryptedHandle<B> {
     /// cache when no change was counted since the listing began and every
     /// side object was read.
     ///
+    /// A directory that has moved by the time the names are decoded is listed
+    /// again at its new path, and the first listing is kept by nobody. If it
+    /// moves again, the second listing is the result and is not kept either.
+    ///
     /// Holds the lock entry of the directory but not its lock. Creates
     /// proceed during a listing, and the entry keeps the change count from
     /// resetting until the listing ends.
     async fn list_all(&self, dir: &SmbPath, pattern: Option<&str>) -> SmbResult<Vec<DirEntry>> {
         let layer = self.layer();
         let shared = &self.shared;
-        let lock = shared.locks.directory(path_key(dir, NameMatch::Exact));
-        let began = Began::of(&lock);
-        let listed = self.inner.list_dir_sized(None, false).await?;
-        let listing = layer.decode(dir, listed).await?;
-        let decoded = without_duplicates(dir, listing.names, |plain| {
-            layer.stored_form(plain).ok().map(|form| form.entry)
-        });
-        if shared.settings.case_insensitive {
-            let entries = decoded.iter().map(|decoded| decoded.entry.clone());
-            shared.keep_names(&lock, began, Hold::Nothing, listing.complete, entries);
-        }
+        let mut dir = dir.clone();
+        let mut moved = false;
+        let decoded = loop {
+            let lock = shared.locks.directory(path_key(&dir, NameMatch::Exact));
+            let began = Began::of(&lock);
+            // The inner handle may not follow the move, so the second
+            // listing opens the directory at its new path.
+            let listed = if moved {
+                layer.list_stored(&dir).await?.unwrap_or_default()
+            } else {
+                self.inner.list_dir_sized(None, false).await?
+            };
+            let listing = layer.decode(&dir, listed).await?;
+            let decoded = without_duplicates(&dir, listing.names, |plain| {
+                layer.stored_form(plain).ok().map(|form| form.entry)
+            });
+            let now = self.node.path();
+            if now == dir {
+                if shared.settings.case_insensitive {
+                    let entries = decoded.iter().map(|decoded| decoded.entry.clone());
+                    shared.keep_names(&lock, began, Hold::Nothing, listing.complete, entries);
+                }
+                break decoded;
+            }
+            if moved {
+                break decoded;
+            }
+            moved = true;
+            dir = now;
+        };
         let matcher = pattern.map(|p| Pattern::new(p, shared.settings.case_insensitive));
         Ok(decoded
             .into_iter()
@@ -77,13 +100,28 @@ impl<B: ShareBackend> EncryptedHandle<B> {
     /// The entry that `name`, a pattern without wildcards, stands for: the one
     /// stored as `name`, else with case-insensitive names the one that differs
     /// in case.
+    ///
+    /// A directory that has moved by the time the lookup ends is searched
+    /// again at its new path, and that answer is the result.
     async fn list_one(&self, dir: &SmbPath, name: &str) -> SmbResult<Vec<DirEntry>> {
+        let found = self.find_one(dir, name, false).await?;
+        let now = self.node.path();
+        if now == *dir {
+            return Ok(found);
+        }
+        self.find_one(&now, name, true).await
+    }
+
+    /// `list_one` for the directory at the stored path `dir`. With `by_path`
+    /// the entries come from a listing of `dir` itself, not from the handle.
+    async fn find_one(&self, dir: &SmbPath, name: &str, by_path: bool) -> SmbResult<Vec<DirEntry>> {
         let layer = self.layer();
         let Ok(form) = layer.stored_form(name) else {
             return Ok(Vec::new());
         };
+        let at = by_path.then_some(dir);
         let mut plain = name.to_string();
-        let mut found = self.list_stored(&form.entry).await?;
+        let mut found = self.list_stored(at, &form.entry).await?;
         if found.is_none() && self.shared.settings.case_insensitive {
             let variant = {
                 let Some(names) = layer.names_of(dir, Hold::Nothing).await? else {
@@ -94,7 +132,7 @@ impl<B: ShareBackend> EncryptedHandle<B> {
             if let Some(variant) = variant
                 && variant.stored != form.entry
             {
-                found = self.list_stored(&variant.stored).await?;
+                found = self.list_stored(at, &variant.stored).await?;
                 plain = variant.plain;
             }
         }
@@ -105,9 +143,13 @@ impl<B: ShareBackend> EncryptedHandle<B> {
     }
 
     /// The entry stored as `stored`, from a listing the inner backend narrows
-    /// to that name. Other entries it returns are ignored.
-    async fn list_stored(&self, stored: &str) -> SmbResult<Option<FileInfo>> {
-        let listed = self.inner.list_dir_sized(Some(stored), false).await?;
+    /// to that name, or from a listing of the stored directory `at` when that
+    /// is given. Other entries it returns are ignored.
+    async fn list_stored(&self, at: Option<&SmbPath>, stored: &str) -> SmbResult<Option<FileInfo>> {
+        let listed = match at {
+            Some(dir) => self.layer().list_stored(dir).await?.unwrap_or_default(),
+            None => self.inner.list_dir_sized(Some(stored), false).await?,
+        };
         Ok(listed
             .into_iter()
             .map(|entry| entry.info)
@@ -286,7 +328,6 @@ impl<B: ShareBackend> DirWatch for NamesWatch<B> {
 
 #[cfg(test)]
 mod tests {
-    use std::io;
     use std::time::Duration;
 
     use tokio::task::JoinHandle;
@@ -296,10 +337,10 @@ mod tests {
     use super::super::names::{StoredName, encode_name};
     use super::super::node::{Found, Origin};
     use super::super::testing::{
-        Hiding, PRIVATE_WORD, Script, change, drop_at, key_schedule, layer, names, names_over,
-        names_settings, names_with, open, open_dir, open_file, other_key_schedule, parked,
-        read_all, renamed, sealed_invalid_names, seed_dir, seed_file, seed_hidden_names, stored_at,
-        stored_bytes, stored_form, stored_name, summary,
+        Hiding, PRIVATE_WORD, Script, change, drop_at, injected, key_schedule, layer, names,
+        names_over, names_settings, names_with, open, open_dir, open_file, other_key_schedule,
+        parked, read_all, renamed, sealed_invalid_names, seed_dir, seed_file, seed_hidden_names,
+        seed_orphan, stored_at, stored_bytes, stored_form, stored_name, summary,
     };
     use super::*;
     use crate::backend::{Handle, OpenAction, OpenIntent};
@@ -508,7 +549,6 @@ mod tests {
         let layer = names_over(faulty.clone()).await;
         seed_file(&files, "a.txt", b"");
         let root = open_dir(&layer, "").await;
-        let injected = || SmbError::Io(io::Error::other("injected"));
 
         faulty.fail_listing(1, injected());
         assert!(matches!(root.list_dir(None).await, Err(SmbError::Io(_))));
@@ -793,7 +833,7 @@ mod tests {
         faulty.fail_open(
             1,
             move |at, _| at.file_name() == Some(side.as_str()),
-            SmbError::Io(io::Error::other("injected")),
+            injected(),
         );
         let root = open_dir(&layer, "").await;
 
@@ -911,18 +951,6 @@ mod tests {
     }
 
     // Empty directories
-
-    /// Puts the side object of the long name `long` into the stored directory
-    /// `dir` of `files`, and no entry.
-    fn seed_orphan(files: &MemFsBackend, dir: &str, long: &str) {
-        let side = stored_form(long).side_object.unwrap();
-        let at = if dir.is_empty() {
-            side.name
-        } else {
-            format!("{dir}\\{}", side.name)
-        };
-        files.clone().with_file(&at, &side.content);
-    }
 
     #[tokio::test]
     async fn a_directory_with_only_orphan_side_objects_is_empty() {

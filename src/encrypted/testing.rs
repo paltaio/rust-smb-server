@@ -248,6 +248,34 @@ pub(super) fn seed_file(files: &MemFsBackend, plain: &str, bytes: &[u8]) {
     seed(files, plain, Some(bytes));
 }
 
+/// A name whose stored form is a long entry and a side object.
+pub(super) fn long_name(fill: &str) -> String {
+    fill.repeat(150)
+}
+
+/// Puts the side object of the long name `name` into the stored directory
+/// `dir` of `files`, with no entry. Returns the path of the object.
+pub(super) fn seed_orphan(files: &MemFsBackend, dir: &str, name: &str) -> String {
+    let side = stored_form(name).side_object.expect("a long name");
+    let at = if dir.is_empty() {
+        side.name
+    } else {
+        format!("{dir}\\{}", side.name)
+    };
+    files.clone().with_file(&at, &side.content);
+    at
+}
+
+/// An error for a fault to answer with.
+pub(super) fn injected() -> SmbError {
+    SmbError::Io(io::Error::other("injected"))
+}
+
+/// The snapshot holds `name` under the stored name it encrypts to.
+pub(super) fn has(names: &Snapshot, name: &str) -> bool {
+    names.entry(name, &stored_name(name)).is_some()
+}
+
 /// A word in the plaintext of each name that `sealed_invalid_names` makes.
 /// Nothing a listing or a watch logs holds it.
 pub(super) const PRIVATE_WORD: &str = "secret";
@@ -728,6 +756,49 @@ impl<B: ShareBackend> ShareBackend for Reporting<B> {
     }
 }
 
+/// Wraps `inner` and refuses to unlink a directory that holds entries, with
+/// `NotEmpty`.
+#[derive(Clone)]
+pub(super) struct Strict<B> {
+    inner: B,
+}
+
+impl<B> Strict<B> {
+    pub(super) fn new(inner: B) -> Self {
+        Self { inner }
+    }
+}
+
+#[async_trait]
+impl<B: ShareBackend> ShareBackend for Strict<B> {
+    async fn open(
+        &self,
+        path: &SmbPath,
+        opts: OpenOptions,
+    ) -> SmbResult<(Box<dyn Handle>, OpenAction)> {
+        self.inner.open(path, opts).await
+    }
+
+    async fn unlink(&self, path: &SmbPath) -> SmbResult<()> {
+        if let Ok((handle, _)) = self.inner.open(path, dir_opts(OpenIntent::Open)).await {
+            let listed = handle.list_dir(None).await;
+            handle.close().await?;
+            if !listed?.is_empty() {
+                return Err(SmbError::NotEmpty);
+            }
+        }
+        self.inner.unlink(path).await
+    }
+
+    async fn rename(&self, from: &SmbPath, to: &SmbPath, replace_if_exists: bool) -> SmbResult<()> {
+        self.inner.rename(from, to, replace_if_exists).await
+    }
+
+    fn capabilities(&self) -> BackendCapabilities {
+        self.inner.capabilities()
+    }
+}
+
 /// A directory handle that reports entries and lists none, as an inner
 /// backend does when it hides some.
 pub(super) struct Hiding;
@@ -882,8 +953,8 @@ enum Answer {
     PathNotFound,
 }
 
-/// An inner backend whose opens of chosen paths fail while its listings
-/// still show them.
+/// An inner backend whose opens, unlinks and renames of chosen paths fail
+/// while its listings still show them.
 #[derive(Clone)]
 pub(super) struct Hidden {
     inner: MemFsBackend,
@@ -898,13 +969,13 @@ impl Hidden {
         }
     }
 
-    /// Opens of `stored` answer `NotFound`.
+    /// Calls on `stored` answer `NotFound`.
     pub(super) fn hide(&self, stored: &str) {
         let mut paths = self.paths.lock().unwrap();
         paths.insert(stored.to_string(), Answer::NotFound);
     }
 
-    /// Opens of `stored` answer `PathNotFound`, as if a directory above it
+    /// Calls on `stored` answer `PathNotFound`, as if a directory above it
     /// were gone.
     pub(super) fn cut_off(&self, stored: &str) {
         let mut paths = self.paths.lock().unwrap();
@@ -913,6 +984,21 @@ impl Hidden {
 
     pub(super) fn show(&self, stored: &str) {
         self.paths.lock().unwrap().remove(stored);
+    }
+
+    /// What a call on `at` answers, if it is hidden.
+    fn refusal(&self, at: &SmbPath) -> SmbResult<()> {
+        let answer = self
+            .paths
+            .lock()
+            .unwrap()
+            .get(&at.display_backslash())
+            .copied();
+        match answer {
+            Some(Answer::NotFound) => Err(SmbError::NotFound),
+            Some(Answer::PathNotFound) => Err(SmbError::PathNotFound),
+            None => Ok(()),
+        }
     }
 }
 
@@ -923,25 +1009,17 @@ impl ShareBackend for Hidden {
         at: &SmbPath,
         opts: OpenOptions,
     ) -> SmbResult<(Box<dyn Handle>, OpenAction)> {
-        let answer = self
-            .paths
-            .lock()
-            .unwrap()
-            .get(&at.display_backslash())
-            .copied();
-        match answer {
-            Some(Answer::NotFound) => return Err(SmbError::NotFound),
-            Some(Answer::PathNotFound) => return Err(SmbError::PathNotFound),
-            None => {}
-        }
+        self.refusal(at)?;
         self.inner.open(at, opts).await
     }
 
     async fn unlink(&self, at: &SmbPath) -> SmbResult<()> {
+        self.refusal(at)?;
         self.inner.unlink(at).await
     }
 
     async fn rename(&self, from: &SmbPath, to: &SmbPath, replace: bool) -> SmbResult<()> {
+        self.refusal(from)?;
         self.inner.rename(from, to, replace).await
     }
 
