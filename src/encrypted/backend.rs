@@ -35,7 +35,19 @@ const MAX_CLIENT_NAME_LEN: u32 = 255;
 ///
 /// The block size, whether names are encrypted and the long-name threshold
 /// are fixed when the share is made. The key is not stored anywhere, and the
-/// data cannot be read without it. Each share needs a key of its own.
+/// data cannot be read without it. Give each share a key of its own. With
+/// one key, a stored file copied into another share's storage reads back
+/// through that share when both use the same block size.
+///
+/// File sizes, times and attributes, the shape of the tree and the length of
+/// every name stay visible in the inner backend.
+///
+/// A read of a block that fails authentication returns
+/// [`SmbError::Io`](crate::SmbError::Io), which clients see as
+/// STATUS_UNEXPECTED_IO_ERROR. A crash can leave the block being written
+/// unreadable.
+///
+/// Over an `S3Backend`, build that backend with `case_insensitive(false)`.
 ///
 /// The backend reports no named streams and no extended attributes, and
 /// answers [`copy_range`](ShareBackend::copy_range) and

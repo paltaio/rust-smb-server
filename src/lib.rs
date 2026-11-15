@@ -55,6 +55,8 @@ SmbServer::builder()
 //! (feature `localfs`) is the reference implementation; its documentation
 //! says where it keeps named streams and extended attributes on each host.
 //! `S3Backend` (feature `s3`) serves a bucket of an S3-compatible store.
+//! `EncryptedBackend` (feature `encryption`) wraps another backend and stores
+//! file contents, and by default names, encrypted under a key.
 //!
 //! What the protocol layer does around the backend calls:
 //!

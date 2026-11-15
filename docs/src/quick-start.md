@@ -11,6 +11,7 @@ cargo add smb-server
 | `localfs` | on | `LocalFsBackend` |
 | `discovery` | off | mDNS and WS-Discovery announcements |
 | `s3` | off | `S3Backend` |
+| `encryption` | off | `EncryptedBackend` |
 
 ```toml
 [dependencies]
@@ -66,6 +67,7 @@ Listens on `127.0.0.1:4445`. Serves directories under `smb-example` in the syste
 | `SMB_STREAMS=0` | Named streams off |
 | `SMB_COPY=0` | Server-side copy off |
 | `SMB_S3_BUCKET` | Serve this S3 bucket as the only share, `s3`. Needs `--features s3`. See [backends](backends.md#example) |
+| `SMB_ENCRYPTION_KEY` | Encryption key, 64 hex digits. Adds `vault`, an encrypted share. With `SMB_S3_BUCKET`, encrypts `s3` instead. Needs `--features encryption`. See [encrypted storage](encrypted-storage.md#example) |
 
 ```sh
 SMB_DISCOVERY=1 SMB_LISTEN='[::]:4445' cargo run -p minimal-smb-example --features discovery

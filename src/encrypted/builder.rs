@@ -54,7 +54,9 @@ impl<B: ShareBackend> EncryptedBackend<B> {
     ///
     /// `build` wipes the builder's buffer for `key` once the keys are derived,
     /// and dropping the builder wipes it too. Copies of `key` that the caller
-    /// keeps are the caller's to wipe.
+    /// keeps are the caller's to wipe. The `hmac` and `sha2` crates keep
+    /// key-derived bytes in internal state that they do not wipe, and
+    /// `aes-gcm` does not wipe its GHASH subkey.
     pub fn builder(inner: B, key: [u8; 32]) -> EncryptedBackendBuilder<B> {
         EncryptedBackendBuilder {
             inner,
@@ -119,7 +121,8 @@ impl<B: ShareBackend> EncryptedBackendBuilder<B> {
     /// Sets how long the decrypted names of a directory are trusted for
     /// changes made outside this backend. The default is 30 seconds;
     /// `Duration::ZERO` lists the directory again on every lookup that needs
-    /// it.
+    /// it. The setting applies only to encrypted names that match without
+    /// regard to case.
     #[must_use]
     pub fn name_cache_ttl(mut self, ttl: Duration) -> Self {
         self.name_cache_ttl = ttl;
@@ -133,14 +136,21 @@ impl<B: ShareBackend> EncryptedBackendBuilder<B> {
     /// The new marker takes the settings set on the builder, else the
     /// defaults, so a share made with other settings has to be restored with
     /// them. Before it writes the marker, `build` checks the key and the
-    /// block size against what the share holds. With encrypted names, at
-    /// least one entry of the root has to decode under the key, and entries
-    /// whose names do not decode are passed over. Of the files, the first
-    /// that holds data, found breadth first among at most 10,000 entries,
-    /// has to have a header of the chosen block size and a first block that
-    /// verifies under the key. A share with no such file passes. A failed check is [`KeyMismatch`](EncryptionError::KeyMismatch),
-    /// or [`SettingMismatch`](EncryptionError::SettingMismatch) for the
-    /// block size.
+    /// block size against what the share holds. It does not check
+    /// `encrypt_names` or `long_name_threshold`, so keep a record of them.
+    /// With encrypted names, at least one entry of the root has to decode
+    /// under the key, and entries whose names do not decode are passed over.
+    /// Of the files, the first that holds data, found breadth first among at
+    /// most 10,000 entries, has to have a header of the chosen block size
+    /// and a first block that is a hole or verifies under the key. A share
+    /// with no such file passes. A failed check is
+    /// [`KeyMismatch`](EncryptionError::KeyMismatch), or
+    /// [`SettingMismatch`](EncryptionError::SettingMismatch) for the block
+    /// size.
+    ///
+    /// With names in the clear, a stray file such as `.DS_Store` can be the
+    /// file that is checked, and fails with `KeyMismatch` until it is
+    /// removed.
     #[must_use]
     pub fn restore_marker(mut self) -> Self {
         self.restore_marker = true;
@@ -163,7 +173,8 @@ impl<B: ShareBackend> EncryptedBackendBuilder<B> {
     /// - [`EncryptionError::SettingMismatch`]: a setting differs from the share's.
     /// - [`EncryptionError::KeyMismatch`]: the key is not the share's.
     /// - [`EncryptionError::MarkerMissing`]: the root has entries and no marker.
-    /// - [`EncryptionError::MarkerInvalid`]: the marker is damaged.
+    /// - [`EncryptionError::MarkerInvalid`]: the marker is not a file of the right size, does
+    ///   not start with the marker magic, or holds field values out of range.
     /// - [`EncryptionError::UnsupportedFormat`]: the marker has another format version.
     /// - [`EncryptionError::Backend`]: the inner backend failed.
     /// - [`EncryptionError::Random`]: the random generator failed.

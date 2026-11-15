@@ -11,6 +11,7 @@ SMB file-sharing server library for Rust.
 - Share listing, mDNS and WS-Discovery
 - Users and shares changeable at run time
 - Pluggable storage: implement `ShareBackend`, or use `LocalFsBackend` or `S3Backend`
+- Encrypted storage: [`EncryptedBackend`](encrypted-storage.md) wraps another backend and encrypts file contents, and by default names
 
 Works with Windows Explorer, macOS Finder, Linux cifs mounts, and `smbclient`.
 

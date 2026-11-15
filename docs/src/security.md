@@ -41,6 +41,10 @@ Where encryption is required, these clients are refused:
 
 `reject_unencrypted_access(false)` on the builder serves all of these unencrypted instead.
 
+## Storage encryption
+
+`encrypt_data` encrypts the SMB 3.x traffic between client and server. `EncryptedBackend` encrypts the file contents, and by default names, in the backend's storage. A share can use both. See [encrypted storage](encrypted-storage.md).
+
 ## Logon throttle
 
 See [Limits and timeouts](limits.md#logon-throttle).

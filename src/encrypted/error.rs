@@ -13,19 +13,23 @@ pub enum EncryptionError {
     /// `setting` names the builder method.
     #[error("invalid setting `{setting}`")]
     InvalidSetting { setting: &'static str },
-    /// A setting the builder was given differs from the share's.
+    /// A setting the builder was given differs from the share's. `setting`
+    /// names the builder method.
     #[error("setting `{setting}` differs from the share's")]
     SettingMismatch { setting: &'static str },
     /// The key is not the share's: the marker does not verify under it, or
     /// [`restore_marker`](crate::EncryptedBackendBuilder::restore_marker)
-    /// found nothing in the share that the key authenticates. A damaged
-    /// marker reads the same.
+    /// found nothing in the share that the key authenticates. A marker
+    /// changed after its version byte reads the same.
     #[error("the key does not match the share")]
     KeyMismatch,
     /// The root of the inner backend holds entries and no marker.
+    /// [`restore_marker`](crate::EncryptedBackendBuilder::restore_marker)
+    /// writes a new one.
     #[error("the share has entries and no marker")]
     MarkerMissing,
-    /// The marker has the wrong size, magic, kind or field values. A crash
+    /// The marker is not a file of the right size, does not start with the
+    /// marker magic, or holds field values outside their ranges. A crash
     /// during the first build can leave a short marker. Deleting a damaged
     /// marker lets
     /// [`restore_marker`](crate::EncryptedBackendBuilder::restore_marker)

@@ -19,6 +19,7 @@
 - [Server-side copy](copy.md)
 - [Share listing](share-listing.md)
 - [Network discovery](discovery.md)
+- [Encrypted storage](encrypted-storage.md)
 
 ---
 

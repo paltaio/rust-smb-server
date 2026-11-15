@@ -73,3 +73,40 @@ The settings named here, and how `S3Backend` works, are in [backends](backends.m
 - Changes made outside the server raise no change notification, and show up to `metadata_ttl` late.
 - When an object is replaced outside the server, an open handle keeps reading the cached chunks of the old version (up to 4 per version, 128 MiB in all) until it needs a chunk that is not cached. That read fetches the new version.
 - Versioned buckets: see [lifecycle rules](backends.md#lifecycle-rules).
+
+## Encrypted storage
+
+The settings named here, and how `EncryptedBackend` works, are in [encrypted storage](encrypted-storage.md).
+
+### Integrity and visibility
+
+- These go undetected: restoring an older block or file, cutting a file at a block boundary, zeroing a block, appending zero blocks, swapping files, moving or copying a stored file, deleting files, and changing times or attributes.
+- Sizes, times, attributes, the tree shape and name lengths stay visible in the storage. See [what is protected](encrypted-storage.md#what-is-protected).
+- The backend does not stop a file at its block limit. See [limits](encrypted-storage.md#limits).
+
+### Writers and crashes
+
+- One backend per stored tree. Another writer, such as a second backend built over the tree, can cause read errors and lost updates. Clones of one backend share their state; several shares can serve one tree through clones.
+- With case-insensitive names, a lookup of another spelling and a create use the names of the directory, which are listed again once per `name_cache_ttl`. A name another writer adds can go unseen for that long.
+- With encrypted names, entries that are not the share's, such as a file put into the inner directory by hand, are left out of listings, and a client cannot delete a directory that holds one. With names in the clear every entry the inner backend lists, except the marker, is listed.
+- A crash or power loss can make the blocks being written unreadable. A power loss can drop or tear any write since the last FLUSH.
+- After a crash, with a partial last block, an append or a write past it can make the old last block unreadable.
+- After a crash, a write into a new file that starts in block 0 can leave an empty file.
+- A write that leaves a gap of blocks after a partial last block first pads that block with zeros. A crash between the padding and the write can leave the file longer, by the padding alone.
+- A write that fails at or past the old end of the stored file cuts the file back to that end, or to the end of the padded last block once that block is written. The blocks that held data stay readable. If the cut fails too, a fragment stays. The next write or truncate cuts off a fragment of up to 28 bytes. A longer one reads as a partial last block, which fails authentication.
+- A write that fails while it overwrites blocks can tear them. A full disk can do this where overwriting needs new space, as on a copy-on-write filesystem.
+- A read of a damaged block fails with STATUS_UNEXPECTED_IO_ERROR. See [damaged blocks](encrypted-storage.md#damaged-blocks).
+
+### Names
+
+- A stored name has about 1.6 characters for each UTF-8 byte of the name, plus 26. Host limits apply to stored paths: ext4, APFS and NTFS take 255-character names, and an S3 key is at most 1024 bytes, which a deep tree reaches sooner. On S3 a path whose key exceeds 1024 bytes fails with STATUS_OBJECT_NAME_INVALID. A lower `long_name_threshold` caps each stored name at that many characters.
+- At the default threshold, a name of more than 143 UTF-8 bytes is stored as two objects. A listing reads the second for each such name the backend has not seen yet.
+- Names are stored as the client spells them, without Unicode normalization, so the composed and decomposed spellings of one name are two names.
+- Windows refuses some names as path components, such as the DOS device names `con` and `nul.txt`. A tree written on another system and served from a Windows host does not list them, and a directory that holds one is not empty.
+- With names in the clear, a client cannot create or open `.smb-encryption` in the root.
+
+### Features
+
+- No named streams or extended attributes. macOS clients keep Finder data in `._` files, which are encrypted like any file.
+- No block cloning. Server-side copy runs as reads and writes through the backend.
+- On aarch64, AES and GHASH run in software unless the build sets the flags in [encrypted storage](encrypted-storage.md#aarch64).
