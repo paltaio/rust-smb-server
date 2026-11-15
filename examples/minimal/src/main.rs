@@ -11,7 +11,8 @@
 //! - not announced on the network; `SMB_DISCOVERY=1` announces it when
 //!   built with the `discovery` feature and listening on an address other
 //!   than loopback,
-//! - named streams on every directory share; `SMB_STREAMS=0` turns them off,
+//! - named streams on every directory share other than `vault`; `SMB_STREAMS=0`
+//!   turns them off,
 //! - server-side copy on every share; `SMB_COPY=0` turns it off,
 //! - with the `s3` feature, `SMB_S3_BUCKET` replaces the three shares with one
 //!   share, `s3` (alice = read+write, bob = read), that serves the bucket. It
@@ -19,7 +20,13 @@
 //!   `SMB_S3_SECRET_KEY` and `SMB_S3_CACHE` (the cache directory), and
 //!   `SMB_S3_PREFIX` to serve only the keys below a prefix. After the server
 //!   stops, the example waits until the changes are in the bucket; a second
-//!   ctrl-c stops the wait.
+//!   ctrl-c stops the wait,
+//! - with the `encryption` feature, `SMB_ENCRYPTION_KEY` (64 hex digits) adds
+//!   `vault` (alice = read+write, bob = read), a share over `<root>/vault` that
+//!   stores encrypted names and contents and has no named streams. With
+//!   `SMB_S3_BUCKET` it encrypts the `s3` share instead. A value that is not
+//!   64 hex digits stops the example, and so does the variable when the
+//!   feature is off.
 
 use std::path::{Path, PathBuf};
 
@@ -60,6 +67,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if s3_bucket.is_some() {
         tracing::warn!("SMB_S3_BUCKET needs the s3 feature; serving the directories of SMB_ROOT");
     }
+    #[cfg(not(feature = "encryption"))]
+    if std::env::var_os("SMB_ENCRYPTION_KEY").is_some() {
+        return Err("SMB_ENCRYPTION_KEY needs the encryption feature".into());
+    }
 
     tracing::info!(?listen, "starting example smb server");
 
@@ -75,15 +86,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "s3")]
     let builder = match &s3 {
         Some(backend) => builder.share(
-            Share::new("s3", backend.clone())
+            s3_share(backend)
+                .await?
                 .user("alice", Access::ReadWrite)
                 .user("bob", Access::Read)
                 .server_side_copy(copy),
         ),
-        None => dir_shares(builder, &root, streams, copy)?,
+        None => dir_shares(builder, &root, streams, copy).await?,
     };
     #[cfg(not(feature = "s3"))]
-    let builder = dir_shares(builder, &root, streams, copy)?;
+    let builder = dir_shares(builder, &root, streams, copy).await?;
     #[cfg(feature = "discovery")]
     let builder = if discovery {
         builder.discovery(smb_server::Discovery::new())
@@ -128,20 +140,23 @@ fn ctrl_c_presses() -> tokio::sync::mpsc::UnboundedReceiver<()> {
     received
 }
 
-/// The three directory shares below `root`, made if missing.
-fn dir_shares(
+/// The three directory shares below `root`, made if missing, and `vault` when
+/// `SMB_ENCRYPTION_KEY` is set.
+async fn dir_shares(
     builder: SmbServerBuilder,
     root: &Path,
     streams: bool,
     copy: bool,
 ) -> Result<SmbServerBuilder, Box<dyn std::error::Error>> {
+    #[cfg(feature = "encryption")]
+    let key = encryption_key()?;
     std::fs::create_dir_all(root.join("public"))?;
     std::fs::create_dir_all(root.join("media"))?;
     std::fs::create_dir_all(root.join("home"))?;
     std::fs::write(root.join("public/hello.txt"), b"hello from smb-server\n")?;
     tracing::info!(?root, "serving directories");
 
-    Ok(builder
+    let builder = builder
         .share(
             Share::new("public", LocalFsBackend::new(root.join("public"))?)
                 .public()
@@ -163,7 +178,63 @@ fn dir_shares(
                 .user("bob", Access::Read)
                 .named_streams(streams)
                 .server_side_copy(copy),
-        ))
+        );
+    #[cfg(feature = "encryption")]
+    let builder = match key {
+        Some(key) => builder.share(
+            vault_share(root, key)
+                .await?
+                .user("alice", Access::ReadWrite)
+                .user("bob", Access::Read)
+                .server_side_copy(copy),
+        ),
+        None => builder,
+    };
+    Ok(builder)
+}
+
+/// The `vault` share: `<root>/vault` (made if missing), encrypted under `key`.
+#[cfg(feature = "encryption")]
+async fn vault_share(root: &Path, key: [u8; 32]) -> Result<Share, Box<dyn std::error::Error>> {
+    let dir = root.join("vault");
+    std::fs::create_dir_all(&dir)?;
+    let backend = smb_server::EncryptedBackend::builder(LocalFsBackend::new(&dir)?, key)
+        .build()
+        .await
+        .map_err(|error| format!("vault: {error}"))?;
+    tracing::info!(?dir, "serving an encrypted directory");
+    Ok(Share::new("vault", backend))
+}
+
+/// The key in `SMB_ENCRYPTION_KEY` (64 hex digits), or `None` when it is unset.
+/// Errors never include the value.
+#[cfg(feature = "encryption")]
+fn encryption_key() -> Result<Option<[u8; 32]>, String> {
+    let Some(value) = std::env::var_os("SMB_ENCRYPTION_KEY") else {
+        return Ok(None);
+    };
+    let invalid = || "SMB_ENCRYPTION_KEY is not 64 hex digits".to_string();
+    let digits = value.to_str().ok_or_else(invalid)?.as_bytes();
+    if digits.len() != 64 {
+        return Err(invalid());
+    }
+    let mut key = [0u8; 32];
+    for (byte, pair) in key.iter_mut().zip(digits.chunks_exact(2)) {
+        let high = hex_digit(pair[0]).ok_or_else(invalid)?;
+        let low = hex_digit(pair[1]).ok_or_else(invalid)?;
+        *byte = (high << 4) | low;
+    }
+    Ok(Some(key))
+}
+
+#[cfg(feature = "encryption")]
+fn hex_digit(digit: u8) -> Option<u8> {
+    match digit {
+        b'0'..=b'9' => Some(digit - b'0'),
+        b'a'..=b'f' => Some(digit - b'a' + 10),
+        b'A'..=b'F' => Some(digit - b'A' + 10),
+        _ => None,
+    }
 }
 
 #[cfg(feature = "s3")]
@@ -183,6 +254,10 @@ async fn s3_backend(bucket: &str) -> Result<smb_server::S3Backend, Box<dyn std::
     let mut builder = smb_server::S3Backend::builder(endpoint.as_str(), region, bucket)
         .credentials(access_key, secret_key)
         .cache_dir(cache.as_path());
+    #[cfg(feature = "encryption")]
+    if encryption_key()?.is_some() {
+        builder = builder.case_insensitive(false);
+    }
     let prefix = std::env::var("SMB_S3_PREFIX").unwrap_or_default();
     if !prefix.is_empty() {
         builder = builder.prefix(prefix.as_str());
@@ -190,6 +265,21 @@ async fn s3_backend(bucket: &str) -> Result<smb_server::S3Backend, Box<dyn std::
     let backend = builder.build().await?;
     tracing::info!(%endpoint, %bucket, %prefix, ?cache, "serving an S3 bucket");
     Ok(backend)
+}
+
+/// The `s3` share over `backend`, encrypted when `SMB_ENCRYPTION_KEY` is set.
+#[cfg(feature = "s3")]
+async fn s3_share(backend: &smb_server::S3Backend) -> Result<Share, Box<dyn std::error::Error>> {
+    #[cfg(feature = "encryption")]
+    if let Some(key) = encryption_key()? {
+        let encrypted = smb_server::EncryptedBackend::builder(backend.clone(), key)
+            .build()
+            .await
+            .map_err(|error| format!("s3: {error}"))?;
+        tracing::info!("serving an encrypted S3 bucket");
+        return Ok(Share::new("s3", encrypted));
+    }
+    Ok(Share::new("s3", backend.clone()))
 }
 
 /// Waits until the changes made through the share are in the bucket, and
