@@ -37,6 +37,8 @@ mod scan;
 mod setup;
 mod size;
 #[cfg(test)]
+mod tamper;
+#[cfg(test)]
 pub(crate) mod testing;
 mod truncate;
 mod unlink;
