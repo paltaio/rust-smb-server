@@ -25,6 +25,8 @@ mod lru;
 mod marker;
 mod names;
 mod node;
+#[cfg(test)]
+mod open_races;
 mod random;
 mod rename;
 mod resolve;
