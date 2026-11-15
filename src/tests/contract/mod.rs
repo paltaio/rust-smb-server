@@ -11,6 +11,9 @@
 //! `EXCLUDED` lists the cases an instance fails because the backend under it
 //! does not keep the contract there. Such a case runs and must fail, so an
 //! entry that is no longer needed stops the test.
+//!
+//! `rebuild` holds one test outside the instances: the layer over S3 across a
+//! restart.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -27,6 +30,8 @@ mod listing;
 mod names;
 mod namespace;
 mod opens;
+#[cfg(all(feature = "encryption", feature = "s3"))]
+mod rebuild;
 mod renames;
 mod unlinks;
 
@@ -54,6 +59,8 @@ impl Fixture {
 const MEMFS: &[&str] = &["memfs"];
 /// The instances over `MemFsBackend`.
 const OVER_MEMFS: &[&str] = &["memfs", "layer_memfs"];
+/// The instances over `S3Backend`.
+const OVER_S3: &[&str] = &["s3", "layer_s3"];
 /// The instances whose answers to a rename come from `LocalFsBackend`.
 const LOCALFS: &[&str] = &["localfs", "layer_clear_localfs", "layer_exact_localfs"];
 
@@ -88,8 +95,14 @@ const EXCLUDED: &[(&str, &[&str])] = &[
         "link_count_is_zero_once_an_open_file_is_unlinked",
         OVER_MEMFS,
     ),
-    // MemFs reports file_index 0.
+    // S3Backend leaves the link count of an unlinked open file at 1.
+    ("link_count_is_zero_once_an_open_file_is_unlinked", OVER_S3),
+    // MemFs and S3Backend report file_index 0.
     ("file_index_is_stable", OVER_MEMFS),
+    ("file_index_is_stable", OVER_S3),
+    // S3Backend keeps listing the name of an unlinked directory, as a
+    // directory or in its old spelling, once another entry takes the name.
+    ("namespace_changes_match_a_model", OVER_S3),
     // MemFs unlinks a directory that has entries.
     ("unlink_refuses_a_directory_with_entries", OVER_MEMFS),
     // MemFs renames into a directory that does not exist.
@@ -114,14 +127,18 @@ async fn run(instance: &str, name: &str, make: Make, case: Case) {
         .await
         .unwrap_or_else(|error| panic!("{instance}: no backend: {error}"));
     let outcome = tokio::spawn(async move { case(&*backend).await }).await;
-    if let Some(after) = after {
-        after.await;
-    }
+    let torn_down = match after {
+        Some(after) => tokio::spawn(after).await,
+        None => Ok(()),
+    };
     let fails = excluded(instance, name);
     match outcome {
         Ok(()) if fails => panic!("{instance}::{name} passes: its entry in EXCLUDED is stale"),
         Err(error) if !fails => std::panic::resume_unwind(error.into_panic()),
         _ => {}
+    }
+    if let Err(error) = torn_down {
+        std::panic::resume_unwind(error.into_panic());
     }
 }
 
@@ -239,3 +256,7 @@ instance!(layer_localfs, instances::layer_localfs);
 instance!(layer_clear_localfs, instances::layer_clear_localfs);
 #[cfg(all(feature = "encryption", feature = "localfs"))]
 instance!(layer_exact_localfs, instances::layer_exact_localfs);
+#[cfg(feature = "s3")]
+instance!(s3, instances::s3);
+#[cfg(all(feature = "encryption", feature = "s3"))]
+instance!(layer_s3, instances::layer_s3);

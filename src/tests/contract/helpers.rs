@@ -9,6 +9,9 @@ use crate::tests::util::{dir_opts, opts, path};
 /// The backend a test runs against.
 pub(super) type Backend<'a> = &'a dyn ShareBackend;
 
+/// Plaintext bytes in a block of the encrypted layer.
+pub(super) const BLOCK: usize = 65_536;
+
 /// Opens the file `name` with read and write access and `intent`.
 pub(super) async fn open(
     backend: Backend<'_>,

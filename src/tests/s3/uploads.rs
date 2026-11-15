@@ -39,11 +39,11 @@ pub(super) fn uploading(builder: S3BackendBuilder) -> S3BackendBuilder {
 
 /// Settings for a backend that stores nothing until a test lets it, with the
 /// delay and part size of [`uploading`].
-pub(super) fn held(builder: S3BackendBuilder) -> S3BackendBuilder {
+pub(crate) fn held(builder: S3BackendBuilder) -> S3BackendBuilder {
     builder.upload_delay(DELAY).part_size(PART)
 }
 
-pub(super) async fn sync(backend: &S3Backend) -> Result<(), S3Error> {
+pub(crate) async fn sync(backend: &S3Backend) -> Result<(), S3Error> {
     tokio::time::timeout(Duration::from_secs(60), backend.sync())
         .await
         .expect("sync returns")

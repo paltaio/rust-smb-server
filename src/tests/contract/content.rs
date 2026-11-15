@@ -1,13 +1,11 @@
 //! Reads, writes, truncation and the sizes they leave.
 
 use super::helpers::{
-    Backend, assert_bytes, contents, mkdir, open, open_dir, open_file, put, read_all, size, write,
+    BLOCK, Backend, assert_bytes, contents, mkdir, open, open_dir, open_file, put, read_all, size,
+    write,
 };
 use crate::backend::{OpenAction, OpenIntent};
 use crate::tests::data::{apply, nonzero_pattern, xorshift};
-
-/// Plaintext bytes in a block of the encrypted layer.
-const BLOCK: usize = 65_536;
 
 /// A read answers fewer bytes than asked only at the end of the file: the
 /// server sends the bytes of one read as the whole answer.

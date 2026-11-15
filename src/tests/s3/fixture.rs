@@ -24,8 +24,8 @@ pub(super) const MIB: usize = 1024 * 1024;
 pub(super) const OLD: &str = "Fri, 24 May 2013 00:00:00 GMT";
 
 /// A bucket made for one test.
-pub(super) struct TestBucket {
-    pub(super) gateway: &'static Gateway,
+pub(crate) struct TestBucket {
+    pub(crate) gateway: &'static Gateway,
     pub(super) name: String,
     /// A client that reaches the gateway directly.
     pub(super) client: S3Client,
@@ -33,7 +33,7 @@ pub(super) struct TestBucket {
 
 impl TestBucket {
     /// Starts the gateway if no test has, and makes a bucket on it.
-    pub(super) async fn new() -> Self {
+    pub(crate) async fn new() -> Self {
         let gateway = tokio::task::spawn_blocking(gateway).await.unwrap();
         let name = gateway.bucket_name();
         let client = S3Client::new(settings(gateway, gateway.addr, &name)).unwrap();

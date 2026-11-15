@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use tokio::sync::watch;
 use tokio::task::JoinSet;
 
 use super::fixture::{TestBucket, foreground, user_metadata};
@@ -56,7 +57,7 @@ pub(super) fn builder(bucket: &TestBucket, addr: SocketAddr) -> S3BackendBuilder
 /// Settings for a backend of `bucket` that keeps its changes in `cache`,
 /// reached at `addr`. Its worker starts no job until a test calls
 /// `hold_uploads(false)` on it.
-pub(super) fn writable_builder(
+pub(crate) fn writable_builder(
     bucket: &TestBucket,
     addr: SocketAddr,
     cache: &Path,
@@ -220,13 +221,10 @@ impl Rig {
         } = self;
         smb.close_all().await;
         drop(smb);
-        let mut exited = backend.worker_exited();
+        let exited = backend.worker_exited();
         drop(backend);
         released();
-        tokio::time::timeout(Duration::from_secs(10), exited.wait_for(|exited| *exited))
-            .await
-            .expect("the worker ends once the backend is dropped")
-            .expect("the worker reports its end");
+        worker_ended(exited).await;
         (bucket, proxy, cache.expect("a writable rig"))
     }
 
@@ -239,6 +237,15 @@ impl Rig {
     pub(super) fn hide(&self, key: &str) {
         hide(&self.proxy, &self.bucket.name, key);
     }
+}
+
+/// Waits until the worker of a backend ends, which it does once every clone
+/// of the backend is dropped.
+pub(crate) async fn worker_ended(mut exited: watch::Receiver<bool>) {
+    tokio::time::timeout(Duration::from_secs(10), exited.wait_for(|exited| *exited))
+        .await
+        .expect("the worker ends once the backend is dropped")
+        .expect("the worker reports its end");
 }
 
 /// The body of a ListObjectsV2 answer with these objects, as keys and sizes,
