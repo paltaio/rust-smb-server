@@ -440,6 +440,7 @@ mod stream;
 mod tests {
     mod aapl;
     mod async_requests;
+    mod contract;
     mod copy;
     pub(crate) mod data;
     #[cfg(feature = "discovery")]

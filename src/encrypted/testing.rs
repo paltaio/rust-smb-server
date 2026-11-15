@@ -73,17 +73,6 @@ pub(super) fn other_file_id() -> [u8; 16] {
     std::array::from_fn(|i| 0xb0 + i as u8)
 }
 
-/// A xorshift64 generator; `seed` must not be zero.
-pub(super) fn xorshift(seed: u64) -> impl FnMut() -> u64 {
-    let mut state = seed;
-    move || {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        state
-    }
-}
-
 pub(super) type Builder = EncryptedBackendBuilder<MemFsBackend>;
 
 /// Builds an encrypted backend over `files` under `key`, with the builder
@@ -101,7 +90,7 @@ pub(super) async fn build(
 }
 
 /// Builds a backend over `inner` that stores names as clients spell them.
-pub(super) async fn clear_over<B: ShareBackend>(inner: B) -> EncryptedBackend<B> {
+pub(crate) async fn clear_over<B: ShareBackend>(inner: B) -> EncryptedBackend<B> {
     clear_blocks(inner, BlockShift::DEFAULT).await
 }
 
@@ -142,13 +131,13 @@ pub(super) fn names_settings() -> Settings {
 }
 
 /// Builds a backend that encrypts names over `inner`.
-pub(super) async fn names_over<B: ShareBackend>(inner: B) -> EncryptedBackend<B> {
+pub(crate) async fn names_over<B: ShareBackend>(inner: B) -> EncryptedBackend<B> {
     names_with(inner, |builder| builder).await
 }
 
 /// Builds a backend that encrypts names over `inner`, with the builder that
 /// `setup` returns.
-pub(super) async fn names_with<B: ShareBackend>(
+pub(crate) async fn names_with<B: ShareBackend>(
     inner: B,
     setup: impl FnOnce(EncryptedBackendBuilder<B>) -> EncryptedBackendBuilder<B>,
 ) -> EncryptedBackend<B> {
@@ -530,14 +519,6 @@ pub(super) const C: usize = B + OVERHEAD;
 /// Where block `index` starts in the stored file.
 pub(super) fn at(index: usize) -> usize {
     H + index * C
-}
-
-/// `model` after `data` is written at `offset`.
-pub(super) fn apply(model: &mut Vec<u8>, offset: usize, data: &[u8]) {
-    if model.len() < offset + data.len() {
-        model.resize(offset + data.len(), 0);
-    }
-    model[offset..offset + data.len()].copy_from_slice(data);
 }
 
 /// The stored size of a file of `logical` bytes.

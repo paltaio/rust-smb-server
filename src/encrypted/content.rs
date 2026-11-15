@@ -234,15 +234,11 @@ mod tests {
     use super::*;
     use crate::backend::{Handle, OpenAction, OpenIntent};
     use crate::ntstatus::STATUS_UNEXPECTED_IO_ERROR;
+    use crate::tests::data::nonzero_pattern;
     use crate::tests::faulty::Faulty;
     use crate::tests::gated::{Gated, Op};
     use crate::tests::logs::Logs;
     use crate::tests::memfs::MemFsBackend;
-
-    /// Bytes that are never zero and change from block to block.
-    fn pattern(len: usize) -> Vec<u8> {
-        (0..len).map(|i| (i % 251 + 1) as u8).collect()
-    }
 
     /// The stored bytes of block `index` of a file of `logical` bytes.
     fn block_at(logical: usize, index: u64) -> Range<usize> {
@@ -269,7 +265,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_read_returns_the_bytes_up_to_the_request_or_the_end_of_the_file() {
-        let plain = pattern(3 * B + 100);
+        let plain = nonzero_pattern(3 * B + 100);
         let end = plain.len();
         let (_, layer) = layer_with(&stored(&plain)).await;
         let handle = open_file(&layer, "f").await;
@@ -315,7 +311,7 @@ mod tests {
     #[tokio::test]
     async fn a_file_of_one_byte_and_a_file_of_whole_blocks_read_in_full() {
         for len in [1, B - 1, B, 2 * B] {
-            let plain = pattern(len);
+            let plain = nonzero_pattern(len);
             let (_, layer) = layer_with(&stored(&plain)).await;
             let handle = open_file(&layer, "f").await;
             assert_eq!(handle.read(0, u32::MAX).await.unwrap(), plain, "len {len}");
@@ -326,7 +322,7 @@ mod tests {
     #[tokio::test]
     async fn blocks_of_zero_bytes_read_as_zeros_whole_or_partial() {
         let len = 4 * B + 50;
-        let mut plain = pattern(len);
+        let mut plain = nonzero_pattern(len);
         let mut bytes = stored(&plain);
         for index in [1, 3, 4] {
             bytes[block_at(len, index)].fill(0);
@@ -354,7 +350,7 @@ mod tests {
     #[tokio::test]
     async fn a_file_of_nothing_but_zero_blocks_reads_as_zeros() {
         let len = 2 * B + 10;
-        let mut bytes = stored(&pattern(len));
+        let mut bytes = stored(&nonzero_pattern(len));
         bytes[H..].fill(0);
         let (_, layer) = layer_with(&bytes).await;
         let handle = open_file(&layer, "f").await;
@@ -365,7 +361,7 @@ mod tests {
     #[tokio::test]
     async fn a_block_with_a_zero_nonce_and_other_bytes_does_not_open() {
         let len = 2 * B + 10;
-        let plain = pattern(len);
+        let plain = nonzero_pattern(len);
         let mut bytes = stored(&plain);
         let block = block_at(len, 1);
         bytes[block.start..block.start + NONCE_LEN].fill(0);
@@ -385,7 +381,7 @@ mod tests {
     async fn a_block_that_fails_authentication_fails_its_reads_with_one_warning_each() {
         let logs = Logs::new();
         let len = 3 * B + 100;
-        let plain = pattern(len);
+        let plain = nonzero_pattern(len);
         let mut bytes = stored(&plain);
         let block = block_at(len, 2);
         bytes[block.start + NONCE_LEN + 5] ^= 1;
@@ -426,7 +422,7 @@ mod tests {
     #[tokio::test]
     async fn a_changed_byte_of_a_block_or_of_the_header_fails_the_read() {
         let len = 2 * B + 10;
-        let plain = pattern(len);
+        let plain = nonzero_pattern(len);
         let good = stored(&plain);
         let block = block_at(len, 1);
         let at = [
@@ -448,7 +444,7 @@ mod tests {
     #[tokio::test]
     async fn a_block_moved_to_another_index_does_not_open() {
         let len = 3 * B;
-        let plain = pattern(len);
+        let plain = nonzero_pattern(len);
         let mut bytes = stored(&plain);
         let (from, to) = (block_at(len, 0), block_at(len, 2));
         let moved = bytes[from].to_vec();
@@ -465,7 +461,7 @@ mod tests {
     #[tokio::test]
     async fn a_file_replaced_from_outside_is_read_once_the_header_reloads() {
         let logs = Logs::new();
-        let old = pattern(2 * B + 10);
+        let old = nonzero_pattern(2 * B + 10);
         let new: Vec<u8> = old.iter().map(|byte| byte ^ 0x5a).collect();
         let (files, faulty, layer) = faulty_file(&stored(&old)).await;
         let handle = open_file(&layer, "f").await;
@@ -487,7 +483,7 @@ mod tests {
     async fn a_block_that_is_corrupt_for_good_fails_after_one_reload() {
         let logs = Logs::new();
         let len = 2 * B + 10;
-        let mut bytes = stored(&pattern(len));
+        let mut bytes = stored(&nonzero_pattern(len));
         bytes[block_at(len, 1).start + 40] ^= 0x80;
         let (_files, faulty, layer) = faulty_file(&bytes).await;
         let handle = open_file(&layer, "f").await;
@@ -502,7 +498,7 @@ mod tests {
     async fn a_replaced_file_that_is_corrupt_too_fails_after_one_retry() {
         let logs = Logs::new();
         let len = 2 * B + 10;
-        let old = pattern(len);
+        let old = nonzero_pattern(len);
         let (files, faulty, layer) = faulty_file(&stored(&old)).await;
         let handle = open_file(&layer, "f").await;
         assert_eq!(handle.read(0, 10).await.unwrap(), old[..10]);
@@ -522,7 +518,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_file_emptied_from_outside_reads_as_empty_and_reads_again_when_it_refills() {
-        let plain = pattern(B + 10);
+        let plain = nonzero_pattern(B + 10);
         let (files, faulty, layer) = faulty_file(&stored(&plain)).await;
         let handle = open_file(&layer, "f").await;
         assert_eq!(handle.read(0, 10).await.unwrap(), plain[..10]);
@@ -535,7 +531,7 @@ mod tests {
         }
         assert_eq!(header_reads(&faulty), loaded, "nothing to read");
 
-        let again = pattern(B);
+        let again = nonzero_pattern(B);
         let refilled = stored_file_with_id(&key_schedule(), shift(), other_file_id(), &again);
         files.clone().with_file("f", &refilled);
         assert_eq!(handle.read(0, 10).await.unwrap(), again[..10]);
@@ -551,7 +547,7 @@ mod tests {
         assert!(handle.read(0, 10).await.unwrap().is_empty());
         assert_eq!(handle.node().header().await, Some(HeaderKind::Absent));
 
-        let plain = pattern(B + 5);
+        let plain = nonzero_pattern(B + 5);
         files.clone().with_file("f", &stored(&plain));
         assert_eq!(handle.read(B as u64 - 2, 10).await.unwrap(), plain[B - 2..]);
         assert_eq!(handle.node().header().await, Some(HeaderKind::Present));
@@ -560,7 +556,7 @@ mod tests {
     #[tokio::test]
     async fn an_invalid_header_in_a_file_with_data_fails_the_read_and_stays_unknown() {
         let logs = Logs::new();
-        let good = stored(&pattern(B + 10));
+        let good = stored(&nonzero_pattern(B + 10));
         let mut bad_magic = good.clone();
         bad_magic[0] ^= 1;
         let mut bad_shift = good.clone();
@@ -587,7 +583,7 @@ mod tests {
     #[tokio::test]
     async fn an_unknown_version_or_suite_is_unsupported() {
         let logs = Logs::new();
-        let good = stored(&pattern(B + 10));
+        let good = stored(&nonzero_pattern(B + 10));
         for at in [4, 5] {
             let mut bytes = good.clone();
             bytes[at] = 9;
@@ -607,7 +603,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_header_that_is_repaired_reads_on_the_next_call() {
-        let plain = pattern(B + 10);
+        let plain = nonzero_pattern(B + 10);
         let good = stored(&plain);
         let mut bad = good.clone();
         bad[0] ^= 1;
@@ -622,7 +618,7 @@ mod tests {
 
     #[tokio::test]
     async fn short_inner_reads_give_the_full_result() {
-        let plain = pattern(3 * B + 100);
+        let plain = nonzero_pattern(3 * B + 100);
         for max in [5, 1000] {
             let (_files, faulty, layer) = faulty_file(&stored(&plain)).await;
             faulty.short_reads(Some(max));
@@ -642,7 +638,7 @@ mod tests {
     #[tokio::test]
     async fn an_inner_read_that_returns_nothing_fails_the_read() {
         let logs = Logs::new();
-        let plain = pattern(2 * B + 10);
+        let plain = nonzero_pattern(2 * B + 10);
         let (_files, faulty, layer) = faulty_file(&stored(&plain)).await;
         let handle = open_file(&layer, "f").await;
 
@@ -671,7 +667,7 @@ mod tests {
     async fn a_stored_file_shorter_than_its_stat_size_fails_the_read() {
         let logs = Logs::new();
         let len = 2 * B + 10;
-        let plain = pattern(len);
+        let plain = nonzero_pattern(len);
         let bytes = stored(&plain);
         let (files, gated, layer) = gated_file(&bytes).await;
         let handle = Arc::new(open_file(&layer, "f").await);
@@ -699,7 +695,7 @@ mod tests {
     /// sees and the bytes it reads.
     fn abnormal_files() -> Vec<(&'static str, Vec<u8>, Vec<u8>)> {
         let head = stored(&[1])[..H].to_vec();
-        let block = pattern(B);
+        let block = nonzero_pattern(B);
         let with_junk = |junk: usize| [stored(&block), vec![7; junk]].concat();
         vec![
             ("empty", Vec::new(), Vec::new()),
@@ -719,7 +715,11 @@ mod tests {
             ("block", stored(&block), block.clone()),
             ("block_and_one_byte", with_junk(1), block.clone()),
             ("block_and_overhead", with_junk(28), block.clone()),
-            ("partial", stored(&pattern(B + 3)), pattern(B + 3)),
+            (
+                "partial",
+                stored(&nonzero_pattern(B + 3)),
+                nonzero_pattern(B + 3),
+            ),
         ]
     }
 
@@ -791,7 +791,7 @@ mod tests {
         for (bits, len) in [(13, 9 * 1024 * 1024 + 17), (20, 7 * 1024 * 1024 + 1)] {
             let shift = BlockShift::new(bits).unwrap();
             let stored_block = shift.block_len() + OVERHEAD;
-            let plain = pattern(len);
+            let plain = nonzero_pattern(len);
             let bytes = stored_file(&key_schedule(), shift, &plain);
             let files = MemFsBackend::new();
             let faulty = Faulty::new(files.clone());
@@ -860,7 +860,7 @@ mod tests {
 
     #[tokio::test]
     async fn offsets_near_the_largest_values_return_empty_or_an_error() {
-        let plain = pattern(2 * B + 10);
+        let plain = nonzero_pattern(2 * B + 10);
         let (_files, faulty, layer) = faulty_file(&stored(&plain)).await;
         let handle = open_file(&layer, "f").await;
         let beyond = [u64::MAX, u64::MAX - 5, 1 << 63, (1 << 63) - 1, 1 << 62];
@@ -895,7 +895,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_read_dropped_while_the_header_loads_leaves_the_file_readable() {
-        let plain = pattern(2 * B + 10);
+        let plain = nonzero_pattern(2 * B + 10);
         let (_, gated, layer) = gated_file(&stored(&plain)).await;
         let handle = open_file(&layer, "f").await;
         let file = handle.node().file().unwrap();
@@ -911,7 +911,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_read_dropped_while_the_size_is_read_for_the_header_load_leaves_the_file_readable() {
-        let plain = pattern(2 * B + 10);
+        let plain = nonzero_pattern(2 * B + 10);
         let (_, gated, layer) = gated_file(&stored(&plain)).await;
         let handle = open_file(&layer, "f").await;
         let file = handle.node().file().unwrap();
@@ -941,7 +941,7 @@ mod tests {
     #[tokio::test]
     async fn a_read_dropped_while_the_blocks_are_read_leaves_the_header_and_the_file_as_they_were()
     {
-        let plain = pattern(2 * B + 10);
+        let plain = nonzero_pattern(2 * B + 10);
         let (_, gated, layer) = gated_file(&stored(&plain)).await;
         let handle = open_file(&layer, "f").await;
         assert_eq!(handle.read(0, 10).await.unwrap(), plain[..10]);
@@ -958,7 +958,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_read_waits_for_a_writer_of_the_file() {
-        let plain = pattern(B);
+        let plain = nonzero_pattern(B);
         let (_, layer) = layer_with(&stored(&plain)).await;
         let handle = Arc::new(open_file(&layer, "f").await);
         let writing = handle.node().file().unwrap().write().await;
@@ -975,7 +975,7 @@ mod tests {
 
     #[tokio::test]
     async fn two_readers_of_a_file_whose_header_is_unread_load_it_once() {
-        let plain = pattern(3 * B + 7);
+        let plain = nonzero_pattern(3 * B + 7);
         let files = MemFsBackend::new();
         let faulty = Faulty::new(files.clone());
         let gated = Gated::new(faulty.clone());

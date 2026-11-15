@@ -240,9 +240,10 @@ pub(crate) fn side_object_name(entry: &str) -> Option<String> {
 mod tests {
     use aes_siv::siv::Aes128Siv;
 
-    use super::super::testing::{key_schedule, other_key_schedule, unhex, xorshift};
+    use super::super::testing::{key_schedule, other_key_schedule, unhex};
     use super::super::wycheproof_siv::CASES;
     use super::*;
+    use crate::tests::data::xorshift;
 
     const A_STORED: &str = "grpvuf7g2h5sd5gwg5iwdpyz4fyq";
 

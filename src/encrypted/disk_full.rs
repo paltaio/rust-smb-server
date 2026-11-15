@@ -7,12 +7,11 @@ use std::ops::Range;
 
 use super::format::{BlockShift, HEADER_LEN, OVERHEAD};
 use super::testing::{
-    apply, clear_blocks, faulty_file_in, key_schedule, open_file, read_all, stored_file,
-    writes_since,
+    clear_blocks, faulty_file_in, key_schedule, open_file, read_all, stored_file, writes_since,
 };
 use crate::backend::Handle;
 use crate::error::{SmbError, SmbResult};
-use crate::tests::data::pattern;
+use crate::tests::data::{apply, pattern};
 
 /// Bytes in the partial last block of the old file.
 const KEPT: usize = 100;

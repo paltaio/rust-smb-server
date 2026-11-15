@@ -184,14 +184,14 @@ mod tests {
     use super::super::node::HeaderKind;
     use super::super::size::logical_size;
     use super::super::testing::{
-        B, Counting, Down, H, apply, assert_err, assert_io, assert_no_wait, at, block_reads,
-        drop_at, faulty_file, faulty_file_in, gated_file, header_reads, key_schedule, layer_over,
-        new_file, nonce_at, open, open_file, other_file_id, read_all, settle, shift, stored,
-        stored_file, stored_file_with_id, stored_len, writes_since,
+        B, Counting, Down, H, assert_err, assert_io, assert_no_wait, at, block_reads, drop_at,
+        faulty_file, faulty_file_in, gated_file, header_reads, key_schedule, layer_over, new_file,
+        nonce_at, open, open_file, other_file_id, read_all, settle, shift, stored, stored_file,
+        stored_file_with_id, stored_len, writes_since,
     };
     use super::*;
     use crate::backend::{Handle, OpenAction, OpenIntent};
-    use crate::tests::data::pattern;
+    use crate::tests::data::{apply, pattern};
     use crate::tests::gated::{Gated, Op};
     use crate::tests::logs::Logs;
     use crate::tests::memfs::MemFsBackend;

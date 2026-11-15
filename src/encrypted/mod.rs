@@ -35,7 +35,7 @@ mod scan;
 mod setup;
 mod size;
 #[cfg(test)]
-mod testing;
+pub(crate) mod testing;
 mod truncate;
 mod unlink;
 mod write;
