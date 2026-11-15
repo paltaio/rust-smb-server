@@ -108,6 +108,8 @@ A read of a block that fails authentication returns STATUS_UNEXPECTED_IO_ERROR a
 | macOS Finder | Error -8084. The copy is left at full size, with zeros after the point of failure |
 | `cp` on macOS and Linux | "Input/output error" |
 
+A copy inside the share fails the same way. Finder shows error -36 and leaves no file.
+
 ## Limits
 
 - Contents: with random nonces, NIST SP 800-38D allows 2^32 block encryptions under one key. The limit applies to each file's key: 256 TiB written to one file at 64 KiB blocks, 32 TiB at 8 KiB, 4 PiB at 1 MiB, every rewrite of a block counted. A truncation to zero, or an open that overwrites the file, starts a new key. The backend does not count writes.
