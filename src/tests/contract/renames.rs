@@ -103,12 +103,10 @@ async fn rename_onto_a_directory(backend: Backend<'_>, replace: bool) {
     assert_eq!(names(backend, "").await, ["d", "e", "f"]);
 }
 
-/// With replace, a rename onto a directory is refused with AccessDenied.
 pub(super) async fn rename_onto_a_directory_with_replace_is_access_denied(backend: Backend<'_>) {
     rename_onto_a_directory(backend, true).await;
 }
 
-/// Without replace, a rename onto a directory is refused with AccessDenied.
 pub(super) async fn rename_onto_a_directory_is_access_denied(backend: Backend<'_>) {
     rename_onto_a_directory(backend, false).await;
 }

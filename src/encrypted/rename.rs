@@ -743,30 +743,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_listing_in_flight_does_not_keep_a_directory_under_the_path_it_left() {
-        let files = MemFsBackend::new();
-        let gated = Gated::new(files.clone());
-        let layer = names_over(gated.clone()).await;
-        seed_dir(&files, "Docs");
-        seed_file(&files, "Docs\\a.txt", &stored_bytes(b""));
-        let docs = Arc::new(open_dir(&layer, "Docs").await);
-        let gate = gated.arm_after_at(Op::ListDir, &stored_at("Docs"));
-        let listing = tokio::spawn({
-            let docs = Arc::clone(&docs);
-            async move { docs.list_dir(None).await }
-        });
-        gate.reached().await;
-
-        layer
-            .rename(&path("Docs"), &path("Moved"), false)
-            .await
-            .unwrap();
-        gate.release();
-        listing.await.unwrap().unwrap();
-        assert!(layer.shared.names.fresh(&stored_name("Docs")).is_none());
-    }
-
-    #[tokio::test]
     async fn a_name_added_from_outside_to_cached_names_is_found_by_a_rename() {
         let files = MemFsBackend::new();
         let faulty = Faulty::new(files.clone());

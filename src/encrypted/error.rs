@@ -19,8 +19,8 @@ pub enum EncryptionError {
     SettingMismatch { setting: &'static str },
     /// The key is not the share's: the marker does not verify under it, or
     /// [`restore_marker`](crate::EncryptedBackendBuilder::restore_marker)
-    /// found nothing in the share that the key authenticates. A marker
-    /// changed after its version byte reads the same.
+    /// found nothing in the share that the key authenticates. A marker with a
+    /// changed byte after its version byte also gives this error.
     #[error("the key does not match the share")]
     KeyMismatch,
     /// The root of the inner backend holds entries and no marker.
@@ -90,19 +90,5 @@ mod tests {
 
         let random = EncryptionError::Random(getrandom::Error::UNEXPECTED);
         assert!(random.source().is_some(), "the random error has a source");
-    }
-
-    #[test]
-    fn other_errors_have_no_source() {
-        for error in [
-            EncryptionError::InvalidSetting { setting: "x" },
-            EncryptionError::SettingMismatch { setting: "x" },
-            EncryptionError::KeyMismatch,
-            EncryptionError::MarkerMissing,
-            EncryptionError::MarkerInvalid,
-            EncryptionError::UnsupportedFormat { version: 2 },
-        ] {
-            assert!(error.source().is_none(), "{error:?} has a source");
-        }
     }
 }

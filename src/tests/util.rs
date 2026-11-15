@@ -1,4 +1,4 @@
-//! Path and open-option builders shared by the test wrappers.
+//! Path and open-option builders for tests.
 
 use crate::backend::{OpenIntent, OpenOptions};
 use crate::path::SmbPath;

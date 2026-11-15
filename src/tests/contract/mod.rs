@@ -10,7 +10,7 @@
 //!
 //! `EXCLUDED` lists the cases an instance fails because the backend under it
 //! does not keep the contract there. Such a case runs and must fail, so an
-//! entry that is no longer needed stops the test.
+//! entry the instance passes stops the test.
 //!
 //! `rebuild` holds one test outside the instances: the layer over S3 across a
 //! restart.

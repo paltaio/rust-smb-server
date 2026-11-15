@@ -323,7 +323,7 @@ mod tests {
         (stored.entry, stored.side_object.unwrap().content)
     }
 
-    // AES-SIV call shape
+    // AES-SIV
 
     #[test]
     fn rfc_5297_a1_deterministic_example() {

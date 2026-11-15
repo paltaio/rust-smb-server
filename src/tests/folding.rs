@@ -17,7 +17,7 @@ use crate::stream::{StreamInfo, StreamName};
 
 /// Wraps `inner` and folds every component of every path and every list
 /// pattern with `str::to_lowercase` before the inner backend sees it, so
-/// `Foo` and `foo` are one entry there, and an inner backend that honours
+/// `Foo` and `foo` are one entry there, and an inner backend that honors
 /// patterns matches without regard to case. Listings and `stat` give the
 /// names as the inner backend stores them, folded. It reports
 /// `case_sensitive: false`, and `file_index` 0 from handles and listings.
