@@ -132,6 +132,11 @@ hex = "0.4"
 des = "0.9"
 
 [[test]]
+name = "integration_encrypted"
+path = "tests/integration_encrypted.rs"
+required-features = ["localfs", "encryption"]
+
+[[test]]
 name = "integration_localfs"
 path = "tests/integration_localfs.rs"
 required-features = ["localfs"]

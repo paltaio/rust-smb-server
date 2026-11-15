@@ -807,6 +807,25 @@ pub fn local(root: &Path) -> LocalFsBackend {
     LocalFsBackend::new(root).expect("open root")
 }
 
+/// The key of every encrypted share the tests serve.
+#[cfg(feature = "encryption")]
+const TEST_KEY: [u8; 32] = [0x5a; 32];
+
+/// `inner` under the encrypted layer, names encrypted.
+#[cfg(feature = "encryption")]
+pub async fn encrypted_over<B: ShareBackend>(inner: B) -> smb_server::EncryptedBackend<B> {
+    smb_server::EncryptedBackend::builder(inner, TEST_KEY)
+        .build()
+        .await
+        .expect("build the encrypted backend")
+}
+
+/// The directory `root` under the encrypted layer, names encrypted.
+#[cfg(feature = "encryption")]
+pub async fn encrypted(root: &Path) -> smb_server::EncryptedBackend<LocalFsBackend> {
+    encrypted_over(local(root)).await
+}
+
 // ---------------------------------------------------------------------------
 // Instrumented backend
 // ---------------------------------------------------------------------------
