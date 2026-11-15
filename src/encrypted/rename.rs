@@ -265,10 +265,10 @@ mod tests {
 
     use super::super::handle::EncryptedHandle;
     use super::super::testing::{
-        Hidden, assert_err, drop_at, has, injected, layer, long_name, names as listed_names,
-        names_over, names_with, open, open_dir, open_dir_as, open_file, read_all, seed_dir,
-        seed_file, settle, shares_node, spawn_open, stored_at, stored_bytes, stored_form,
-        stored_name,
+        Hidden, assert_err, drop_at, fail_open_of, has, injected, layer, long_name,
+        names as listed_names, names_over, names_with, open, open_dir, open_dir_as, open_file,
+        read_all, seed_dir, seed_file, settle, shares_node, spawn_open, stored_at, stored_bytes,
+        stored_form, stored_name,
     };
     use super::*;
     use crate::backend::{Handle, OpenAction, OpenIntent};
@@ -598,12 +598,7 @@ mod tests {
         let side = form.side_object.clone().expect("a long name");
         let counter = layer.shared.locks.directory(String::new());
         let (renames, changes) = (faulty.renames(), counter.changes());
-        let side_name = side.name.clone();
-        faulty.fail_open(
-            1,
-            move |at, _| at.file_name() == Some(side_name.as_str()),
-            injected(),
-        );
+        fail_open_of(&faulty, &side.name);
 
         let error = layer
             .rename(&path("a.txt"), &path(&long), false)

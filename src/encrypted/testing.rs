@@ -34,6 +34,7 @@ use crate::backend::{
 };
 use crate::error::{SmbError, SmbResult};
 use crate::path::SmbPath;
+use crate::tests::data::{apply, pattern};
 use crate::tests::faulty::Faulty;
 use crate::tests::gated::{Gate, Gated, Op};
 use crate::tests::memfs::MemFsBackend;
@@ -568,6 +569,56 @@ pub(super) async fn drop_at<T>(gate: &Gate, call: impl Future<Output = SmbResult
 /// The inner writes made since `from`.
 pub(super) fn writes_since(faulty: &Faulty<MemFsBackend>, from: usize) -> Vec<(u64, usize)> {
     faulty.write_calls().split_off(from)
+}
+
+/// Fails the next open of an entry called `name`.
+pub(super) fn fail_open_of(faulty: &Faulty<MemFsBackend>, name: &str) {
+    let name = name.to_string();
+    faulty.fail_open(
+        1,
+        move |at, _| at.file_name() == Some(name.as_str()),
+        injected(),
+    );
+}
+
+/// Bytes in the partial last block of the old file in the edit tests.
+pub(super) const KEPT: usize = 100;
+
+/// A write of `len` bytes at `offset`, or a truncate to `len` bytes.
+#[derive(Clone, Copy)]
+pub(super) enum Edit {
+    Write { offset: usize, len: usize },
+    Truncate { len: usize },
+}
+
+/// Makes `edit` through `handle`. A write stores `pattern(len, 2)`.
+pub(super) async fn perform<H: Handle>(handle: &H, edit: Edit) -> SmbResult<()> {
+    match edit {
+        Edit::Write { offset, len } => handle
+            .write(offset as u64, &pattern(len, 2))
+            .await
+            .map(|_| ()),
+        Edit::Truncate { len } => handle.truncate(len as u64).await,
+    }
+}
+
+/// `plain` as a file of `len` bytes: cut, or followed by zeros.
+pub(super) fn resized(plain: &[u8], len: usize) -> Vec<u8> {
+    let mut bytes = plain.to_vec();
+    bytes.resize(len, 0);
+    bytes
+}
+
+/// The file `plain` after `edit`.
+pub(super) fn edited(plain: &[u8], edit: Edit) -> Vec<u8> {
+    match edit {
+        Edit::Write { offset, len } => {
+            let mut bytes = plain.to_vec();
+            apply(&mut bytes, offset, &pattern(len, 2));
+            bytes
+        }
+        Edit::Truncate { len } => resized(plain, len),
+    }
 }
 
 /// The nonce of the block that starts at `start` in `bytes`.

@@ -337,10 +337,10 @@ mod tests {
     use super::super::names::{StoredName, encode_name};
     use super::super::node::{Found, Origin};
     use super::super::testing::{
-        Hiding, PRIVATE_WORD, Script, change, drop_at, injected, key_schedule, layer, names,
-        names_over, names_settings, names_with, open, open_dir, open_file, other_key_schedule,
-        parked, read_all, renamed, sealed_invalid_names, seed_dir, seed_file, seed_hidden_names,
-        seed_orphan, stored_at, stored_bytes, stored_form, stored_name, summary,
+        Hiding, PRIVATE_WORD, Script, change, drop_at, fail_open_of, injected, key_schedule, layer,
+        names, names_over, names_settings, names_with, open, open_dir, open_file,
+        other_key_schedule, parked, read_all, renamed, sealed_invalid_names, seed_dir, seed_file,
+        seed_hidden_names, seed_orphan, stored_at, stored_bytes, stored_form, stored_name, summary,
     };
     use super::*;
     use crate::backend::{Handle, OpenAction, OpenIntent};
@@ -830,11 +830,7 @@ mod tests {
         seed_file(&files, "a.txt", b"");
         seed_file(&files, &long, b"");
         let side = stored_form(&long).side_object.unwrap().name;
-        faulty.fail_open(
-            1,
-            move |at, _| at.file_name() == Some(side.as_str()),
-            injected(),
-        );
+        fail_open_of(&faulty, &side);
         let root = open_dir(&layer, "").await;
 
         assert_eq!(listed(&root, None).await, ["a.txt"]);

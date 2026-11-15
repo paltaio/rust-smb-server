@@ -360,8 +360,8 @@ mod tests {
 
     use super::super::format::MARKER_NAME;
     use super::super::testing::{
-        GatedLayer, has, injected, names_over, names_with, open_file, parked, seed_dir, seed_file,
-        seed_hidden_names, spawn_open, stored_at, stored_form, stored_name,
+        GatedLayer, fail_open_of, has, injected, names_over, names_with, open_file, parked,
+        seed_dir, seed_file, seed_hidden_names, spawn_open, stored_at, stored_form, stored_name,
     };
     use super::*;
     use crate::backend::{BackendCapabilities, Handle, OpenAction, OpenIntent};
@@ -654,11 +654,7 @@ mod tests {
         seed_file(&files, &broken, b"");
         seed_file(&files, &sound, b"");
         let side = stored_form(&broken).side_object.unwrap().name;
-        faulty.fail_open(
-            1,
-            move |at, _| at.file_name() == Some(side.as_str()),
-            injected(),
-        );
+        fail_open_of(&faulty, &side);
 
         let names = layer.names_of(&root(), Hold::Lock).await.unwrap().unwrap();
         assert_eq!(names.len(), 2);

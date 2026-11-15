@@ -150,9 +150,9 @@ mod tests {
     use super::super::node::HeaderKind;
     use super::super::scan::Hold;
     use super::super::testing::{
-        Hidden, drop_at, injected, layer, names_over, names_with, open, open_dir, open_dir_as,
-        open_file, read_all, refused, refused_dir, seed_dir, seed_file, settle, shares_node,
-        spawn_open, stored_at, stored_bytes, stored_form, stored_name, writes_since,
+        Hidden, drop_at, fail_open_of, injected, layer, names_over, names_with, open, open_dir,
+        open_dir_as, open_file, read_all, refused, refused_dir, seed_dir, seed_file, settle,
+        shares_node, spawn_open, stored_at, stored_bytes, stored_form, stored_name, writes_since,
     };
     use super::*;
     use crate::backend::{Handle, OpenIntent};
@@ -470,13 +470,8 @@ mod tests {
         let long = long();
         let form = stored_form(&long);
         let side = form.side_object.clone().expect("a long name");
-        let side_name = side.name.clone();
 
-        faulty.fail_open(
-            1,
-            move |at, _| at.file_name() == Some(side_name.as_str()),
-            injected(),
-        );
+        fail_open_of(&faulty, &side.name);
         let error = refused(&layer, &long, OpenIntent::Create).await;
         assert!(matches!(error, SmbError::Io(_)), "{error:?}");
         assert_eq!(files.contents(&form.entry), None);

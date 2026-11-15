@@ -186,8 +186,8 @@ mod tests {
     use super::super::testing::{
         B, Counting, Down, H, assert_err, assert_io, assert_no_wait, at, block_reads, drop_at,
         faulty_file, faulty_file_in, gated_file, header_reads, key_schedule, layer_over, new_file,
-        nonce_at, open, open_file, other_file_id, read_all, settle, shift, stored, stored_file,
-        stored_file_with_id, stored_len, writes_since,
+        nonce_at, open, open_file, other_file_id, read_all, resized, settle, shift, stored,
+        stored_file, stored_file_with_id, stored_len, writes_since,
     };
     use super::*;
     use crate::backend::{Handle, OpenAction, OpenIntent};
@@ -198,13 +198,6 @@ mod tests {
 
     // Inner writes are counted from 1: the first is the marker the layer
     // writes when it is built.
-
-    /// `plain` as a file of `len` bytes: cut, or followed by zeros.
-    fn resized(plain: &[u8], len: usize) -> Vec<u8> {
-        let mut model = plain.to_vec();
-        model.resize(len, 0);
-        model
-    }
 
     #[tokio::test]
     async fn a_shrink_keeps_the_data_before_the_cut_and_stores_the_size_of_its_length() {

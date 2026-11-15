@@ -7,20 +7,12 @@ use std::ops::Range;
 
 use super::format::{BlockShift, HEADER_LEN, OVERHEAD};
 use super::testing::{
-    clear_blocks, faulty_file_in, key_schedule, open_file, read_all, stored_file, writes_since,
+    Edit, KEPT, clear_blocks, edited, faulty_file_in, key_schedule, open_file, perform, read_all,
+    resized, stored_file, writes_since,
 };
 use crate::backend::Handle;
-use crate::error::{SmbError, SmbResult};
-use crate::tests::data::{apply, pattern};
-
-/// Bytes in the partial last block of the old file.
-const KEPT: usize = 100;
-
-#[derive(Clone, Copy)]
-enum Edit {
-    Write { offset: usize, len: usize },
-    Truncate { len: usize },
-}
+use crate::error::SmbError;
+use crate::tests::data::pattern;
 
 /// An edit of a file of `whole` blocks and a partial one, which makes the
 /// partial block longer. The part of that block from the old end on is
@@ -120,22 +112,6 @@ fn extensions(b: usize, whole: usize) -> Vec<Case> {
             end + 3 * b + 7,
         ),
     ]
-}
-
-async fn perform<H: Handle>(handle: &H, edit: Edit) -> SmbResult<()> {
-    match edit {
-        Edit::Write { offset, len } => handle
-            .write(offset as u64, &pattern(len, 2))
-            .await
-            .map(|_| ()),
-        Edit::Truncate { len } => handle.truncate(len as u64).await,
-    }
-}
-
-fn resized(plain: &[u8], len: usize) -> Vec<u8> {
-    let mut bytes = plain.to_vec();
-    bytes.resize(len, 0);
-    bytes
 }
 
 /// The `written` ranges, as offset and length, cover all of `target`.
@@ -252,18 +228,6 @@ impl<'a> Run<'a> {
         resized(&self.plain, len)
     }
 
-    /// The file after the edit.
-    fn after(&self) -> Vec<u8> {
-        match self.case.edit {
-            Edit::Write { offset, len } => {
-                let mut bytes = self.plain.clone();
-                apply(&mut bytes, offset, &pattern(len, 2));
-                bytes
-            }
-            Edit::Truncate { len } => resized(&self.plain, len),
-        }
-    }
-
     /// The inner writes of the edit with no fault.
     async fn clean(&self) -> Vec<(u64, usize)> {
         let (_files, faulty, layer) = faulty_file_in(self.shift, &self.stored).await;
@@ -271,7 +235,7 @@ impl<'a> Run<'a> {
         let before = faulty.write_calls().len();
         perform(&handle, self.case.edit).await.unwrap();
         assert!(
-            read_all(&handle).await == self.after(),
+            read_all(&handle).await == edited(&self.plain, self.case.edit),
             "{}: the edit",
             self.name()
         );
@@ -324,7 +288,7 @@ impl<'a> Run<'a> {
             );
             perform(&handle, self.case.edit).await.unwrap();
             assert!(
-                read_all(&reader).await == self.after(),
+                read_all(&reader).await == edited(&self.plain, self.case.edit),
                 "{name}: the edit again"
             );
             return;
@@ -357,10 +321,10 @@ impl<'a> Run<'a> {
             // A torn block can still open when the unapplied bytes happen to
             // equal the new ones.
             Ok(got) => {
-                let edited = self.after();
+                let after = edited(&self.plain, self.case.edit);
                 let start = first * self.b;
                 assert!(
-                    got[..] == edited[start..start + got.len()],
+                    got[..] == after[start..start + got.len()],
                     "{name}: the rewritten blocks"
                 );
             }
