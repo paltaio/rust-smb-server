@@ -101,6 +101,24 @@ pub(crate) fn block_range(
     })
 }
 
+/// `stored_size` computed in 128 bits, where nothing overflows.
+#[cfg(any(test, fuzzing))]
+pub(super) fn expected_stored_size(shift: BlockShift, logical: u64) -> Option<u64> {
+    if logical == 0 {
+        return Some(0);
+    }
+    let (block, overhead) = (u128::from(shift.block_size()), u128::from(BLOCK_OVERHEAD));
+    let logical = u128::from(logical);
+    let tail = match logical % block {
+        0 => 0,
+        rest => rest + overhead,
+    };
+    let stored = u128::from(HEADER) + logical / block * (block + overhead) + tail;
+    u64::try_from(stored)
+        .ok()
+        .filter(|&stored| stored <= MAX_STORED_SIZE)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,21 +127,6 @@ mod tests {
 
     fn shift(shift: u8) -> BlockShift {
         BlockShift::new(shift).unwrap()
-    }
-
-    /// The stored size computed in u128, which holds it for every u64.
-    fn expected_stored_size(shift: u8, logical: u64) -> Option<u64> {
-        if logical == 0 {
-            return Some(0);
-        }
-        let block = 1u128 << shift;
-        let logical = u128::from(logical);
-        let tail = match logical % block {
-            0 => 0,
-            rest => rest + 28,
-        };
-        let size = 24 + logical / block * (block + 28) + tail;
-        u64::try_from(size).ok().filter(|s| *s <= MAX_STORED_SIZE)
     }
 
     fn mapped(s: u8, stored: u64) -> (u64, StoredKind) {
@@ -225,7 +228,7 @@ mod tests {
                 }
             }
             for logical in samples(bits) {
-                let expected = expected_stored_size(bits, logical);
+                let expected = expected_stored_size(s, logical);
                 assert_eq!(
                     stored_size(s, logical),
                     expected,

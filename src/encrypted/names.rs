@@ -16,20 +16,20 @@ use super::keys::KeySchedule;
 use crate::path::is_valid_component;
 
 /// Length of the SIV that starts an AES-SIV output.
-const SIV_LEN: usize = 16;
+pub(super) const SIV_LEN: usize = 16;
 /// Longest name in UTF-8: 255 UTF-16 units of at most three bytes each.
 const MAX_NAME_BYTES: usize = 3 * 255;
 /// Longest AES-SIV output of a name.
-const MAX_SEALED_LEN: usize = SIV_LEN + MAX_NAME_BYTES;
+pub(super) const MAX_SEALED_LEN: usize = SIV_LEN + MAX_NAME_BYTES;
 /// Longest stored name, in characters.
-const MAX_STORED_NAME_LEN: usize = 255;
+pub(super) const MAX_STORED_NAME_LEN: usize = 255;
 /// Longest side object. A caller takes the size of an object first and reads
 /// none of one that is longer; `decode_long` refuses it too.
 pub(crate) const MAX_SIDE_OBJECT_LEN: usize = 1024;
 /// Bytes of the SHA-256 digest that name a long entry.
 const HASH_BYTES: usize = 20;
 const HASH_CHARS: usize = base32::encoded_len(HASH_BYTES);
-const LONG_SUFFIX: &str = ".l";
+pub(super) const LONG_SUFFIX: &str = ".l";
 const SIDE_SUFFIX: &str = ".n";
 /// The associated data of every name: one component, empty. Zero components
 /// give a different output.
@@ -126,7 +126,7 @@ fn open_siv(key: &[u8; 64], ad: &[u8], sealed: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// Base32 of the first 20 bytes of the SHA-256 of `content`.
-fn long_hash(content: &[u8]) -> String {
+pub(super) fn long_hash(content: &[u8]) -> String {
     base32::encode(&Sha256::digest(content)[..HASH_BYTES])
 }
 
@@ -161,11 +161,18 @@ pub(crate) fn encode_name(keys: &KeySchedule, name: &str, threshold: u8) -> Opti
     })
 }
 
+/// The AES-SIV output of `plaintext` as `encode_name` makes it, without the
+/// check that the plaintext is a valid path component or UTF-8.
+#[cfg(any(test, fuzzing))]
+pub(super) fn seal_unchecked(keys: &KeySchedule, plaintext: &[u8]) -> Vec<u8> {
+    seal_siv(keys.name_key(), NAME_AD, plaintext)
+}
+
 /// The short stored form of `plaintext` as `encode_name` makes it, without the
 /// check that the plaintext is a valid path component.
 #[cfg(test)]
 pub(super) fn encode_unchecked(keys: &KeySchedule, plaintext: &str) -> String {
-    base32::encode(&seal_siv(keys.name_key(), NAME_AD, plaintext.as_bytes()))
+    base32::encode(&seal_unchecked(keys, plaintext.as_bytes()))
 }
 
 /// The name in an AES-SIV output: 17 to 781 bytes, a SIV that authenticates,

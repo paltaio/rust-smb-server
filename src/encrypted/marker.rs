@@ -14,7 +14,7 @@ type HmacSha256 = Hmac<Sha256>;
 const MAGIC: &[u8; 8] = b"smbencmk";
 const NAMES_ENCRYPTED: u8 = 1;
 /// Bytes the MAC covers.
-const BODY_LEN: usize = MARKER_LEN - 32;
+pub(super) const BODY_LEN: usize = MARKER_LEN - 32;
 
 /// Settings a share keeps for its whole life.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,7 +51,7 @@ fn marker_mac(keys: &KeySchedule) -> HmacSha256 {
 }
 
 /// The marker made of `body` and the MAC over it.
-fn sign(keys: &KeySchedule, body: &[u8; BODY_LEN]) -> [u8; MARKER_LEN] {
+pub(super) fn sign(keys: &KeySchedule, body: &[u8; BODY_LEN]) -> [u8; MARKER_LEN] {
     let mut mac = marker_mac(keys);
     mac.update(body);
     let mut out = [0u8; MARKER_LEN];

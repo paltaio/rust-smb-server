@@ -881,6 +881,14 @@ pub mod fuzzing {
         crate::discovery::wsd::fuzz_http(data);
     }
 
+    /// Parses `data` as stored data of an encrypted share under a fixed key.
+    /// The first byte picks the parser (marker, file header, short name, long
+    /// name, sizes or block) and the rest is its input.
+    #[cfg(feature = "encryption")]
+    pub fn encrypted_input(data: &[u8]) {
+        crate::encrypted::fuzz_input::run(data);
+    }
+
     /// Dispatches one frame payload on a fresh connection to `server`.
     pub async fn dispatch(server: &crate::SmbServer, frame: &[u8]) -> Option<Vec<u8>> {
         let state = server.state();

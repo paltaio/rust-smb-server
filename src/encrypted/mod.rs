@@ -15,6 +15,8 @@ mod create;
 mod disk_full;
 mod error;
 mod format;
+#[cfg(any(test, fuzzing))]
+pub(crate) mod fuzz_input;
 mod handle;
 mod header;
 mod inner;
