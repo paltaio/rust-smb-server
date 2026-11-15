@@ -18,6 +18,8 @@ mod header;
 mod inner;
 mod keys;
 mod list;
+#[cfg(test)]
+mod listing_races;
 mod locks;
 mod lru;
 mod marker;
