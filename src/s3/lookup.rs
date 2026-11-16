@@ -79,7 +79,9 @@ impl Shared {
 
     /// Drops what is cached of the object at `key`, which the backend
     /// deleted, and its row in the cached listing of its directory. The key
-    /// of a directory marker drops the directory.
+    /// of a directory marker drops the directory. This comes after the store
+    /// deleted the object and before the overlay lets go of the key to
+    /// delete, so a listing made meanwhile sees the change to its rows.
     pub(super) fn deleted(&self, key: &str) {
         let key = key.strip_suffix('/').unwrap_or(key);
         let dir = parent_key(key);
@@ -90,6 +92,9 @@ impl Shared {
     /// as its row in the cached listing of its directory. The directories
     /// above the key are there now, with or without a marker object of their
     /// own: each gets its row in the cached listing of the directory above.
+    /// This comes after the store has the object and before the entry that
+    /// held it lets go of it, so a listing made meanwhile sees the change to
+    /// its rows.
     pub(super) fn remember(&self, key: &str, known: Known, kind: RowKind) {
         let dir = parent_key(key);
         let mut cache = self.cache();
@@ -443,8 +448,20 @@ impl Shared {
     /// has them or else from the store, page by page. A directory with no
     /// keys below it has no entries.
     pub(super) async fn listing(&self, dir: &str, retry: &Retry) -> SmbResult<Arc<DirListing>> {
-        if let Some(listing) = self.cache().listing(dir, Instant::now()) {
-            return Ok(listing);
+        Ok(self.listed(dir, retry).await?.rows)
+    }
+
+    /// [`listing`](Self::listing), with a note of whether the backend changed
+    /// the rows of the directory since the read began. A listing read from the
+    /// store is cached with the changes made to the rows meanwhile, unless
+    /// they cannot be taken in.
+    pub(super) async fn listed(&self, dir: &str, retry: &Retry) -> SmbResult<Listed<'_>> {
+        let (read, cached) = {
+            let (id, cached) = self.cache().begin_read(dir, Instant::now());
+            (Reading { shared: self, id }, cached)
+        };
+        if let Some(rows) = cached {
+            return Ok(Listed { rows, read });
         }
         let prefix = dir_prefix(dir);
         let mut builder = ListingBuilder::new(prefix.clone());
@@ -467,10 +484,12 @@ impl Shared {
                 break;
             }
         }
-        let listing = Arc::new(builder.finish().unwrap_or_default());
-        self.cache()
-            .put_listing(dir, Arc::clone(&listing), Instant::now());
-        Ok(listing)
+        let rows = self.cache().keep_read(
+            read.id,
+            builder.finish().unwrap_or_default(),
+            Instant::now(),
+        );
+        Ok(Listed { rows, read })
     }
 
     /// Whether the directory with key `dir` holds nothing: no entry of the
@@ -511,6 +530,41 @@ impl Shared {
                 return Ok(true);
             }
         }
+    }
+}
+
+/// The rows of a directory. The cache notes the changes the backend makes to
+/// them until this is dropped.
+pub(super) struct Listed<'a> {
+    pub(super) rows: Arc<DirListing>,
+    read: Reading<'a>,
+}
+
+impl Listed<'_> {
+    /// Whether the backend changed the rows of the directory since the read of
+    /// them began. The rows already show the changes made until the read
+    /// ended.
+    pub(super) fn changed(&self) -> bool {
+        self.read.changed()
+    }
+}
+
+/// A read of a directory listing, which the cache knows of until this is
+/// dropped.
+struct Reading<'a> {
+    shared: &'a Shared,
+    id: u64,
+}
+
+impl Reading<'_> {
+    fn changed(&self) -> bool {
+        self.shared.cache().read_changed(self.id)
+    }
+}
+
+impl Drop for Reading<'_> {
+    fn drop(&mut self) {
+        self.shared.cache().end_read(self.id);
     }
 }
 

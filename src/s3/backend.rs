@@ -331,6 +331,17 @@ impl S3Backend {
         self.shared.cache().limit_rows(rows);
     }
 
+    /// How many reads of a directory listing are under way.
+    pub(crate) fn listing_reads(&self) -> usize {
+        self.shared.cache().reads()
+    }
+
+    /// How many times a listing of a directory is read at most, when the
+    /// directory changes while it is.
+    pub(crate) fn listing_attempts() -> usize {
+        super::list::LIST_ATTEMPTS
+    }
+
     /// Drops the chunks kept for reads and bounds them to `per_version` for
     /// one version of an object and `bytes` in all.
     pub(crate) fn limit_read_chunks(&self, per_version: usize, bytes: usize) {
@@ -461,6 +472,28 @@ impl S3Backend {
         &self,
     ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
         gates(&self.shared.jobs.pause_listed)
+    }
+
+    /// Makes the next listing of a directory wait once it has the rows of the
+    /// store, as [`pause_after_hash`](Self::pause_after_hash) does.
+    pub(crate) fn pause_after_rows(&self) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        gates(&self.shared.jobs.pause_rows)
+    }
+
+    /// Makes the next listing of a directory wait once it has the entries of
+    /// the overlay below it, as [`pause_after_hash`](Self::pause_after_hash)
+    /// does.
+    pub(crate) fn pause_after_below(&self) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        gates(&self.shared.jobs.pause_below)
+    }
+
+    /// Makes the next `reads` reads of a directory listing see the rows of the
+    /// directory change once they have them.
+    pub(crate) fn change_listings(&self, reads: usize) {
+        self.shared
+            .jobs
+            .churn
+            .store(reads, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Makes the next task that records a closed file wait before it takes

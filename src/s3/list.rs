@@ -2,6 +2,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::task::JoinSet;
 use tokio::time::{Instant, timeout_at};
@@ -29,6 +30,10 @@ struct Fetch {
     is_dir: bool,
 }
 
+/// How many times the listing of a directory is read, when the directory
+/// changes while it is.
+pub(super) const LIST_ATTEMPTS: usize = 4;
+
 /// The entries of `dir` that match `pattern`: those of its listing in the
 /// bucket, less the keys to delete, and the overlay's entries in their place.
 pub(super) async fn list_entries(
@@ -43,20 +48,61 @@ pub(super) async fn list_entries(
         return single(shared, dir, name, &retry).await;
     }
 
-    let listing = shared.listing(&dir.key, &retry).await?;
-    let below = shared.overlay.below(&dir.key);
-    let direct: Vec<Direct> = below
-        .direct
-        .iter()
-        .map(|entry| Direct {
-            name: entry.state().name().to_owned(),
-            is_dir: entry.is_dir(),
-        })
-        .collect();
+    // The rows of the store and what the overlay holds are read one after the
+    // other, so a change made to the directory in between can show in only one
+    // of them. A read that met a change to the rows or to the overlay is made
+    // again; after LIST_ATTEMPTS reads, or when another would end past the
+    // deadline, the last one stands. A change to the rows is noted before the
+    // overlay lets go of the entry or key to delete that covered it, so a read
+    // that met no change has every name in one of the two. The cache takes in
+    // the changes made to the rows while they are read, so a read made again
+    // is served by it. When a read made again fails, the one before it stands.
+    let mut attempt = 1;
+    let mut earlier = None;
+    let (listing, below, direct, hidden) = loop {
+        let started = Instant::now();
+        let listed = match shared.listed(&dir.key, &retry).await {
+            Ok(listed) => listed,
+            Err(e) => match earlier.take() {
+                Some(read) => {
+                    debug!(error = %e, "a listing made again failed; the one before it stands");
+                    break read;
+                }
+                None => return Err(e),
+            },
+        };
+        #[cfg(test)]
+        {
+            change_rows(shared, &dir.key);
+            super::jobs::pause(&shared.jobs.pause_rows).await;
+        }
+        let watch = shared.overlay.watch(&dir.key);
+        let below = shared.overlay.below(&dir.key);
+        #[cfg(test)]
+        super::jobs::pause(&shared.jobs.pause_below).await;
+        let hidden = shared.overlay.hidden(&dir.key, &listed.rows.rows);
+        let direct: Vec<Direct> = below
+            .direct
+            .iter()
+            .map(|entry| Direct {
+                name: entry.state().name().to_owned(),
+                is_dir: entry.is_dir(),
+            })
+            .collect();
+        let again = listed.changed() || watch.changed();
+        let read = (Arc::clone(&listed.rows), below, direct, hidden);
+        if !again || attempt == LIST_ATTEMPTS || !fits_before(deadline, started.elapsed()) {
+            break read;
+        }
+        earlier = Some(read);
+        attempt += 1;
+    };
     let rows: Vec<&Row> = listing
         .rows
         .iter()
-        .filter(|row| !shared.hidden(&dir.key, row))
+        .zip(&hidden)
+        .filter(|(_, hidden)| !**hidden)
+        .map(|(row, _)| row)
         .collect();
     let matcher = pattern.map(|p| Pattern::new(p, shared.case_insensitive));
     let picked: Vec<Picked> = merge(&rows, &direct, &below.implied, shared.case_insensitive)
@@ -96,6 +142,26 @@ pub(super) async fn list_entries(
     Ok(entries)
 }
 
+/// Whether a read that took `spent` can be made again before `deadline`.
+fn fits_before(deadline: Instant, spent: Duration) -> bool {
+    Instant::now()
+        .checked_add(spent)
+        .is_some_and(|end| end < deadline)
+}
+
+/// Changes the rows of `dir` if a test asked for it.
+#[cfg(test)]
+fn change_rows(shared: &Shared, dir: &str) {
+    use std::sync::atomic::Ordering::SeqCst;
+    let asked = shared
+        .jobs
+        .churn
+        .fetch_update(SeqCst, SeqCst, |reads| reads.checked_sub(1));
+    if asked.is_ok() {
+        shared.forget_file(&join_key(dir, "changed"));
+    }
+}
+
 /// The entry of `dir` named `name`, which has no wildcard.
 async fn single(
     shared: &Arc<Shared>,
@@ -116,18 +182,6 @@ async fn single(
         }]),
         Err(SmbError::NotFound | SmbError::PathNotFound) => Ok(Vec::new()),
         Err(e) => Err(e),
-    }
-}
-
-impl Shared {
-    /// Whether the overlay hides `row`: a file whose key is to be deleted, or a
-    /// directory that is gone.
-    fn hidden(&self, dir: &str, row: &Row) -> bool {
-        let key = join_key(dir, &row.name);
-        match row.kind {
-            RowKind::File(_) => self.overlay.tombstoned(&key),
-            RowKind::Dir => self.overlay.dir_dead(&key),
-        }
     }
 }
 
@@ -233,5 +287,19 @@ impl Shared {
             self.cache().put_known(key, known, Instant::now());
         }
         head
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_read_is_made_again_only_if_it_fits_before_the_deadline() {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        assert!(fits_before(deadline, Duration::from_secs(1)));
+        assert!(!fits_before(deadline, Duration::from_secs(31)));
+        assert!(!fits_before(Instant::now(), Duration::ZERO));
+        assert!(!fits_before(deadline, Duration::MAX));
     }
 }

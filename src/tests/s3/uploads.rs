@@ -11,10 +11,11 @@ use sha2::{Digest as _, Sha256};
 use tokio::sync::Notify;
 
 use super::fixture::{MIB, foreground, is_missing, pattern, put, range};
-use super::moves::crash;
+use super::moves::{crash, make, path};
 use super::proxy::{Fault, Proxy, Reply, Seen};
 use super::share::{
-    FILE_OVERWRITE_IF, Rig, Smb, filetime, is_data_read, wait_for_requests, wait_until_async,
+    FILE_OVERWRITE_IF, Rig, Smb, filetime, is_data_read, listing_reply, names, run_bounded,
+    wait_for_requests, wait_until_async,
 };
 use super::writes::{create_dir, create_file, entry_records, open_rw, records};
 use crate::ntstatus::STATUS_OBJECT_NAME_NOT_FOUND;
@@ -22,7 +23,7 @@ use crate::proto::messages::FileId;
 use crate::s3::encode::{hex, uri_encode};
 use crate::s3::object::{Metadata, ObjectHead};
 use crate::s3::record::{EntryRecord, Record, RecordId};
-use crate::{S3Backend, S3BackendBuilder, S3Error};
+use crate::{OpenOptions, S3Backend, S3BackendBuilder, S3Error, ShareBackend, SmbPath};
 
 /// How long a changed file rests before the backend stores it.
 const DELAY: Duration = Duration::from_millis(150);
@@ -708,6 +709,665 @@ async fn files_flushed_before_a_restart_are_stored_by_the_next_backend() {
     assert_eq!(left(&rig, "data"), 0);
     assert_eq!(left(&rig, "records"), 0);
     assert_eq!(rig.smb.contents("a.txt", 100).await, b"flushed");
+}
+
+fn is_root_listing(seen: &Seen) -> bool {
+    seen.method == "GET" && seen.has_param("delimiter") && !seen.has_param("prefix")
+}
+
+/// The names the backend lists in the share root, sorted.
+async fn root_names(backend: &S3Backend) -> Vec<String> {
+    let (root, _) = backend
+        .open(&SmbPath::root(), OpenOptions::default())
+        .await
+        .unwrap();
+    let mut listed: Vec<String> = root
+        .list_dir(None)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.info.name)
+        .collect();
+    root.close().await.unwrap();
+    listed.sort();
+    listed
+}
+
+/// Starts a listing of the share root from the store. The store answers with
+/// the objects `before`, as they were when the listing began, and the answer
+/// is held until the gate returned is notified.
+async fn listing_in_flight(
+    rig: &Rig,
+    before: &[(&str, u64)],
+) -> (Arc<Notify>, tokio::task::JoinHandle<Vec<String>>) {
+    listing_in_flight_with(rig, before, &[]).await
+}
+
+/// [`listing_in_flight`] for a store that also has the directories `prefixes`.
+async fn listing_in_flight_with(
+    rig: &Rig,
+    before: &[(&str, u64)],
+    prefixes: &[&str],
+) -> (Arc<Notify>, tokio::task::JoinHandle<Vec<String>>) {
+    let backend = rig.backend.clone();
+    read_in_flight(
+        rig,
+        before,
+        prefixes,
+        async move { root_names(&backend).await },
+    )
+    .await
+}
+
+/// Runs `read`, which asks for the listing of the share root, with the cache
+/// empty. The store answers with the objects `before` and the directories
+/// `prefixes`, once the gate returned is notified.
+async fn read_in_flight<T: Send + 'static>(
+    rig: &Rig,
+    before: &[(&str, u64)],
+    prefixes: &[&str],
+    read: impl std::future::Future<Output = T> + Send + 'static,
+) -> (Arc<Notify>, tokio::task::JoinHandle<T>) {
+    rig.backend.limit_listing_rows(100_000);
+    let asked = rig.proxy.count(is_root_listing);
+    let gate = Arc::new(Notify::new());
+    rig.proxy.inject(
+        is_root_listing,
+        Fault::HoldReply(Arc::clone(&gate), listing_reply(before, prefixes)),
+        1,
+    );
+    let read = tokio::spawn(read);
+    wait_for_requests(&rig.proxy, asked + 1, is_root_listing).await;
+    (gate, read)
+}
+
+/// Whether the backend finds nothing at `name` in the share root. With names
+/// matched without regard to case, a miss reads the listing of the root.
+async fn is_not_found(backend: &S3Backend, name: &str) -> bool {
+    backend
+        .open(&path(name), OpenOptions::default())
+        .await
+        .is_err()
+}
+
+/// Lists the share root from the store while the backend stores what it holds.
+/// The answer of the store arrives after the last request of the backend ended.
+async fn list_while_stored(rig: &Rig, before: &[(&str, u64)]) -> Vec<String> {
+    let (gate, listing) = listing_in_flight(rig, before).await;
+    rig.backend.hold_uploads(false);
+    sync(&rig.backend).await.unwrap();
+    gate.notify_one();
+    listing.await.unwrap()
+}
+
+/// Lists the share root while `act` runs. It runs once the listing has the
+/// rows of the store, and ends before the listing reads what the backend holds.
+async fn list_between(rig: &Rig, act: impl std::future::Future<Output = ()>) -> Vec<String> {
+    let (reached, resume) = rig.backend.pause_after_rows();
+    let listing = tokio::spawn({
+        let backend = rig.backend.clone();
+        async move { root_names(&backend).await }
+    });
+    reached.notified().await;
+    act.await;
+    resume.notify_one();
+    listing.await.unwrap()
+}
+
+fn strings(names: &[&str]) -> Vec<String> {
+    names.iter().map(|name| (*name).to_owned()).collect()
+}
+
+#[tokio::test]
+async fn a_file_stored_while_its_directory_is_listed_is_in_the_listing() {
+    let mut rig = Rig::writable_with(held).await;
+    make(&mut rig, "a.txt", b"a").await;
+    make(&mut rig, "b.txt", b"b").await;
+
+    let during = list_while_stored(&rig, &[]).await;
+    let after = root_names(&rig.backend).await;
+    let want = strings(&["a.txt", "b.txt"]);
+    assert_eq!([during, after], [want.clone(), want]);
+}
+
+#[tokio::test]
+async fn a_file_a_restart_brings_back_is_in_a_listing_that_overlaps_its_upload() {
+    let mut rig = Rig::writable_with(held).await;
+    make(&mut rig, "a.txt", b"a").await;
+    make(&mut rig, "b.txt", b"b").await;
+    let rig = rig.restart_with(held).await;
+
+    let during = list_while_stored(&rig, &[]).await;
+    let after = root_names(&rig.backend).await;
+    let want = strings(&["a.txt", "b.txt"]);
+    assert_eq!([during, after], [want.clone(), want]);
+}
+
+#[tokio::test]
+async fn a_file_stored_after_a_listing_has_its_rows_is_in_the_listing() {
+    let mut rig = Rig::writable_with(held).await;
+    make(&mut rig, "a.txt", b"a").await;
+    make(&mut rig, "b.txt", b"b").await;
+
+    let during = list_between(&rig, async {
+        rig.backend.hold_uploads(false);
+        sync(&rig.backend).await.unwrap();
+    })
+    .await;
+    let after = root_names(&rig.backend).await;
+    let want = strings(&["a.txt", "b.txt"]);
+    assert_eq!([during, after], [want.clone(), want]);
+}
+
+#[tokio::test]
+async fn a_file_deleted_while_its_directory_is_listed_is_not_listed_again() {
+    let rig = Rig::writable_with(held).await;
+    put(rig.store(), "gone.txt", b"x").await;
+    put(rig.store(), "kept.txt", b"y").await;
+    rig.backend.unlink(&path("gone.txt")).await.unwrap();
+
+    let during = list_while_stored(&rig, &[("gone.txt", 1), ("kept.txt", 1)]).await;
+    let after = root_names(&rig.backend).await;
+    let want = strings(&["kept.txt"]);
+    assert_eq!([during, after], [want.clone(), want]);
+}
+
+#[tokio::test]
+async fn a_file_renamed_while_its_directory_is_listed_is_listed_once() {
+    let rig = Rig::writable_with(held).await;
+    put(rig.store(), "x.txt", b"x").await;
+    let (gate, listing) = listing_in_flight(&rig, &[("x.txt", 1)]).await;
+    rig.backend
+        .rename(&path("x.txt"), &path("y.txt"), false)
+        .await
+        .unwrap();
+    gate.notify_one();
+    assert_eq!(listing.await.unwrap(), strings(&["y.txt"]));
+}
+
+#[tokio::test]
+async fn a_stored_file_renamed_and_moved_while_its_directory_is_listed_is_listed_once() {
+    let rig = Rig::writable_with(held).await;
+    put(rig.store(), "x.txt", b"x").await;
+    let (gate, listing) = listing_in_flight(&rig, &[("x.txt", 1)]).await;
+    rig.backend
+        .rename(&path("x.txt"), &path("y.txt"), false)
+        .await
+        .unwrap();
+    rig.backend.hold_uploads(false);
+    sync(&rig.backend).await.unwrap();
+    gate.notify_one();
+    let during = listing.await.unwrap();
+    let after = root_names(&rig.backend).await;
+    let want = strings(&["y.txt"]);
+    assert_eq!([during, after], [want.clone(), want]);
+}
+
+#[tokio::test]
+async fn a_changed_file_renamed_and_stored_while_its_directory_is_listed_is_listed_once() {
+    let mut rig = Rig::writable_with(held).await;
+    put(rig.store(), "a.txt", b"old").await;
+    let file = rig.smb.create("a.txt", open_rw()).await.unwrap();
+    assert_eq!(rig.smb.write(file.id, 0, b"NEW").await, Ok(3));
+    rig.smb.close(file.id).await;
+    let (gate, listing) = listing_in_flight(&rig, &[("a.txt", 3)]).await;
+    rig.backend
+        .rename(&path("a.txt"), &path("b.txt"), false)
+        .await
+        .unwrap();
+    rig.backend.hold_uploads(false);
+    sync(&rig.backend).await.unwrap();
+    gate.notify_one();
+    let during = listing.await.unwrap();
+    let after = root_names(&rig.backend).await;
+    let want = strings(&["b.txt"]);
+    assert_eq!([during, after], [want.clone(), want]);
+}
+
+#[tokio::test]
+async fn a_file_made_and_deleted_while_its_directory_is_listed_is_not_listed() {
+    let mut rig = Rig::writable_with(held).await;
+    make(&mut rig, "e.txt", b"e").await;
+    let (gate, listing) = listing_in_flight(&rig, &[]).await;
+    rig.backend.unlink(&path("e.txt")).await.unwrap();
+    gate.notify_one();
+    let during = listing.await.unwrap();
+    let after = root_names(&rig.backend).await;
+    assert_eq!([during, after], [Vec::<String>::new(), Vec::new()]);
+}
+
+#[tokio::test]
+async fn a_changed_file_deleted_and_stored_while_its_directory_is_listed_is_not_listed() {
+    let mut rig = Rig::writable_with(held).await;
+    put(rig.store(), "e.txt", b"old").await;
+    let file = rig.smb.create("e.txt", open_rw()).await.unwrap();
+    assert_eq!(rig.smb.write(file.id, 0, b"NEW").await, Ok(3));
+    rig.smb.close(file.id).await;
+    let (gate, listing) = listing_in_flight(&rig, &[("e.txt", 3)]).await;
+    rig.backend.unlink(&path("e.txt")).await.unwrap();
+    rig.backend.hold_uploads(false);
+    sync(&rig.backend).await.unwrap();
+    gate.notify_one();
+    let during = listing.await.unwrap();
+    let after = root_names(&rig.backend).await;
+    assert_eq!([during, after], [Vec::<String>::new(), Vec::new()]);
+}
+
+#[tokio::test]
+async fn a_file_stored_and_deleted_while_its_directory_is_listed_is_not_listed() {
+    let mut rig = Rig::writable_with(held).await;
+    make(&mut rig, "e.txt", b"e").await;
+    let (gate, listing) = listing_in_flight(&rig, &[]).await;
+    rig.backend.hold_uploads(false);
+    sync(&rig.backend).await.unwrap();
+    rig.backend.unlink(&path("e.txt")).await.unwrap();
+    sync(&rig.backend).await.unwrap();
+    gate.notify_one();
+    let during = listing.await.unwrap();
+    let after = root_names(&rig.backend).await;
+    assert_eq!([during, after], [Vec::<String>::new(), Vec::new()]);
+}
+
+#[tokio::test]
+async fn a_file_stored_and_renamed_while_its_directory_is_listed_is_listed_once() {
+    let mut rig = Rig::writable_with(held).await;
+    make(&mut rig, "e.txt", b"e").await;
+    let (gate, listing) = listing_in_flight(&rig, &[]).await;
+    rig.backend.hold_uploads(false);
+    sync(&rig.backend).await.unwrap();
+    rig.backend
+        .rename(&path("e.txt"), &path("f.txt"), false)
+        .await
+        .unwrap();
+    sync(&rig.backend).await.unwrap();
+    gate.notify_one();
+    let during = listing.await.unwrap();
+    let after = root_names(&rig.backend).await;
+    let want = strings(&["f.txt"]);
+    assert_eq!([during, after], [want.clone(), want]);
+}
+
+#[tokio::test]
+async fn a_changed_file_renamed_and_stored_after_its_directory_was_read_is_listed_once() {
+    let mut rig = Rig::writable_with(held).await;
+    put(rig.store(), "a.txt", b"old").await;
+    let file = rig.smb.create("a.txt", open_rw()).await.unwrap();
+    assert_eq!(rig.smb.write(file.id, 0, b"NEW").await, Ok(3));
+    rig.smb.close(file.id).await;
+    let during = list_between(&rig, async {
+        rig.backend
+            .rename(&path("a.txt"), &path("b.txt"), false)
+            .await
+            .unwrap();
+        rig.backend.hold_uploads(false);
+        sync(&rig.backend).await.unwrap();
+    })
+    .await;
+    let after = root_names(&rig.backend).await;
+    let want = strings(&["b.txt"]);
+    assert_eq!([during, after], [want.clone(), want]);
+}
+
+#[tokio::test]
+async fn a_file_stored_and_opened_by_another_handle_after_its_directory_was_read_is_listed() {
+    let mut rig = Rig::writable_with(held).await;
+    make(&mut rig, "a.txt", b"a").await;
+    let (reached, resume) = rig.backend.pause_after_rows();
+    let listing = tokio::spawn({
+        let backend = rig.backend.clone();
+        async move { root_names(&backend).await }
+    });
+    reached.notified().await;
+    rig.backend.hold_uploads(false);
+    sync(&rig.backend).await.unwrap();
+    let open = rig.smb.open("a.txt").await.unwrap();
+    resume.notify_one();
+    let during = listing.await.unwrap();
+    rig.smb.close(open.id).await;
+    let after = root_names(&rig.backend).await;
+    let want = strings(&["a.txt"]);
+    assert_eq!([during, after], [want.clone(), want]);
+}
+
+#[tokio::test]
+async fn a_file_stored_and_opened_by_another_handle_while_the_store_is_read_is_listed() {
+    let mut rig = Rig::writable_with(held).await;
+    make(&mut rig, "a.txt", b"a").await;
+    let (gate, listing) = listing_in_flight(&rig, &[]).await;
+    rig.backend.hold_uploads(false);
+    sync(&rig.backend).await.unwrap();
+    let open = rig.smb.open("a.txt").await.unwrap();
+    gate.notify_one();
+    let during = listing.await.unwrap();
+    rig.smb.close(open.id).await;
+    let after = root_names(&rig.backend).await;
+    let want = strings(&["a.txt"]);
+    assert_eq!([during, after], [want.clone(), want]);
+}
+
+#[tokio::test]
+async fn a_listing_read_during_a_burst_of_stores_and_a_delete_shows_every_file_and_is_kept() {
+    const FILES: usize = 1100;
+    // The listing waits for the stores of a thousand files, which may take
+    // longer than the default request timeout.
+    let mut rig =
+        Rig::writable_with(|builder| held(builder).request_timeout(Duration::from_secs(3600)))
+            .await;
+    put(rig.store(), "x.txt", b"x").await;
+    rig.backend.unlink(&path("x.txt")).await.unwrap();
+    for n in 0..FILES {
+        make(&mut rig, &format!("f{n:04}.txt"), b"f").await;
+    }
+    let (gate, listing) = listing_in_flight(&rig, &[("x.txt", 1)]).await;
+    rig.backend.hold_uploads(false);
+    sync(&rig.backend).await.unwrap();
+    let open = rig.smb.open("f0000.txt").await.unwrap();
+    gate.notify_one();
+    let during = listing.await.unwrap();
+    rig.smb.close(open.id).await;
+    let reads = rig.proxy.count(is_root_listing);
+    let after = root_names(&rig.backend).await;
+    assert_eq!(
+        rig.proxy.count(is_root_listing),
+        reads,
+        "the listing was read from the store again"
+    );
+    let want: Vec<String> = (0..FILES).map(|n| format!("f{n:04}.txt")).collect();
+    assert_eq!([during, after], [want.clone(), want]);
+}
+
+#[tokio::test]
+async fn a_directory_renamed_while_its_parent_is_listed_is_listed_once() {
+    for stored in [false, true] {
+        let rig = Rig::writable_with(held).await;
+        put(rig.store(), "d/f.txt", b"f").await;
+        let (gate, listing) = listing_in_flight_with(&rig, &[], &["d/"]).await;
+        rig.backend
+            .rename(&path("d"), &path("e"), false)
+            .await
+            .unwrap();
+        if stored {
+            rig.backend.hold_uploads(false);
+            sync(&rig.backend).await.unwrap();
+        }
+        gate.notify_one();
+        let during = listing.await.unwrap();
+        let after = root_names(&rig.backend).await;
+        let want = strings(&["e"]);
+        assert_eq!([during, after], [want.clone(), want], "stored {stored}");
+    }
+}
+
+#[tokio::test]
+async fn a_file_deleted_and_made_again_in_another_case_while_its_directory_is_listed_is_listed_once()
+ {
+    for stored in [false, true] {
+        let mut rig = Rig::writable_with(held).await;
+        put(rig.store(), "File.txt", b"a").await;
+        let (gate, listing) = listing_in_flight(&rig, &[("File.txt", 1)]).await;
+        rig.backend.unlink(&path("File.txt")).await.unwrap();
+        make(&mut rig, "file.txt", b"new").await;
+        if stored {
+            rig.backend.hold_uploads(false);
+            sync(&rig.backend).await.unwrap();
+        }
+        gate.notify_one();
+        let during = listing.await.unwrap();
+        let after = root_names(&rig.backend).await;
+        assert!(
+            during.len() == 1 && after.len() == 1,
+            "stored {stored}: {during:?} then {after:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_file_stored_after_a_cached_listing_was_read_is_listed() {
+    let mut rig = Rig::writable_with(held).await;
+    rig.backend.limit_listing_rows(100_000);
+    make(&mut rig, "a.txt", b"a").await;
+    assert_eq!(root_names(&rig.backend).await, strings(&["a.txt"]));
+    let reads = rig.proxy.count(is_root_listing);
+    make(&mut rig, "b.txt", b"b").await;
+    let during = list_between(&rig, async {
+        rig.backend.hold_uploads(false);
+        sync(&rig.backend).await.unwrap();
+    })
+    .await;
+    assert_eq!(
+        rig.proxy.count(is_root_listing),
+        reads,
+        "the store was read"
+    );
+    let after = root_names(&rig.backend).await;
+    let want = strings(&["a.txt", "b.txt"]);
+    assert_eq!([during, after], [want.clone(), want]);
+}
+
+#[tokio::test]
+async fn a_file_renamed_while_the_overlay_is_read_for_its_directory_is_listed_once() {
+    let rig = Rig::writable_with(held).await;
+    put(rig.store(), "x.txt", b"x").await;
+    let reads = rig.proxy.count(is_root_listing);
+    let (reached, resume) = rig.backend.pause_after_below();
+    let listing = tokio::spawn({
+        let backend = rig.backend.clone();
+        async move { root_names(&backend).await }
+    });
+    reached.notified().await;
+    rig.backend
+        .rename(&path("x.txt"), &path("y.txt"), false)
+        .await
+        .unwrap();
+    resume.notify_one();
+    let during = listing.await.unwrap();
+    let after = root_names(&rig.backend).await;
+    let want = strings(&["y.txt"]);
+    assert_eq!([during, after], [want.clone(), want]);
+    assert_eq!(
+        rig.proxy.count(is_root_listing) - reads,
+        1,
+        "the listing was made again from the store"
+    );
+}
+
+#[tokio::test]
+async fn a_listing_of_a_directory_that_changes_during_every_read_is_read_a_few_times_and_not_kept()
+{
+    let rig = Rig::writable_with(held).await;
+    for name in ["a.txt", "b.txt", "c.txt"] {
+        put(rig.store(), name, b"x").await;
+    }
+    rig.backend.limit_listing_rows(100_000);
+    let want = strings(&["a.txt", "b.txt", "c.txt"]);
+    let start = rig.proxy.count(is_root_listing);
+    let attempts = S3Backend::listing_attempts();
+
+    rig.backend.change_listings(usize::MAX);
+    assert_eq!(root_names(&rig.backend).await, want);
+    assert_eq!(rig.proxy.count(is_root_listing) - start, attempts);
+
+    rig.backend.change_listings(0);
+    assert_eq!(root_names(&rig.backend).await, want);
+    assert_eq!(rig.proxy.count(is_root_listing) - start, attempts + 1);
+    assert_eq!(root_names(&rig.backend).await, want);
+    assert_eq!(rig.proxy.count(is_root_listing) - start, attempts + 1);
+}
+
+#[tokio::test]
+async fn a_listing_that_took_over_half_the_request_timeout_is_not_read_again() {
+    let mut rig =
+        Rig::writable_with(|builder| held(builder).request_timeout(Duration::from_secs(8))).await;
+    make(&mut rig, "a.txt", b"a").await;
+    let (gate, listing) = listing_in_flight(&rig, &[]).await;
+    rig.backend.hold_uploads(false);
+    sync(&rig.backend).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(4200)).await;
+    let reads = rig.proxy.count(is_root_listing);
+    gate.notify_one();
+    listing.await.unwrap();
+    assert_eq!(rig.proxy.count(is_root_listing), reads);
+}
+
+#[tokio::test]
+async fn a_listing_dropped_while_the_store_is_read_leaves_no_read_behind() {
+    let rig = Rig::writable_with(held).await;
+    put(rig.store(), "a.txt", b"a").await;
+    let (gate, listing) = listing_in_flight(&rig, &[("a.txt", 1)]).await;
+    assert_eq!(rig.backend.listing_reads(), 1);
+    listing.abort();
+    assert!(listing.await.unwrap_err().is_cancelled());
+    assert_eq!(rig.backend.listing_reads(), 0);
+    gate.notify_one();
+    assert_eq!(root_names(&rig.backend).await, strings(&["a.txt"]));
+    assert_eq!(rig.backend.listing_reads(), 0);
+}
+
+#[tokio::test]
+async fn a_listing_made_again_that_fails_gives_the_one_made_before() {
+    let rig = Rig::writable_with(held).await;
+    let want = strings(&["a.txt", "b.txt", "c.txt"]);
+    for name in &want {
+        put(rig.store(), name, b"x").await;
+    }
+    rig.backend.limit_listing_rows(100_000);
+    let start = rig.proxy.count(is_root_listing);
+    rig.backend.change_listings(1);
+    let (reached, resume) = rig.backend.pause_after_rows();
+    let listing = tokio::spawn({
+        let backend = rig.backend.clone();
+        async move { root_names(&backend).await }
+    });
+    reached.notified().await;
+    rig.proxy.inject(
+        is_root_listing,
+        Fault::Reply(Reply::error(403, "AccessDenied")),
+        usize::MAX,
+    );
+    resume.notify_one();
+    assert_eq!(listing.await.unwrap(), want);
+    assert_eq!(rig.proxy.count(is_root_listing) - start, 2);
+    assert_eq!(rig.backend.listing_reads(), 0);
+}
+
+#[tokio::test]
+async fn a_lookup_that_reads_a_directory_while_files_land_in_it_leaves_it_cached() {
+    const ROUNDS: usize = 4;
+    let mut rig = Rig::writable_with(held).await;
+    put(rig.store(), "seed.txt", b"s").await;
+    let mut stored = vec!["seed.txt".to_owned()];
+    for round in 0..ROUNDS {
+        let name = format!("f{round}.txt");
+        rig.backend.hold_uploads(true);
+        make(&mut rig, &name, b"f").await;
+        let start = rig.proxy.count(is_root_listing);
+        let before: Vec<(&str, u64)> = stored.iter().map(|name| (name.as_str(), 1)).collect();
+        let (gate, lookup) = read_in_flight(&rig, &before, &[], {
+            let backend = rig.backend.clone();
+            async move { is_not_found(&backend, "absent.txt").await }
+        })
+        .await;
+        rig.backend.hold_uploads(false);
+        sync(&rig.backend).await.unwrap();
+        gate.notify_one();
+        assert!(lookup.await.unwrap());
+
+        let read = rig.proxy.count(is_root_listing);
+        assert!(is_not_found(&rig.backend, "other.txt").await);
+        stored.push(name);
+        assert_eq!(root_names(&rig.backend).await, {
+            let mut want = stored.clone();
+            want.sort();
+            want
+        });
+        assert_eq!(
+            rig.proxy.count(is_root_listing),
+            read,
+            "round {round}: the listing was read from the store again"
+        );
+        assert_eq!(read - start, 1, "round {round}");
+        assert_eq!(rig.backend.listing_reads(), 0);
+    }
+}
+
+#[tokio::test]
+async fn a_file_stored_after_the_rows_took_in_one_stored_during_the_read_is_listed() {
+    let mut rig = Rig::writable_with(held).await;
+    make(&mut rig, "a.txt", b"a").await;
+    let (reached, resume) = rig.backend.pause_after_rows();
+    let (gate, listing) = listing_in_flight(&rig, &[]).await;
+    rig.backend.hold_uploads(false);
+    sync(&rig.backend).await.unwrap();
+    rig.backend.hold_uploads(true);
+    make(&mut rig, "b.txt", b"b").await;
+    gate.notify_one();
+    reached.notified().await;
+    rig.backend.hold_uploads(false);
+    sync(&rig.backend).await.unwrap();
+    resume.notify_one();
+    let during = listing.await.unwrap();
+    let after = root_names(&rig.backend).await;
+    let want = strings(&["a.txt", "b.txt"]);
+    assert_eq!([during, after], [want.clone(), want]);
+}
+
+#[tokio::test]
+async fn a_listing_read_while_files_land_is_made_again_from_the_cache() {
+    let mut rig = Rig::writable_with(held).await;
+    put(rig.store(), "seed.txt", b"s").await;
+    make(&mut rig, "a.txt", b"a").await;
+    make(&mut rig, "b.txt", b"b").await;
+    let (gate, listing) = listing_in_flight(&rig, &[("seed.txt", 1)]).await;
+    rig.backend.hold_uploads(false);
+    sync(&rig.backend).await.unwrap();
+    let reads = rig.proxy.count(is_root_listing);
+    gate.notify_one();
+    let want = strings(&["a.txt", "b.txt", "seed.txt"]);
+    assert_eq!(listing.await.unwrap(), want);
+    assert_eq!(rig.proxy.count(is_root_listing), reads);
+    assert_eq!(root_names(&rig.backend).await, want);
+    assert_eq!(rig.proxy.count(is_root_listing), reads);
+}
+
+const CYCLES: usize = 200;
+
+/// Makes files, builds a backend over their records that stores them at once,
+/// and lists the share root right away, over and over.
+async fn list_files_left_by_an_earlier_backend() {
+    let mut rig = Rig::writable_with(held).await;
+    let mut missing = Vec::new();
+    for cycle in 0..CYCLES {
+        let wanted: Vec<String> = (0..3).map(|n| format!("c{cycle:03}-{n}.txt")).collect();
+        for name in &wanted {
+            make(&mut rig, name, name.as_bytes()).await;
+        }
+        rig = rig.restart_with(uploading).await;
+        let root = rig.smb.open_dir("").await.unwrap();
+        let listed = rig.smb.list(root.id, "*").await;
+        rig.smb.close(root.id).await;
+        let seen = names(&listed);
+        if wanted.iter().any(|name| !seen.contains(&name.as_str())) {
+            missing.push(cycle);
+        }
+        sync(&rig.backend).await.unwrap();
+        for name in &wanted {
+            rig.store().delete_object(name, foreground()).await.unwrap();
+        }
+        rig = rig.restart_with(held).await;
+    }
+    assert!(
+        missing.is_empty(),
+        "files were missing in cycles {missing:?}"
+    );
+}
+
+#[test]
+fn files_an_earlier_backend_left_are_listed_at_once_while_they_are_stored() {
+    run_bounded(
+        "the cycles did not end",
+        Duration::from_secs(600),
+        list_files_left_by_an_earlier_backend,
+    );
 }
 
 #[tokio::test]

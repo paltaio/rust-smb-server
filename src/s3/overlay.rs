@@ -23,7 +23,7 @@ use super::client::MAX_DELETE_KEYS;
 use super::dirmove::{Batch, Left};
 use super::entry::{Counted, Entry, Progress, Sealed, State};
 use super::error::S3Error;
-use super::keys::{Slot, dir_prefix, slot};
+use super::keys::{Row, RowKind, Slot, dir_prefix, join_key, slot};
 use super::lookup::Found;
 use super::queue::Queue;
 use super::readahead::ReadAhead;
@@ -49,6 +49,14 @@ struct Tomb {
 struct Source {
     key: String,
     holder: Arc<Entry>,
+}
+
+/// A note of whether the entries and keys to delete below a directory changed.
+struct Watch {
+    id: u64,
+    /// The prefix of the keys below the directory.
+    below: Slot,
+    changed: bool,
 }
 
 /// The entries, keys to delete and requests in flight of a backend. Every map
@@ -90,6 +98,11 @@ struct Index {
     /// object of the bucket either: the rename holds every entry below the
     /// one it moves, and is making its move.
     frozen: HashSet<Slot>,
+    /// The directories whose listings are being made. Every change to
+    /// `entries`, `hidden` or `apart` marks the watches of the directories
+    /// above it.
+    watches: Vec<Watch>,
+    next_watch: u64,
     /// How many running jobs write a key of each slot.
     writing: HashMap<Slot, usize>,
     /// The entries that wait for a slot to clear.
@@ -283,13 +296,36 @@ impl Index {
         self.hidden.values().map(Vec::len).sum()
     }
 
+    /// Marks the watches of the directories above the name `name`.
+    fn touched(&mut self, name: &Slot) {
+        for watch in &mut self.watches {
+            if name != &watch.below && name.starts_with(&watch.below) {
+                watch.changed = true;
+            }
+        }
+    }
+
+    /// Puts `entry` in the slot `name`, and returns the entry that was there.
+    fn put_entry(&mut self, name: Slot, entry: Arc<Entry>) -> Option<Arc<Entry>> {
+        self.touched(&name);
+        self.entries.insert(name, entry)
+    }
+
+    /// Takes the entry out of the slot `name`.
+    fn remove_entry(&mut self, name: &Slot) {
+        if self.entries.remove(name).is_some() {
+            self.touched(name);
+        }
+    }
+
     /// Notes that `key` is to be deleted, by an entry or as a key no entry
     /// owns.
     fn hide(&mut self, key: &str) {
         let name = self.slot(key);
-        let keys = self.hidden.entry(name).or_default();
+        let keys = self.hidden.entry(name.clone()).or_default();
         if !keys.iter().any(|held| held == key) {
             keys.push(key.to_owned());
+            self.touched(&name);
         }
     }
 
@@ -300,13 +336,18 @@ impl Index {
             return;
         }
         let name = self.slot(key);
+        let mut changed = self.apart.remove(key);
         if let Some(keys) = self.hidden.get_mut(&name) {
+            let before = keys.len();
             keys.retain(|held| held != key);
+            changed |= keys.len() < before;
             if keys.is_empty() {
                 self.hidden.remove(&name);
             }
         }
-        self.apart.remove(key);
+        if changed {
+            self.touched(&name);
+        }
     }
 
     /// Notes that the store holds the key to delete `key` as another object
@@ -314,6 +355,8 @@ impl Index {
     fn keep_apart(&mut self, key: &str) {
         if self.hides_exact(key) {
             self.apart.insert(key.to_owned());
+            let name = self.slot(key);
+            self.touched(&name);
         }
     }
 
@@ -349,7 +392,7 @@ impl Index {
             .get(&name)
             .is_some_and(|held| Arc::ptr_eq(held, entry))
         {
-            self.entries.remove(&name);
+            self.remove_entry(&name);
         }
         self.cleared(key);
     }
@@ -833,6 +876,9 @@ pub(super) struct Below {
     pub(super) implied: Vec<String>,
 }
 
+/// How many rows [`Overlay::hidden`] checks with the index locked once.
+const HIDDEN_CHUNK: usize = 1024;
+
 pub(super) struct Overlay {
     fold: bool,
     /// How long an entry rests after its last change before a job may start.
@@ -1043,6 +1089,33 @@ pub(super) struct Reservation<'a> {
 impl Drop for Reservation<'_> {
     fn drop(&mut self) {
         self.overlay.lock().reserved.remove(&self.name);
+    }
+}
+
+/// A note of the changes made to the entries and the keys to delete below a
+/// directory since it was made.
+pub(super) struct Watching<'a> {
+    overlay: &'a Overlay,
+    id: u64,
+}
+
+impl Watching<'_> {
+    /// Whether an entry or a key to delete below the directory changed.
+    pub(super) fn changed(&self) -> bool {
+        self.overlay
+            .lock()
+            .watches
+            .iter()
+            .any(|watch| watch.id == self.id && watch.changed)
+    }
+}
+
+impl Drop for Watching<'_> {
+    fn drop(&mut self) {
+        self.overlay
+            .lock()
+            .watches
+            .retain(|watch| watch.id != self.id);
     }
 }
 
@@ -1344,11 +1417,11 @@ impl Overlay {
             state.detached = state.handles > 0;
             index.recount(&entry, &mut state, false);
             drop(state);
-            index.entries.remove(&slot);
+            index.remove_entry(&slot);
         }
         let entry = Entry::found(found, ahead);
         entry.state().handles = 1;
-        index.entries.insert(slot, Arc::clone(&entry));
+        index.put_entry(slot, Arc::clone(&entry));
         Ok(self.held(entry))
     }
 
@@ -1380,7 +1453,7 @@ impl Overlay {
             state.may_exist |= index.hides(&state.key);
             self.schedule(&entry, &mut state);
         }
-        index.entries.insert(slot, Arc::clone(&entry));
+        index.put_entry(slot, Arc::clone(&entry));
         Ok(self.held(entry))
     }
 
@@ -1461,6 +1534,44 @@ impl Overlay {
             }
         }
         below
+    }
+
+    /// Whether the overlay hides each of `rows`, the rows of the store in the
+    /// directory `dir`: a file whose key is to be deleted, or a directory that
+    /// is gone.
+    pub(super) fn hidden(&self, dir: &str, rows: &[Row]) -> Vec<bool> {
+        let marker = dir_prefix(dir);
+        let mut hidden = Vec::with_capacity(rows.len());
+        for chunk in rows.chunks(HIDDEN_CHUNK) {
+            let index = self.lock();
+            if index.has_hidden_below(&marker) {
+                hidden.extend(chunk.iter().map(|row| {
+                    let key = join_key(dir, &row.name);
+                    match row.kind {
+                        RowKind::File(_) => index.hides(&key),
+                        RowKind::Dir => index.dir_dead(&key),
+                    }
+                }));
+            } else {
+                hidden.resize(hidden.len() + chunk.len(), false);
+            }
+        }
+        hidden
+    }
+
+    /// Notes the changes made to the entries and the keys to delete below the
+    /// directory `dir`, until the value returned is dropped.
+    pub(super) fn watch(&self, dir: &str) -> Watching<'_> {
+        let (below, _) = self.below_bounds(dir);
+        let mut index = self.lock();
+        let id = index.next_watch;
+        index.next_watch += 1;
+        index.watches.push(Watch {
+            id,
+            below,
+            changed: false,
+        });
+        Watching { overlay: self, id }
     }
 
     /// Whether two names are one name.
@@ -1565,7 +1676,7 @@ impl Overlay {
                 index.recount(&entry, &mut state, true);
                 self.schedule(&entry, &mut state);
             }
-            let taken = index.entries.insert(slot, entry);
+            let taken = index.put_entry(slot, entry);
             debug_assert!(taken.is_none(), "two recovered entries have one name");
         }
         let now = Instant::now();
@@ -1658,7 +1769,7 @@ impl Overlay {
             index.recount(entry, &mut state, true);
             self.schedule(entry, &mut state);
         }
-        let displaced = index.entries.insert(self.slot(to), Arc::clone(entry));
+        let displaced = index.put_entry(self.slot(to), Arc::clone(entry));
         debug_assert!(
             displaced.is_none(),
             "an entry holds a name that a rename reserved"
@@ -1718,9 +1829,7 @@ impl Overlay {
                 index.recount(&moved.entry, &mut state, true);
                 self.schedule(&moved.entry, &mut state);
             }
-            index
-                .entries
-                .insert(self.slot(&moved.to), Arc::clone(&moved.entry));
+            index.put_entry(self.slot(&moved.to), Arc::clone(&moved.entry));
         }
         drop(index);
         self.touch();
@@ -2237,6 +2346,12 @@ impl Overlay {
         self.lock().entries.len()
     }
 
+    /// How many directories are being watched.
+    #[cfg(test)]
+    pub(super) fn watching(&self) -> usize {
+        self.lock().watches.len()
+    }
+
     /// How many times an entry was put to wait for a slot.
     #[cfg(test)]
     pub(super) fn parks(&self) -> usize {
@@ -2449,6 +2564,135 @@ mod tests {
         overlay.install(vec![kept("p/Sub/a"), kept("p/sub/b")], Vec::new());
         let below = overlay.below("p");
         assert_eq!(below.implied.len(), 1);
+    }
+
+    fn row(name: &str, is_dir: bool) -> Row {
+        let kind = if is_dir {
+            RowKind::Dir
+        } else {
+            RowKind::File(crate::s3::keys::FileStamp {
+                size: 1,
+                etag: String::new(),
+                last_modified: std::time::SystemTime::UNIX_EPOCH,
+            })
+        };
+        Row {
+            name: name.to_owned(),
+            kind,
+        }
+    }
+
+    #[test]
+    fn a_row_is_hidden_when_its_key_is_to_be_deleted_or_its_directory_is_gone() {
+        let overlay = test_overlay(true);
+        overlay.install(
+            vec![kept("p/a")],
+            vec![tombstone(&["P/X.txt", "p/d/", "q/y.txt"])],
+        );
+        let rows = [
+            row("x.txt", false),
+            row("y.txt", false),
+            row("d", true),
+            row("e", true),
+        ];
+        assert_eq!(overlay.hidden("p", &rows), [true, false, true, false]);
+        assert_eq!(overlay.hidden("r", &rows), [false; 4]);
+    }
+
+    #[test]
+    fn rows_beyond_one_chunk_are_each_checked() {
+        let overlay = test_overlay(false);
+        let gone = [0, HIDDEN_CHUNK - 1, HIDDEN_CHUNK, 3 * HIDDEN_CHUNK - 1];
+        let keys: Vec<String> = gone.iter().map(|n| format!("p/f{n:05}")).collect();
+        let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
+        overlay.install(Vec::new(), vec![tombstone(&keys)]);
+        let rows: Vec<Row> = (0..3 * HIDDEN_CHUNK)
+            .map(|n| row(&format!("f{n:05}"), false))
+            .collect();
+        let hidden = overlay.hidden("p", &rows);
+        let at: Vec<usize> = (0..hidden.len()).filter(|n| hidden[*n]).collect();
+        assert_eq!(at, gone);
+    }
+
+    /// Whether a watch of `dir` noted `change`.
+    fn marked(overlay: &Overlay, dir: &str, change: impl FnOnce()) -> bool {
+        let watch = overlay.watch(dir);
+        change();
+        watch.changed()
+    }
+
+    #[test]
+    fn a_watch_notes_an_entry_put_or_taken_out_below_its_directory() {
+        let overlay = test_overlay(true);
+        let mut held = Vec::new();
+        assert!(marked(&overlay, "p", || held
+            .push(overlay.insert_new(kept("p/a")).unwrap())));
+        assert!(marked(&overlay, "P", || held
+            .push(overlay.insert_new(kept("p/Sub/b")).unwrap())));
+        assert!(marked(&overlay, "p/sub", || held
+            .push(overlay.insert_new(kept("p/sub/c")).unwrap())));
+        let entry = Arc::clone(&held[0].entry);
+        assert!(marked(&overlay, "p", || overlay.evict(&entry)));
+        assert_eq!(overlay.watching(), 0);
+    }
+
+    #[test]
+    fn a_watch_notes_the_old_and_the_new_name_of_an_entry_that_moves() {
+        let overlay = test_overlay(false);
+        let held = overlay.insert_new(kept("p/a")).unwrap();
+        let (from, to, other) = (overlay.watch("p"), overlay.watch("q"), overlay.watch("r"));
+        overlay.renamed(&held.entry, "q/b", |_| {}, None);
+        assert!(from.changed() && to.changed());
+        assert!(!other.changed());
+    }
+
+    #[test]
+    fn a_watch_does_not_note_changes_elsewhere() {
+        let overlay = test_overlay(false);
+        let watch = overlay.watch("p/sub");
+        let held = [
+            overlay.insert_new(kept("p/a")).unwrap(),
+            overlay.insert_new(kept("q/sub/a")).unwrap(),
+            overlay.insert_new(kept("p/subs/a")).unwrap(),
+            overlay.insert_new(kept("p/sub")).unwrap(),
+        ];
+        overlay.install(Vec::new(), vec![tombstone(&["p/sub/", "p/other"])]);
+        overlay.lock().remove_tomb("p/sub/");
+        assert!(!watch.changed());
+        drop(held);
+        let held = overlay.insert_new(kept("p/sub/a")).unwrap();
+        assert!(watch.changed());
+        drop(held);
+    }
+
+    #[test]
+    fn a_watch_notes_a_key_to_delete_that_is_added_or_taken_off() {
+        let overlay = test_overlay(true);
+        assert!(marked(&overlay, "p", || {
+            overlay.install(Vec::new(), vec![tombstone(&["p/X"])]);
+        }));
+        assert!(marked(&overlay, "p", || overlay.keep_apart("p/X")));
+        assert!(marked(&overlay, "p", || {
+            overlay.lock().remove_tomb("p/X");
+        }));
+        assert!(!marked(&overlay, "p", || {
+            overlay.lock().remove_tomb("p/X");
+        }));
+        assert!(!marked(&overlay, "p", || overlay.keep_apart("p/X")));
+    }
+
+    #[test]
+    fn a_dropped_watch_is_not_kept() {
+        let overlay = test_overlay(false);
+        let first = overlay.watch("p");
+        let second = overlay.watch("p");
+        assert_eq!(overlay.watching(), 2);
+        drop(first);
+        overlay.install(vec![kept("p/a")], Vec::new());
+        assert!(second.changed());
+        assert_eq!(overlay.watching(), 1);
+        drop(second);
+        assert_eq!(overlay.watching(), 0);
     }
 
     fn tombstone(keys: &[&str]) -> TombstoneRecord {

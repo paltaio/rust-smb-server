@@ -130,6 +130,18 @@ pub(super) struct Jobs {
     /// it.
     #[cfg(test)]
     pub(super) pause_listed: std::sync::Mutex<Option<Gates>>,
+    /// Makes the next listing of a directory wait once it has the rows of the
+    /// store, before it reads the overlay.
+    #[cfg(test)]
+    pub(super) pause_rows: std::sync::Mutex<Option<Gates>>,
+    /// Makes the next listing of a directory wait once it has the entries of
+    /// the overlay below it, before it checks which rows the overlay hides.
+    #[cfg(test)]
+    pub(super) pause_below: std::sync::Mutex<Option<Gates>>,
+    /// How many of the next reads of a directory listing see its rows change
+    /// once they have them.
+    #[cfg(test)]
+    pub(super) churn: std::sync::atomic::AtomicUsize,
     /// Makes the next task that records a closed file wait before it takes the
     /// locks of the entry.
     #[cfg(test)]
@@ -178,6 +190,12 @@ impl Jobs {
             pause_create: std::sync::Mutex::new(None),
             #[cfg(test)]
             pause_listed: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            pause_rows: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            pause_below: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            churn: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             pause_close: std::sync::Mutex::new(None),
             #[cfg(test)]

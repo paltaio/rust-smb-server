@@ -179,6 +179,58 @@ struct Learned<T> {
     value: T,
 }
 
+/// Most changes to rows kept for one read of a listing. A read that meets more
+/// is not cached.
+const MAX_READ_CHANGES: usize = 1000;
+
+/// What the backend did to a row of a directory.
+#[derive(Clone, Copy)]
+enum Change<'a> {
+    /// A row put in place of the row of its name.
+    Put(&'a Row),
+    /// The row with this name taken out.
+    Take(&'a str),
+}
+
+/// A read of the listing of a directory, from the cache or the store.
+#[derive(Debug)]
+struct Read {
+    dir: String,
+    /// `dir` as names are compared.
+    name: Slot,
+    /// The backend changed the rows of the directory since the read began.
+    changed: bool,
+    /// The changes to the rows of `dir` since the read began, oldest first:
+    /// a name, and the row put in its place or none.
+    changes: Vec<(String, Option<Row>)>,
+    /// Whether `changes` is the whole of what the backend did to the rows
+    /// since the read began. It is not for a read of a cached listing, nor
+    /// after the rows were dropped, after a change to another spelling of
+    /// `dir`, after more changes than are kept, or once the read is done.
+    keep: bool,
+}
+
+impl Read {
+    /// Notes a change to the rows of the directory `dir`, or that they were
+    /// dropped when `change` is `None`.
+    fn note(&mut self, dir: &str, change: Option<Change<'_>>) {
+        self.changed = true;
+        let room = self.keep && self.dir == dir && self.changes.len() < MAX_READ_CHANGES;
+        match change {
+            Some(Change::Put(row)) if room => {
+                self.changes.push((row.name.clone(), Some(row.clone())));
+            }
+            Some(Change::Take(name)) if room => self.changes.push((name.to_owned(), None)),
+            _ => self.stop_keeping(),
+        }
+    }
+
+    fn stop_keeping(&mut self) {
+        self.keep = false;
+        self.changes = Vec::new();
+    }
+}
+
 /// What the backend learned of the store, each item trusted for `ttl`: what
 /// is at a key, and the entries of a directory by its key. With `fold`, a
 /// change to a key or a directory reaches what is held under every spelling of
@@ -189,6 +241,8 @@ pub(super) struct MetaCache {
     fold: bool,
     keys: Lru<Learned<Known>>,
     listings: Lru<Learned<Arc<DirListing>>>,
+    reads: HashMap<u64, Read>,
+    next_read: u64,
 }
 
 impl MetaCache {
@@ -202,6 +256,8 @@ impl MetaCache {
             fold,
             keys: Lru::new(keys, fold),
             listings: Lru::new(rows, fold),
+            reads: HashMap::new(),
+            next_read: 0,
         }
     }
 
@@ -242,9 +298,11 @@ impl MetaCache {
     }
 
     /// Drops what is known of the object at `key` and the listing of the
-    /// directory `dir` it is in.
+    /// directory `dir` it is in. The reads of that listing that are under way
+    /// are not kept.
     pub(super) fn forget_file(&mut self, key: &str, dir: &str) {
         self.keys.remove_spellings(key);
+        self.rows_changed(dir, None);
         self.listings.remove_spellings(dir);
     }
 
@@ -259,8 +317,10 @@ impl MetaCache {
     /// Adds `row` to the cached listing of the directory `dir`, if there is
     /// one. The listing keeps its age. With `fold`, the listings of the other
     /// spellings of `dir` go, and so does a listing that has a row of another
-    /// spelling of the name: the store may hold the two as one object.
+    /// spelling of the name: the store may hold the two as one object. The
+    /// reads of that listing that are under way take in the row.
     pub(super) fn add_row(&mut self, dir: &str, row: Row) {
+        self.rows_changed(dir, Some(Change::Put(&row)));
         self.listings.remove_others(dir);
         let Some(learned) = self.listings.get(dir) else {
             return;
@@ -277,14 +337,16 @@ impl MetaCache {
     /// deleted, and its row in the cached listing of the directory `dir`. With
     /// `fold`, the listings of the other spellings of `dir` go, and so does a
     /// listing whose row for the object is spelled in another case than `key`.
+    /// The reads of that listing that are under way take in the change.
     pub(super) fn deleted_file(&mut self, key: &str, dir: &str) {
+        let name = last_name(key);
         self.keys.remove_spellings(key);
+        self.rows_changed(dir, Some(Change::Take(name)));
         self.listings.remove_others(dir);
         let Some(learned) = self.listings.get(dir) else {
             return;
         };
         let (at, listing) = (learned.at, Arc::clone(&learned.value));
-        let name = last_name(key);
         if self.fold
             && listing.find_exact(name).is_none()
             && listing.find_folded(name, false).is_some()
@@ -293,6 +355,89 @@ impl MetaCache {
             return;
         }
         self.put_listing(dir, Arc::new(listing.without_row(name)), at);
+    }
+
+    /// Tells the reads of the listing of `dir` that are under way that the
+    /// backend made `change` to its rows, or dropped them when there is none.
+    fn rows_changed(&mut self, dir: &str, change: Option<Change<'_>>) {
+        if self.reads.is_empty() {
+            return;
+        }
+        let name = slot(dir, self.fold);
+        for read in self.reads.values_mut().filter(|read| read.name == name) {
+            read.note(dir, change);
+        }
+    }
+
+    /// Starts a read of the listing of `dir`, and returns its id with the
+    /// cached listing, if there is a fresh one. Until
+    /// [`end_read`](Self::end_read), the changes the backend makes to the rows
+    /// of `dir` are noted, and kept when the listing is to be read from the
+    /// store.
+    pub(super) fn begin_read(&mut self, dir: &str, now: Instant) -> (u64, Option<Arc<DirListing>>) {
+        let cached = self.listing(dir, now);
+        let id = self.next_read;
+        self.next_read += 1;
+        self.reads.insert(
+            id,
+            Read {
+                dir: dir.to_owned(),
+                name: slot(dir, self.fold),
+                changed: false,
+                changes: Vec::new(),
+                keep: cached.is_none(),
+            },
+        );
+        (id, cached)
+    }
+
+    /// Ends the read `id`.
+    pub(super) fn end_read(&mut self, id: u64) {
+        self.reads.remove(&id);
+    }
+
+    /// Whether the backend changed the rows of the directory of the read `id`
+    /// since it began. A read that ended counts as changed.
+    pub(super) fn read_changed(&self, id: u64) -> bool {
+        self.reads.get(&id).is_none_or(|read| read.changed)
+    }
+
+    /// How many reads are under way.
+    #[cfg(test)]
+    pub(super) fn reads(&self) -> usize {
+        self.reads.len()
+    }
+
+    /// Keeps `listing`, which the read `id` got from the store, as the cached
+    /// listing of its directory, with the changes the backend made to the
+    /// rows since the read began. The store may have answered before a
+    /// change: the changes are made to the listing in the order they were
+    /// made, and one that the listing already shows leaves it as it is.
+    /// Returns the listing as kept. When the changes cannot be made, because
+    /// the rows were dropped, more were made than are kept, or names that
+    /// differ in case only are in play, nothing is kept and the listing is
+    /// returned as it was read.
+    pub(super) fn keep_read(
+        &mut self,
+        id: u64,
+        listing: DirListing,
+        now: Instant,
+    ) -> Arc<DirListing> {
+        let fold = self.fold;
+        let Some(read) = self.reads.get_mut(&id).filter(|read| read.keep) else {
+            return Arc::new(listing);
+        };
+        let changes = std::mem::take(&mut read.changes);
+        read.stop_keeping();
+        let dir = read.dir.clone();
+        match replay(listing, changes, fold) {
+            Ok(listing) => {
+                let listing = Arc::new(listing);
+                self.put_listing(&dir, Arc::clone(&listing), now);
+                listing
+            }
+            Err(listing) => Arc::new(listing),
+        }
     }
 
     pub(super) fn put_listing(&mut self, dir: &str, listing: Arc<DirListing>, now: Instant) {
@@ -306,6 +451,40 @@ impl MetaCache {
             weight,
         );
     }
+}
+
+/// `listing` with `changes` made to it, oldest first. When names fold and a
+/// changed name has another spelling in the listing or among the changes, the
+/// store may hold both as one object: the listing is returned as it was.
+fn replay(
+    listing: DirListing,
+    changes: Vec<(String, Option<Row>)>,
+    fold: bool,
+) -> Result<DirListing, DirListing> {
+    if changes.is_empty() {
+        return Ok(listing);
+    }
+    let last: HashMap<String, Option<Row>> = changes.into_iter().collect();
+    if fold && folds_apart(&listing, &last) {
+        return Err(listing);
+    }
+    Ok(listing.edited(last))
+}
+
+/// Whether a changed name has another spelling among the rows of `listing` or
+/// the changed names.
+fn folds_apart(listing: &DirListing, changed: &HashMap<String, Option<Row>>) -> bool {
+    let mut folded: HashMap<String, &str> = HashMap::with_capacity(changed.len());
+    for name in changed.keys() {
+        if folded.insert(name.to_lowercase(), name).is_some() {
+            return true;
+        }
+    }
+    listing.rows.iter().any(|row| {
+        folded
+            .get(&row.name.to_lowercase())
+            .is_some_and(|name| *name != row.name)
+    })
 }
 
 /// Whether something learned at `at` is still trusted at `now`.
@@ -722,6 +901,344 @@ mod tests {
             row_names(&mut cache, "d", now),
             Some(vec!["a".to_owned(), "b".to_owned()])
         );
+    }
+
+    fn names_of(listing: &DirListing) -> Vec<&str> {
+        listing.rows.iter().map(|row| row.name.as_str()).collect()
+    }
+
+    fn read_of(names: &[&str]) -> DirListing {
+        DirListing {
+            rows: names.iter().map(|name| file_row(name)).collect(),
+        }
+    }
+
+    fn sized_row(name: &str, size: u64) -> Row {
+        Row {
+            name: name.to_owned(),
+            kind: RowKind::File(stamp("\"e\"", size, 1_000)),
+        }
+    }
+
+    fn begin(cache: &mut MetaCache, dir: &str) -> u64 {
+        cache.begin_read(dir, Instant::now()).0
+    }
+
+    #[test]
+    fn a_listing_read_while_the_rows_of_its_directory_stood_is_kept() {
+        let now = Instant::now();
+        let mut cache = MetaCache::new(Duration::from_secs(30), false);
+        let read = begin(&mut cache, "d");
+        cache.add_row("other", file_row("x"));
+        cache.deleted_file("other/y", "other");
+        assert!(!cache.read_changed(read));
+        let listing = cache.keep_read(read, read_of(&["a", "b"]), now);
+        assert_eq!(listing.rows.len(), 2);
+        assert_eq!(
+            row_names(&mut cache, "d", now),
+            Some(vec!["a".to_owned(), "b".to_owned()])
+        );
+    }
+
+    #[test]
+    fn a_listing_read_while_the_directory_changed_has_the_changes() {
+        let now = Instant::now();
+        let mut cache = MetaCache::new(Duration::from_secs(30), false);
+        let read = begin(&mut cache, "d");
+        cache.add_row("d", file_row("new"));
+        cache.deleted_file("d/old", "d");
+        cache.add_row("other", file_row("x"));
+        assert!(cache.read_changed(read));
+        let listing = cache.keep_read(read, read_of(&["keep", "old"]), now);
+        assert_eq!(names_of(&listing), ["keep", "new"]);
+        assert_eq!(
+            row_names(&mut cache, "d", now),
+            Some(vec!["keep".to_owned(), "new".to_owned()])
+        );
+        assert!(cache.listing("other", now).is_none());
+        assert!(cache.read_changed(read));
+    }
+
+    #[test]
+    fn a_row_put_during_a_read_replaces_the_row_the_read_has() {
+        let now = Instant::now();
+        let mut cache = MetaCache::new(Duration::from_secs(30), false);
+        let read = begin(&mut cache, "d");
+        cache.add_row("d", sized_row("a", 9));
+        let held = DirListing {
+            rows: vec![sized_row("a", 1), sized_row("b", 1)],
+        };
+        let listing = cache.keep_read(read, held, now);
+        assert_eq!(listing.rows, [sized_row("a", 9), sized_row("b", 1)]);
+        assert_eq!(cache.listing("d", now).unwrap().rows, listing.rows);
+    }
+
+    #[test]
+    fn a_change_the_read_already_shows_leaves_it_as_it_is() {
+        let now = Instant::now();
+        let mut cache = MetaCache::new(Duration::from_secs(30), false);
+        let read = begin(&mut cache, "d");
+        cache.add_row("d", file_row("a"));
+        cache.deleted_file("d/z", "d");
+        let listing = cache.keep_read(read, read_of(&["a", "b"]), now);
+        assert_eq!(*listing, read_of(&["a", "b"]));
+        assert_eq!(*cache.listing("d", now).unwrap(), read_of(&["a", "b"]));
+    }
+
+    #[test]
+    fn rows_put_during_a_read_take_their_place_in_the_order_of_the_keys() {
+        let now = Instant::now();
+        let mut cache = MetaCache::new(Duration::from_secs(30), false);
+        let read = begin(&mut cache, "d");
+        cache.add_row("d", file_row("c"));
+        cache.add_row(
+            "d",
+            Row {
+                name: "b".to_owned(),
+                kind: RowKind::Dir,
+            },
+        );
+        cache.add_row("d", file_row("a"));
+        let listing = cache.keep_read(read, read_of(&["b.txt", "d"]), now);
+        assert_eq!(names_of(&listing), ["a", "b.txt", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn changes_to_one_name_made_during_a_read_apply_in_order() {
+        let now = Instant::now();
+        let mut cache = MetaCache::new(Duration::from_secs(30), false);
+        let read = begin(&mut cache, "d");
+        cache.add_row("d", file_row("a"));
+        cache.deleted_file("d/a", "d");
+        cache.deleted_file("d/b", "d");
+        cache.add_row("d", file_row("b"));
+        cache.add_row("d", file_row("c"));
+        cache.deleted_file("d/c", "d");
+        cache.add_row("d", sized_row("c", 5));
+        let listing = cache.keep_read(read, read_of(&["b", "c"]), now);
+        assert_eq!(listing.rows, [file_row("b"), sized_row("c", 5)]);
+    }
+
+    #[test]
+    fn a_listing_read_while_its_rows_were_dropped_is_not_kept() {
+        let now = Instant::now();
+        let mut cache = MetaCache::new(Duration::from_secs(30), false);
+        let read = begin(&mut cache, "d");
+        cache.forget_file("d/f", "d");
+        assert!(cache.read_changed(read));
+        let listing = cache.keep_read(read, read_of(&["f", "g"]), now);
+        assert_eq!(names_of(&listing), ["f", "g"]);
+        assert!(cache.listing("d", now).is_none());
+        assert!(cache.read_changed(read));
+    }
+
+    #[test]
+    fn a_listing_read_while_its_rows_were_dropped_is_not_kept_whatever_else_changed() {
+        let now = Instant::now();
+        let mut cache = MetaCache::new(Duration::from_secs(30), false);
+        let before = begin(&mut cache, "d");
+        cache.add_row("d", file_row("n"));
+        cache.forget_file("d/f", "d");
+        let after = begin(&mut cache, "d");
+        cache.forget_file("d/f", "d");
+        cache.add_row("d", file_row("m"));
+        for read in [before, after] {
+            let listing = cache.keep_read(read, read_of(&["a"]), now);
+            assert_eq!(names_of(&listing), ["a"]);
+            assert!(cache.listing("d", now).is_none());
+        }
+    }
+
+    #[test]
+    fn a_listing_read_while_another_spelling_of_the_directory_changed_is_not_kept() {
+        let now = Instant::now();
+        let mut cache = MetaCache::new(Duration::from_secs(30), true);
+        let read = begin(&mut cache, "Dir");
+        cache.add_row("dir", file_row("new"));
+        let listing = cache.keep_read(read, read_of(&["a"]), now);
+        assert_eq!(names_of(&listing), ["a"]);
+        assert!(cache.listing("Dir", now).is_none());
+    }
+
+    #[test]
+    fn a_read_that_ended_keeps_no_changes() {
+        let now = Instant::now();
+        let mut cache = MetaCache::new(Duration::from_secs(30), false);
+        let read = begin(&mut cache, "d");
+        cache.end_read(read);
+        cache.add_row("d", file_row("new"));
+        assert_eq!(cache.reads(), 0);
+        let listing = cache.keep_read(read, read_of(&["a"]), now);
+        assert_eq!(names_of(&listing), ["a"]);
+        assert!(cache.listing("d", now).is_none());
+    }
+
+    #[test]
+    fn reads_of_one_directory_that_overlap_each_get_the_changes_made_since_they_began() {
+        let now = Instant::now();
+        let mut cache = MetaCache::new(Duration::from_secs(30), false);
+        let first = begin(&mut cache, "d");
+        cache.add_row("d", file_row("c1"));
+        let second = begin(&mut cache, "d");
+        cache.add_row("d", file_row("c2"));
+        let listed = cache.keep_read(first, read_of(&["x"]), now);
+        assert_eq!(names_of(&listed), ["c1", "c2", "x"]);
+        cache.end_read(first);
+        assert_eq!(cache.reads(), 1);
+
+        cache.add_row("d", file_row("c3"));
+        cache.deleted_file("d/x", "d");
+        let listed = cache.keep_read(second, read_of(&["x", "c1"]), now);
+        assert_eq!(names_of(&listed), ["c1", "c2", "c3"]);
+        assert_eq!(
+            row_names(&mut cache, "d", now),
+            Some(vec!["c1".to_owned(), "c2".to_owned(), "c3".to_owned()])
+        );
+        cache.end_read(second);
+        assert_eq!(cache.reads(), 0);
+    }
+
+    #[test]
+    fn a_listing_read_while_more_changes_were_made_than_are_kept_is_not_kept() {
+        let now = Instant::now();
+        let mut cache = MetaCache::new(Duration::from_secs(30), false);
+        let read = begin(&mut cache, "d");
+        for n in 0..=MAX_READ_CHANGES {
+            cache.add_row("d", file_row(&format!("n{n}")));
+        }
+        let listing = cache.keep_read(read, read_of(&["a"]), now);
+        assert_eq!(names_of(&listing), ["a"]);
+        assert!(cache.listing("d", now).is_none());
+        assert!(cache.read_changed(read));
+
+        let read = begin(&mut cache, "d");
+        for n in 0..MAX_READ_CHANGES {
+            cache.add_row("d", file_row(&format!("n{n}")));
+        }
+        let listing = cache.keep_read(read, read_of(&["a"]), now);
+        assert_eq!(listing.rows.len(), MAX_READ_CHANGES + 1);
+        assert!(cache.listing("d", now).is_some());
+    }
+
+    #[test]
+    fn a_read_of_a_cached_listing_notes_the_changes_made_to_it_and_keeps_none() {
+        let now = Instant::now();
+        let mut cache = MetaCache::new(Duration::from_secs(30), false);
+        cache.put_listing("d", named(&["a"]), now);
+        let (read, cached) = cache.begin_read("d", now);
+        assert_eq!(names_of(&cached.unwrap()), ["a"]);
+        assert!(!cache.read_changed(read));
+        cache.add_row("d", file_row("b"));
+        cache.deleted_file("d/a", "d");
+        assert!(cache.read_changed(read));
+        assert!(cache.reads[&read].changes.is_empty());
+    }
+
+    #[test]
+    fn a_read_that_took_in_its_changes_only_notes_the_ones_after() {
+        let now = Instant::now();
+        let mut cache = MetaCache::new(Duration::from_secs(30), false);
+        let read = begin(&mut cache, "d");
+        cache.add_row("d", file_row("a"));
+        cache.keep_read(read, read_of(&[]), now);
+        cache.add_row("d", file_row("b"));
+        assert!(cache.read_changed(read));
+        assert!(cache.reads[&read].changes.is_empty());
+        let again = cache.keep_read(read, read_of(&["z"]), now);
+        assert_eq!(names_of(&again), ["z"]);
+        assert_eq!(
+            row_names(&mut cache, "d", now),
+            Some(vec!["a".to_owned(), "b".to_owned()])
+        );
+    }
+
+    #[test]
+    fn a_change_is_noted_by_the_reads_that_began_before_it() {
+        let mut cache = MetaCache::new(Duration::from_secs(30), false);
+        let first = begin(&mut cache, "d");
+        cache.add_row("d", file_row("c"));
+        let second = begin(&mut cache, "d");
+        let apart = begin(&mut cache, "e");
+        assert!(cache.read_changed(first));
+        assert!(!cache.read_changed(second));
+        assert!(!cache.read_changed(apart));
+        assert_eq!(cache.reads(), 3);
+    }
+
+    #[test]
+    fn a_change_to_another_spelling_of_the_directory_is_a_change_when_names_fold() {
+        for fold in [true, false] {
+            let mut cache = MetaCache::new(Duration::from_secs(30), fold);
+            let read = begin(&mut cache, "Dir");
+            cache.add_row("dir", file_row("new"));
+            assert_eq!(cache.read_changed(read), fold, "fold {fold}");
+        }
+    }
+
+    #[test]
+    fn the_changes_made_to_a_read_give_what_they_give_a_cached_listing() {
+        let now = Instant::now();
+        let base = ["a", "b", "c", "d", "e"];
+        for fold in [false, true] {
+            let mut read_cache = MetaCache::new(Duration::from_secs(30), fold);
+            let mut held_cache = MetaCache::new(Duration::from_secs(30), fold);
+            held_cache.put_listing("d", named(&base), now);
+            let read = begin(&mut read_cache, "d");
+            for cache in [&mut read_cache, &mut held_cache] {
+                cache.add_row("d", file_row("f"));
+                cache.deleted_file("d/b", "d");
+                cache.add_row("d", file_row("a"));
+                cache.add_row("d", file_row("b"));
+                cache.deleted_file("d/f", "d");
+                cache.deleted_file("d/e", "d");
+                cache.add_row("d", file_row("g"));
+            }
+            let listed = read_cache.keep_read(read, read_of(&base), now);
+            let held = held_cache.listing("d", now).unwrap();
+            assert_eq!(listed.rows, held.rows, "fold {fold}");
+            assert_eq!(names_of(&listed), ["a", "b", "c", "d", "g"]);
+        }
+    }
+
+    #[test]
+    fn a_listing_read_while_a_row_of_another_case_was_put_is_kept_only_when_names_differ() {
+        let now = Instant::now();
+        for fold in [true, false] {
+            let mut cache = MetaCache::new(Duration::from_secs(30), fold);
+            let read = begin(&mut cache, "d");
+            cache.add_row("d", file_row("file.txt"));
+            let listing = cache.keep_read(read, read_of(&["File.txt"]), now);
+            assert_eq!(cache.listing("d", now).is_some(), !fold, "fold {fold}");
+            assert_eq!(listing.rows.len(), if fold { 1 } else { 2 }, "fold {fold}");
+        }
+    }
+
+    #[test]
+    fn a_listing_read_while_a_row_of_another_case_was_deleted_is_kept_only_when_names_differ() {
+        let now = Instant::now();
+        for fold in [true, false] {
+            let mut cache = MetaCache::new(Duration::from_secs(30), fold);
+            let read = begin(&mut cache, "d");
+            cache.deleted_file("d/file.txt", "d");
+            let listing = cache.keep_read(read, read_of(&["File.txt"]), now);
+            assert_eq!(names_of(&listing), ["File.txt"], "fold {fold}");
+            assert_eq!(cache.listing("d", now).is_some(), !fold, "fold {fold}");
+        }
+    }
+
+    #[test]
+    fn a_listing_read_while_a_name_moved_to_another_case_is_kept_only_when_names_differ() {
+        let now = Instant::now();
+        for fold in [true, false] {
+            let mut cache = MetaCache::new(Duration::from_secs(30), fold);
+            let read = begin(&mut cache, "d");
+            cache.deleted_file("d/File.txt", "d");
+            cache.add_row("d", file_row("file.txt"));
+            let listing = cache.keep_read(read, read_of(&["File.txt"]), now);
+            assert_eq!(cache.listing("d", now).is_some(), !fold, "fold {fold}");
+            let want: &[&str] = if fold { &["File.txt"] } else { &["file.txt"] };
+            assert_eq!(names_of(&listing), want, "fold {fold}");
+        }
     }
 
     #[test]

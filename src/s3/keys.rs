@@ -1,7 +1,7 @@
 //! Object keys, and the directory listings built from the keys of a store.
 
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::SystemTime;
 
 use crate::error::{SmbError, SmbResult};
@@ -138,6 +138,19 @@ impl DirListing {
             .cloned()
             .collect();
         rows.push(row);
+        rows.sort_by(by_key);
+        DirListing { rows }
+    }
+
+    /// The listing with the rows named in `edits` replaced, each by the row it
+    /// holds or by none.
+    pub(super) fn edited(self, mut edits: HashMap<String, Option<Row>>) -> DirListing {
+        let mut rows: Vec<Row> = self
+            .rows
+            .into_iter()
+            .filter(|row| !edits.contains_key(&row.name))
+            .collect();
+        rows.extend(edits.drain().filter_map(|(_, row)| row));
         rows.sort_by(by_key);
         DirListing { rows }
     }
