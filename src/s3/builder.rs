@@ -409,7 +409,7 @@ impl S3BackendBuilder {
             listing_metadata_max: self.listing_metadata_max,
             head_concurrency: head_concurrency(self.upload_concurrency),
             built,
-            cache: Mutex::new(MetaCache::new(self.metadata_ttl)),
+            cache: Mutex::new(MetaCache::new(self.metadata_ttl, self.case_insensitive)),
             read_chunk: u64::from(self.read_chunk),
             max_dir_rename_objects: self.max_dir_rename_objects,
             ahead,

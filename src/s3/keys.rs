@@ -159,6 +159,14 @@ impl DirListing {
         self.rows.iter().find(|row| row.name == name)
     }
 
+    /// Whether a row has a name that differs from `name` in case only.
+    pub(super) fn has_other_spelling(&self, name: &str) -> bool {
+        let folded = name.to_lowercase();
+        self.rows
+            .iter()
+            .any(|row| row.name != name && folds_to(&row.name, &folded))
+    }
+
     /// The row named `name`, or else the first row in key order whose name
     /// folds to the same lowercase text. With `dirs_only`, only directories
     /// count.

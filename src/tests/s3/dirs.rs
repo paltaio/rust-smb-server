@@ -767,6 +767,81 @@ async fn a_renamed_directory_leaves_behind_a_directory_deleted_below_it_in_anoth
     assert!(all_records(&rig).is_empty());
 }
 
+#[tokio::test]
+async fn a_directory_deleted_in_another_case_than_it_was_listed_in_is_gone_when_the_delete_runs() {
+    let mut rig = Rig::writable_with(held).await;
+    for dir in ["A", "A\\e", "A\\E\\d", "A\\E\\d\\b"] {
+        make_dir(&rig, dir).await;
+    }
+    rig.backend.hold_uploads(false);
+    sync(&rig.backend).await.unwrap();
+    rig.backend.hold_uploads(true);
+    rig.backend.hold_sweeps(true);
+    rig.backend.unlink(&path("A\\E\\D\\b")).await.unwrap();
+    assert!(listed(&mut rig, "a\\e\\d").await.is_empty());
+    rig.backend.hold_sweeps(false);
+    rig.backend.hold_uploads(false);
+    sync(&rig.backend).await.unwrap();
+
+    assert_eq!(keys_folded(&rig).await, ["a/", "a/e/", "a/e/d/"]);
+    assert!(listed(&mut rig, "a\\e\\d").await.is_empty());
+    assert!(rig.smb.open_dir("a\\e\\d\\b").await.is_err());
+    assert!(rig.backend.failures().is_empty());
+}
+
+#[tokio::test]
+async fn a_file_deleted_in_another_case_than_it_was_listed_in_is_gone_when_the_delete_runs() {
+    for (gone, listed_in) in [("d\\f.txt", "D"), ("d\\F.TXT", "d")] {
+        let mut rig = Rig::writable_with(held).await;
+        make_dir(&rig, "D").await;
+        make(&mut rig, "D\\f.txt", b"data").await;
+        rig.backend.hold_uploads(false);
+        sync(&rig.backend).await.unwrap();
+        rig.backend.hold_uploads(true);
+        rig.backend.hold_sweeps(true);
+        rig.backend.unlink(&path(gone)).await.unwrap();
+        assert!(listed(&mut rig, listed_in).await.is_empty(), "{gone}");
+        rig.backend.hold_sweeps(false);
+        rig.backend.hold_uploads(false);
+        sync(&rig.backend).await.unwrap();
+
+        assert_eq!(keys_folded(&rig).await, ["d/"], "{gone}");
+        assert!(listed(&mut rig, listed_in).await.is_empty(), "{gone}");
+        assert!(rig.smb.open("D\\f.txt").await.is_err(), "{gone}");
+        assert!(rig.backend.failures().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn a_file_renamed_to_another_case_leaves_no_row_behind_when_it_is_deleted() {
+    let mut rig = Rig::writable_with(held).await;
+    make_dir(&rig, "D").await;
+    make(&mut rig, "D\\File.txt", b"data").await;
+    rig.backend.hold_uploads(false);
+    sync(&rig.backend).await.unwrap();
+    rig.backend.hold_uploads(true);
+    assert_eq!(listed(&mut rig, "D").await, ["File.txt"]);
+    rig.backend
+        .rename(&path("D\\File.txt"), &path("D\\file.txt"), false)
+        .await
+        .unwrap();
+    rig.backend.hold_uploads(false);
+    sync(&rig.backend).await.unwrap();
+    rig.backend.hold_uploads(true);
+    rig.backend.hold_sweeps(true);
+    rig.backend.unlink(&path("D\\file.txt")).await.unwrap();
+    assert!(listed(&mut rig, "D").await.is_empty());
+    rig.backend.hold_sweeps(false);
+    rig.backend.hold_uploads(false);
+    sync(&rig.backend).await.unwrap();
+
+    assert_eq!(keys_folded(&rig).await, ["d/"]);
+    assert!(listed(&mut rig, "D").await.is_empty());
+    assert!(rig.smb.open("D\\file.txt").await.is_err());
+    assert!(rig.smb.open("D\\File.txt").await.is_err());
+    assert!(rig.backend.failures().is_empty());
+}
+
 // Renaming directories.
 
 #[tokio::test]
