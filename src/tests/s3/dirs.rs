@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering::SeqCst;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use tokio::sync::Notify;
@@ -2845,6 +2845,57 @@ async fn a_case_only_rename_onto_a_directory_that_is_deleted_is_not_refused() {
         assert_eq!(rig.smb.contents("e\\a.txt", 10).await, b"a");
         assert!(rig.backend.failures().is_empty());
     }
+}
+
+/// The whole seconds on the clock the store stamps objects with.
+fn seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+#[tokio::test]
+async fn a_marker_whose_time_moves_between_two_requests_is_one_object_in_two_cases() {
+    let mut rig = Rig::writable_with(held).await;
+    if !folds(&rig).await {
+        return;
+    }
+    make_dir(&rig, "E").await;
+    make(&mut rig, "E\\a.txt", b"a").await;
+    let made = seconds();
+    rig.backend
+        .rename(&path("E"), &path("e"), false)
+        .await
+        .unwrap();
+
+    let (compared, stored) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+    rig.proxy.inject(
+        is_head_of(&rig.bucket.name, "e/"),
+        Fault::Hold(Arc::clone(&compared)),
+        1,
+    );
+    rig.proxy.inject(
+        is_put_of(&rig.bucket.name, "e/a.txt"),
+        Fault::Hold(Arc::clone(&stored)),
+        1,
+    );
+    wait_until("the clock moves to the next second", || seconds() > made).await;
+    rig.backend.hold_uploads(false);
+    // The request for `e/` waits at the proxy after the one for `E/` has read
+    // the time of the directory. The file stored meanwhile moves that time.
+    wait_for_requests(&rig.proxy, 1, is_head_of(&rig.bucket.name, "e/")).await;
+    stored.notify_one();
+    wait_until_async("the file is in the bucket", async || {
+        remote(&rig, "e/a.txt").await.is_some()
+    })
+    .await;
+    compared.notify_one();
+    sync(&rig.backend).await.unwrap();
+
+    assert_eq!(keys_folded(&rig).await, ["e/", "e/a.txt"]);
+    assert_eq!(remote(&rig, "e/a.txt").await.unwrap(), b"a");
+    assert!(rig.backend.failures().is_empty());
 }
 
 #[tokio::test]

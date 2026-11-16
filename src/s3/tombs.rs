@@ -92,6 +92,17 @@ fn is_marker_kept(key: &str, error: &S3Error) -> bool {
     key.ends_with('/') && error.code() == Some("ErrDirectoryNotEmpty")
 }
 
+/// Whether the HEADs of `key` and of its other spelling may describe one
+/// object: the same size and ETag, and for a file the same time. A store that
+/// keeps a directory as a folder gives its marker the time of the folder,
+/// which moves whenever an object below it is stored, so two requests for one
+/// marker can disagree.
+fn alike(key: &str, first: &ObjectHead, second: &ObjectHead) -> bool {
+    first.size == second.size
+        && first.etag == second.etag
+        && (key.ends_with('/') || first.last_modified == second.last_modified)
+}
+
 /// Whether the store refuses a marker for good where an object of the same
 /// name is: the directory is left as it is.
 fn is_marker_conflict(error: &S3Error) -> bool {
@@ -129,8 +140,10 @@ impl Shared {
     /// ignores case answers a listing under either spelling of the directory
     /// with the spelling asked for, so the directory above the first
     /// difference is listed instead: a store that tells the two apart lists
-    /// both spellings there. A directory too large to list in full counts as
-    /// one object, which keeps both keys.
+    /// both spellings there. A pair of markers, whose keys end in `/`, is
+    /// decided here alone, by whether the listing shows both spellings. A
+    /// directory too large to list in full counts as one object, which keeps
+    /// both keys.
     async fn listed_apart(&self, a: &str, b: &str, retry: &Retry) -> Result<bool, S3Error> {
         let (names_a, names_b): (Vec<&str>, Vec<&str>) =
             (a.split('/').collect(), b.split('/').collect());
@@ -174,7 +187,8 @@ impl Shared {
     /// and time, and the store does not list both names. `None` if they name
     /// two objects, or one is not there. The time has a resolution of a
     /// second, so two objects made within one second can agree in all three;
-    /// only the listing tells them apart.
+    /// only the listing tells them apart. The time of a marker is not
+    /// compared: it moves when an object below the marker is stored.
     ///
     /// # Errors
     ///
@@ -191,9 +205,7 @@ impl Shared {
         ) else {
             return Ok(None);
         };
-        let alike = (first.size, &first.etag, first.last_modified)
-            == (second.size, &second.etag, second.last_modified);
-        if alike && !self.listed_apart(a, b, retry).await? {
+        if alike(a, &first, &second) && !self.listed_apart(a, b, retry).await? {
             return Ok(Some(second));
         }
         Ok(None)
@@ -458,6 +470,32 @@ mod tests {
 
     fn keys(keys: &[&str]) -> Vec<String> {
         keys.iter().map(|key| (*key).to_owned()).collect()
+    }
+
+    fn head(size: u64, etag: &str, seconds: u64) -> ObjectHead {
+        ObjectHead {
+            size,
+            etag: etag.to_owned(),
+            last_modified: std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds),
+            metadata: Default::default(),
+        }
+    }
+
+    #[test]
+    fn two_requests_for_a_file_agree_on_size_etag_and_time() {
+        let first = head(3, "\"a\"", 10);
+        assert!(alike("d/f", &first, &head(3, "\"a\"", 10)));
+        assert!(!alike("d/f", &first, &head(3, "\"a\"", 11)));
+        assert!(!alike("d/f", &first, &head(4, "\"a\"", 10)));
+        assert!(!alike("d/f", &first, &head(3, "\"b\"", 10)));
+    }
+
+    #[test]
+    fn two_requests_for_a_marker_agree_whatever_its_time() {
+        let first = head(0, "\"a\"", 10);
+        assert!(alike("d/", &first, &head(0, "\"a\"", 11)));
+        assert!(!alike("d/", &first, &head(1, "\"a\"", 10)));
+        assert!(!alike("d/", &first, &head(0, "\"b\"", 10)));
     }
 
     #[test]
