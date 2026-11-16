@@ -1,6 +1,5 @@
 //! Reads of file data.
 
-use std::fs::File;
 use std::io;
 use std::ops::Range;
 use std::sync::Arc;
@@ -13,7 +12,7 @@ use tracing::debug;
 use crate::error::{SmbError, SmbResult};
 
 use super::backend::Shared;
-use super::data::{disk_error, read_full_at};
+use super::data::{DataFile, disk_error, read_full_at};
 use super::entry::{Base, Entry};
 use super::error::S3Error;
 use super::object::{ByteRange, ObjectHead};
@@ -28,7 +27,7 @@ enum Plan {
     Base { key: String, head: Arc<ObjectHead> },
     /// Pieces of local data and of the base, in order.
     Local {
-        file: Arc<File>,
+        file: Arc<DataFile>,
         base: Option<(String, Arc<ObjectHead>)>,
         pieces: Vec<(Range<u64>, bool)>,
     },
@@ -89,7 +88,7 @@ impl Entry {
 
     /// Whether a read of the entry is still planned over the local data in
     /// `file` and the object `base`: the entry has that file and that base.
-    fn reads_over(&self, file: &Arc<File>, base: Option<&(String, Arc<ObjectHead>)>) -> bool {
+    fn reads_over(&self, file: &Arc<DataFile>, base: Option<&(String, Arc<ObjectHead>)>) -> bool {
         let state = self.state();
         let same_file = state
             .local()
@@ -172,7 +171,7 @@ impl Entry {
     async fn read_local(
         &self,
         shared: &Shared,
-        file: &Arc<File>,
+        file: &Arc<DataFile>,
         base: Option<&(String, Arc<ObjectHead>)>,
         pieces: &[(Range<u64>, bool)],
         retry: &Retry,
@@ -185,8 +184,9 @@ impl Entry {
         let mut present = if from_file.is_empty() {
             Vec::new()
         } else {
-            let file = Arc::clone(file);
+            let data = Arc::clone(file);
             tokio::task::spawn_blocking(move || {
+                let file = data.file()?;
                 from_file
                     .into_iter()
                     .map(|range| {

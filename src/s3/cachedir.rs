@@ -29,7 +29,7 @@ use tracing::{debug, error};
 
 use crate::backend::VolumeInfo;
 
-use super::data::{self, private_options};
+use super::data::{self, DataFile, private_options};
 use super::error::S3Error;
 use super::keys::{Slot, dir_prefix, join_key, slot};
 use super::record::{EntryRecord, MAX_RECORD_LEN, Record, RecordId, TombstoneRecord, escape};
@@ -67,6 +67,10 @@ pub(crate) struct Hooks {
     pub(crate) data_moves: AtomicUsize,
     /// The failures injected are those of a full disk.
     pub(crate) disk_full: AtomicBool,
+    /// The syncs of data files wait, with the file open, while this is set.
+    pub(crate) hold_syncs: AtomicBool,
+    /// Syncs of data files that began.
+    pub(crate) data_syncs: AtomicUsize,
 }
 
 /// What a call of the directory did to a record.
@@ -96,13 +100,25 @@ impl Hooks {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push((op, id.clone()));
     }
+
+    /// Counts a sync that begins and keeps it waiting while a test holds the
+    /// syncs, for 60 s at most.
+    fn hold_sync(&self) {
+        self.data_syncs.fetch_add(1, Ordering::SeqCst);
+        for _ in 0..6000 {
+            if !self.hold_syncs.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
 }
 
 /// What the records of a cache directory say.
 #[derive(Default)]
 pub(crate) struct Recovered {
-    /// The entries, with the open data file of those that have local data.
-    pub(crate) entries: Vec<(EntryRecord, Option<File>)>,
+    /// The entries, with the data file of those that have local data.
+    pub(crate) entries: Vec<(EntryRecord, Option<DataFile>)>,
     pub(crate) tombstones: Vec<TombstoneRecord>,
 }
 
@@ -251,9 +267,12 @@ impl CacheDir {
         self.root.join("records").join(id.as_str())
     }
 
-    /// Makes the data file of entry `id`, `len` bytes of holes.
-    pub(crate) fn create_data(&self, id: &RecordId, len: u64) -> io::Result<File> {
-        data::create(&self.data_path(id), len)
+    /// Makes the data file of entry `id`, `len` bytes of holes. It holds the
+    /// descriptor it was made with.
+    pub(crate) fn create_data(&self, id: &RecordId, len: u64) -> io::Result<DataFile> {
+        let path = self.data_path(id);
+        let file = data::create(&path, len)?;
+        Ok(DataFile::new(path, Some(file)))
     }
 
     pub(crate) fn remove_data(&self, id: &RecordId) -> io::Result<()> {
@@ -268,6 +287,14 @@ impl CacheDir {
             return Err(e);
         }
         data::write_all_at(file, bytes, offset)
+    }
+
+    /// Makes the data of `data` durable.
+    pub(crate) fn sync_data(&self, data: &DataFile) -> io::Result<()> {
+        let file = data.file()?;
+        #[cfg(test)]
+        self.hooks.hold_sync();
+        file.sync_all()
     }
 
     /// On Unix hosts, syncs the directory of the data files, so their names
@@ -520,15 +547,17 @@ impl CacheDir {
         }
     }
 
-    /// Checks `entry` and opens its data file. `keys` collects the names the
-    /// entries hold: their keys, and the marker keys of directories.
+    /// Checks `entry` and, if it has local data, its data file, which is cut or
+    /// grown to the length the record gives. Returns the data file with no
+    /// descriptor open. `keys` collects the names the entries hold: their keys,
+    /// and the marker keys of directories.
     fn revive(
         &self,
         entry: &EntryRecord,
         prefix: &str,
         fold: bool,
         keys: &mut HashSet<Slot>,
-    ) -> Result<Option<File>, String> {
+    ) -> Result<Option<DataFile>, String> {
         if entry.key != join_key(prefix, &entry.path) {
             return Err("the key is not the path below the prefix".to_owned());
         }
@@ -557,7 +586,7 @@ impl CacheDir {
                     file.set_len(local.len)
                         .map_err(|e| format!("the data file cannot be resized: {e}"))?;
                 }
-                Some(file)
+                Some(DataFile::new(self.data_path(&entry.id), None))
             }
         };
         keys.insert(name);
@@ -620,11 +649,11 @@ impl CacheDir {
     }
 }
 
-/// Notes an entry that came back from its record, with the open data file it
-/// has if it has local data.
+/// Notes an entry that came back from its record, with the data file it has
+/// if it has local data.
 fn revived(
     entry: EntryRecord,
-    data: Option<File>,
+    data: Option<DataFile>,
     exact: &mut HashSet<String>,
     live: &mut HashSet<RecordId>,
     recovered: &mut Recovered,
@@ -802,7 +831,7 @@ mod tests {
 
     fn store(dir: &CacheDir, record: &EntryRecord, data: Option<&[u8]>) {
         if let Some(bytes) = data {
-            let file = dir.create_data(&record.id, 0).unwrap();
+            let file = dir.create_data(&record.id, 0).unwrap().file().unwrap();
             data::write_all_at(&file, bytes, 0).unwrap();
         }
         dir.write_record(&record.id, &record.encode()).unwrap();
@@ -971,7 +1000,8 @@ mod tests {
         for (record, file) in &recovered.entries {
             if *record == with_data {
                 let mut buf = [0u8; 5];
-                data::read_full_at(file.as_ref().unwrap(), &mut buf, 0).unwrap();
+                let file = file.as_ref().unwrap().file().unwrap();
+                data::read_full_at(&file, &mut buf, 0).unwrap();
                 assert_eq!(&buf, b"hello");
             } else {
                 assert_eq!(*record, without);
@@ -1032,7 +1062,7 @@ mod tests {
         let recovered = dir.recover("pre/fix", false).unwrap();
         assert_eq!(recovered.entries.len(), 1);
         assert_eq!(recovered.entries[0].0, long);
-        let file = recovered.entries[0].1.as_ref().unwrap();
+        let file = recovered.entries[0].1.as_ref().unwrap().file().unwrap();
         assert_eq!(file.metadata().unwrap().len(), 2, "cut to the record");
 
         let mut moved = conflicts(temp.path());
@@ -1056,10 +1086,10 @@ mod tests {
 
         let recovered = dir.recover("pre/fix", false).unwrap();
         assert_eq!(recovered.entries.len(), 1);
-        let file = recovered.entries[0].1.as_ref().unwrap();
+        let file = recovered.entries[0].1.as_ref().unwrap().file().unwrap();
         assert_eq!(file.metadata().unwrap().len(), 10);
         let mut buf = [1u8; 10];
-        data::read_full_at(file, &mut buf, 0).unwrap();
+        data::read_full_at(&file, &mut buf, 0).unwrap();
         assert_eq!(&buf[..4], b"abcd");
         assert!(conflicts(temp.path()).is_empty());
     }

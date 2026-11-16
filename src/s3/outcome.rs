@@ -57,7 +57,7 @@ pub(super) fn fill(
 ) -> SmbResult<bool> {
     let cache = shared.local()?;
     let _io = entry.lock_io();
-    let (file, pieces) = {
+    let (held, pieces) = {
         let state = entry.state();
         state.attached()?;
         let Some(local) = state.local() else {
@@ -68,7 +68,10 @@ pub(super) fn fill(
             to_fill(&local.present, local.len, range),
         )
     };
-    if let Some(data) = data {
+    if let Some(data) = data
+        && !pieces.is_empty()
+    {
+        let file = held.file().map_err(disk_error)?;
         for piece in &pieces {
             let from = usize::try_from(piece.start - range.start)
                 .map_err(|_| SmbError::InvalidParameter)?;
@@ -83,7 +86,7 @@ pub(super) fn fill(
     let mut state = entry.state();
     let Some(local) = state
         .local_mut()
-        .filter(|local| Arc::ptr_eq(&local.file, &file))
+        .filter(|local| Arc::ptr_eq(&local.file, &held))
     else {
         return Ok(false);
     };

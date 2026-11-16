@@ -87,7 +87,8 @@ impl Shared {
                 OpenAction::Opened
             }
         };
-        Ok((Box::new(S3Handle::entry(Arc::clone(self), held)), action))
+        let handle = S3Handle::entry(Arc::clone(self), held).await;
+        Ok((Box::new(handle), action))
     }
 
     /// Makes the file or directory at `path`, which is not there. `None` if
@@ -109,10 +110,11 @@ impl Shared {
         } else {
             self.create_file(key, now).await?
         };
-        Ok(held.map(|held| {
-            let handle: Box<dyn Handle> = Box::new(S3Handle::entry(Arc::clone(self), held));
-            (handle, OpenAction::Created)
-        }))
+        let Some(held) = held else {
+            return Ok(None);
+        };
+        let handle = S3Handle::entry(Arc::clone(self), held).await;
+        Ok(Some((Box::new(handle), OpenAction::Created)))
     }
 
     /// Makes the file `key`: its data file and its entry. The work runs on
@@ -123,8 +125,8 @@ impl Shared {
         let overlay = Arc::clone(&self.overlay);
         let id = new_id().map_err(SmbError::Io)?;
         spawn_blocking(move || {
-            let file = local.create_data(&id, 0).map_err(disk_error)?;
-            let held = overlay.insert_new(Entry::created_file(key, id.clone(), now, file));
+            let data = local.create_data(&id, 0).map_err(disk_error)?;
+            let held = overlay.insert_new(Entry::created_file(key, id.clone(), now, data));
             if held.is_err() {
                 let _ = local.remove_data(&id);
             }

@@ -24,7 +24,6 @@ use crate::s3::client::S3Client;
 use crate::s3::encode::uri_encode;
 use crate::server::ServerState;
 use crate::tests::peer::{Peer, status};
-use crate::tests::util::raise_file_limit;
 use crate::utils::FILETIME_OFFSET;
 use crate::{Handle, OpenOptions, S3Backend, S3BackendBuilder, Share, ShareBackend, SmbServer};
 
@@ -188,7 +187,6 @@ impl Rig {
         cache: tempfile::TempDir,
         configure: impl FnOnce(S3BackendBuilder) -> S3BackendBuilder,
     ) -> Self {
-        raise_file_limit();
         let backend = configure(writable_builder(&bucket, proxy.addr, cache.path()))
             .build()
             .await

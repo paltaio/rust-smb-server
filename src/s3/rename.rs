@@ -320,7 +320,7 @@ fn move_record(
     may_exist: bool,
 ) -> SmbResult<Moved> {
     let cache = shared.local()?;
-    let (record, id, recorded, first, file, batch) = {
+    let (record, id, recorded, first, data, batch) = {
         let mut state = entry.state();
         state.attached()?;
         let work = state.local().is_some()
@@ -354,8 +354,8 @@ fn move_record(
     record.gone = gone.to_vec();
     record.remote = may_exist;
     record.generation += 1;
-    if let Some(file) = file {
-        file.sync_all().map_err(disk_error)?;
+    if let Some(data) = data {
+        cache.sync_data(&data).map_err(disk_error)?;
         if first {
             cache.sync_data_dir().map_err(disk_error)?;
         }

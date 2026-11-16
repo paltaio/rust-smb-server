@@ -2380,6 +2380,7 @@ impl Overlay {
 mod tests {
     use super::*;
     use crate::s3::cachedir::{CacheDir, RecordOp};
+    use crate::s3::data::DataFile;
     use crate::s3::entry::State;
     use crate::s3::lookup::DirRef;
     use crate::s3::record::{BatchRecord, RecordId};
@@ -2408,9 +2409,13 @@ mod tests {
     /// A file with local data, which a job has to store.
     fn stored_later(overlay: &Arc<Overlay>, key: &str) -> Held {
         let id = RecordId::parse(&"b".repeat(32)).unwrap();
-        let file = tempfile::tempfile().unwrap();
         overlay
-            .insert_new(Entry::created_file(key.to_owned(), id, 1, file))
+            .insert_new(Entry::created_file(
+                key.to_owned(),
+                id,
+                1,
+                DataFile::absent(),
+            ))
             .unwrap()
     }
 
@@ -2909,7 +2914,7 @@ mod tests {
         let make = |key: &str| {
             let mut state = State::new(key.to_owned(), false);
             state.set_local(crate::s3::entry::Local {
-                file: Arc::new(tempfile::tempfile().unwrap()),
+                file: Arc::new(DataFile::absent()),
                 len: 0,
                 present: crate::s3::ranges::RangeSet::new(),
             });
@@ -2958,7 +2963,7 @@ mod tests {
             present.insert(0..covered);
         }
         crate::s3::entry::Local {
-            file: Arc::new(tempfile::tempfile().unwrap()),
+            file: Arc::new(DataFile::absent()),
             len,
             present,
         }

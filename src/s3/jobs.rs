@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, watch};
 use tokio::task::{Id, JoinError, JoinHandle, JoinSet};
 use tracing::error;
 
@@ -69,6 +69,10 @@ impl PanicHook {
 /// The size of the largest object one CopyObject request takes.
 const MAX_COPY: u64 = 5 << 30;
 
+/// How many tasks that record closed files make their data durable at once.
+/// Each holds a descriptor of its data file until it is done.
+pub(super) const SAVES_AT_ONCE: usize = 8;
+
 /// What the worker runs jobs with, and the signals it sends.
 pub(super) struct Jobs {
     /// The size of the parts of a multipart upload; objects up to this size go
@@ -89,9 +93,15 @@ pub(super) struct Jobs {
     /// later holds the backend state, so the cache directory stays locked until
     /// it ends.
     tasks: watch::Sender<usize>,
+    /// Lets [`SAVES_AT_ONCE`] of the tasks that record closed files work at a
+    /// time; the others wait.
+    pub(super) save_slots: Semaphore,
     /// How many of those tasks record closed files.
     #[cfg(test)]
     pub(super) saves: watch::Sender<usize>,
+    /// How many jobs ended for lack of descriptors, to rest and try again.
+    #[cfg(test)]
+    pub(super) descriptor_rests: std::sync::atomic::AtomicUsize,
     /// Keeps the worker from starting jobs while set.
     #[cfg(test)]
     pub(super) held: std::sync::atomic::AtomicBool,
@@ -171,8 +181,11 @@ impl Jobs {
             stop: Stop::new(),
             exited: watch::Sender::new(false),
             tasks: watch::Sender::new(0),
+            save_slots: Semaphore::new(SAVES_AT_ONCE),
             #[cfg(test)]
             saves: watch::Sender::new(0),
+            #[cfg(test)]
+            descriptor_rests: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             held: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]

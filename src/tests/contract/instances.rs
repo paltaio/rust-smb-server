@@ -18,8 +18,6 @@ use crate::tests::s3::fixture::TestBucket;
 #[cfg(feature = "s3")]
 use crate::tests::s3::share::{worker_ended, writable_builder};
 #[cfg(feature = "s3")]
-use crate::tests::util::raise_file_limit;
-#[cfg(feature = "s3")]
 use crate::{S3Backend, S3BackendBuilder};
 
 #[cfg(feature = "s3")]
@@ -85,7 +83,6 @@ pub(super) async fn s3_backend(
     cache: &Path,
     configure: impl FnOnce(S3BackendBuilder) -> S3BackendBuilder,
 ) -> Result<(S3Backend, watch::Receiver<bool>), Error> {
-    raise_file_limit();
     let backend = configure(writable_builder(bucket, bucket.gateway.addr, cache))
         .build()
         .await?;

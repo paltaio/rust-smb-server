@@ -517,6 +517,29 @@ impl S3Backend {
         self.shared.jobs.saves.subscribe()
     }
 
+    /// How many tasks that record closed files sync data files at once, at
+    /// most.
+    pub(crate) fn saves_at_once(&self) -> usize {
+        super::jobs::SAVES_AT_ONCE
+    }
+
+    /// How many jobs ended to rest because no descriptor was left.
+    #[cfg(unix)]
+    pub(crate) fn descriptor_rests(&self) -> usize {
+        self.shared
+            .jobs
+            .descriptor_rests
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Whether the data file of the entry for `key` has a descriptor open, or
+    /// `None` if the entry has no data file.
+    pub(crate) fn data_open(&self, key: &str) -> Option<bool> {
+        let entry = self.shared.overlay.peek(key)?;
+        let state = entry.state();
+        state.local().map(|local| local.file.is_open())
+    }
+
     /// Makes the task that records the entries of the next moved directory
     /// panic.
     pub(crate) fn panic_dissolve(&self) {

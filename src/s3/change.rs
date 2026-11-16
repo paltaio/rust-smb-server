@@ -166,12 +166,15 @@ pub(super) fn ensure_local(
         }
         state.attached()?;
         if let Some(local) = state.local() {
-            return Ok(Arc::clone(&local.file));
+            let data = Arc::clone(&local.file);
+            drop(state);
+            return data.file().map_err(disk_error);
         }
         let len = len.unwrap_or_else(|| state.size());
         (state.id().map_err(SmbError::Io)?, len)
     };
-    let file = Arc::new(cache.create_data(&id, len).map_err(disk_error)?);
+    let data = Arc::new(cache.create_data(&id, len).map_err(disk_error)?);
+    let file = data.file().map_err(disk_error)?;
     let mut state = entry.state();
     if let Err(e) = state.attached() {
         drop(state);
@@ -179,7 +182,7 @@ pub(super) fn ensure_local(
         return Err(e);
     }
     state.set_local(Local {
-        file: Arc::clone(&file),
+        file: data,
         len,
         present: RangeSet::new(),
     });
@@ -293,6 +296,31 @@ pub(super) async fn flush(shared: &Arc<Shared>, held: &Held) -> SmbResult<()> {
     blocking(shared, held, |shared, entry| seal(shared, entry, false)).await
 }
 
+/// Opens the data file of the file `held`, if it has one that is not open yet,
+/// for the handle that has just opened it: the descriptor stays open until the
+/// last handle on the entry closes. The open does not take the `io` lock, so it
+/// does not wait for the save of a closed file, which holds the lock through
+/// its sync. A file that cannot be opened, because it was unlinked or stored
+/// first, is left to the next use, which reports the error.
+pub(super) async fn open_data(shared: &Arc<Shared>, held: &Held) {
+    if held
+        .entry
+        .state()
+        .local()
+        .is_none_or(|local| local.file.is_open())
+    {
+        return;
+    }
+    let opened = blocking(shared, held, |_, entry| {
+        let data = entry.state().local().map(|local| Arc::clone(&local.file));
+        data.map_or(Ok(()), |data| data.file().map(drop).map_err(disk_error))
+    })
+    .await;
+    if let Err(e) = opened {
+        debug!(error = %e, "the data file of an open file could not be opened");
+    }
+}
+
 /// Ends the hold of a handle that closes. If it was the last handle open on a
 /// file whose local data no record covers, a task of its own makes the data
 /// durable and records it, as a flush does; the close does not wait for it. The
@@ -301,7 +329,7 @@ pub(super) async fn flush(shared: &Arc<Shared>, held: &Held) -> SmbResult<()> {
 pub(super) fn close_file(shared: &Arc<Shared>, held: Held) {
     let seals = {
         let mut state = held.entry.state();
-        state.open = state.open.saturating_sub(1);
+        state.closed();
         state.open == 0 && !state.detached && state.unsealed()
     };
     if !seals {
@@ -311,7 +339,10 @@ pub(super) fn close_file(shared: &Arc<Shared>, held: Held) {
     tokio::spawn(async move {
         #[cfg(test)]
         super::jobs::pause(&shared.jobs.pause_close).await;
-        let sealed = blocking(&shared, &held, seal_closed).await;
+        let sealed = {
+            let _slot = shared.jobs.save_slots.acquire().await;
+            blocking(&shared, &held, seal_closed).await
+        };
         if let Err(e) = sealed {
             let path = held.entry.state().path(&shared.prefix);
             warn!(error = %e, path = %path, "the data of a closed file could not be saved in the cache directory");
@@ -365,20 +396,20 @@ fn seal_with(
     tombs: TombsHeld<'_>,
 ) -> SmbResult<()> {
     let cache = shared.local()?;
-    let (file, mut record, first) = {
+    let (data, mut record, first) = {
         let mut state = entry.state();
         state.attached()?;
         let Some(local) = state.local() else {
             return Ok(());
         };
-        let file = Arc::clone(&local.file);
+        let data = Arc::clone(&local.file);
         let sealed = state.sealed();
         if !force && sealed.is_some_and(|sealed| sealed.generation == state.generation) {
             return Ok(());
         }
         let record =
             Entry::record(&mut state, &shared.prefix, shared.built).map_err(SmbError::Io)?;
-        (file, record, sealed.is_none())
+        (data, record, sealed.is_none())
     };
     if let Some(gone) = &gone {
         record.gone.clone_from(gone);
@@ -387,7 +418,7 @@ fn seal_with(
         generation: record.generation,
         len: record.local.as_ref().map_or(0, |local| local.len),
     };
-    file.sync_all().map_err(disk_error)?;
+    cache.sync_data(&data).map_err(disk_error)?;
     if first {
         cache.sync_data_dir().map_err(disk_error)?;
     }

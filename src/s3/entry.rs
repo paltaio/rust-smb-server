@@ -1,7 +1,6 @@
 //! A file or directory the backend has a handle open on or holds changes
 //! for.
 
-use std::fs::File;
 use std::io;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
@@ -11,6 +10,7 @@ use crate::error::{SmbError, SmbResult};
 use crate::utils::now_filetime;
 
 use super::cachedir::new_id;
+use super::data::DataFile;
 use super::dirmove::Batch;
 use super::error::S3Error;
 use super::keys::{dir_prefix, last_name, path_below};
@@ -25,7 +25,7 @@ use super::retry::Stop;
 /// The local data of a file: a sparse file with the bytes written into it
 /// and the ranges of those that count.
 pub(super) struct Local {
-    pub(super) file: Arc<File>,
+    pub(super) file: Arc<DataFile>,
     /// The length of the file as clients see it.
     pub(super) len: u64,
     /// The ranges whose bytes are in `file`. The other bytes below `len` are
@@ -274,10 +274,40 @@ impl State {
         }
     }
 
-    /// Makes `new` the local data of a file.
+    /// Makes `new` the local data of a file. Its data file keeps a descriptor
+    /// open only while a handle is open on the entry.
     pub(super) fn set_local(&mut self, new: Local) {
+        if self.open > 0 {
+            new.file.keep();
+        } else {
+            new.file.release();
+        }
+        self.put_local(new);
+    }
+
+    fn put_local(&mut self, new: Local) {
         if let Body::File { local, .. } = &mut self.body {
             *local = Some(new);
+        }
+    }
+
+    /// Notes a handle that opened. The data file of the entry keeps a
+    /// descriptor open while a handle is open on the entry.
+    pub(super) fn opened(&mut self) {
+        self.open += 1;
+        if let Some(local) = self.local() {
+            local.file.keep();
+        }
+    }
+
+    /// Notes a handle that closed. The last one lets go of the descriptor of
+    /// the data file.
+    pub(super) fn closed(&mut self) {
+        self.open = self.open.saturating_sub(1);
+        if self.open == 0
+            && let Some(local) = self.local()
+        {
+            local.file.release();
         }
     }
 
@@ -699,11 +729,12 @@ impl Entry {
     }
 
     /// A new file at `key` with no bytes, created at `now`, whose data file
-    /// has the id `id`.
-    pub(super) fn created_file(key: String, id: RecordId, now: u64, file: File) -> Arc<Entry> {
+    /// has the id `id`. The descriptor `file` holds stays open for the handle
+    /// that opens the file next.
+    pub(super) fn created_file(key: String, id: RecordId, now: u64, file: DataFile) -> Arc<Entry> {
         let mut state = State::new(key, false);
         state.id = Some(id);
-        state.set_local(Local {
+        state.put_local(Local {
             file: Arc::new(file),
             len: 0,
             present: RangeSet::new(),
@@ -742,11 +773,10 @@ impl Entry {
         Entry::from_state(state)
     }
 
-    /// The entry a record describes, with its open data file if it has local
-    /// data.
+    /// The entry a record describes, with its data file if it has local data.
     pub(super) fn recovered(
         record: EntryRecord,
-        file: Option<File>,
+        file: Option<DataFile>,
         ahead: &Arc<ReadAhead>,
     ) -> Arc<Entry> {
         let source = record.source().map(str::to_owned);
@@ -892,7 +922,7 @@ mod tests {
         let mut state = State::new("f".to_owned(), false);
         state.id = Some(RecordId::parse(&"a".repeat(32)).unwrap());
         state.set_local(Local {
-            file: Arc::new(tempfile::tempfile().unwrap()),
+            file: Arc::new(DataFile::absent()),
             len: 10,
             present: std::iter::once(0..10).collect(),
         });
@@ -936,7 +966,7 @@ mod tests {
         assert!(file.has_work(), "keys to delete");
         file.gone.clear();
         file.set_local(Local {
-            file: Arc::new(tempfile::tempfile().unwrap()),
+            file: Arc::new(DataFile::absent()),
             len: 0,
             present: RangeSet::new(),
         });
@@ -1075,6 +1105,52 @@ mod tests {
     }
 
     #[test]
+    fn the_data_file_of_an_entry_stays_open_only_while_a_handle_is_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data");
+        crate::s3::data::create(&path, 4).unwrap();
+        let mut state = State::new("f".to_owned(), false);
+        state.set_local(Local {
+            file: Arc::new(DataFile::new(path, None)),
+            len: 4,
+            present: RangeSet::new(),
+        });
+        let data = Arc::clone(&state.local().unwrap().file);
+        drop(data.file().unwrap());
+        assert!(!data.is_open(), "no handle is open");
+        state.opened();
+        state.opened();
+        drop(data.file().unwrap());
+        assert!(data.is_open());
+        state.closed();
+        assert!(data.is_open(), "a handle is still open");
+        state.closed();
+        assert!(!data.is_open());
+        drop(data.file().unwrap());
+        assert!(!data.is_open());
+    }
+
+    #[test]
+    fn a_created_file_keeps_the_descriptor_its_data_file_was_made_with() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data");
+        let file = crate::s3::data::create(&path, 0).unwrap();
+        let id = RecordId::parse(&"c".repeat(32)).unwrap();
+        let entry = Entry::created_file("f".to_owned(), id, 1, DataFile::new(path, Some(file)));
+        let mut state = entry.state();
+        let data = Arc::clone(&state.local().unwrap().file);
+        assert!(data.is_open());
+        let made = data.file().unwrap();
+        state.opened();
+        assert!(
+            Arc::ptr_eq(&made, &data.file().unwrap()),
+            "the handle does not open the file again"
+        );
+        state.closed();
+        assert!(!data.is_open());
+    }
+
+    #[test]
     fn an_entry_gets_no_job_while_one_runs_after_it_failed_or_left_or_has_nothing_to_store() {
         let delay = Duration::from_secs(5);
         let mut running = kept(1);
@@ -1167,7 +1243,7 @@ mod tests {
         let mut state = State::new("new".to_owned(), false);
         state.base = Some(Base::at("old"));
         state.set_local(Local {
-            file: Arc::new(tempfile::tempfile().unwrap()),
+            file: Arc::new(DataFile::absent()),
             len: 4,
             present: std::iter::once(0..2).collect(),
         });

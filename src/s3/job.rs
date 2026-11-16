@@ -27,6 +27,7 @@ use crate::error::{SmbError, SmbResult};
 use super::backend::Shared;
 use super::cache::Known;
 use super::change;
+use super::data::{disk_error, out_of_descriptors};
 use super::entry::{Body, Entry, Upload};
 use super::error::S3Error;
 use super::jobs::Running;
@@ -46,8 +47,8 @@ mod copy;
 /// The content type of a file that was never in the bucket.
 const NEW_FILE_TYPE: &str = "application/octet-stream";
 
-/// The least an entry rests after a job met a full disk, whatever the upload
-/// delay is.
+/// The least an entry rests after a job met a full disk or had no descriptor
+/// left, whatever the upload delay is.
 pub(super) const FULL_DISK_REST: Duration = Duration::from_secs(1);
 
 /// Why a job ended before it stored what its entry holds.
@@ -67,6 +68,9 @@ enum Halt {
     /// after it has rested for the upload delay, and at least
     /// [`FULL_DISK_REST`].
     Full,
+    /// The process has no descriptor left to open the data file with: the
+    /// entry rests as it does for [`Halt::Full`].
+    Descriptors,
     /// The object the entry starts from changed in the bucket, or is gone.
     Conflict(S3Error),
     /// The job failed for good.
@@ -180,6 +184,7 @@ impl Job<'_> {
         }
         match error {
             SmbError::DiskFull => Halt::Full,
+            SmbError::Io(ref e) if out_of_descriptors(e) => Halt::Descriptors,
             other => Halt::Failed(S3Error::cache(other)),
         }
     }
@@ -223,10 +228,19 @@ impl Job<'_> {
                     path = %self.path,
                     "the disk of the cache directory is full; the upload is tried again after the file has rested"
                 );
-                let now = Instant::now();
-                let mut state = self.entry().state();
-                state.changed = now;
-                state.rest_until = Some(now + FULL_DISK_REST);
+                self.rest();
+            }
+            Halt::Descriptors => {
+                warn!(
+                    path = %self.path,
+                    "no file descriptor is left to open the data file; the upload is tried again after the file has rested"
+                );
+                #[cfg(test)]
+                self.shared
+                    .jobs
+                    .descriptor_rests
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.rest();
             }
             Halt::Conflict(error) => self.conflict(error).await,
             Halt::Failed(error) => self.fail(error).await,
@@ -277,6 +291,14 @@ impl Job<'_> {
                 }
             }
         }
+    }
+
+    /// The entry rests before its next job.
+    fn rest(&self) {
+        let now = Instant::now();
+        let mut state = self.entry().state();
+        state.changed = now;
+        state.rest_until = Some(now + FULL_DISK_REST);
     }
 
     /// The job failed for good: the entry is marked, in its record too, and
@@ -368,7 +390,8 @@ impl Job<'_> {
         self.blocking(|shared, entry| change::seal(shared, entry, false))
             .await?;
         let filled = self.fill().await?;
-        let snapshot = self.snapshot()?;
+        let file = self.open_data().await?;
+        let snapshot = self.snapshot(file)?;
         self.check()?;
         let jobs = &self.shared.jobs;
         let part_size =
@@ -602,9 +625,25 @@ impl Job<'_> {
         Ok(Some(padded.freeze()))
     }
 
-    /// Takes stock of the file. Called once nothing is missing, which stays
-    /// so: writes and truncates only add bytes.
-    fn snapshot(&self) -> Result<Snapshot, Halt> {
+    /// Opens the data file of the entry for the requests of the job to read:
+    /// the descriptor a handle keeps, else one that is closed when the job
+    /// drops it.
+    async fn open_data(&self) -> Result<Arc<File>, Halt> {
+        let opened = self
+            .blocking(|_, entry| {
+                let _io = entry.lock_io();
+                let data = entry.state().local().map(|local| Arc::clone(&local.file));
+                data.map(|data| data.file().map_err(disk_error)).transpose()
+            })
+            .await?;
+        opened.ok_or(Halt::Gone)
+    }
+
+    /// Takes stock of the file, whose data file is open as `file`. Called once
+    /// nothing is missing, which stays so: writes and truncates only add bytes,
+    /// and nothing but the landing of this job drops or replaces the local
+    /// data.
+    fn snapshot(&self, file: Arc<File>) -> Result<Snapshot, Halt> {
         let state = self.entry().state();
         if state.detached {
             return Err(Halt::Gone);
@@ -629,7 +668,7 @@ impl Job<'_> {
         Ok(Snapshot {
             key: state.key.clone(),
             generation: state.generation,
-            file: Arc::clone(&local.file),
+            file,
             len: local.len,
             metadata,
             replaced: state.prior.clone(),

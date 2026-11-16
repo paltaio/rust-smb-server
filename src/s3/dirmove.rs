@@ -4,7 +4,6 @@
 //! the background, once records of their own have replaced the batch.
 
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
 use std::io;
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -19,7 +18,7 @@ use super::cache::Known;
 use super::cachedir::{CacheDir, new_id};
 use super::change::{persist_held, recount_source};
 use super::client::ListRequest;
-use super::data::disk_error;
+use super::data::{DataFile, disk_error};
 use super::entry::{Base, Entry, Sealed, State};
 use super::error::S3Error;
 use super::job::FULL_DISK_REST;
@@ -480,7 +479,7 @@ struct Step {
     record: EntryRecord,
     /// The data file the record claims, and whether it is the first record of
     /// the entry.
-    data: Option<(Arc<File>, bool)>,
+    data: Option<(Arc<DataFile>, bool)>,
 }
 
 /// The part of `key` below the directory `from`, if it is below it.
@@ -814,8 +813,8 @@ fn commit_dir(
         return Err(SmbError::AccessDenied);
     }
     let mut first = false;
-    for (file, is_first) in &files {
-        file.sync_all().map_err(disk_error)?;
+    for (data, is_first) in &files {
+        cache.sync_data(data).map_err(disk_error)?;
         first |= is_first;
     }
     if first {

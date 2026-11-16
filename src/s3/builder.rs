@@ -387,7 +387,7 @@ impl S3BackendBuilder {
         let entries = recovered
             .entries
             .into_iter()
-            .map(|(record, file)| Entry::recovered(record, file, &ahead))
+            .map(|(record, data)| Entry::recovered(record, data, &ahead))
             .collect();
         let restored = overlay.install(entries, recovered.tombstones);
         if restored > 0 {

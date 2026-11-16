@@ -38,12 +38,20 @@ impl S3Handle {
         }
     }
 
-    pub(super) fn entry(shared: Arc<Shared>, held: Held) -> Self {
-        held.entry.state().open += 1;
-        S3Handle {
+    /// A handle on the entry `held`. The data file of the entry, if it has
+    /// one, stays open while a handle is open on the entry, so the handle's
+    /// reads and writes do not open it each time, and reach it if an upload
+    /// takes it out of the cache directory meanwhile.
+    pub(super) async fn entry(shared: Arc<Shared>, held: Held) -> Self {
+        held.entry.state().opened();
+        let handle = S3Handle {
             shared,
             node: Node::Entry(held),
+        };
+        if let Node::Entry(held) = &handle.node {
+            change::open_data(&handle.shared, held).await;
         }
+        handle
     }
 
     /// The directory the handle is on.
@@ -154,8 +162,7 @@ impl Handle for S3Handle {
 impl Drop for S3Handle {
     fn drop(&mut self) {
         if let Node::Entry(held) = &self.node {
-            let mut state = held.entry.state();
-            state.open = state.open.saturating_sub(1);
+            held.entry.state().closed();
         }
     }
 }

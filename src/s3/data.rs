@@ -2,9 +2,84 @@
 
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::error::SmbError;
+
+/// The data file of an entry. A use opens the file by its path and lets go of
+/// the descriptor when it is done. While a handle is open on the entry, the
+/// descriptor of the first use stays open for the ones that follow: the
+/// handle's reads and writes then reach the file they were planned on even if
+/// the entry is deleted or its data file is made again meanwhile.
+pub(crate) struct DataFile {
+    path: PathBuf,
+    cache: Mutex<Cache>,
+}
+
+struct Cache {
+    /// A handle is open on the entry: a descriptor that is opened is kept in
+    /// `file`.
+    kept: bool,
+    file: Option<Arc<File>>,
+}
+
+impl DataFile {
+    /// The data file at `path`, with `file`, a descriptor open on it, if the
+    /// caller has one. That descriptor stays open until
+    /// [`release`](Self::release).
+    pub(super) fn new(path: PathBuf, file: Option<File>) -> Self {
+        DataFile {
+            path,
+            cache: Mutex::new(Cache {
+                kept: false,
+                file: file.map(Arc::new),
+            }),
+        }
+    }
+
+    fn cache(&self) -> MutexGuard<'_, Cache> {
+        self.cache.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The file, open: the descriptor kept, else one opened by the path.
+    pub(super) fn file(&self) -> io::Result<Arc<File>> {
+        if let Some(file) = &self.cache().file {
+            return Ok(Arc::clone(file));
+        }
+        let file = Arc::new(private_options().read(true).write(true).open(&self.path)?);
+        let mut cache = self.cache();
+        if cache.kept {
+            return Ok(Arc::clone(cache.file.get_or_insert(file)));
+        }
+        Ok(file)
+    }
+
+    /// Whether a descriptor is kept open.
+    pub(super) fn is_open(&self) -> bool {
+        self.cache().file.is_some()
+    }
+
+    /// Keeps open the descriptor of the next use, or the one that is open,
+    /// until [`release`](Self::release).
+    pub(super) fn keep(&self) {
+        self.cache().kept = true;
+    }
+
+    /// Lets go of the descriptor kept. A use that has it holds it until it is
+    /// done.
+    pub(super) fn release(&self) {
+        let mut cache = self.cache();
+        cache.kept = false;
+        cache.file = None;
+    }
+
+    /// A data file with no path, for tests of state that never opens it.
+    #[cfg(test)]
+    pub(super) fn absent() -> Self {
+        DataFile::new(PathBuf::new(), None)
+    }
+}
 
 /// Options for a file only the owner may read and write.
 pub(super) fn private_options() -> OpenOptions {
@@ -103,6 +178,19 @@ pub(super) fn write_all_at(file: &File, data: &[u8], offset: u64) -> io::Result<
     Ok(())
 }
 
+/// Whether `e` says the process has no descriptor left to open a file with.
+pub(super) fn out_of_descriptors(e: &io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        matches!(e.raw_os_error(), Some(libc::EMFILE | libc::ENFILE))
+    }
+    #[cfg(windows)]
+    {
+        const ERROR_TOO_MANY_OPEN_FILES: i32 = 4;
+        e.raw_os_error() == Some(ERROR_TOO_MANY_OPEN_FILES)
+    }
+}
+
 /// The error a failed disk operation fails a request with.
 pub(super) fn disk_error(e: io::Error) -> SmbError {
     match e.kind() {
@@ -138,6 +226,19 @@ mod tests {
     }
 
     #[test]
+    fn a_lack_of_descriptors_is_told_apart_from_other_failures() {
+        #[cfg(unix)]
+        let (lacking, other) = ([libc::EMFILE, libc::ENFILE], libc::ENOENT);
+        #[cfg(windows)]
+        let (lacking, other) = ([4, 4], 2);
+        for code in lacking {
+            assert!(out_of_descriptors(&io::Error::from_raw_os_error(code)));
+        }
+        assert!(!out_of_descriptors(&io::Error::from_raw_os_error(other)));
+        assert!(!out_of_descriptors(&io::Error::other("x")));
+    }
+
+    #[test]
     fn a_data_file_has_its_length_and_reads_holes_as_zeros() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("data");
@@ -157,6 +258,42 @@ mod tests {
         let mut buf = [1u8; 4];
         read_full_at(&again, &mut buf, 10).unwrap();
         assert_eq!(buf, [0; 4]);
+    }
+
+    #[test]
+    fn a_data_file_is_opened_by_its_path_and_kept_open_only_when_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data");
+        create(&path, 4).unwrap();
+        let data = DataFile::new(path, None);
+        drop(data.file().unwrap());
+        assert!(!data.is_open(), "a use that is done lets go");
+        data.keep();
+        let kept = data.file().unwrap();
+        assert!(data.is_open());
+        assert!(Arc::ptr_eq(&kept, &data.file().unwrap()));
+        data.release();
+        assert!(!data.is_open());
+        assert!(!Arc::ptr_eq(&kept, &data.file().unwrap()));
+        assert!(!data.is_open(), "released for good");
+    }
+
+    #[test]
+    fn a_kept_descriptor_reaches_a_data_file_that_is_deleted_or_made_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data");
+        write_all_at(&create(&path, 0).unwrap(), b"old", 0).unwrap();
+        let data = DataFile::new(path.clone(), None);
+        data.keep();
+        drop(data.file().unwrap());
+        std::fs::remove_file(&path).unwrap();
+        write_all_at(&create(&path, 0).unwrap(), b"new", 0).unwrap();
+        let mut buf = [0u8; 3];
+        read_full_at(&data.file().unwrap(), &mut buf, 0).unwrap();
+        assert_eq!(&buf, b"old");
+        data.release();
+        read_full_at(&data.file().unwrap(), &mut buf, 0).unwrap();
+        assert_eq!(&buf, b"new");
     }
 
     #[cfg(unix)]
