@@ -18,6 +18,8 @@ use crate::tests::s3::fixture::TestBucket;
 #[cfg(feature = "s3")]
 use crate::tests::s3::share::{worker_ended, writable_builder};
 #[cfg(feature = "s3")]
+use crate::tests::util::raise_file_limit;
+#[cfg(feature = "s3")]
 use crate::{S3Backend, S3BackendBuilder};
 
 #[cfg(feature = "s3")]
@@ -75,27 +77,6 @@ pub(super) async fn layer_exact_localfs() -> Result<Fixture, Error> {
     Ok(over(layer, dir))
 }
 
-/// Raises the soft limit on open files. A backend keeps open every file it
-/// has made until it stores the file, and a process on macOS starts with room
-/// for 256.
-#[cfg(all(feature = "s3", unix))]
-fn raise_file_limit() {
-    static RAISED: std::sync::Once = std::sync::Once::new();
-    RAISED.call_once(|| {
-        let mut limit = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        // SAFETY: `limit` is a valid rlimit for both calls to read and write.
-        unsafe {
-            if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) == 0 {
-                limit.rlim_cur = limit.rlim_cur.max(limit.rlim_max.min(8192));
-                libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
-            }
-        }
-    });
-}
-
 /// A backend of the bucket that keeps its changes in `cache`, built with the
 /// settings `configure` makes, and the signal that its worker has ended.
 #[cfg(feature = "s3")]
@@ -104,7 +85,6 @@ pub(super) async fn s3_backend(
     cache: &Path,
     configure: impl FnOnce(S3BackendBuilder) -> S3BackendBuilder,
 ) -> Result<(S3Backend, watch::Receiver<bool>), Error> {
-    #[cfg(unix)]
     raise_file_limit();
     let backend = configure(writable_builder(bucket, bucket.gateway.addr, cache))
         .build()

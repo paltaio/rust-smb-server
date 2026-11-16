@@ -1122,6 +1122,22 @@ async fn a_file_deleted_and_made_again_in_another_case_while_its_directory_is_li
 }
 
 #[tokio::test]
+async fn a_directory_with_no_marker_is_listed_once_a_file_lands_below_it_while_its_parent_is_read()
+{
+    let mut rig = Rig::writable_with(held).await;
+    let (gate, listing) = listing_in_flight(&rig, &[]).await;
+    put(rig.store(), "x/y/seed.txt", b"s").await;
+    make(&mut rig, "x\\y\\new.txt", b"n").await;
+    rig.backend.hold_uploads(false);
+    sync(&rig.backend).await.unwrap();
+    gate.notify_one();
+    let during = listing.await.unwrap();
+    let after = root_names(&rig.backend).await;
+    let want = strings(&["x"]);
+    assert_eq!([during, after], [want.clone(), want]);
+}
+
+#[tokio::test]
 async fn a_file_stored_after_a_cached_listing_was_read_is_listed() {
     let mut rig = Rig::writable_with(held).await;
     rig.backend.limit_listing_rows(100_000);
@@ -1172,6 +1188,23 @@ async fn a_file_renamed_while_the_overlay_is_read_for_its_directory_is_listed_on
 }
 
 #[tokio::test]
+async fn a_file_made_after_the_overlay_is_watched_and_before_it_is_read_is_listed() {
+    let mut rig = Rig::writable_with(held).await;
+    let (reached, resume) = rig.backend.pause_after_watch();
+    let listing = tokio::spawn({
+        let backend = rig.backend.clone();
+        async move { root_names(&backend).await }
+    });
+    reached.notified().await;
+    make(&mut rig, "n.txt", b"n").await;
+    resume.notify_one();
+    let during = listing.await.unwrap();
+    let after = root_names(&rig.backend).await;
+    let want = strings(&["n.txt"]);
+    assert_eq!([during, after], [want.clone(), want]);
+}
+
+#[tokio::test]
 async fn a_listing_of_a_directory_that_changes_during_every_read_is_read_a_few_times_and_not_kept()
 {
     let rig = Rig::writable_with(held).await;
@@ -1199,14 +1232,44 @@ async fn a_listing_that_took_over_half_the_request_timeout_is_not_read_again() {
     let mut rig =
         Rig::writable_with(|builder| held(builder).request_timeout(Duration::from_secs(8))).await;
     make(&mut rig, "a.txt", b"a").await;
+    // The rows are dropped from the cache once the read has them, so a read
+    // made again would go to the store.
+    rig.backend.change_listings(1);
     let (gate, listing) = listing_in_flight(&rig, &[]).await;
     rig.backend.hold_uploads(false);
     sync(&rig.backend).await.unwrap();
     tokio::time::sleep(Duration::from_millis(4200)).await;
     let reads = rig.proxy.count(is_root_listing);
     gate.notify_one();
-    listing.await.unwrap();
+    assert_eq!(listing.await.unwrap(), strings(&["a.txt"]));
     assert_eq!(rig.proxy.count(is_root_listing), reads);
+}
+
+#[tokio::test]
+async fn a_listing_made_again_that_stalls_gives_the_one_made_before_well_before_the_timeout() {
+    let timeout = Duration::from_secs(8);
+    let rig = Rig::writable_with(|builder| held(builder).request_timeout(timeout)).await;
+    let want = strings(&["a.txt", "b.txt", "c.txt"]);
+    for name in &want {
+        put(rig.store(), name, b"x").await;
+    }
+    rig.backend.limit_listing_rows(100_000);
+    let start = rig.proxy.count(is_root_listing);
+    rig.backend.change_listings(1);
+    let (reached, resume) = rig.backend.pause_after_rows();
+    let began = std::time::Instant::now();
+    let listing = tokio::spawn({
+        let backend = rig.backend.clone();
+        async move { root_names(&backend).await }
+    });
+    reached.notified().await;
+    rig.proxy.inject(is_root_listing, Fault::Stall, usize::MAX);
+    resume.notify_one();
+    assert_eq!(listing.await.unwrap(), want);
+    let took = began.elapsed();
+    assert!(took < timeout / 2, "the listing took {took:?}");
+    assert_eq!(rig.proxy.count(is_root_listing) - start, 2);
+    assert_eq!(rig.backend.listing_reads(), 0);
 }
 
 #[tokio::test]

@@ -397,9 +397,9 @@ impl MetaCache {
     }
 
     /// Whether the backend changed the rows of the directory of the read `id`
-    /// since it began. A read that ended counts as changed.
+    /// since it began.
     pub(super) fn read_changed(&self, id: u64) -> bool {
-        self.reads.get(&id).is_none_or(|read| read.changed)
+        self.reads.get(&id).is_some_and(|read| read.changed)
     }
 
     /// How many reads are under way.
@@ -480,10 +480,21 @@ fn folds_apart(listing: &DirListing, changed: &HashMap<String, Option<Row>>) -> 
             return true;
         }
     }
+    // The rows are checked with the cache lock held: one buffer holds each
+    // ASCII name in lowercase in turn.
+    let mut lower = String::new();
     listing.rows.iter().any(|row| {
-        folded
-            .get(&row.name.to_lowercase())
-            .is_some_and(|name| *name != row.name)
+        let owned;
+        let key = if row.name.is_ascii() {
+            lower.clear();
+            lower.push_str(&row.name);
+            lower.make_ascii_lowercase();
+            lower.as_str()
+        } else {
+            owned = row.name.to_lowercase();
+            owned.as_str()
+        };
+        folded.get(key).is_some_and(|name| *name != row.name)
     })
 }
 
@@ -1239,6 +1250,28 @@ mod tests {
             let want: &[&str] = if fold { &["File.txt"] } else { &["file.txt"] };
             assert_eq!(names_of(&listing), want, "fold {fold}");
         }
+    }
+
+    fn changed_names(names: &[&str]) -> HashMap<String, Option<Row>> {
+        names
+            .iter()
+            .map(|name| ((*name).to_owned(), Some(file_row(name))))
+            .collect()
+    }
+
+    #[test]
+    fn a_changed_name_folds_apart_from_a_row_or_a_change_of_another_case() {
+        let rows = read_of(&["Alpha.txt", "caf\u{e9}.txt", "other"]);
+        let apart = |names: &[&str]| folds_apart(&rows, &changed_names(names));
+        assert!(apart(&["ALPHA.TXT"]));
+        assert!(apart(&["alpha.txt"]));
+        assert!(apart(&["CAF\u{c9}.TXT"]));
+        assert!(apart(&["new", "NEW"]));
+        assert!(apart(&["\u{c9}", "\u{e9}"]));
+        assert!(!apart(&["Alpha.txt"]));
+        assert!(!apart(&["caf\u{e9}.txt", "new"]));
+        assert!(!apart(&["alpha.txt.bak", "Other2"]));
+        assert!(!apart(&[]));
     }
 
     #[test]

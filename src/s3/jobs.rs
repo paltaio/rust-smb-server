@@ -134,6 +134,11 @@ pub(super) struct Jobs {
     /// store, before it reads the overlay.
     #[cfg(test)]
     pub(super) pause_rows: std::sync::Mutex<Option<Gates>>,
+    /// Makes the next listing of a directory wait once it has begun to note the
+    /// changes to the overlay, before it reads the entries of the overlay below
+    /// the directory.
+    #[cfg(test)]
+    pub(super) pause_watch: std::sync::Mutex<Option<Gates>>,
     /// Makes the next listing of a directory wait once it has the entries of
     /// the overlay below it, before it checks which rows the overlay hides.
     #[cfg(test)]
@@ -192,6 +197,8 @@ impl Jobs {
             pause_listed: std::sync::Mutex::new(None),
             #[cfg(test)]
             pause_rows: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            pause_watch: std::sync::Mutex::new(None),
             #[cfg(test)]
             pause_below: std::sync::Mutex::new(None),
             #[cfg(test)]

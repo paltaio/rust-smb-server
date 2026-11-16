@@ -34,6 +34,10 @@ struct Fetch {
 /// changes while it is.
 pub(super) const LIST_ATTEMPTS: usize = 4;
 
+/// A read made again is given up on after as long as the read before it took,
+/// or the request timeout divided by this, whichever is more.
+const RETRY_SHARE: u32 = 4;
+
 /// The entries of `dir` that match `pattern`: those of its listing in the
 /// bucket, less the keys to delete, and the overlay's entries in their place.
 pub(super) async fn list_entries(
@@ -56,12 +60,15 @@ pub(super) async fn list_entries(
     // overlay lets go of the entry or key to delete that covered it, so a read
     // that met no change has every name in one of the two. The cache takes in
     // the changes made to the rows while they are read, so a read made again
-    // is served by it. When a read made again fails, the one before it stands.
+    // is served by it. When a read made again fails or runs past its limit,
+    // the one before it stands.
     let mut attempt = 1;
     let mut earlier = None;
+    let mut limit = deadline;
     let (listing, below, direct, hidden) = loop {
         let started = Instant::now();
-        let listed = match shared.listed(&dir.key, &retry).await {
+        let read_retry = Retry::Foreground { deadline: limit };
+        let listed = match shared.listed(&dir.key, &read_retry).await {
             Ok(listed) => listed,
             Err(e) => match earlier.take() {
                 Some(read) => {
@@ -76,7 +83,11 @@ pub(super) async fn list_entries(
             change_rows(shared, &dir.key);
             super::jobs::pause(&shared.jobs.pause_rows).await;
         }
+        // The watch comes first: a change made after it is noted, and one made
+        // before it is in what the overlay holds.
         let watch = shared.overlay.watch(&dir.key);
+        #[cfg(test)]
+        super::jobs::pause(&shared.jobs.pause_watch).await;
         let below = shared.overlay.below(&dir.key);
         #[cfg(test)]
         super::jobs::pause(&shared.jobs.pause_below).await;
@@ -91,9 +102,13 @@ pub(super) async fn list_entries(
             .collect();
         let again = listed.changed() || watch.changed();
         let read = (Arc::clone(&listed.rows), below, direct, hidden);
-        if !again || attempt == LIST_ATTEMPTS || !fits_before(deadline, started.elapsed()) {
+        if !again || attempt == LIST_ATTEMPTS {
             break read;
         }
+        let Some(next) = retry_limit(deadline, shared.request_timeout, started.elapsed()) else {
+            break read;
+        };
+        limit = next;
         earlier = Some(read);
         attempt += 1;
     };
@@ -142,11 +157,18 @@ pub(super) async fn list_entries(
     Ok(entries)
 }
 
-/// Whether a read that took `spent` can be made again before `deadline`.
-fn fits_before(deadline: Instant, spent: Duration) -> bool {
-    Instant::now()
-        .checked_add(spent)
-        .is_some_and(|end| end < deadline)
+/// When a read made again is given up on, or `None` if it is not to be made:
+/// one as long as the read that took `spent` would not end before `deadline`.
+/// The read may take as long as that one, or a share of `timeout` if that is
+/// more, and ends at `deadline` at the latest.
+fn retry_limit(deadline: Instant, timeout: Duration, spent: Duration) -> Option<Instant> {
+    let now = Instant::now();
+    now.checked_add(spent).filter(|end| *end < deadline)?;
+    let allowed = spent.max(timeout / RETRY_SHARE);
+    Some(
+        now.checked_add(allowed)
+            .map_or(deadline, |end| end.min(deadline)),
+    )
 }
 
 /// Changes the rows of `dir` if a test asked for it.
@@ -296,10 +318,39 @@ mod tests {
 
     #[test]
     fn a_read_is_made_again_only_if_it_fits_before_the_deadline() {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        assert!(fits_before(deadline, Duration::from_secs(1)));
-        assert!(!fits_before(deadline, Duration::from_secs(31)));
-        assert!(!fits_before(Instant::now(), Duration::ZERO));
-        assert!(!fits_before(deadline, Duration::MAX));
+        let timeout = Duration::from_secs(40);
+        let deadline = Instant::now() + timeout;
+        assert!(retry_limit(deadline, timeout, Duration::from_secs(1)).is_some());
+        assert!(retry_limit(deadline, timeout, Duration::from_secs(41)).is_none());
+        assert!(retry_limit(Instant::now(), timeout, Duration::ZERO).is_none());
+        assert!(retry_limit(deadline, timeout, Duration::MAX).is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_read_made_again_may_take_as_long_as_the_one_before_or_a_share_of_the_timeout() {
+        let timeout = Duration::from_secs(40);
+        let now = Instant::now();
+        let deadline = now + timeout;
+        let share = timeout / RETRY_SHARE;
+        assert_eq!(
+            retry_limit(deadline, timeout, Duration::ZERO),
+            Some(now + share)
+        );
+        assert_eq!(retry_limit(deadline, timeout, share / 2), Some(now + share));
+        let long = Duration::from_secs(25);
+        assert_eq!(retry_limit(deadline, timeout, long), Some(now + long));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_read_made_again_ends_by_the_deadline() {
+        let timeout = Duration::from_secs(40);
+        let now = Instant::now();
+        let soon = now + Duration::from_secs(5);
+        assert_eq!(retry_limit(soon, timeout, Duration::ZERO), Some(soon));
+        let deadline = now + timeout;
+        assert_eq!(
+            retry_limit(deadline, Duration::MAX, Duration::ZERO),
+            Some(deadline)
+        );
     }
 }

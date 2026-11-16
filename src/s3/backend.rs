@@ -480,6 +480,13 @@ impl S3Backend {
         gates(&self.shared.jobs.pause_rows)
     }
 
+    /// Makes the next listing of a directory wait once it has begun to note
+    /// the changes to the overlay and before it reads the entries of the
+    /// overlay, as [`pause_after_hash`](Self::pause_after_hash) does.
+    pub(crate) fn pause_after_watch(&self) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        gates(&self.shared.jobs.pause_watch)
+    }
+
     /// Makes the next listing of a directory wait once it has the entries of
     /// the overlay below it, as [`pause_after_hash`](Self::pause_after_hash)
     /// does.
