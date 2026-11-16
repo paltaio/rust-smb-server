@@ -252,7 +252,6 @@ fn prefers(new: &str, held: &str, canonical: Option<&str>) -> bool {
 struct NamesWatch<B> {
     inner: Box<dyn DirWatch>,
     shared: Arc<Shared<B>>,
-    /// The watched directory is the share root.
     in_root: bool,
 }
 

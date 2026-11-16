@@ -83,7 +83,7 @@ impl<B> Shared<B> {
     }
 }
 
-/// What the caller of a build holds.
+/// What the caller of a listing holds.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Hold {
     /// The lock of the directory, or the tree lock exclusively. Nothing

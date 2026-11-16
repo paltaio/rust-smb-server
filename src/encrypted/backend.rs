@@ -47,7 +47,8 @@ const MAX_CLIENT_NAME_LEN: u32 = 255;
 /// STATUS_UNEXPECTED_IO_ERROR. A crash can leave the block being written
 /// unreadable.
 ///
-/// Over an `S3Backend`, build that backend with `case_insensitive(false)`.
+/// With encrypted names over an `S3Backend`, build that backend with
+/// `case_insensitive(false)`.
 ///
 /// The backend reports no named streams and no extended attributes, and
 /// answers [`copy_range`](ShareBackend::copy_range) and
@@ -100,7 +101,6 @@ impl<B: ShareBackend> Shared<B> {
     }
 }
 
-/// The settings in force.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Settings {
     pub(super) encrypt_names: bool,

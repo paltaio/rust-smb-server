@@ -53,7 +53,6 @@ impl<B: ShareBackend> EncryptedHandle<B> {
         &self.node
     }
 
-    /// The handle is on the share root.
     pub(super) fn on_root(&self) -> bool {
         self.node.path().is_root()
     }

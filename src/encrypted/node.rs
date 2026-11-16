@@ -62,7 +62,7 @@ pub(super) fn is_at_or_below(key: &str, dir: &str) -> bool {
             .is_some_and(|rest| rest.is_empty() || rest.starts_with('\\'))
 }
 
-/// What the layer knows of the header of a stored file.
+/// What the backend knows of the header of a stored file.
 pub(super) enum HeaderState {
     /// The file may have a header that is not read yet.
     Unknown,
@@ -107,7 +107,7 @@ pub(super) struct Node {
     table: Arc<NodeTable>,
     /// The inner file id, 0 when the inner backend reports none.
     file_index: u64,
-    /// The stored path as of the last rename through the layer.
+    /// The stored path as of the last rename through the backend.
     path: Mutex<SmbPath>,
     /// Path keys are folded unless names compare exactly.
     names: NameMatch,

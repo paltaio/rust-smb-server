@@ -167,8 +167,8 @@ pub(super) fn many_names(count: usize) -> Arc<Snapshot> {
     Arc::new(Snapshot::new(entries, Instant::now()))
 }
 
-/// `layer` with a directory name cache that holds at most `limit` names. No
-/// clone of `layer` may exist.
+/// `layer` with a directory name cache that holds up to `limit` names in all.
+/// One directory over the limit is kept alone. No clone of `layer` may exist.
 pub(super) fn with_name_limit<B>(
     mut layer: EncryptedBackend<B>,
     limit: usize,

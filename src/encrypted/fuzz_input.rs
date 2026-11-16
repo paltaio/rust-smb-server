@@ -351,8 +351,8 @@ fn sizes(payload: &[u8]) -> bool {
 
 /// A shift byte, a file id, a block index as a big-endian `u64` and stored
 /// bytes. The stored bytes are opened as the block. Their first 12 bytes also
-/// serve as a nonce and the bytes after them, up to one block, as a plaintext
-/// to seal and open again.
+/// serve as a nonce and the bytes after them, up to one block and `PAST` bytes
+/// more, as a plaintext to seal and open again.
 fn block(payload: &[u8]) -> bool {
     const HEAD: usize = 1 + FILE_ID_LEN + 8;
     let Some((head, stored)) = payload.split_at_checked(HEAD) else {
@@ -406,8 +406,8 @@ fn open_checked(cipher: &FileCipher, shift: BlockShift, index: u64, stored: &[u8
 
 /// Seals the bytes of `stored` after its nonce under that nonce, opens the
 /// result, and opens it with a bit altered, at another index and under another
-/// file id. `salt` picks the bit. One byte past a block is sealed too, to see
-/// it refused.
+/// file id. `salt` picks the bit. The plaintext runs up to one block and
+/// `PAST` bytes more; one that passes the block is refused.
 fn seal_checked(
     cipher: &FileCipher,
     shift: BlockShift,

@@ -19,7 +19,6 @@ pub(super) async fn close_after_reading(handle: Box<dyn Handle>) {
     let _ = handle.close().await;
 }
 
-/// The error says the entry is not there.
 pub(super) fn is_missing(error: &SmbError) -> bool {
     matches!(
         error,

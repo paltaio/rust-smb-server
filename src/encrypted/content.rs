@@ -68,7 +68,6 @@ impl<B: ShareBackend> EncryptedHandle<B> {
         }
     }
 
-    /// The size of the stored file.
     pub(super) async fn stored_size(&self) -> SmbResult<u64> {
         Ok(self.inner.stat().await?.end_of_file)
     }
@@ -95,9 +94,9 @@ impl<B: ShareBackend> EncryptedHandle<B> {
     }
 
     /// Reads the header of the stored file, which has `stored` bytes, into
-    /// `meta`. A file of no more than a header has none. A header that
-    /// cannot be read or is not valid leaves the state unknown and fails with
-    /// `Io`.
+    /// `meta`. A file of no more than a header has none. A header that is not
+    /// valid fails with `Io`, and an error of the inner read is returned as it
+    /// is. Either leaves the state unknown.
     pub(super) async fn load_header(&self, meta: &mut FileMeta, stored: u64) -> SmbResult<()> {
         if stored <= HEADER_LEN as u64 {
             meta.header = HeaderState::Absent;

@@ -147,8 +147,8 @@ impl<B: ShareBackend> EncryptedHandle<B> {
 
     /// Applies `change` to the file under its exclusive lock. A block that
     /// does not open makes the header reload, once. The change runs again if
-    /// the stored file has a different file id, and fails with the block
-    /// error otherwise.
+    /// the stored file has a different file id, or none, and fails with the
+    /// block error otherwise. An error of the reload is returned instead.
     pub(super) async fn change_file(
         &self,
         file: &RwLock<FileMeta>,

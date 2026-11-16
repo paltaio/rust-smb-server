@@ -1,4 +1,6 @@
 //! Backend that stores file contents and names encrypted under a caller key.
+//!
+//! In this module, the layer is `EncryptedBackend` over its inner backend.
 
 mod backend;
 mod base32;

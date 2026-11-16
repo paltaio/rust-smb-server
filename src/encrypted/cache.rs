@@ -10,7 +10,9 @@ use super::locks::{DirLock, lock};
 use super::lru::Lru;
 use super::node::is_at_or_below;
 
-/// Most names the directory caches hold, counted across directories.
+/// Weight limit of the directory name cache, in names counted across
+/// directories, an empty directory counting as one. A directory with more
+/// names than this is kept alone.
 pub(super) const MAX_CACHED_NAMES: usize = 100_000;
 
 /// Most long entries the long-name cache holds.
@@ -127,7 +129,8 @@ pub(super) struct NameCache {
 }
 
 impl NameCache {
-    /// A cache that keeps a snapshot for `ttl` and at most `limit` names.
+    /// A cache that keeps a snapshot for `ttl`, up to `limit` names in all.
+    /// One directory over the limit is kept alone.
     pub(super) fn new(ttl: Duration, limit: usize) -> Self {
         Self {
             ttl,
@@ -197,7 +200,6 @@ impl NameCache {
         });
     }
 
-    /// Drops the snapshot of the directory `key`.
     pub(super) fn forget(&self, key: &str) {
         lock(&self.directories).remove(key);
     }

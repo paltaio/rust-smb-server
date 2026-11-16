@@ -43,7 +43,7 @@ Where encryption is required, these clients are refused:
 
 ## Storage encryption
 
-`encrypt_data` encrypts the SMB 3.x traffic between client and server. `EncryptedBackend` encrypts the file contents, and by default names, in the backend's storage. A share can use both. See [encrypted storage](encrypted-storage.md).
+`encrypt_data` encrypts the SMB 3.x traffic between client and server. `EncryptedBackend` stores the file contents, and by default names, encrypted in its inner backend. A share can use both. See [encrypted storage](encrypted-storage.md).
 
 ## Logon throttle
 

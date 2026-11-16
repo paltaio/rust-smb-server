@@ -38,15 +38,15 @@ let vault = EncryptedBackend::builder(s3.clone(), key).build().await?;
 let share = Share::new("vault", vault).user("alice", Access::ReadWrite);
 ```
 
-Build the inner `S3Backend` with `case_insensitive(false)`. With the default `true`, a lookup of a key the bucket does not hold also lists the directory. The cache directory records the case setting, and `build` refuses one made with the other value. Call `s3.sync()` after `serve` returns, as in [backends](backends.md#uploads-and-shutdown).
+With encrypted names, build the inner `S3Backend` with `case_insensitive(false)`. With the default `true`, a lookup of a key the bucket does not hold also lists the directory. The cache directory records the case setting, and `build` refuses one made with the other value. Call `s3.sync()` after `serve` returns, as in [backends](backends.md#uploads-and-shutdown).
 
 ## What is protected
 
-Contents are encrypted in blocks with AES-256-GCM, each file under a key of its own. Names are encrypted with AES-SIV unless `encrypt_names(false)` is set.
+Contents are encrypted in blocks with AES-256-GCM, each file under a key of its own. Each file that holds data starts with a header carrying a random file id, from which the file's key derives. Names are encrypted with AES-SIV unless `encrypt_names(false)` is set.
 
-Someone who reads the inner storage still learns:
+Someone who reads the inner backend's storage still learns:
 
-- the exact size of every file, and where it has holes
+- the exact size of every file, and where it has holes (blocks never written)
 - the number of files and directories, and the shape of the tree
 - times, attributes and POSIX modes
 - the length of every name, and which names are equal in different directories
@@ -71,7 +71,7 @@ A changed byte inside a block, a block moved to another position or to a file wi
 
 ## Marker
 
-The root of the inner backend holds `.smb-encryption`, 60 bytes: the format version, the settings fixed at creation, a random share id and an HMAC-SHA-256 of them under a key derived from the share key. Clients cannot list or open it.
+The root of the inner backend holds `.smb-encryption`, 60 bytes: the format version, the settings fixed at creation, a random 16-byte share id and an HMAC-SHA-256 of them under a key derived from the share key. Clients cannot list or open it.
 
 `build` writes it into an empty root, unless the inner backend is read-only, and reads it from any other root. It fails when:
 

@@ -67,7 +67,6 @@ impl Requested {
     }
 }
 
-/// The path of the marker.
 fn marker_path() -> SmbPath {
     MARKER_NAME
         .parse()

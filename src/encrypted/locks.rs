@@ -47,8 +47,8 @@ struct DirTable {
 ///
 /// It also counts the changes made to the names of the directory. The count
 /// lives as long as the entry does, and the entry lives as long as someone
-/// holds the `Arc` the table gave out. A build of the directory's names that
-/// holds the `Arc` while it lists sees every change that lands meanwhile, and
+/// holds the `Arc` the table gave out. A listing of the directory's names that
+/// holds the `Arc` while it runs sees every change that lands meanwhile, and
 /// the count does not start over under it.
 pub(super) struct DirLock {
     key: String,
@@ -126,12 +126,10 @@ impl DirLock {
         }
     }
 
-    /// The number of changes counted.
     pub(super) fn changes(&self) -> u64 {
         self.changes.load(Ordering::Acquire)
     }
 
-    /// Counts a change to the names of the directory.
     pub(super) fn count_change(&self) {
         self.changes.fetch_add(1, Ordering::AcqRel);
     }
