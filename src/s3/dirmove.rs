@@ -266,11 +266,13 @@ impl Shared {
     /// changes the case of the name only skips the lookup of the new name,
     /// which the store would answer with the directory itself, and lists the
     /// parent instead. The listing starts once the requests in flight that
-    /// delete keys below the directory have ended. The entries and the batch
+    /// delete keys below the directory have ended. Each listed key that a key
+    /// to delete spells in another case is compared with it, and does not move
+    /// if the store holds one object under both. The entries and the batch
     /// record are then made in one step, and the call answers. The objects
     /// follow in the background. The work runs as a task of its own, so a
-    /// request that is dropped does not leave it half done. The lookups and
-    /// listings share the deadline `retry` has.
+    /// request that is dropped does not leave it half done. The lookups,
+    /// comparisons and listings share the deadline `retry` has.
     ///
     /// # Errors
     ///
@@ -305,15 +307,21 @@ impl Shared {
         let mut subtree = self.overlay.hold_below(&from)?;
         self.await_deletes(&subtree, retry).await?;
         for _ in 0..ATTEMPTS {
-            let listed = self.list_below(&from, retry).await?;
+            let objects = self.list_below(&from, retry).await?;
+            let same = self.compare_spellings(&objects, retry).await?;
             #[cfg(test)]
             super::jobs::pause(&self.jobs.pause_listed).await;
             subtree.freeze(to, self.max_dir_rename_objects)?;
-            let heads = self.cached_heads(&listed);
+            let heads = self.cached_heads(&objects);
+            let listed = Listed {
+                objects,
+                heads,
+                same,
+            };
             let (shared, held, entries) = (Arc::clone(self), source.another(), subtree.entries());
             let (name, target) = (from.clone(), to.to_owned());
             let moved = spawn_blocking(move || {
-                commit_dir(&shared, &held, &entries, &name, &target, &listed, &heads)
+                commit_dir(&shared, &held, &entries, &name, &target, &listed)
             })
             .await
             .map_err(|e| SmbError::Io(io::Error::other(e)))??;
@@ -418,11 +426,46 @@ impl Shared {
             }
         }
     }
+
+    /// The keys of `listed` that are the object of a key to delete that spells
+    /// them in another case. A store that ignores case holds one object under
+    /// both spellings, and a store that keeps case holds two. A key to delete
+    /// that the store is known to hold apart is not looked up.
+    async fn compare_spellings(
+        &self,
+        listed: &[ListedObject],
+        retry: &Retry,
+    ) -> SmbResult<HashSet<String>> {
+        let mut same = HashSet::new();
+        for object in listed {
+            for variant in self.overlay.other_spellings(&object.key) {
+                let found = self
+                    .one_object(&variant, &object.key, retry)
+                    .await
+                    .map_err(S3Error::into_smb_error)?;
+                if found.is_some() {
+                    same.insert(object.key.clone());
+                    break;
+                }
+            }
+        }
+        Ok(same)
+    }
 }
 
 /// How many times a rename lists the directory before it fails with `Sharing`,
 /// when each move finds the entries below it not as the listing left them.
 const ATTEMPTS: usize = 3;
+
+/// The objects listed below a directory that is being moved.
+struct Listed {
+    objects: Vec<ListedObject>,
+    /// What the metadata cache holds of each object, by position.
+    heads: Vec<Option<Arc<ObjectHead>>>,
+    /// The keys among `objects` that are the object of a key to delete that
+    /// spells them in another case.
+    same: HashSet<String>,
+}
 
 /// What a move made: the batch record that holds the entries until they have
 /// records of their own.
@@ -603,8 +646,7 @@ fn steps_for(
     from: &str,
     to: &str,
     existing: &[Arc<Entry>],
-    listed: &[ListedObject],
-    heads: &[Option<Arc<ObjectHead>>],
+    listed: &Listed,
 ) -> SmbResult<Option<Vec<Step>>> {
     let fold = shared.case_insensitive;
     let held_keys: HashMap<Slot, String> = existing
@@ -625,11 +667,16 @@ fn steps_for(
         .collect();
     let mut deleted: Vec<&str> = Vec::new();
     let mut objects: Vec<(&ListedObject, Option<Arc<ObjectHead>>)> = Vec::new();
-    for (object, head) in listed.iter().zip(heads) {
+    for (object, head) in listed.objects.iter().zip(&listed.heads) {
         let Some(rest) = below(&object.key, from) else {
             continue;
         };
-        if shared.overlay.to_delete(&object.key) {
+        // Keys to delete do not move, and neither does a listed key that is
+        // the object of a key to delete in another case, which a store that
+        // ignores case lists under its own spelling. Only the keys that
+        // `compare_spellings` found count; a key to delete made since matches
+        // its exact spelling only.
+        if shared.overlay.to_delete(&object.key) || listed.same.contains(&object.key) {
             deleted.push(&object.key);
             continue;
         }
@@ -719,8 +766,7 @@ fn commit_dir(
     held_entries: &[Arc<Entry>],
     from: &str,
     to: &str,
-    listed: &[ListedObject],
-    heads: &[Option<Arc<ObjectHead>>],
+    listed: &Listed,
 ) -> SmbResult<Option<Committed>> {
     let cache = shared.local()?;
     let root = &held.entry;
@@ -748,7 +794,7 @@ fn commit_dir(
     #[cfg(test)]
     super::jobs::pause_blocking(&shared.jobs.pause_reserved);
 
-    let Some(steps) = steps_for(shared, root, from, to, &existing, listed, heads)? else {
+    let Some(steps) = steps_for(shared, root, from, to, &existing, listed)? else {
         return Ok(None);
     };
     let mut records = Vec::with_capacity(steps.len());

@@ -171,6 +171,22 @@ impl Index {
             .is_some_and(|keys| keys.iter().any(|held| held == key))
     }
 
+    /// The keys to delete that differ from `key` in case only and that the
+    /// store is not known to hold as other objects than `key`. None while
+    /// `key` is to be deleted itself.
+    fn other_spellings(&self, key: &str) -> Vec<String> {
+        if self.hides_exact(key) {
+            return Vec::new();
+        }
+        self.hidden
+            .get(&self.slot(key))
+            .into_iter()
+            .flatten()
+            .filter(|held| !self.apart.contains(*held))
+            .cloned()
+            .collect()
+    }
+
     /// Whether an entry is at the directory `key` or below it. A file at the
     /// name is not at the directory.
     fn has_entry_at_or_below(&self, key: &str) -> bool {
@@ -1476,6 +1492,13 @@ impl Overlay {
         self.lock().hides_exact(key)
     }
 
+    /// The keys to delete that differ from `key` in case only and that the
+    /// store is not known to hold as other objects than `key`. None while
+    /// `key` is to be deleted itself.
+    pub(super) fn other_spellings(&self, key: &str) -> Vec<String> {
+        self.lock().other_spellings(key)
+    }
+
     /// Whether the directory `key` is gone: its marker key is to be deleted,
     /// and no entry is at the directory or below it.
     pub(super) fn dir_dead(&self, key: &str) -> bool {
@@ -2458,6 +2481,29 @@ mod tests {
         assert!(overlay.dir_dead("F"));
         assert!(!overlay.dir_dead("f"));
         assert!(overlay.tombstoned("g/"), "G/ is not kept apart");
+    }
+
+    #[test]
+    fn the_other_spellings_of_a_key_are_the_keys_to_delete_the_store_may_hold_as_it() {
+        let spellings = |overlay: &Overlay, key: &str| {
+            let mut found = overlay.other_spellings(key);
+            found.sort();
+            found
+        };
+        let overlay = test_overlay(true);
+        overlay.install(Vec::new(), vec![tombstone(&["Doc", "DOC", "x/F/", "y"])]);
+        assert_eq!(spellings(&overlay, "doc"), ["DOC", "Doc"]);
+        assert_eq!(spellings(&overlay, "x/f/"), ["x/F/"]);
+        assert!(spellings(&overlay, "Doc").is_empty(), "it is to be deleted");
+        assert!(spellings(&overlay, "y").is_empty());
+        assert!(spellings(&overlay, "other").is_empty());
+
+        overlay.keep_apart("DOC");
+        assert_eq!(spellings(&overlay, "doc"), ["Doc"]);
+
+        let exact = test_overlay(false);
+        exact.install(Vec::new(), vec![tombstone(&["Doc"])]);
+        assert!(spellings(&exact, "doc").is_empty());
     }
 
     #[test]

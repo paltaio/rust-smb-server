@@ -586,13 +586,15 @@ async fn root_folded(rig: &Rig) -> Vec<(String, bool, u64)> {
         .collect()
 }
 
-/// [`keys`] in lower case.
+/// [`keys`] in lower case, in order.
 async fn keys_folded(rig: &Rig) -> Vec<String> {
-    keys(rig)
+    let mut folded: Vec<String> = keys(rig)
         .await
         .into_iter()
         .map(|key| key.to_lowercase())
-        .collect()
+        .collect();
+    folded.sort();
+    folded
 }
 
 #[tokio::test]
@@ -731,6 +733,38 @@ async fn a_file_stored_where_one_was_deleted_in_another_case_is_listed_before_th
         assert_eq!(keys(&rig).await, ["doc"]);
     }
     assert!(rig.backend.failures().is_empty());
+}
+
+#[tokio::test]
+async fn a_renamed_directory_leaves_behind_a_directory_deleted_below_it_in_another_case() {
+    let mut rig = Rig::writable_with(held).await;
+    let folds = folds(&rig).await;
+    for dir in ["A", "A\\e", "A\\E\\d", "A\\E\\d\\b"] {
+        make_dir(&rig, dir).await;
+    }
+    rig.backend.hold_uploads(false);
+    sync(&rig.backend).await.unwrap();
+    rig.backend.hold_uploads(true);
+    rig.backend.hold_sweeps(true);
+    rig.backend.unlink(&path("A\\E\\D\\b")).await.unwrap();
+    rig.backend
+        .rename(&path("A"), &path("a"), false)
+        .await
+        .unwrap();
+
+    assert_eq!(listed(&mut rig, "").await, ["a"]);
+    assert_eq!(listed(&mut rig, "a\\e").await, ["d"]);
+    assert!(listed(&mut rig, "a\\e\\d").await.is_empty());
+    rig.backend.hold_sweeps(false);
+    rig.backend.hold_uploads(false);
+    sync(&rig.backend).await.unwrap();
+
+    assert_eq!(keys_folded(&rig).await, ["a/", "a/e/", "a/e/d/"]);
+    if !folds {
+        assert_eq!(keys(&rig).await, ["a/", "a/e/", "a/e/d/"]);
+    }
+    assert!(rig.backend.failures().is_empty());
+    assert!(all_records(&rig).is_empty());
 }
 
 // Renaming directories.
@@ -1998,6 +2032,32 @@ async fn a_file_that_lands_while_its_directory_is_listed_moves_with_it() {
 }
 
 #[tokio::test]
+async fn a_key_deleted_after_the_listing_does_not_take_the_object_of_another_spelling() {
+    let mut rig = Rig::writable_with(held).await;
+    if folds(&rig).await {
+        return;
+    }
+    put(rig.store(), "d/A.txt", b"upper").await;
+    put(rig.store(), "d/a.txt", b"lower").await;
+    let (listed_all, resume) = rig.backend.pause_after_listing();
+    let renaming = tokio::spawn({
+        let backend = rig.backend.clone();
+        async move { backend.rename(&path("d"), &path("e"), false).await }
+    });
+    listed_all.notified().await;
+    rig.backend.unlink(&path("d\\A.txt")).await.unwrap();
+    resume.notify_one();
+    renaming.await.unwrap().unwrap();
+
+    assert_eq!(listed(&mut rig, "e").await, ["a.txt"]);
+    rig.backend.hold_uploads(false);
+    sync(&rig.backend).await.unwrap();
+    assert_eq!(keys(&rig).await, ["e/", "e/a.txt"]);
+    assert_eq!(remote(&rig, "e/a.txt").await.unwrap(), b"lower");
+    assert!(rig.backend.failures().is_empty());
+}
+
+#[tokio::test]
 async fn a_file_created_in_a_directory_that_was_renamed_meanwhile_is_not_made() {
     let rig = Rig::writable_with(held).await;
     put(rig.store(), "d/f.txt", b"f").await;
@@ -2715,6 +2775,27 @@ async fn a_key_is_to_be_deleted_only_when_its_exact_spelling_is() {
     sync(&rig.backend).await.unwrap();
     assert_eq!(keys(&rig).await, ["e/", "e/a.txt"]);
     assert_eq!(remote(&rig, "e/a.txt").await.unwrap(), b"lower");
+}
+
+#[tokio::test]
+async fn a_key_to_delete_is_not_the_object_of_another_spelling_that_has_the_same_content() {
+    let mut rig = Rig::writable_with(held).await;
+    if folds(&rig).await {
+        return;
+    }
+    put(rig.store(), "d/A.txt", b"same").await;
+    put(rig.store(), "d/a.txt", b"same").await;
+    rig.backend.unlink(&path("d\\A.txt")).await.unwrap();
+    rig.backend
+        .rename(&path("d"), &path("e"), false)
+        .await
+        .unwrap();
+    assert_eq!(listed(&mut rig, "e").await, ["a.txt"]);
+    rig.backend.hold_uploads(false);
+    sync(&rig.backend).await.unwrap();
+    assert_eq!(keys(&rig).await, ["e/", "e/a.txt"]);
+    assert_eq!(remote(&rig, "e/a.txt").await.unwrap(), b"same");
+    assert!(rig.backend.failures().is_empty());
 }
 
 #[tokio::test]

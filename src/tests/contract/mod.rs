@@ -98,12 +98,6 @@ const EXCLUDED: &[(&str, &[&str])] = &[
     // MemFs and S3Backend report file_index 0.
     ("file_index_is_stable", OVER_MEMFS),
     ("file_index_is_stable", OVER_S3),
-    // The test gateways on macOS and Windows fold case. A directory rename on
-    // such a store brings back a deleted directory below it: the store lists
-    // the keys below the renamed directory in the spelling it keeps, so the
-    // deleted directory, spelled otherwise, is not known as deleted.
-    #[cfg(any(target_os = "macos", windows))]
-    ("namespace_changes_match_a_model", &["s3"]),
     // MemFs unlinks a directory that has entries.
     ("unlink_refuses_a_directory_with_entries", OVER_MEMFS),
     // MemFs renames into a directory that does not exist.

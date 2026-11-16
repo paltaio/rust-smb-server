@@ -173,7 +173,9 @@ use super::retry::Retry;
 /// name that differs in case only from an object it is to delete, the backend
 /// asks the store for both names: if they have the same size, ETag and
 /// modification time and are not both listed, they are one object, and it is
-/// not deleted. With
+/// not deleted. A rename of a directory asks the same for each object below it
+/// that differs in case only from an object to delete, and does not move the
+/// object if the two are one. With
 /// [`case_insensitive(false)`](crate::S3BackendBuilder::case_insensitive) the
 /// store has to keep case.
 ///
