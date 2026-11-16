@@ -84,7 +84,7 @@ impl Job<'_> {
             return Ok(None);
         }
         self.shared
-            .one_object(&job.from, &job.key, self.stop())
+            .one_object(&job.from, &job.key, &self.retry())
             .await
             .map_err(|e| self.halt(e))
     }

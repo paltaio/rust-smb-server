@@ -574,6 +574,165 @@ async fn a_file_made_through_the_share_where_a_directory_was_deleted_is_listed_a
     }
 }
 
+// Names made in another case than one that was deleted.
+
+/// [`root_entries`] with the names in lower case, for a store that keeps the
+/// spelling of the first name it was given.
+async fn root_folded(rig: &Rig) -> Vec<(String, bool, u64)> {
+    root_entries(rig)
+        .await
+        .into_iter()
+        .map(|(name, is_dir, size)| (name.to_lowercase(), is_dir, size))
+        .collect()
+}
+
+/// [`keys`] in lower case.
+async fn keys_folded(rig: &Rig) -> Vec<String> {
+    keys(rig)
+        .await
+        .into_iter()
+        .map(|key| key.to_lowercase())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_directory_made_where_one_was_deleted_in_another_case_is_listed() {
+    let rig = Rig::writable_with(held).await;
+    let folds = folds(&rig).await;
+    make_dir(&rig, "F").await;
+    rig.backend.unlink(&path("F")).await.unwrap();
+    make_dir(&rig, "f").await;
+
+    assert_eq!(rig.backend.overlay_len(), 0);
+    assert_eq!(root_folded(&rig).await, [("f".to_owned(), true, 0)]);
+    if !folds {
+        assert_eq!(root_entries(&rig).await, [("f".to_owned(), true, 0)]);
+    }
+    let (dir, _) = rig
+        .backend
+        .open(&path("f"), OpenOptions::default())
+        .await
+        .unwrap();
+    assert!(dir.stat().await.unwrap().is_directory);
+    dir.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_directory_made_in_another_case_than_one_deleted_stays_when_the_delete_runs() {
+    let mut rig = Rig::writable_with(held).await;
+    let folds = folds(&rig).await;
+    make_dir(&rig, "F").await;
+    rig.backend.unlink(&path("F")).await.unwrap();
+    make_dir(&rig, "f").await;
+    rig.backend.hold_uploads(false);
+    sync(&rig.backend).await.unwrap();
+
+    assert_eq!(keys_folded(&rig).await, ["f/"]);
+    if !folds {
+        assert_eq!(keys(&rig).await, ["f/"]);
+    }
+    assert_eq!(root_folded(&rig).await, [("f".to_owned(), true, 0)]);
+    assert!(rig.smb.open_dir("f").await.is_ok());
+    assert!(rig.backend.failures().is_empty());
+    assert!(all_records(&rig).is_empty());
+}
+
+#[tokio::test]
+async fn a_directory_made_in_another_case_while_the_delete_runs_is_made_after_it() {
+    let mut rig = Rig::writable_with(held).await;
+    let folds = folds(&rig).await;
+    make_dir(&rig, "F").await;
+    rig.backend.unlink(&path("F")).await.unwrap();
+    let gate = Arc::new(Notify::new());
+    rig.proxy
+        .inject(is_delete, Fault::Hold(Arc::clone(&gate)), 1);
+    rig.backend.hold_uploads(false);
+    wait_for_requests(&rig.proxy, 1, is_delete).await;
+
+    let making = tokio::spawn({
+        let backend = rig.backend.clone();
+        async move {
+            let (dir, _) = backend.open(&path("f"), create_options(true)).await?;
+            dir.close().await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!making.is_finished(), "the open waits for the delete");
+    gate.notify_one();
+    making.await.unwrap().unwrap();
+    sync(&rig.backend).await.unwrap();
+
+    assert_eq!(keys_folded(&rig).await, ["f/"]);
+    if !folds {
+        assert_eq!(keys(&rig).await, ["f/"]);
+    }
+    assert!(rig.smb.open_dir("f").await.is_ok());
+    assert!(rig.backend.failures().is_empty());
+}
+
+#[tokio::test]
+async fn a_directory_renamed_to_another_case_than_one_deleted_stays_when_the_delete_runs() {
+    let mut rig = Rig::writable_with(held).await;
+    let folds = folds(&rig).await;
+    make_dir(&rig, "e").await;
+    rig.backend.unlink(&path("e")).await.unwrap();
+    make_dir(&rig, "d").await;
+    rig.backend
+        .rename(&path("d"), &path("E"), false)
+        .await
+        .unwrap();
+    rig.backend.hold_sweeps(true);
+    rig.backend.hold_uploads(false);
+    wait_until("the directory leaves the overlay", || {
+        rig.backend.overlay_len() == 0
+    })
+    .await;
+
+    assert_eq!(root_folded(&rig).await, [("e".to_owned(), true, 0)]);
+    rig.backend.hold_sweeps(false);
+    sync(&rig.backend).await.unwrap();
+
+    assert_eq!(keys_folded(&rig).await, ["e/"]);
+    if !folds {
+        assert_eq!(keys(&rig).await, ["E/"]);
+    }
+    let shown = root_folded(&rig).await;
+    assert!(!shown.is_empty() && shown.iter().all(|entry| entry.0 == "e" && entry.1));
+    assert!(rig.smb.open_dir("E").await.is_ok());
+    assert!(rig.backend.failures().is_empty());
+    assert!(all_records(&rig).is_empty());
+}
+
+#[tokio::test]
+async fn a_file_stored_where_one_was_deleted_in_another_case_is_listed_before_the_delete_runs() {
+    let mut rig = Rig::writable_with(uploading).await;
+    put(rig.store(), "Doc", b"old").await;
+    let folds = folds(&rig).await;
+    rig.backend.hold_sweeps(true);
+    rig.backend.unlink(&path("Doc")).await.unwrap();
+    make(&mut rig, "doc", b"new content").await;
+    wait_until_async("the new file is stored", async || {
+        remote(&rig, "doc").await.as_deref() == Some(b"new content".as_slice())
+    })
+    .await;
+    wait_until("the file leaves the overlay", || {
+        rig.backend.overlay_len() == 0
+    })
+    .await;
+
+    assert_eq!(root_folded(&rig).await, [("doc".to_owned(), false, 11)]);
+    assert_eq!(rig.smb.contents("doc", 100).await, b"new content");
+    rig.backend.hold_sweeps(false);
+    sync(&rig.backend).await.unwrap();
+
+    assert_eq!(root_folded(&rig).await, [("doc".to_owned(), false, 11)]);
+    assert_eq!(remote(&rig, "doc").await.unwrap(), b"new content");
+    if !folds {
+        assert_eq!(keys(&rig).await, ["doc"]);
+    }
+    assert!(rig.backend.failures().is_empty());
+}
+
 // Renaming directories.
 
 #[tokio::test]
@@ -2574,6 +2733,37 @@ async fn a_case_only_rename_onto_a_directory_of_the_new_spelling_is_refused() {
     ));
     assert_unchanged(&rig);
     assert_eq!(listed(&mut rig, "").await, ["DOCS", "docs"]);
+}
+
+#[tokio::test]
+async fn a_case_only_rename_onto_a_directory_that_is_deleted_is_not_refused() {
+    for replace in [false, true] {
+        let mut rig = Rig::writable_with(held).await;
+        let folds = folds(&rig).await;
+        make_dir(&rig, "e").await;
+        rig.backend.unlink(&path("e")).await.unwrap();
+        make_dir(&rig, "E").await;
+        make(&mut rig, "E\\a.txt", b"a").await;
+        rig.backend
+            .rename(&path("E"), &path("e"), replace)
+            .await
+            .unwrap();
+
+        assert_eq!(listed(&mut rig, "").await, ["e"], "replace {replace}");
+        assert_eq!(listed(&mut rig, "e").await, ["a.txt"], "replace {replace}");
+        rig.backend.hold_uploads(false);
+        sync(&rig.backend).await.unwrap();
+        assert_eq!(
+            keys_folded(&rig).await,
+            ["e/", "e/a.txt"],
+            "replace {replace}"
+        );
+        if !folds {
+            assert_eq!(keys(&rig).await, ["e/", "e/a.txt"], "replace {replace}");
+        }
+        assert_eq!(rig.smb.contents("e\\a.txt", 10).await, b"a");
+        assert!(rig.backend.failures().is_empty());
+    }
 }
 
 #[tokio::test]

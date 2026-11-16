@@ -15,7 +15,7 @@ use super::backend::Shared;
 use super::data::disk_error;
 use super::dirmove::Left;
 use super::entry::{Entry, Sealed, State};
-use super::keys::{RowKind, child_key, last_name, path_below, slot};
+use super::keys::{RowKind, child_key, dir_prefix, last_name, path_below, slot};
 use super::overlay::{Held, Moving};
 use super::record::RecordId;
 use super::retry::Retry;
@@ -93,8 +93,9 @@ impl Shared {
 impl Shared {
     /// Fails with `AccessDenied` if the directory `held` in the directory
     /// `parent` is to get the spelling `key` of its name, which differs in case
-    /// only, and the listing of `parent` has another directory with that
-    /// spelling: the store keeps both, and the rename would mix them.
+    /// only, and the listing of `parent` has a directory of each spelling, the
+    /// new one with a marker that is not to be deleted: the store keeps both,
+    /// and the rename would mix them.
     async fn refuse_case_duplicate(
         &self,
         parent: &str,
@@ -106,9 +107,14 @@ impl Shared {
             return Ok(());
         }
         let listing = self.listing(parent, retry).await?;
-        let duplicate = listing
-            .find_exact(last_name(key))
-            .is_some_and(|row| matches!(row.kind, RowKind::Dir) && row.name != last_name(held));
+        let is_dir = |name: &str| {
+            listing
+                .find_exact(name)
+                .is_some_and(|row| matches!(row.kind, RowKind::Dir))
+        };
+        let duplicate = is_dir(last_name(key))
+            && is_dir(last_name(held))
+            && !self.overlay.to_delete(&dir_prefix(key));
         if duplicate {
             return Err(SmbError::AccessDenied);
         }

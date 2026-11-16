@@ -13,12 +13,13 @@ use super::backend::Shared;
 use super::cache::Known;
 use super::change;
 use super::client::{ListRequest, MAX_DELETE_KEYS, MAX_LISTED};
+use super::entry::Entry;
 use super::error::S3Error;
 use super::keys::{dir_prefix, join_key};
 use super::meta;
 use super::object::ObjectHead;
 use super::overlay::Deleting;
-use super::retry::{BASE_DELAY, Retry, Stop};
+use super::retry::{BASE_DELAY, Retry};
 
 /// The most pages of a directory listing that the comparison of two keys reads.
 const MAX_LIST_PAGES: usize = 100;
@@ -33,6 +34,16 @@ pub(super) struct Deleted {
     pub(super) failed: Vec<(String, S3Error)>,
     /// The backend ended before the requests did.
     pub(super) stopped: bool,
+}
+
+/// A key to delete that differs in case only from a key an entry has just
+/// stored.
+pub(super) struct Variant {
+    pub(super) key: String,
+    /// The entry that owns the key to delete, if one does.
+    pub(super) owner: Option<Arc<Entry>>,
+    /// The store holds the key and the key just stored as one object.
+    pub(super) same: bool,
 }
 
 /// Why the keys of a claim could not be deleted: the store refused a request
@@ -92,8 +103,8 @@ fn is_marker_conflict(error: &S3Error) -> bool {
 
 impl Shared {
     /// The object at `key`, or `None` if there is none.
-    async fn head_if_there(&self, key: &str, stop: &Stop) -> Result<Option<ObjectHead>, S3Error> {
-        match self.client.head_object(key, Retry::until(stop)).await {
+    async fn head_if_there(&self, key: &str, retry: &Retry) -> Result<Option<ObjectHead>, S3Error> {
+        match self.client.head_object(key, retry.clone()).await {
             Ok(head) => Ok(Some(head)),
             Err(e) if e.is_no_such_key() => Ok(None),
             Err(e) => Err(e),
@@ -101,17 +112,14 @@ impl Shared {
     }
 
     /// Whether the store lists the object `key` under that spelling.
-    async fn lists(&self, key: &str, stop: &Stop) -> Result<bool, S3Error> {
+    async fn lists(&self, key: &str, retry: &Retry) -> Result<bool, S3Error> {
         let request = ListRequest {
             prefix: key,
             delimited: false,
             continuation_token: None,
             max_keys: Some(1),
         };
-        let page = self
-            .client
-            .list_objects(&request, Retry::until(stop))
-            .await?;
+        let page = self.client.list_objects(&request, retry.clone()).await?;
         Ok(page.objects.first().is_some_and(|object| object.key == key))
     }
 
@@ -123,14 +131,14 @@ impl Shared {
     /// difference is listed instead: a store that tells the two apart lists
     /// both spellings there. A directory too large to list in full counts as
     /// one object, which keeps both keys.
-    async fn listed_apart(&self, a: &str, b: &str, stop: &Stop) -> Result<bool, S3Error> {
+    async fn listed_apart(&self, a: &str, b: &str, retry: &Retry) -> Result<bool, S3Error> {
         let (names_a, names_b): (Vec<&str>, Vec<&str>) =
             (a.split('/').collect(), b.split('/').collect());
         let Some(at) = names_a.iter().zip(&names_b).position(|(x, y)| x != y) else {
             return Ok(false);
         };
         if at + 1 == names_a.len().min(names_b.len()) {
-            return Ok(self.lists(a, stop).await? && self.lists(b, stop).await?);
+            return Ok(self.lists(a, retry).await? && self.lists(b, retry).await?);
         }
         let above = dir_prefix(&names_a[..at].join("/"));
         let wanted = [
@@ -146,10 +154,7 @@ impl Shared {
                 continuation_token: token.as_deref(),
                 max_keys: None,
             };
-            let page = self
-                .client
-                .list_objects(&request, Retry::until(stop))
-                .await?;
+            let page = self.client.list_objects(&request, retry.clone()).await?;
             for (found, name) in seen.iter_mut().zip(&wanted) {
                 *found |= page.prefixes.contains(name);
             }
@@ -178,20 +183,49 @@ impl Shared {
         &self,
         a: &str,
         b: &str,
-        stop: &Stop,
+        retry: &Retry,
     ) -> Result<Option<ObjectHead>, S3Error> {
         let (Some(first), Some(second)) = (
-            self.head_if_there(a, stop).await?,
-            self.head_if_there(b, stop).await?,
+            self.head_if_there(a, retry).await?,
+            self.head_if_there(b, retry).await?,
         ) else {
             return Ok(None);
         };
         let alike = (first.size, &first.etag, first.last_modified)
             == (second.size, &second.etag, second.last_modified);
-        if alike && !self.listed_apart(a, b, stop).await? {
+        if alike && !self.listed_apart(a, b, retry).await? {
             return Ok(Some(second));
         }
         Ok(None)
+    }
+
+    /// The keys to delete that differ in case only from `key`, which `entry`
+    /// has just stored, each with whether the store holds it and `key` as one
+    /// object. Empty unless names ignore case. The caller notes that it writes
+    /// the slot of `key`, so no request deletes one of the keys meanwhile.
+    ///
+    /// # Errors
+    ///
+    /// Fails with the error of the first request the store refuses.
+    pub(super) async fn compare_variants(
+        &self,
+        entry: &Arc<Entry>,
+        key: &str,
+        retry: &Retry,
+    ) -> Result<Vec<Variant>, S3Error> {
+        let mut found: Vec<Variant> = Vec::new();
+        for (variant, owner) in self.overlay.variants(key, entry) {
+            let same = match found.iter().find(|seen| seen.key == variant) {
+                Some(seen) => seen.same,
+                None => self.one_object(&variant, key, retry).await?.is_some(),
+            };
+            found.push(Variant {
+                key: variant,
+                owner,
+                same,
+            });
+        }
+        Ok(found)
     }
 
     /// The keys among `twins`, each with the other spelling of its name, that
@@ -206,9 +240,10 @@ impl Shared {
         &self,
         twins: &[(String, String)],
     ) -> Result<Vec<String>, S3Error> {
+        let retry = Retry::until(&self.jobs.stop);
         let mut same = Vec::new();
         for (key, twin) in twins {
-            if self.one_object(key, twin, &self.jobs.stop).await?.is_some() {
+            if self.one_object(key, twin, &retry).await?.is_some() {
                 same.push(key.clone());
             }
         }

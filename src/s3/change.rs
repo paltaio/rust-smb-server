@@ -32,6 +32,7 @@ use super::payload::Payload;
 use super::ranges::RangeSet;
 use super::record::{EntryRecord, LocalRecord, RecordId};
 use super::retry::Retry;
+use super::tombs::Variant;
 use super::unlink::drop_superseded;
 
 /// Runs `work` on a blocking thread, for `held`: the entry stays in the
@@ -478,6 +479,19 @@ pub(super) async fn take_over_marker(
     let marker = dir_prefix(key);
     blocking(shared, held, move |shared, entry| {
         outcome::take_over(shared, entry, &marker, &shared.jobs.stop)
+    })
+    .await
+}
+
+/// [`outcome::settle`] for the keys to delete that differ in case only from
+/// the marker object of the new directory of `held`.
+pub(super) async fn settle(
+    shared: &Arc<Shared>,
+    held: &Held,
+    found: Vec<Variant>,
+) -> SmbResult<()> {
+    blocking(shared, held, move |shared, _| {
+        outcome::settle(shared, found)
     })
     .await
 }

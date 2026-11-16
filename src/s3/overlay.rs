@@ -67,6 +67,10 @@ struct Index {
     gone: HashMap<String, Vec<Arc<Entry>>>,
     /// The keys to delete, owned or not, by slot.
     hidden: BTreeMap<Slot, Vec<String>>,
+    /// The keys among `hidden` that the store holds as another object than
+    /// the other spellings of their name. Such a key hides its own spelling
+    /// only.
+    apart: HashSet<String>,
     /// The entries that left a batch with a tombstone record standing for
     /// them, with the batch, until its record is rewritten without them.
     covered: HashMap<RecordId, Arc<Batch>>,
@@ -141,9 +145,13 @@ impl Index {
         slot(key, self.fold)
     }
 
-    /// Whether `key` is to be deleted from the bucket, or a key of its slot.
+    /// Whether `key` is to be deleted from the bucket, or a key of its slot
+    /// that the store does not keep apart from `key`.
     fn hides(&self, key: &str) -> bool {
-        self.hidden.contains_key(&self.slot(key))
+        self.hidden.get(&self.slot(key)).is_some_and(|keys| {
+            keys.iter()
+                .any(|held| held == key || !self.apart.contains(held))
+        })
     }
 
     /// Whether a key other than `marker` itself is to be deleted below the
@@ -281,6 +289,15 @@ impl Index {
             if keys.is_empty() {
                 self.hidden.remove(&name);
             }
+        }
+        self.apart.remove(key);
+    }
+
+    /// Notes that the store holds the key to delete `key` as another object
+    /// than the other spellings of its name, if it is still to be deleted.
+    fn keep_apart(&mut self, key: &str) {
+        if self.hides_exact(key) {
+            self.apart.insert(key.to_owned());
         }
     }
 
@@ -1447,7 +1464,8 @@ impl Overlay {
     }
 
     /// Whether `key`, or another spelling of it when names ignore case, is to
-    /// be deleted from the bucket.
+    /// be deleted from the bucket. A key the store keeps apart from the other
+    /// spellings of its name counts only for its own spelling.
     pub(super) fn tombstoned(&self, key: &str) -> bool {
         self.lock().hides(key)
     }
@@ -1894,6 +1912,13 @@ impl Overlay {
         }
         found.sort_by(|a, b| a.0.cmp(&b.0));
         found
+    }
+
+    /// Notes that the store holds the key to delete `key` as another object
+    /// than the other spellings of its name, so it hides its own spelling
+    /// only.
+    pub(super) fn keep_apart(&self, key: &str) {
+        self.lock().keep_apart(key);
     }
 
     /// The entries other than `entry` that own `key` to delete.
@@ -2421,6 +2446,40 @@ mod tests {
         exact.install(Vec::new(), vec![tombstone(&["Gone/x"])]);
         assert!(exact.tombstoned("Gone/x"));
         assert!(!exact.tombstoned("gone/x"));
+    }
+
+    #[test]
+    fn a_key_to_delete_the_store_keeps_apart_hides_its_own_spelling_only() {
+        let overlay = test_overlay(true);
+        overlay.install(Vec::new(), vec![tombstone(&["F/", "G/"])]);
+        overlay.keep_apart("F/");
+        assert!(overlay.tombstoned("F/"));
+        assert!(!overlay.tombstoned("f/"));
+        assert!(overlay.dir_dead("F"));
+        assert!(!overlay.dir_dead("f"));
+        assert!(overlay.tombstoned("g/"), "G/ is not kept apart");
+    }
+
+    #[test]
+    fn a_key_is_kept_apart_only_while_it_is_to_be_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = CacheDir::open(&dir.path().join("c"), "identity").unwrap();
+        let overlay = test_overlay(true);
+        overlay.keep_apart("F");
+        let id = RecordId::parse(&"d".repeat(32)).unwrap();
+        overlay.unlinked(&kept("F"), &["F".to_owned()], &id);
+        assert!(overlay.tombstoned("f"), "it was not kept apart before");
+
+        overlay.keep_apart("F");
+        assert!(!overlay.tombstoned("f"));
+        let record = TombstoneRecord {
+            id: id.clone(),
+            keys: vec!["F".to_owned()],
+        };
+        cache.write_record(&id, &record.encode()).unwrap();
+        overlay.drop_tombs(&cache, &["F".to_owned()]).unwrap();
+        overlay.unlinked(&kept("F"), &["F".to_owned()], &id);
+        assert!(overlay.tombstoned("f"), "it is not kept apart any more");
     }
 
     #[test]

@@ -27,7 +27,6 @@ use crate::error::{SmbError, SmbResult};
 use super::backend::Shared;
 use super::cache::Known;
 use super::change;
-use super::data::disk_error;
 use super::entry::{Body, Entry, Upload};
 use super::error::S3Error;
 use super::jobs::Running;
@@ -475,43 +474,23 @@ impl Job<'_> {
     /// names match without regard to case there can be such keys, and a store
     /// that ignores case holds one and `key` as one object, so deleting it
     /// would delete the object just stored. A key that names the object at
-    /// `key` leaves the records of the keys to delete, without a delete. The
+    /// `key` leaves the records of the keys to delete, without a delete. One
+    /// that names another object stays, and hides its own spelling only. The
     /// job's note that it writes the slot of `key` keeps the variants from
     /// being deleted meanwhile. The requests stop with the backend, not with
     /// the job.
     async fn settle_variants(&self, key: &str) -> Result<(), Halt> {
-        let variants = self.shared.overlay.variants(key, self.entry());
-        let mut checked: Vec<(String, bool)> = Vec::new();
-        for (variant, owner) in variants {
-            let one = match checked.iter().find(|(seen, _)| *seen == variant) {
-                Some((_, one)) => *one,
-                None => {
-                    let one = self
-                        .shared
-                        .one_object(&variant, key, &self.shared.jobs.stop)
-                        .await
-                        .map_err(|e| classify(e, true))?
-                        .is_some();
-                    checked.push((variant.clone(), one));
-                    one
-                }
-            };
-            if !one {
-                continue;
-            }
-            self.blocking(move |shared, _| match owner {
-                Some(owner) => match outcome::taken_over(shared, &owner, &[variant]) {
-                    Err(SmbError::AccessDenied) => Ok(()),
-                    done => done,
-                },
-                None => shared
-                    .overlay
-                    .drop_tombs(shared.local()?, &[variant])
-                    .map_err(disk_error),
-            })
-            .await?;
+        let retry = Retry::until(&self.shared.jobs.stop);
+        let found = self
+            .shared
+            .compare_variants(self.entry(), key, &retry)
+            .await
+            .map_err(|e| classify(e, true))?;
+        if found.is_empty() {
+            return Ok(());
         }
-        Ok(())
+        self.blocking(move |shared, _| outcome::settle(shared, found))
+            .await
     }
 
     /// Aborts a multipart upload an earlier backend left running.
@@ -964,6 +943,7 @@ impl Job<'_> {
         let head = change::store_marker(self.shared, &key, metadata, self.retry())
             .await
             .map_err(|e| self.halt(e))?;
+        self.settle_variants(&dir_prefix(&key)).await?;
         let took = change::marker_put(self.shared, self.run.held(), generation, &key, head)
             .await
             .map_err(|e| self.local(e))?;

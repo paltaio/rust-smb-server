@@ -92,14 +92,14 @@ use super::retry::Retry;
 /// objects, if a key below it cannot move, or if the move is too large for
 /// one record in the cache directory. A key cannot move if no client could
 /// open its name, if another key lands on the same name, or, when the rename
-/// changes only the case of the name, if a directory of the new spelling is
-/// beside it. Both fail with `Sharing` if the directory, one above it or one
-/// below it is being renamed or deleted; a rename also if a directory below
-/// it is still being made, or if the keys below it keep changing while they
-/// are listed. While a directory is being renamed or checked for a delete, a
-/// create or a rename that lands below it fails with `Sharing`. While a
-/// rename moves the entries, so does an open of an existing name below it
-/// that the backend holds nothing of.
+/// changes only the case of the name, if the parent lists a directory of each
+/// spelling and neither is to be deleted. Both fail with `Sharing` if the
+/// directory, one above it or one below it is being renamed or deleted; a
+/// rename also if a directory below it is still being made, or if the keys
+/// below it keep changing while they are listed. While a directory is being
+/// renamed or checked for a delete, a create or a rename that lands below it
+/// fails with `Sharing`. While a rename moves the entries, so does an open of
+/// an existing name below it that the backend holds nothing of.
 ///
 /// A file the backend holds bytes of is stored in the bucket in the
 /// background, [`upload_delay`](crate::S3BackendBuilder::upload_delay) after
@@ -169,10 +169,11 @@ use super::retry::Retry;
 /// that treats such names as one name keeps the object under its old spelling
 /// when a file is renamed to a new spelling of its name. Before it deletes an
 /// object whose name differs in case only from the name of a file the backend
-/// holds, and when it has just stored a file under a name that differs in case
-/// only from an object it is to delete, the backend asks the store for both
-/// names: if they have the same size, ETag and modification time and are not
-/// both listed, they are one object, and it is not deleted. With
+/// holds, and when it has just stored a file or a directory marker under a
+/// name that differs in case only from an object it is to delete, the backend
+/// asks the store for both names: if they have the same size, ETag and
+/// modification time and are not both listed, they are one object, and it is
+/// not deleted. With
 /// [`case_insensitive(false)`](crate::S3BackendBuilder::case_insensitive) the
 /// store has to keep case.
 ///
@@ -348,7 +349,7 @@ impl S3Backend {
     /// only, as one object.
     pub(crate) async fn one_object(&self, a: &str, b: &str) -> bool {
         self.shared
-            .one_object(a, b, &self.shared.jobs.stop)
+            .one_object(a, b, &Retry::until(&self.shared.jobs.stop))
             .await
             .expect("the store answers")
             .is_some()

@@ -25,6 +25,7 @@ use super::object::ObjectHead;
 use super::ranges::RangeSet;
 use super::record::RecordId;
 use super::retry::Stop;
+use super::tombs::Variant;
 use super::unlink::drop_record;
 
 /// The parts of `range` that a fill writes into a file of `len` bytes that
@@ -166,6 +167,40 @@ pub(super) fn take_over(
         release_key(shared, owners, key)
     })?;
     Ok(taken.is_some())
+}
+
+/// Takes in the keys to delete that differ in case only from a key an entry
+/// has just stored, as the store holds them. One that names the object stored
+/// leaves the entry that owns it, or the records of the keys to delete, and no
+/// request deletes it; the cached listing of its directory is dropped, as it
+/// may hold the object under both spellings. One that names another object
+/// stays to be deleted, and hides its own spelling only.
+///
+/// # Errors
+///
+/// Fails when the record of an owner, or a record of the keys to delete,
+/// cannot be written. The keys after the first that fails are left as they
+/// are.
+pub(super) fn settle(shared: &Shared, found: Vec<Variant>) -> SmbResult<()> {
+    for Variant { key, owner, same } in found {
+        if !same {
+            shared.overlay.keep_apart(&key);
+            continue;
+        }
+        let name = key.strip_suffix('/').unwrap_or(&key).to_owned();
+        match owner {
+            Some(owner) => match taken_over(shared, &owner, &[key]) {
+                Err(SmbError::AccessDenied) => {}
+                done => done?,
+            },
+            None => shared
+                .overlay
+                .drop_tombs(shared.local()?, &[key])
+                .map_err(disk_error)?,
+        }
+        shared.forget_file(&name);
+    }
+    Ok(())
 }
 
 /// Makes `owners` and the records of keys to delete let go of `key`.

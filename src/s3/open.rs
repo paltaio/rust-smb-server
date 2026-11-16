@@ -16,8 +16,9 @@ use super::cachedir::new_id;
 use super::change;
 use super::data::disk_error;
 use super::entry::Entry;
+use super::error::S3Error;
 use super::handle::S3Handle;
-use super::keys::child_key;
+use super::keys::{child_key, dir_prefix};
 use super::meta;
 use super::overlay::{Fence, Held, Writes};
 use super::retry::Retry;
@@ -159,7 +160,8 @@ impl Shared {
     /// Writes the record of the new directory, puts its marker object, and
     /// makes the directory known to the cache. A marker the store refuses
     /// because the directory is there already counts as put. Once the marker
-    /// is put, keys to delete that name it are let go; if that fails, the open
+    /// is put, keys to delete that name it, or another spelling of it that the
+    /// store holds as the same object, are let go; if that fails, the open
     /// goes on and the job of the directory puts the marker again and lets
     /// them go. If the record or the marker fails, the open fails, the record
     /// is removed, and the keys to delete stay; a record that cannot be
@@ -184,7 +186,10 @@ impl Shared {
                     }
                     e.into_smb_error()
                 })?;
-            let taken = change::take_over_marker(self, held, &key).await;
+            let taken = match change::take_over_marker(self, held, &key).await {
+                Ok(true) => self.settle_marker(held, &key, &retry).await.map(|()| true),
+                other => other,
+            };
             Ok::<_, SmbError>((head, taken))
         };
         let (head, taken) = match put.await {
@@ -209,7 +214,7 @@ impl Shared {
             // backend ends: the keys to delete stay as they are.
             Ok(false) => {}
             Err(e) => {
-                warn!(error = %e, "the keys to delete that name a new directory could not be let go; its job puts the marker again");
+                warn!(error = %e, "the keys to delete that name a new directory could not be settled; its job puts the marker again");
                 held.entry.state().creating = false;
             }
         }
@@ -237,6 +242,26 @@ impl Shared {
             }
         })
         .await
+    }
+
+    /// Settles the keys to delete that differ in case only from the marker
+    /// of the new directory `key`, which has just been put, as a job settles
+    /// those of a key it stored. Fails with `Io` once `retry` runs out of
+    /// time.
+    async fn settle_marker(
+        self: &Arc<Self>,
+        held: &Held,
+        key: &str,
+        retry: &Retry,
+    ) -> SmbResult<()> {
+        let found = self
+            .compare_variants(&held.entry, &dir_prefix(key), retry)
+            .await
+            .map_err(S3Error::into_smb_error)?;
+        if found.is_empty() {
+            return Ok(());
+        }
+        change::settle(self, held, found).await
     }
 }
 
