@@ -6,6 +6,7 @@ rust-version = "1.95"
 license = "MIT"
 repository = "https://github.com/paltaio/rust-smb-server"
 description = "SMB2/3 file-sharing server library with pluggable storage backends."
+exclude = ["src/encrypted/wycheproof_gcm.rs", "src/encrypted/wycheproof_siv.rs"]
 
 [package.metadata.docs.rs]
 all-features = true
