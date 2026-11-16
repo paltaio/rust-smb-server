@@ -316,11 +316,11 @@ pub trait ShareBackend: Send + Sync + 'static {
 
     /// Rename `from` to `to`.
     ///
-    /// If `to` names an existing file other than `from`, including another
-    /// hard link to the same file, fail with [`SmbError::Exists`] unless
-    /// `replace_if_exists` is set, in which case the existing file is
-    /// replaced. An existing directory at `to` is never
-    /// replaced: fail with [`SmbError::AccessDenied`].
+    /// If `to` names an existing file or directory other than `from`,
+    /// including another hard link to the same file, fail with
+    /// [`SmbError::Exists`] unless `replace_if_exists` is set. With it set,
+    /// an existing file is replaced; an existing directory is never
+    /// replaced: fail with [`SmbError::AccessDenied`] (MS-FSA 2.1.5.15.12).
     async fn rename(&self, from: &SmbPath, to: &SmbPath, replace_if_exists: bool) -> SmbResult<()>;
 
     /// Static capabilities. TREE_CONNECT clamps access to read-only when

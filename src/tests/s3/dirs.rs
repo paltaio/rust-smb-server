@@ -21,8 +21,8 @@ use super::share::{
 use super::uploads::{fill, held, is_create_of, is_head_of, is_put_of, left, sync, uploading};
 use super::writes::{changes, create_dir, create_file, create_options, open_rw, records};
 use crate::ntstatus::{
-    STATUS_ACCESS_DENIED, STATUS_DIRECTORY_NOT_EMPTY, STATUS_OBJECT_NAME_NOT_FOUND,
-    STATUS_OBJECT_PATH_NOT_FOUND,
+    STATUS_ACCESS_DENIED, STATUS_DIRECTORY_NOT_EMPTY, STATUS_OBJECT_NAME_COLLISION,
+    STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND,
 };
 use crate::s3::cachedir::RecordOp;
 use crate::s3::client::ListRequest;
@@ -1089,15 +1089,14 @@ async fn a_directory_is_not_renamed_onto_a_name_that_is_taken_or_into_itself() {
     put(rig.store(), "a/x.txt", b"x").await;
     put(rig.store(), "b/y.txt", b"y").await;
     put(rig.store(), "file.txt", b"f").await;
-    for replace in [false, true] {
-        assert!(
-            matches!(
-                rig.backend.rename(&path("a"), &path("b"), replace).await,
-                Err(SmbError::AccessDenied)
-            ),
-            "onto a directory, replace {replace}"
-        );
-    }
+    assert!(matches!(
+        rig.backend.rename(&path("a"), &path("b"), false).await,
+        Err(SmbError::Exists)
+    ));
+    assert!(matches!(
+        rig.backend.rename(&path("a"), &path("b"), true).await,
+        Err(SmbError::AccessDenied)
+    ));
     assert!(matches!(
         rig.backend
             .rename(&path("a"), &path("file.txt"), false)
@@ -1147,6 +1146,10 @@ async fn a_directory_is_renamed_through_the_share() {
     rig.smb.close(made.id).await;
     assert_eq!(
         rig.smb.rename(other.id, "taken").await,
+        STATUS_OBJECT_NAME_COLLISION
+    );
+    assert_eq!(
+        rig.smb.rename_with(other.id, "taken", true).await,
         STATUS_ACCESS_DENIED
     );
     rig.smb.close(other.id).await;

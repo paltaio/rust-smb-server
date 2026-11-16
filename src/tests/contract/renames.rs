@@ -94,9 +94,14 @@ async fn rename_onto_a_directory(backend: Backend<'_>, replace: bool) {
     mkdir(backend, "e").await;
     put(backend, "f", b"data").await;
     for from in ["f", "e"] {
+        let expected = if replace {
+            SmbError::AccessDenied
+        } else {
+            SmbError::Exists
+        };
         assert_refused(
             backend.rename(&path(from), &path("d"), replace).await,
-            SmbError::AccessDenied,
+            expected,
             &format!("rename {from} onto a directory, replace {replace}"),
         );
     }
@@ -107,7 +112,7 @@ pub(super) async fn rename_onto_a_directory_with_replace_is_access_denied(backen
     rename_onto_a_directory(backend, true).await;
 }
 
-pub(super) async fn rename_onto_a_directory_is_access_denied(backend: Backend<'_>) {
+pub(super) async fn rename_onto_a_directory_without_replace_exists(backend: Backend<'_>) {
     rename_onto_a_directory(backend, false).await;
 }
 

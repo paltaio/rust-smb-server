@@ -66,8 +66,8 @@ impl<B: ShareBackend> EncryptedBackend<B> {
     ///
     /// - The same entry with the same spelling: nothing to do. With another
     ///   spelling the entry is renamed to the stored name of `to_name`.
-    /// - Another entry that is a directory: `AccessDenied`. A file without
-    ///   `replace`: `Exists`.
+    /// - Another entry without `replace`: `Exists`. A directory with
+    ///   `replace`: `AccessDenied`.
     /// - Another file with `replace`, stored as `to_name` encrypts to: it is
     ///   replaced. Stored under another spelling: the entry replaces it under
     ///   that spelling, then moves to the stored name of `to_name`. If that
@@ -117,11 +117,11 @@ impl<B: ShareBackend> EncryptedBackend<B> {
             return Ok(Attempt::Done);
         }
         if let Some(held) = &replaced {
-            if held.directory {
-                return Err(SmbError::AccessDenied);
-            }
             if !replace {
                 return Err(SmbError::Exists);
+            }
+            if held.directory {
+                return Err(SmbError::AccessDenied);
             }
         }
 
@@ -453,7 +453,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_rename_onto_a_directory_is_denied_and_onto_a_file_without_replace_exists() {
+    async fn a_rename_onto_a_directory_exists_without_replace_and_is_denied_with_it() {
         let files = MemFsBackend::new();
         let faulty = Faulty::new(files.clone());
         let layer = names_over(faulty.clone()).await;
@@ -462,9 +462,16 @@ mod tests {
         let (src, _) = open(&layer, "src", OpenIntent::Create).await;
         let renames = faulty.renames();
 
-        for (to, replace) in [("Dir", false), ("Dir", true), ("dir", false), ("DIR", true)] {
+        for to in ["Dir", "dir"] {
             let error = layer
-                .rename(&path("src"), &path(to), replace)
+                .rename(&path("src"), &path(to), false)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, SmbError::Exists), "{to}: {error:?}");
+        }
+        for to in ["Dir", "DIR"] {
+            let error = layer
+                .rename(&path("src"), &path(to), true)
                 .await
                 .unwrap_err();
             assert!(matches!(error, SmbError::AccessDenied), "{to}: {error:?}");

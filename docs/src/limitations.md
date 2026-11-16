@@ -37,7 +37,7 @@ The settings named here, and how `S3Backend` works, are in [backends](backends.m
 
 - Renames and deletes show at once. The bucket follows in the background: a renamed file is stored at its new key, and its old key is deleted once the new key holds its content. The objects of deleted files are deleted in batches once nothing has been deleted for `upload_delay`, at most a minute after the first was due.
 - A directory rename moves at most `max_dir_rename_objects` objects, counting the entries the server holds for it. A larger directory fails with STATUS_ACCESS_DENIED and nothing changes.
-- A rename fails with STATUS_ACCESS_DENIED when the new name is an existing directory, and a directory cannot replace a file.
+- A directory cannot replace a file: a rename of a directory onto a file with ReplaceIfExists set fails with STATUS_ACCESS_DENIED.
 - A directory rename also fails with STATUS_ACCESS_DENIED when:
   - a key below the directory has a name no client could open
   - two keys would get the same name

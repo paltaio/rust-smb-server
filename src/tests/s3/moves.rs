@@ -698,6 +698,8 @@ async fn a_rename_onto_a_directory_or_into_a_missing_one_fails() {
     let mut rig = Rig::writable_with(held).await;
     put(rig.store(), "f.txt", b"x").await;
     put(rig.store(), "d/x", b"x").await;
+    let onto_dir = rig.backend.rename(&path("f.txt"), &path("d"), false).await;
+    assert!(matches!(onto_dir, Err(SmbError::Exists)));
     let onto_dir = rig.backend.rename(&path("f.txt"), &path("d"), true).await;
     assert!(matches!(onto_dir, Err(SmbError::AccessDenied)));
     let missing = rig
@@ -726,7 +728,14 @@ async fn a_rename_through_the_share_maps_its_failures_to_statuses() {
         rig.smb.rename(file.id, "g.txt").await,
         STATUS_OBJECT_NAME_COLLISION
     );
-    assert_eq!(rig.smb.rename(file.id, "d").await, STATUS_ACCESS_DENIED);
+    assert_eq!(
+        rig.smb.rename(file.id, "d").await,
+        STATUS_OBJECT_NAME_COLLISION
+    );
+    assert_eq!(
+        rig.smb.rename_with(file.id, "d", true).await,
+        STATUS_ACCESS_DENIED
+    );
     assert_eq!(
         rig.smb.rename(file.id, "nope\\f.txt").await,
         STATUS_OBJECT_PATH_NOT_FOUND

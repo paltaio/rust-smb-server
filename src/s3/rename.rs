@@ -28,10 +28,10 @@ impl Shared {
     ///
     /// # Errors
     ///
-    /// Fails with `Exists` if another file has the name and `replace` is not
-    /// set, with `AccessDenied` if a directory has it or a directory is to
-    /// replace a file, and with `PathNotFound` if the parent of `to` is not a
-    /// directory.
+    /// Fails with `Exists` if another file or directory has the name and
+    /// `replace` is not set, with `AccessDenied` if `replace` is set and a
+    /// directory has the name or a directory is to replace a file, and with
+    /// `PathNotFound` if the parent of `to` is not a directory.
     pub(super) async fn rename(
         self: &Arc<Self>,
         from: &SmbPath,
@@ -68,8 +68,8 @@ impl Shared {
             };
             let target = match target {
                 Some(target) if Arc::ptr_eq(&target.entry, &source.entry) => None,
-                Some(target) if target.entry.is_dir() => return Err(SmbError::AccessDenied),
                 Some(_) if !replace => return Err(SmbError::Exists),
+                Some(target) if target.entry.is_dir() => return Err(SmbError::AccessDenied),
                 Some(_) if source.entry.is_dir() => return Err(SmbError::AccessDenied),
                 other => other,
             };

@@ -303,6 +303,11 @@ async fn rename_with_replace_if_exists() {
         ntstatus::STATUS_OBJECT_NAME_COLLISION
     );
     assert_eq!(
+        c.set_info(tmp, FILE_RENAME_INFORMATION, rename_info("dir", false))
+            .await,
+        ntstatus::STATUS_OBJECT_NAME_COLLISION
+    );
+    assert_eq!(
         c.set_info(tmp, FILE_RENAME_INFORMATION, rename_info("dir", true))
             .await,
         ntstatus::STATUS_ACCESS_DENIED

@@ -61,8 +61,6 @@ const MEMFS: &[&str] = &["memfs"];
 const OVER_MEMFS: &[&str] = &["memfs", "layer_memfs"];
 /// The instances over `S3Backend`.
 const OVER_S3: &[&str] = &["s3", "layer_s3"];
-/// The instances whose answers to a rename come from `LocalFsBackend`.
-const LOCALFS: &[&str] = &["localfs", "layer_clear_localfs", "layer_exact_localfs"];
 
 /// The cases an instance fails, by name.
 const EXCLUDED: &[(&str, &[&str])] = &[
@@ -109,11 +107,6 @@ const EXCLUDED: &[(&str, &[&str])] = &[
     ("rename_into_a_missing_directory_is_path_not_found", MEMFS),
     // MemFs renames the root.
     ("rename_of_the_root_is_refused", MEMFS),
-    // MemFs and LocalFs answer Exists to a rename onto a directory when it does
-    // not replace. The layer forwards the rename, and so gives their answer,
-    // unless it matches names itself.
-    ("rename_onto_a_directory_is_access_denied", MEMFS),
-    ("rename_onto_a_directory_is_access_denied", LOCALFS),
 ];
 
 fn excluded(instance: &str, case: &str) -> bool {
@@ -188,7 +181,7 @@ macro_rules! instance {
                 renames::rename_moves_a_directory_with_its_entries,
                 renames::rename_onto_a_file_needs_replace,
                 renames::rename_onto_a_directory_with_replace_is_access_denied,
-                renames::rename_onto_a_directory_is_access_denied,
+                renames::rename_onto_a_directory_without_replace_exists,
                 renames::rename_of_a_missing_source_is_not_found,
                 renames::rename_from_a_missing_directory_is_refused,
                 renames::rename_into_a_missing_directory_is_path_not_found,
