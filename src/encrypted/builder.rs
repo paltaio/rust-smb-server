@@ -55,8 +55,10 @@ impl<B: ShareBackend> EncryptedBackend<B> {
     /// `build` wipes the builder's buffer for `key` once the keys are derived,
     /// and dropping the builder wipes it too. Copies of `key` that the caller
     /// keeps are the caller's to wipe. The `hmac` and `sha2` crates keep
-    /// key-derived bytes in internal state that they do not wipe, and
-    /// `aes-gcm` does not wipe its GHASH subkey.
+    /// key-derived bytes in internal state that they do not wipe. The GHASH
+    /// subkey of `aes-gcm` is not wiped either: it sits in each cipher and in
+    /// copies made during setup and for every operation, and `aes-gcm` wipes
+    /// only one temporary copy.
     pub fn builder(inner: B, key: [u8; 32]) -> EncryptedBackendBuilder<B> {
         EncryptedBackendBuilder {
             inner,

@@ -95,7 +95,7 @@ A failed check is `KeyMismatch`, or `SettingMismatch` for the block size, and no
 
 - Give each share a key of its own. With one key, a stored file copied into another share's storage reads back through that share when both use the same block size.
 - The key is not stored anywhere. Losing it loses the data. Losing the marker loses no data. `restore_marker()` does not check `encrypt_names` or `long_name_threshold`, so keep a record of them.
-- `build` wipes the builder's copy of the key once the derived keys exist, and the derived keys and AES key schedules are wiped when dropped. A copy the caller keeps is the caller's to wipe. Not wiped: the `hmac` and `sha2` crates' internal state, and the GHASH subkey of `aes-gcm`.
+- `build` wipes the builder's copy of the key once the derived keys exist, and the derived keys and AES key schedules are wiped when dropped. A copy the caller keeps is the caller's to wipe. Not wiped: the `hmac` and `sha2` crates' internal state, and the GHASH subkey of `aes-gcm`, which sits in each cipher and in copies made during setup and for every operation. `aes-gcm` wipes one temporary copy of it.
 
 ## Damaged blocks
 

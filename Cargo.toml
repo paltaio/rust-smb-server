@@ -123,7 +123,7 @@ discovery = [
     "windows-sys/Win32_NetworkManagement_Dns",
     "windows-sys/Win32_System_SystemInformation",
 ]
-encryption = ["dep:aes-siv", "dep:zeroize", "aes/zeroize"]
+encryption = ["dep:aes-siv", "dep:zeroize", "aes/zeroize", "aes-gcm/zeroize"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
