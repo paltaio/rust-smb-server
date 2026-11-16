@@ -201,7 +201,6 @@ impl<B: ShareBackend> ShareBackend for EncryptedBackend<B> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::names::encode_name;
     use super::super::testing::{
         Reporting, build, key, key_schedule, many_names, names_settings, read_only,
     };
@@ -242,13 +241,6 @@ mod tests {
         assert_eq!(names.keys(), ["b"]);
         names.install_if("big".to_string(), many_names(100_001), || true);
         assert_eq!(names.keys(), ["big"]);
-    }
-
-    #[tokio::test]
-    async fn the_backend_derives_its_keys_from_the_key() {
-        let backend = built(&MemFsBackend::new()).await;
-        let stored = |keys: &KeySchedule| encode_name(keys, "report.txt", 255).unwrap().entry;
-        assert_eq!(stored(&backend.shared.keys), stored(&key_schedule()));
     }
 
     #[tokio::test]
@@ -372,6 +364,22 @@ mod tests {
                 "{intent:?}: `f` is no name of the share"
             );
         }
+        assert!(matches!(
+            backend.unlink(&path("f")).await,
+            Err(SmbError::NotFound)
+        ));
+        assert!(matches!(
+            backend.rename(&path("f"), &path("g"), false).await,
+            Err(SmbError::NotFound)
+        ));
+        assert_eq!(files.contents("f").unwrap(), b"abc");
+    }
+
+    #[tokio::test]
+    async fn the_root_lists_only_the_names_of_the_share_and_cannot_be_unlinked_or_renamed() {
+        let files = MemFsBackend::new();
+        let backend = built(&files).await;
+        files.clone().with_file("f", b"abc");
         let (handle, action) = backend
             .open(&path("new"), opts(OpenIntent::Create))
             .await
@@ -379,16 +387,8 @@ mod tests {
         assert_eq!(action, OpenAction::Created);
         handle.close().await.unwrap();
         assert!(matches!(
-            backend.unlink(&path("f")).await,
-            Err(SmbError::NotFound)
-        ));
-        assert!(matches!(
             backend.unlink(&SmbPath::root()).await,
             Err(SmbError::AccessDenied)
-        ));
-        assert!(matches!(
-            backend.rename(&path("f"), &path("g"), false).await,
-            Err(SmbError::NotFound)
         ));
         assert!(matches!(
             backend.rename(&SmbPath::root(), &path("g"), false).await,
@@ -414,8 +414,6 @@ mod tests {
             assert_eq!(names, ["new"]);
         }
         assert!(!root.dir_is_empty().await.unwrap());
-        assert!(root.watch().await.unwrap().is_none());
-        assert!(root.as_any().is_none());
         root.close().await.unwrap();
         assert_eq!(files.open_handles(), 0);
     }

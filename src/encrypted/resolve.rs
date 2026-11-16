@@ -666,7 +666,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_name_the_inner_backend_denies_twice_is_a_sharing_violation() {
+    async fn a_listed_name_that_fails_to_open_twice_is_a_sharing_violation() {
         let files = MemFsBackend::new();
         let hidden = Hidden::new(files.clone());
         let faulty = Faulty::new(hidden.clone());
@@ -682,7 +682,10 @@ mod tests {
             5,
             "exact, directory, name, directory, name"
         );
-        assert!(layer.shared.names.fresh("").is_none(), "nothing is trusted");
+        assert!(
+            layer.shared.names.fresh("").is_none(),
+            "the names of the root are dropped"
+        );
 
         hidden.show(&stored_at("Foo"));
         let handle = open_file(&layer, "foo").await;
@@ -735,7 +738,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_walked_directory_the_inner_backend_denies_twice_is_a_sharing_violation() {
+    async fn a_walked_directory_that_fails_to_open_twice_is_a_sharing_violation() {
         let files = MemFsBackend::new();
         let hidden = Hidden::new(files.clone());
         let faulty = Faulty::new(hidden.clone());
@@ -902,7 +905,11 @@ mod tests {
         assert_eq!(handle.node().header().await, Some(HeaderKind::Absent));
         assert_eq!(handle.stat().await.unwrap().name, "Data.BIN");
         assert_eq!(handle.stat().await.unwrap().end_of_file, 0);
-        assert_eq!(files.open_handles(), 2, "the check open is closed");
+        assert_eq!(
+            files.open_handles(),
+            2,
+            "the open that stats the file first is closed"
+        );
     }
 
     #[tokio::test]

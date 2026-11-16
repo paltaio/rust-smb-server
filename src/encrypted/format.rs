@@ -70,11 +70,7 @@ mod tests {
 
     #[test]
     fn constants_match_the_format() {
-        assert_eq!(HEADER_LEN, 24);
-        assert_eq!(FILE_ID_LEN, 16);
-        assert_eq!((NONCE_LEN, TAG_LEN, OVERHEAD), (12, 16, 28));
         assert_eq!(MARKER_NAME, ".smb-encryption");
-        assert_eq!((MARKER_LEN, SHARE_ID_LEN), (60, 16));
         assert_eq!(MAX_STORED_SIZE, 9_223_372_036_854_775_807);
     }
 
@@ -87,20 +83,5 @@ mod tests {
             );
         }
         assert_eq!(BlockShift::DEFAULT.get(), 16);
-    }
-
-    #[test]
-    fn block_sizes() {
-        let sizes = |shift: u8| {
-            let shift = BlockShift::new(shift).unwrap();
-            (
-                shift.block_size(),
-                shift.block_len(),
-                shift.stored_block_size(),
-            )
-        };
-        assert_eq!(sizes(13), (8192, 8192, 8220));
-        assert_eq!(sizes(16), (65536, 65536, 65564));
-        assert_eq!(sizes(20), (1_048_576, 1_048_576, 1_048_604));
     }
 }

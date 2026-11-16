@@ -252,17 +252,6 @@ mod tests {
     use crate::tests::memfs::MemFsBackend;
     use crate::tests::util::{opts, path};
 
-    async fn file(files: &MemFsBackend, name: &str) -> Box<dyn Handle> {
-        let faulty = Faulty::new(files.clone());
-        faulty.short_reads(Some(4));
-        faulty.short_writes(Some(3));
-        faulty
-            .open(&path(name), opts(OpenIntent::OpenOrCreate))
-            .await
-            .unwrap()
-            .0
-    }
-
     #[tokio::test]
     async fn a_side_object_is_read_up_to_1024_bytes_and_no_further() {
         let files = MemFsBackend::new()
@@ -291,24 +280,6 @@ mod tests {
             Err(SmbError::Io(_))
         ));
         assert_eq!(files.open_handles(), 0);
-    }
-
-    #[tokio::test]
-    async fn reads_continue_after_short_reads() {
-        let files = MemFsBackend::new().with_file("f", b"0123456789");
-        let handle = file(&files, "f").await;
-        assert_eq!(read_full(&*handle, 2, 7).await.unwrap(), b"2345678");
-        assert_eq!(read_full(&*handle, 0, 0).await.unwrap(), b"");
-    }
-
-    #[tokio::test]
-    async fn a_read_past_the_end_fails() {
-        let files = MemFsBackend::new().with_file("f", b"0123");
-        let handle = file(&files, "f").await;
-        let Err(SmbError::Io(error)) = read_full(&*handle, 2, 5).await else {
-            panic!("a short file is not read in full");
-        };
-        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
     }
 
     #[test]
@@ -460,31 +431,5 @@ mod tests {
             panic!("a write that takes nothing fails");
         };
         assert_eq!(error.kind(), io::ErrorKind::WriteZero);
-    }
-
-    #[tokio::test]
-    async fn writes_continue_after_short_writes() {
-        let files = MemFsBackend::new();
-        let handle = file(&files, "f").await;
-        write_full(&*handle, 0, b"0123456789").await.unwrap();
-        write_full(&*handle, 4, b"abc").await.unwrap();
-        write_full(&*handle, 0, b"").await.unwrap();
-        assert_eq!(files.contents("f").unwrap(), b"0123abc789");
-    }
-
-    #[tokio::test]
-    async fn a_write_that_takes_nothing_fails() {
-        let files = MemFsBackend::new();
-        let faulty = Faulty::new(files.clone());
-        faulty.short_writes(Some(0));
-        let (handle, _) = faulty
-            .open(&path("f"), opts(OpenIntent::Create))
-            .await
-            .unwrap();
-        let Err(SmbError::Io(error)) = write_full(&*handle, 0, b"x").await else {
-            panic!("a write of nothing is an error");
-        };
-        assert_eq!(error.kind(), io::ErrorKind::WriteZero);
-        assert_eq!(files.contents("f").unwrap(), b"");
     }
 }

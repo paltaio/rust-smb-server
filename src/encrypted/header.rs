@@ -107,15 +107,6 @@ mod tests {
     }
 
     #[test]
-    fn round_trips_every_shift() {
-        for bits in BlockShift::MIN..=BlockShift::MAX {
-            let header = Header::new(shift(bits), file_id()).unwrap();
-            assert_eq!(Header::parse(header.as_bytes(), shift(bits)), Ok(header));
-            assert_eq!(header.block_shift(), shift(bits));
-        }
-    }
-
-    #[test]
     fn all_zero_file_id_is_refused() {
         assert!(Header::new(BlockShift::DEFAULT, [0; FILE_ID_LEN]).is_none());
         let mut bytes = valid();

@@ -6,13 +6,12 @@ use tempfile::tempdir;
 
 use crate::common;
 use crate::common::client::*;
-use crate::common::instances::Instance;
 use crate::instances;
 
-async fn set_info_checks_the_open_first_then_the_request<I: Instance>() {
+async fn set_info_checks_the_open_first_then_the_request() {
     let td = tempdir().unwrap();
-    I::file(td.path(), "f.txt", b"data").await;
-    let server = Server::public(I::at(td.path()).await).await;
+    std::fs::write(td.path().join("f.txt"), b"data").unwrap();
+    let server = Server::public(local(td.path())).await;
     let mut c = server.client().await;
     let f = c.open("f.txt", RW | DELETE, SHARE_ALL).await.unwrap();
     let bogus = FileId::new(0xBAD, 0xBAD);
@@ -127,12 +126,11 @@ async fn rename_to_a_stream_name_is_refused_on_a_share_without_streams() {
 }
 
 instances! {
-    both: [
-        set_info_checks_the_open_first_then_the_request,
-    ],
+    both: [],
     plain_only: [
-        rename_with_a_root_directory_is_refused, // checks the file on the host
-        #[cfg(target_os = "linux")] disposition_counts_names_the_listing_hides, // makes a host name that listings hide
-        rename_to_a_stream_name_is_refused_on_a_share_without_streams, // checks the files on the host
+        rename_with_a_root_directory_is_refused,
+        #[cfg(target_os = "linux")] disposition_counts_names_the_listing_hides,
+        rename_to_a_stream_name_is_refused_on_a_share_without_streams,
+        set_info_checks_the_open_first_then_the_request,
     ],
 }

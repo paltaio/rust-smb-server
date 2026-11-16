@@ -1,6 +1,7 @@
 //! Stored files, names and markers changed by someone who holds no key. Each
-//! case runs over `MemFsBackend` and over `LocalFsBackend`: it edits the
-//! stored bytes behind the backend, then reads them through a new one.
+//! case runs over `MemFsBackend`, and over `LocalFsBackend` with the `localfs`
+//! feature. It edits the stored bytes behind the backend, then reads them
+//! through a new one.
 //!
 //! Offsets follow the stored format. The header is `HEADER_LEN` bytes. Block
 //! `i` starts at `HEADER_LEN + i * (block size + OVERHEAD)` and holds a nonce

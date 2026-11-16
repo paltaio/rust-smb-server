@@ -160,7 +160,6 @@ macro_rules! instance {
                 opens::a_missing_directory_on_the_way_is_path_not_found,
                 opens::a_missing_last_name_is_not_found,
                 opens::a_file_on_the_way_is_path_not_found,
-                opens::nested_entries_open_through_their_directories,
                 opens::a_write_only_open_writes,
                 opens::the_root_is_a_directory_that_exists,
                 opens::deep_trees_open_and_rename_whole,

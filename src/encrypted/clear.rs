@@ -481,7 +481,11 @@ mod tests {
             assert_eq!(files.contents(name), Some(Vec::new()));
             assert_eq!(handle.node().header().await, Some(HeaderKind::Absent));
         }
-        assert_eq!(files.open_handles(), 2, "the check open is closed");
+        assert_eq!(
+            files.open_handles(),
+            2,
+            "the open that stats the file first is closed"
+        );
     }
 
     async fn an_overwriting_open_of_a_missing_file_creates_it_or_fails<B: ShareBackend>(
@@ -527,7 +531,11 @@ mod tests {
                 "{intent:?}"
             );
         }
-        assert_eq!(files.open_handles(), 0, "the check open is closed");
+        assert_eq!(
+            files.open_handles(),
+            0,
+            "the open that stats the file first is closed"
+        );
         assert_eq!(layer.node_count(), 0);
     }
 
@@ -554,7 +562,11 @@ mod tests {
         assert_eq!(opened.node().header().await, Some(HeaderKind::Unknown));
         assert_eq!(made.node().header().await, Some(HeaderKind::Absent));
         assert_eq!(files.contents("f"), Some(b"abc".to_vec()));
-        assert_eq!(files.open_handles(), 2, "the check open is closed");
+        assert_eq!(
+            files.open_handles(),
+            2,
+            "the open that stats the file first is closed"
+        );
         assert!(opened.node().file().unwrap().try_write().is_ok());
     }
 
@@ -775,28 +787,6 @@ mod tests {
             Err(SmbError::AccessDenied)
         ));
         assert_eq!(files.contents("f"), Some(Vec::new()));
-    }
-
-    #[tokio::test]
-    async fn names_that_differ_in_case_reach_one_node_when_the_inner_backend_folds() {
-        let files = MemFsBackend::new();
-        let layer = clear_over(Folding::new(files.clone())).await;
-        let (first, _) = open(&layer, "Report.docx", OpenIntent::Create).await;
-        let (second, _) = open(&layer, "REPORT.DOCX", OpenIntent::Open).await;
-        assert!(shares_node(&first, &second));
-        assert_eq!(layer.node_count(), 1);
-
-        layer
-            .rename(&path("report.docx"), &path("Final.docx"), false)
-            .await
-            .unwrap();
-        assert_eq!(first.node().path(), path("Final.docx"));
-        let (third, _) = open(&layer, "FINAL.docx", OpenIntent::Open).await;
-        assert!(shares_node(&first, &third));
-
-        layer.unlink(&path("FINAL.DOCX")).await.unwrap();
-        assert!(first.node().is_detached());
-        assert_eq!(layer.node_count(), 0);
     }
 
     #[tokio::test]
@@ -1118,36 +1108,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_open_waits_for_the_create_of_its_name() {
-        let files = MemFsBackend::new();
-        let gated = Gated::new(files.clone());
-        let layer = clear_over(gated.clone()).await;
-        let gate = gated.arm_after_at(Op::Open, "f");
-        let creating = spawn_open(&layer, "f", OpenIntent::Create);
-        gate.reached().await;
-
-        let directory = layer.shared.locks.directory(String::new());
-        assert!(directory.is_exclusive(), "the create holds its directory");
-        assert!(layer.shared.locks.tree.try_write().is_err());
-        assert_eq!(files.contents("f"), Some(Vec::new()));
-        assert_eq!(layer.node_count(), 0, "the create has no node yet");
-        let opening = spawn_open(&layer, "f", OpenIntent::Open);
-        settle().await;
-        assert!(!opening.is_finished());
-        assert_eq!(layer.node_count(), 0);
-
-        gate.release();
-        let (created, action) = creating.await.unwrap().unwrap();
-        assert_eq!(action, OpenAction::Created);
-        let (opened, action) = opening.await.unwrap().unwrap();
-        assert_eq!(action, OpenAction::Opened);
-        assert!(shares_node(&created, &opened));
-        assert_eq!(created.node().header().await, Some(HeaderKind::Absent));
-        assert_eq!(layer.node_count(), 1);
-        assert!(directory.is_free());
-    }
-
-    #[tokio::test]
     async fn every_open_that_creates_holds_its_directory_exclusively() {
         for intent in [
             OpenIntent::Create,
@@ -1158,18 +1118,36 @@ mod tests {
             let gated = Gated::new(files.clone());
             let layer = clear_over(gated.clone()).await;
             let gate = gated.arm_at(Op::Open, "f");
+            let after_create =
+                (intent == OpenIntent::Create).then(|| gated.arm_after_at(Op::Open, "f"));
             let creating = spawn_open(&layer, "f", intent);
             gate.reached().await;
             assert!(
                 layer.shared.locks.directory(String::new()).is_exclusive(),
                 "{intent:?}"
             );
+            assert!(layer.shared.locks.tree.try_write().is_err(), "{intent:?}");
 
             let opening = spawn_open(&layer, "f", OpenIntent::Open);
             settle().await;
             assert!(!opening.is_finished(), "{intent:?}");
 
             gate.release();
+            if let Some(after_create) = after_create {
+                after_create.reached().await;
+                assert_eq!(files.contents("f"), Some(Vec::new()), "{intent:?}");
+                assert!(
+                    layer.shared.locks.directory(String::new()).is_exclusive(),
+                    "{intent:?} after the inner create"
+                );
+                assert!(
+                    layer.shared.locks.tree.try_write().is_err(),
+                    "{intent:?} after the inner create"
+                );
+                settle().await;
+                assert!(!opening.is_finished(), "{intent:?} after the inner create");
+                after_create.release();
+            }
             let (created, action) = creating.await.unwrap().unwrap();
             assert_eq!(action, OpenAction::Created, "{intent:?}");
             let (opened, action) = opening.await.unwrap().unwrap();
@@ -1198,69 +1176,6 @@ mod tests {
         gate.release();
         let (_, action) = truncating.await.unwrap().unwrap();
         assert_eq!(action, OpenAction::Overwritten);
-    }
-
-    #[tokio::test]
-    async fn an_unlink_and_a_create_wait_for_an_open_to_get_its_node() {
-        let files = MemFsBackend::new();
-        let gated = Gated::new(files.clone());
-        let layer = clear_over(gated.clone()).await;
-        files.clone().with_file("f", b"abc");
-        let gate = gated.arm_at(Op::Stat, "f");
-        let opening = spawn_open(&layer, "f", OpenIntent::Open);
-        gate.reached().await;
-        let directory = layer.shared.locks.directory(String::new());
-        assert!(!directory.is_free() && !directory.is_exclusive());
-
-        let unlinking = tokio::spawn({
-            let layer = layer.clone();
-            async move { layer.unlink(&path("f")).await }
-        });
-        settle().await;
-        let creating = spawn_open(&layer, "f", OpenIntent::Create);
-        settle().await;
-        assert!(!unlinking.is_finished());
-        assert!(!creating.is_finished());
-        assert_eq!(files.contents("f"), Some(b"abc".to_vec()));
-
-        gate.release();
-        let (old, _) = opening.await.unwrap().unwrap();
-        unlinking.await.unwrap().unwrap();
-        let (new, action) = creating.await.unwrap().unwrap();
-        assert_eq!(action, OpenAction::Created);
-        assert!(old.node().is_detached());
-        assert!(!shares_node(&old, &new));
-        assert_eq!(old.node().header().await, Some(HeaderKind::Unknown));
-        assert_eq!(new.node().header().await, Some(HeaderKind::Absent));
-        assert_eq!(layer.node_count(), 1);
-    }
-
-    #[tokio::test]
-    async fn a_directory_rename_waits_for_an_open_below_it_to_get_its_node() {
-        let files = MemFsBackend::new();
-        let gated = Gated::new(files.clone());
-        let layer = clear_over(gated.clone()).await;
-        files.clone().with_dir("d").with_file("d\\f", b"");
-        let gate = gated.arm_at(Op::Stat, "d\\f");
-        let opening = spawn_open(&layer, "d\\f", OpenIntent::Open);
-        gate.reached().await;
-        assert!(layer.shared.locks.tree.try_write().is_err());
-
-        let renaming = tokio::spawn({
-            let layer = layer.clone();
-            async move { layer.rename(&path("d"), &path("e"), false).await }
-        });
-        settle().await;
-        assert!(!renaming.is_finished());
-        assert!(files.contents("d\\f").is_some());
-
-        gate.release();
-        let (below, _) = opening.await.unwrap().unwrap();
-        renaming.await.unwrap().unwrap();
-        assert_eq!(below.node().path(), path("e\\f"));
-        let (again, _) = open(&layer, "e\\f", OpenIntent::Open).await;
-        assert!(shares_node(&below, &again));
-        assert_eq!(layer.node_count(), 1);
     }
 
     #[tokio::test]

@@ -160,7 +160,7 @@ mod tests {
     use crate::tests::util::path;
 
     #[tokio::test]
-    async fn a_file_is_unlinked_under_any_spelling_and_leaves_the_names_and_the_nodes() {
+    async fn a_file_is_unlinked_under_any_spelling_and_is_gone_from_the_names_and_the_nodes() {
         let (files, layer) = layer().await;
         let (_other, _) = open(&layer, "Other.txt", OpenIntent::Create).await;
         let (made, _) = open(&layer, "Foo.txt", OpenIntent::Create).await;
@@ -327,7 +327,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_name_the_inner_backend_denies_twice_is_a_sharing_violation() {
+    async fn a_name_the_inner_backend_cannot_find_twice_is_a_sharing_violation() {
         let files = MemFsBackend::new();
         let hidden = Hidden::new(files.clone());
         let layer = names_over(hidden.clone()).await;
@@ -336,7 +336,10 @@ mod tests {
 
         let error = layer.unlink(&path("foo")).await.unwrap_err();
         assert!(matches!(error, SmbError::Sharing), "{error:?}");
-        assert!(layer.shared.names.fresh("").is_none(), "nothing is trusted");
+        assert!(
+            layer.shared.names.fresh("").is_none(),
+            "the cached names are dropped"
+        );
         assert!(files.contents(&stored_at("Foo")).is_some());
 
         hidden.show(&stored_at("Foo"));
@@ -488,7 +491,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_sweep_of_side_objects_waits_for_a_create_in_the_directory() {
+    async fn removing_the_side_objects_waits_for_a_create_in_the_directory() {
         let files = MemFsBackend::new();
         let gated = Gated::new(Strict::new(files.clone()));
         let layer = names_over(gated.clone()).await;
@@ -508,7 +511,7 @@ mod tests {
             async move { layer.unlink(&path("Docs")).await }
         });
         settle().await;
-        assert!(!unlinking.is_finished(), "the sweep waits for the create");
+        assert!(!unlinking.is_finished(), "the removal waits for the create");
         assert!(files.contents(&side_at).is_some());
 
         gate.release();

@@ -5,11 +5,6 @@
 //! could slip into the gap. The change must wait for the open. Afterwards the
 //! handles of one file hold one node, and the handles of two files never hold
 //! the same one.
-//!
-//! Every scenario runs with encrypted names and with names in the clear.
-//! `an_open_waits_for_a_create_that_has_no_node_yet` and
-//! `a_create_waits_for_an_open_that_has_no_node_yet` also run over a store that
-//! reports file ids.
 
 use tokio::task::JoinHandle;
 
@@ -252,7 +247,7 @@ async fn an_unlink_and_a_create_wait_for(names: Names, intent: OpenIntent) {
     assert_eq!(scene.layer.node_count(), 2);
 }
 
-async fn a_rename_on_another_clone_waits_for_an_open_that_has_no_node_yet(names: Names) {
+async fn a_directory_rename_waits_for_an_open_below_it_that_has_no_node_yet(names: Names) {
     let scene = Scene::new(names, |files| files).await;
     names.seed_dir(&scene.files, "d");
     names.seed_file(&scene.files, "d\\f");
@@ -350,6 +345,6 @@ scenarios! {
     memfs_only: [
         an_unlink_and_a_create_wait_for_an_open_that_has_no_node_yet,
         an_unlink_and_a_create_wait_for_a_truncating_open_that_has_no_node_yet,
-        a_rename_on_another_clone_waits_for_an_open_that_has_no_node_yet,
+        a_directory_rename_waits_for_an_open_below_it_that_has_no_node_yet,
     ],
 }

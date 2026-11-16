@@ -330,10 +330,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_threshold_with_names_in_the_clear_is_invalid_whatever_the_order() {
+    async fn a_threshold_with_names_in_the_clear_is_invalid() {
         let error = refused(|builder| builder.encrypt_names(false).long_name_threshold(100)).await;
-        assert_invalid(&error, "long_name_threshold");
-        let error = refused(|builder| builder.long_name_threshold(100).encrypt_names(false)).await;
         assert_invalid(&error, "long_name_threshold");
     }
 

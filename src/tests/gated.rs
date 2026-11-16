@@ -647,30 +647,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_listing_parked_after_the_inner_call_returns_the_old_entries() {
-        let files = MemFsBackend::new().with_dir("d").with_file("d\\a", b"");
-        let gated = Gated::new(files.clone());
-        let dir = open_shared(&gated, "d", dir_opts(OpenIntent::Open)).await;
-        let gate = gated.arm_after_at(Op::ListDir, "d");
-        let listing = tokio::spawn({
-            let dir = Arc::clone(&dir);
-            async move { dir.list_dir(None).await }
-        });
-        gate.reached().await;
-        files.clone().with_file("d\\b", b"");
-        gate.release();
-        let names: Vec<_> = listing
-            .await
-            .unwrap()
-            .unwrap()
-            .into_iter()
-            .map(|entry| entry.info.name)
-            .collect();
-        assert_eq!(names, ["a"]);
-        assert_eq!(dir.list_dir(None).await.unwrap().len(), 2);
-    }
-
-    #[tokio::test]
     async fn forwards_every_call_it_does_not_park() {
         let recorder = Recorder::default();
         let gated = Gated::new(recorder.clone());

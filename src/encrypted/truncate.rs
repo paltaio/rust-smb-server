@@ -614,8 +614,8 @@ mod tests {
             "one load, then one reload for each truncate"
         );
 
-        // A cut at a block edge needs no rewrite, and so does a cut in a
-        // block that opens.
+        // A cut at a block edge reads no block. A cut inside a block that
+        // opens rewrites it. Both succeed.
         handle.truncate(2 * B as u64).await.unwrap();
         handle.truncate(B as u64 - 5).await.unwrap();
         assert_eq!(read_all(&handle).await, plain[..B - 5]);

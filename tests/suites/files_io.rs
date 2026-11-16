@@ -77,10 +77,10 @@ async fn write_through_needs_an_unbuffered_write_and_reaches_storage<I: Instance
     assert_eq!(Counters::get(&counters.flushes), before + 1);
 }
 
-async fn rdma_channels_are_refused_on_smb3<I: Instance>() {
+async fn rdma_channels_are_refused_on_smb3() {
     let td = tempdir().unwrap();
-    I::file(td.path(), "f.txt", b"data").await;
-    let server = Server::public(I::at(td.path()).await).await;
+    std::fs::write(td.path().join("f.txt"), b"data").unwrap();
+    let server = Server::public(local(td.path())).await;
     let mut c = server.client_at(SMB302).await;
     let f = c.open("f.txt", RW, SHARE_ALL).await.unwrap();
     for channel in [1, 2, 3] {
@@ -177,12 +177,12 @@ async fn read_shorter_than_minimum_count_is_end_of_file<I: Instance>() {
 instances! {
     both: [
         write_through_needs_an_unbuffered_write_and_reaches_storage,
-        rdma_channels_are_refused_on_smb3,
         flush_needs_write_access_on_files,
         read_shorter_than_minimum_count_is_end_of_file,
     ],
     plain_only: [
-        data_offset_past_0x100_is_refused, // reads the file back from the host
-        write_data_or_append_data_alone_overwrites_and_grows, // reads the file back from the host
+        data_offset_past_0x100_is_refused,
+        write_data_or_append_data_alone_overwrites_and_grows,
+        rdma_channels_are_refused_on_smb3,
     ],
 }

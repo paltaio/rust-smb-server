@@ -24,7 +24,6 @@ pub(super) async fn open(
         .unwrap_or_else(|error| panic!("open {name} {intent:?}: {error:?}"))
 }
 
-/// Opens the existing file `name`.
 pub(super) async fn open_file(backend: Backend<'_>, name: &str) -> Box<dyn Handle> {
     open(backend, name, OpenIntent::Open).await.0
 }
@@ -37,7 +36,6 @@ pub(super) async fn open_dir(backend: Backend<'_>, name: &str) -> Box<dyn Handle
     }
 }
 
-/// Makes the directory `name`.
 pub(super) async fn mkdir(backend: Backend<'_>, name: &str) {
     match backend
         .open(&path(name), dir_opts(OpenIntent::Create))

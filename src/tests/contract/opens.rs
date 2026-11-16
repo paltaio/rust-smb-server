@@ -187,20 +187,20 @@ pub(super) async fn a_missing_directory_on_the_way_is_path_not_found(backend: Ba
 
 pub(super) async fn a_missing_last_name_is_not_found(backend: Backend<'_>) {
     mkdir(backend, "d").await;
-    for name in ["f", "d\\f"] {
-        for intent in [OpenIntent::Open, OpenIntent::Truncate] {
-            assert_refused(
-                backend.open(&path(name), opts(intent)).await,
-                SmbError::NotFound,
-                &format!("{intent:?} {name}"),
-            );
-        }
+    for intent in [OpenIntent::Open, OpenIntent::Truncate] {
         assert_refused(
-            backend.open(&path(name), dir_opts(OpenIntent::Open)).await,
+            backend.open(&path("d\\f"), opts(intent)).await,
             SmbError::NotFound,
-            &format!("open directory {name}"),
+            &format!("{intent:?} d\\f"),
         );
     }
+    assert_refused(
+        backend
+            .open(&path("d\\f"), dir_opts(OpenIntent::Open))
+            .await,
+        SmbError::NotFound,
+        "open directory d\\f",
+    );
 }
 
 pub(super) async fn a_file_on_the_way_is_path_not_found(backend: Backend<'_>) {
@@ -212,16 +212,6 @@ pub(super) async fn a_file_on_the_way_is_path_not_found(backend: Backend<'_>) {
             &format!("{intent:?} below a file"),
         );
     }
-}
-
-pub(super) async fn nested_entries_open_through_their_directories(backend: Backend<'_>) {
-    mkdir(backend, "a").await;
-    mkdir(backend, "a\\b").await;
-    put(backend, "a\\b\\c.txt", b"deep").await;
-    assert_bytes(&contents(backend, "a\\b\\c.txt").await, b"deep", "the file");
-    assert_eq!(names(backend, "").await, ["a"]);
-    assert_eq!(names(backend, "a").await, ["b"]);
-    assert_eq!(names(backend, "a\\b").await, ["c.txt"]);
 }
 
 pub(super) async fn a_write_only_open_writes(backend: Backend<'_>) {
@@ -315,6 +305,7 @@ pub(super) async fn deep_trees_open_and_rename_whole(backend: Backend<'_>) {
         "the bottom file",
     );
     assert_eq!(names(backend, &bottom).await, ["f"]);
+    assert_eq!(names(backend, "level00\\level01").await, ["f", "level02"]);
 
     backend
         .rename(&path("level00"), &path("moved"), false)

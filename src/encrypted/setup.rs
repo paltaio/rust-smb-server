@@ -449,19 +449,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_damaged_marker_is_a_key_mismatch() {
-        for at in [9, 59] {
-            let mut bytes = good_marker();
-            bytes[at] ^= 1;
-            let error = failure_with_marker(&bytes).await;
-            assert!(
-                matches!(error, EncryptionError::KeyMismatch),
-                "byte {at}: expected a key mismatch, got {error:?}"
-            );
-        }
-    }
-
-    #[tokio::test]
     async fn a_directory_named_like_the_marker_is_invalid() {
         let files = MemFsBackend::new().with_dir(MARKER_NAME);
         let error = build(&files, |builder| builder).await.unwrap_err();

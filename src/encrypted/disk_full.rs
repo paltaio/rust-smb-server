@@ -48,8 +48,9 @@ impl Case {
         }
     }
 
-    /// The padded last block and the run are not next to each other. The run
-    /// is a third write, and starts at or above the end of the padded block.
+    /// The padded last block and the new blocks are not next to each other.
+    /// The new blocks are a third write, which starts at or above the end of
+    /// the padded block.
     fn apart(self) -> Self {
         Self {
             writes: 3,

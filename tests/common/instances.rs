@@ -31,7 +31,7 @@ pub trait Instance {
     async fn dir(root: &Path, name: &str);
 }
 
-/// `LocalFsBackend`, filled through the host.
+/// `LocalFsBackend`, filled directly in the directory.
 pub struct Plain;
 
 impl Instance for Plain {
@@ -93,7 +93,10 @@ impl Instance for Encrypted {
 }
 
 /// Runs each `both` function once per instance, in the modules `plain` and
-/// `encrypted`, and each `plain_only` function in `plain`.
+/// `encrypted`, and each `plain_only` function in `plain`. `plain_only` holds
+/// the tests that read or change the share directory directly, where the
+/// encrypted instance holds ciphertext, and the tests whose asserted answer
+/// comes from the handler alone.
 #[macro_export]
 macro_rules! instances {
     (

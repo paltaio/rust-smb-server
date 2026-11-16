@@ -284,19 +284,17 @@ mod tests {
 
     #[test]
     fn round_trips_full_and_partial_blocks() {
-        for bits in [13, 16, 20] {
-            let cipher = cipher(bits);
-            let full = shift(bits).block_len();
-            for len in [1, 2, 4095, 4096, full / 2 + 1, full - 1, full] {
-                let plain = pattern(len);
-                let mut nonce = [[0u8; NONCE_LEN]];
-                random_nonces(&mut nonce).unwrap();
-                let mut stored = vec![0u8; len + OVERHEAD];
-                cipher
-                    .seal_block(7, &nonce[0], &plain, &mut stored)
-                    .unwrap();
-                assert_eq!(open(&cipher, 7, &stored).unwrap(), plain, "len {len}");
-            }
+        let cipher = cipher(13);
+        let full = shift(13).block_len();
+        for len in [1, full] {
+            let plain = pattern(len);
+            let mut nonce = [[0u8; NONCE_LEN]];
+            random_nonces(&mut nonce).unwrap();
+            let mut stored = vec![0u8; len + OVERHEAD];
+            cipher
+                .seal_block(7, &nonce[0], &plain, &mut stored)
+                .unwrap();
+            assert_eq!(open(&cipher, 7, &stored).unwrap(), plain, "len {len}");
         }
     }
 

@@ -4,8 +4,8 @@
 //! The model keeps entries under their names folded by the backend's case
 //! rule. A call that the model says succeeds must succeed, and one it says
 //! fails must fail with some error; the contract names the errors of only some
-//! of those. After each step every directory is listed, and now and then every
-//! file is read.
+//! of those. After each step every directory is listed, and every 25 steps
+//! every file is read.
 
 use std::collections::BTreeMap;
 

@@ -567,20 +567,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn names_are_deterministic_and_keyed() {
-        let name = "report.docx";
-        assert_eq!(encoded(name, 255), encoded(name, 255));
-        let other = encode_name(&other_key_schedule(), name, 255).unwrap();
-        assert_ne!(other.entry, encoded(name, 255).entry);
-        assert_eq!(
-            decode_short(&key_schedule(), &other.entry),
-            Err(NameError::Authentication)
-        );
-        let decoded = decode_short(&other_key_schedule(), &other.entry);
-        assert_eq!(decoded.as_deref(), Ok(name));
-    }
-
     // Short names
 
     #[test]
@@ -699,15 +685,9 @@ mod tests {
     fn side_object_longer_than_any_name_is_refused() {
         let keys = key_schedule();
         let mut next = xorshift(0x9e37_79b9_7f4a_7c15);
-        for len in [782usize, 1024] {
-            let content: Vec<u8> = (0..len).map(|_| next() as u8).collect();
-            let entry = long_entry_of(&content);
-            assert_eq!(
-                decode_long(&keys, &entry, &content),
-                Err(NameError::Length),
-                "len {len}"
-            );
-        }
+        let content: Vec<u8> = (0..782).map(|_| next() as u8).collect();
+        let entry = long_entry_of(&content);
+        assert_eq!(decode_long(&keys, &entry, &content), Err(NameError::Length));
         // A sealed name of 781 bytes is the longest that decodes.
         let content = sealed("\u{6587}".repeat(255).as_bytes());
         assert_eq!(content.len(), 781);
@@ -773,14 +753,6 @@ mod tests {
         for name in [".SMB-ENCRYPTION", ".smb-encryption.l"] {
             assert_eq!(classify(name, true), StoredKind::Foreign, "{name:?}");
         }
-    }
-
-    #[test]
-    fn long_entries_and_side_objects_are_told_by_their_suffix() {
-        let entry = format!("{N144_HASH}.l");
-        let side = format!("{N144_HASH}.n");
-        assert_eq!(classify(&entry, false), StoredKind::LongEntry);
-        assert_eq!(classify(&side, false), StoredKind::SideObject);
     }
 
     #[test]

@@ -100,7 +100,6 @@ impl Ids {
     }
 }
 
-/// The path of the entry `name` of the directory `dir`.
 fn child(dir: &str, name: &str) -> String {
     if dir.is_empty() {
         name.to_string()

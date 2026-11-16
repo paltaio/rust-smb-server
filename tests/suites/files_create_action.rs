@@ -151,6 +151,6 @@ instances! {
         missing_parent_is_path_not_found,
     ],
     plain_only: [
-        open_if_opens_an_existing_file_with_the_access_asked_for, // reads the file back from the host
+        open_if_opens_an_existing_file_with_the_access_asked_for,
     ],
 }

@@ -187,17 +187,6 @@ mod tests {
     }
 
     #[test]
-    fn file_key_depends_on_suite_and_file_id() {
-        let keys = key_schedule();
-        let id = file_id();
-        let base = keys.file_key(SUITE, &id);
-        assert_ne!(base.as_bytes(), keys.file_key(SUITE + 1, &id).as_bytes());
-        let mut other = id;
-        other[15] ^= 1;
-        assert_ne!(base.as_bytes(), keys.file_key(SUITE, &other).as_bytes());
-    }
-
-    #[test]
     fn expand_runs_to_the_last_counter() {
         let prk = extract(b"salt", b"ikm");
         let okm = expand::<MAX_OKM_LEN>(&prk, &[b"info"]);

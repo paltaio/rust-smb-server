@@ -187,10 +187,10 @@ instances! {
         query_info_reports_delete_pending_on_every_open,
     ],
     plain_only: [
-        file_stays_until_the_last_open_closes, // checks the file on the host
-        clearing_the_disposition_through_another_open_keeps_the_file, // checks the file on the host
-        delete_on_close_waits_for_the_other_opens, // checks the file on the host
-        delete_on_close_of_a_read_only_file_leaves_it_whole, // sets host permissions, reads the file back
-        #[cfg(target_os = "linux")] delete_on_close_keeps_a_directory_with_hidden_entries, // makes a host name that listings hide
+        file_stays_until_the_last_open_closes,
+        clearing_the_disposition_through_another_open_keeps_the_file,
+        delete_on_close_waits_for_the_other_opens,
+        delete_on_close_of_a_read_only_file_leaves_it_whole,
+        #[cfg(target_os = "linux")] delete_on_close_keeps_a_directory_with_hidden_entries,
     ],
 }

@@ -22,9 +22,6 @@ use crate::stream::{StreamInfo, StreamName};
 /// names as the inner backend stores them, folded. It reports
 /// `case_sensitive: false`, and `file_index` 0 from handles and listings.
 ///
-/// Folding revalidates each component, so a valid name whose lowercase form
-/// is longer, such as 128 or more U+0130, answers `NameInvalid`.
-///
 /// Handles it returns have no `as_any`.
 #[derive(Clone)]
 pub(crate) struct Folding<B> {
@@ -361,16 +358,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_name_that_is_longer_when_folded_is_invalid() {
+    async fn a_name_that_grows_past_the_limit_when_folded_is_invalid() {
         let folding = Folding::new(MemFsBackend::new());
-        folding
-            .open(&path(&"\u{130}".repeat(127)), opts(OpenIntent::Create))
-            .await
-            .unwrap();
+        let fits = path(&"\u{130}".repeat(127));
+        folding.open(&fits, opts(OpenIntent::Create)).await.unwrap();
+        let grows = path(&"\u{130}".repeat(128));
         assert!(matches!(
-            folding
-                .open(&path(&"\u{130}".repeat(128)), opts(OpenIntent::Create))
-                .await,
+            folding.open(&grows, opts(OpenIntent::Create)).await,
             Err(SmbError::NameInvalid)
         ));
     }

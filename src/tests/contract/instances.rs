@@ -28,7 +28,6 @@ pub(super) async fn memfs() -> Result<Fixture, Error> {
     Ok(Fixture::new(MemFsBackend::new()))
 }
 
-/// A backend over a new directory, and the directory.
 #[cfg(feature = "localfs")]
 fn local() -> Result<(LocalFsBackend, tempfile::TempDir), Error> {
     let dir = tempfile::tempdir()?;
@@ -77,8 +76,8 @@ pub(super) async fn layer_exact_localfs() -> Result<Fixture, Error> {
 }
 
 /// Raises the soft limit on open files. A backend keeps open every file it
-/// has made and not yet stored, and a process on macOS starts with room for
-/// 256.
+/// has made until it stores the file, and a process on macOS starts with room
+/// for 256.
 #[cfg(all(feature = "s3", unix))]
 fn raise_file_limit() {
     static RAISED: std::sync::Once = std::sync::Once::new();

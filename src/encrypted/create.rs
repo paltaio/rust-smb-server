@@ -150,9 +150,10 @@ mod tests {
     use super::super::node::HeaderKind;
     use super::super::scan::Hold;
     use super::super::testing::{
-        Hidden, drop_at, fail_open_of, injected, layer, names_over, names_with, open, open_dir,
-        open_dir_as, open_file, read_all, refused, refused_dir, seed_dir, seed_file, settle,
-        shares_node, spawn_open, stored_at, stored_bytes, stored_form, stored_name, writes_since,
+        Hidden, drop_at, fail_open_of, injected, layer, long_name, names_over, names_with, open,
+        open_dir, open_dir_as, open_file, read_all, refused, refused_dir, seed_dir, seed_file,
+        settle, shares_node, spawn_open, stored_at, stored_bytes, stored_form, stored_len,
+        stored_name, writes_since,
     };
     use super::*;
     use crate::backend::{Handle, OpenIntent};
@@ -169,11 +170,6 @@ mod tests {
         OpenIntent::OpenOrCreate,
         OpenIntent::OverwriteOrCreate,
     ];
-
-    /// A name whose stored form is a long entry and a side object.
-    fn long() -> String {
-        "x".repeat(150)
-    }
 
     #[tokio::test]
     async fn create_fails_for_an_entry_of_any_case_file_or_directory() {
@@ -358,7 +354,10 @@ mod tests {
         assert_eq!(handle.stat().await.unwrap().name, "Docs.txt");
         handle.write(0, b"hello").await.unwrap();
         assert_eq!(read_all(&handle).await, b"hello");
-        assert_eq!(files.contents(&stored_at("Docs.txt")).unwrap().len(), 57);
+        assert_eq!(
+            files.contents(&stored_at("Docs.txt")).unwrap().len(),
+            stored_len(5)
+        );
 
         let before = faulty.opens();
         let variant = open_file(&layer, "DOCS.TXT").await;
@@ -425,7 +424,7 @@ mod tests {
         let files = MemFsBackend::new();
         let gated = Gated::new(files.clone());
         let layer = names_over(gated.clone()).await;
-        let long = long();
+        let long = long_name("x");
         let form = stored_form(&long);
         let side = form.side_object.clone().expect("a long name");
         let gate = gated.arm_at(Op::Open, &form.entry);
@@ -449,7 +448,7 @@ mod tests {
         let files = MemFsBackend::new();
         let gated = Gated::new(files.clone());
         let layer = names_over(gated.clone()).await;
-        let long = long();
+        let long = long_name("x");
         let entry = stored_form(&long).entry;
         let gate = gated.arm_at(Op::Open, &entry);
         assert_eq!(layer.shared.long_names.len(), 0);
@@ -467,7 +466,7 @@ mod tests {
         let files = MemFsBackend::new();
         let faulty = Faulty::new(files.clone());
         let layer = names_over(faulty.clone()).await;
-        let long = long();
+        let long = long_name("x");
         let form = stored_form(&long);
         let side = form.side_object.clone().expect("a long name");
 
@@ -500,7 +499,7 @@ mod tests {
     #[tokio::test]
     async fn a_directory_in_the_place_of_a_side_object_fails_the_create_before_the_entry() {
         let (files, layer) = layer().await;
-        let long = long();
+        let long = long_name("x");
         let form = stored_form(&long);
         let side = form.side_object.expect("a long name");
         files.clone().with_dir(&side.name);
@@ -513,7 +512,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_side_object_with_the_same_content_is_left_alone_and_another_is_rewritten() {
-        let long = long();
+        let long = long_name("x");
         let side = stored_form(&long).side_object.expect("a long name");
         let mut flipped = side.content.clone();
         flipped[0] ^= 1;
@@ -557,7 +556,7 @@ mod tests {
     #[tokio::test]
     async fn a_long_directory_is_made_with_its_side_object_and_opens_in_any_case() {
         let (files, layer) = layer().await;
-        let long = long();
+        let long = long_name("x");
         let form = stored_form(&long);
         let side = form.side_object.expect("a long name");
 
@@ -692,7 +691,7 @@ mod tests {
         assert_eq!(
             faulty.opens() - before,
             3,
-            "exact, exact in the entry, entry"
+            "`DOCS` misses, `A.TXT` misses in `Docs`, the entry opens"
         );
         assert!(shares_node(&file, &variant));
         assert!(docs.node().is_directory());
@@ -987,7 +986,7 @@ mod tests {
                 builder.case_insensitive(insensitive)
             })
             .await;
-            let long = long();
+            let long = long_name("x");
             let form = stored_form(&long);
             let side = form.side_object.expect("a long name").name;
             let before = faulty.open_calls().len();
@@ -1057,7 +1056,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_cached_name_the_inner_backend_denies_twice_is_a_sharing_violation() {
+    async fn a_cached_name_the_inner_backend_cannot_find_twice_is_a_sharing_violation() {
         let files = MemFsBackend::new();
         let hidden = Hidden::new(files.clone());
         let layer = names_over(hidden.clone()).await;
@@ -1067,7 +1066,10 @@ mod tests {
         for intent in [OpenIntent::OpenOrCreate, OpenIntent::OverwriteOrCreate] {
             let error = refused(&layer, "foo", intent).await;
             assert!(matches!(error, SmbError::Sharing), "{intent:?}: {error:?}");
-            assert!(layer.shared.names.fresh("").is_none(), "nothing is trusted");
+            assert!(
+                layer.shared.names.fresh("").is_none(),
+                "the cached names are dropped"
+            );
         }
         let error = refused(&layer, "FOO", OpenIntent::Create).await;
         assert!(matches!(error, SmbError::Exists), "{error:?}");

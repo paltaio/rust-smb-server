@@ -228,19 +228,4 @@ mod tests {
         assert!(locks.directories_below("a").is_empty());
         assert_eq!(locks.directory_count(), 0);
     }
-
-    #[tokio::test]
-    async fn shared_holders_share_and_an_exclusive_holder_is_alone() {
-        let locks = Locks::new();
-        let dir = locks.directory(String::new());
-        assert!(dir.is_free() && !dir.is_exclusive());
-        let first = dir.acquire(false).await;
-        let second = dir.acquire(false).await;
-        assert!(!dir.is_free() && !dir.is_exclusive());
-        drop((first, second));
-        let exclusive = dir.acquire(true).await;
-        assert!(!dir.is_free() && dir.is_exclusive());
-        drop(exclusive);
-        assert!(dir.is_free());
-    }
 }

@@ -620,7 +620,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_listing_that_fails_fails_the_build_and_keeps_nothing() {
+    async fn a_listing_that_fails_fails_the_lookup_and_keeps_nothing() {
         let files = MemFsBackend::new();
         let faulty = Faulty::new(files.clone());
         let layer = names_over(faulty.clone()).await;

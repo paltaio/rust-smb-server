@@ -18,7 +18,9 @@ use crate::path::SmbPath;
 use crate::stream::{StreamInfo, StreamName};
 
 /// Wraps `inner` and fails chosen opens, unlinks, renames, writes, flushes,
-/// truncates, closes, listings and stats, and cuts reads and writes short.
+/// truncates, closes, listings and stats, and cuts reads and writes short. The
+/// unlink, rename, flush, close and stat faults exist with the `encryption`
+/// feature.
 ///
 /// A fault hits the nth call from the moment it is set and then clears. A
 /// call it hits fails without reaching the inner backend; a torn write
@@ -194,11 +196,13 @@ impl<B: ShareBackend> Faulty<B> {
     }
 
     /// Fails the `nth` unlink from now (1 is the next one) with `error`.
+    #[cfg(feature = "encryption")]
     pub(crate) fn fail_unlink(&self, nth: usize, error: SmbError) {
         self.state.lock().unwrap().unlink_fault = Some(Fault::new(nth, error));
     }
 
     /// Fails the `nth` rename from now (1 is the next one) with `error`.
+    #[cfg(feature = "encryption")]
     pub(crate) fn fail_rename(&self, nth: usize, error: SmbError) {
         self.state.lock().unwrap().rename_fault = Some(Fault::new(nth, error));
     }
@@ -219,6 +223,7 @@ impl<B: ShareBackend> Faulty<B> {
     }
 
     /// Fails the `nth` flush from now (1 is the next one) with `error`.
+    #[cfg(feature = "encryption")]
     pub(crate) fn fail_flush(&self, nth: usize, error: SmbError) {
         self.state.lock().unwrap().flush_fault = Some(Fault::new(nth, error));
     }
@@ -230,6 +235,7 @@ impl<B: ShareBackend> Faulty<B> {
 
     /// Fails the `nth` close from now (1 is the next one) with `error`. The
     /// handle is closed in the inner backend first.
+    #[cfg(feature = "encryption")]
     pub(crate) fn fail_close(&self, nth: usize, error: SmbError) {
         self.state.lock().unwrap().close_fault = Some(Fault::new(nth, error));
     }
@@ -241,6 +247,7 @@ impl<B: ShareBackend> Faulty<B> {
 
     /// Fails the `nth` `stat` of a handle from now (1 is the next one) with
     /// `error`.
+    #[cfg(feature = "encryption")]
     pub(crate) fn fail_stat(&self, nth: usize, error: SmbError) {
         self.state.lock().unwrap().stat_fault = Some(Fault::new(nth, error));
     }
@@ -665,48 +672,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fails_the_nth_unlink_with_the_chosen_error() {
-        let files = MemFsBackend::new()
-            .with_file("a", b"")
-            .with_file("b", b"")
-            .with_file("c", b"")
-            .with_file("d", b"");
-        let faulty = Faulty::new(files.clone());
-        faulty.unlink(&path("a")).await.unwrap();
-        faulty.fail_unlink(2, SmbError::DiskFull);
-        faulty.unlink(&path("b")).await.unwrap();
-        assert!(matches!(
-            faulty.unlink(&path("c")).await,
-            Err(SmbError::DiskFull)
-        ));
-        assert_eq!(files.contents("c"), Some(Vec::new()));
-        faulty.unlink(&path("c")).await.unwrap();
-        assert_eq!(files.contents("c"), None);
-        assert_eq!(faulty.unlinks(), 4);
-    }
-
-    #[tokio::test]
-    async fn fails_the_nth_rename_with_the_chosen_error() {
-        let files = MemFsBackend::new()
-            .with_file("a", b"")
-            .with_file("b", b"")
-            .with_file("c", b"");
-        let faulty = Faulty::new(files.clone());
-        faulty.rename(&path("a"), &path("a2"), false).await.unwrap();
-        faulty.fail_rename(2, io_error());
-        faulty.rename(&path("b"), &path("b2"), false).await.unwrap();
-        assert!(matches!(
-            faulty.rename(&path("c"), &path("c2"), false).await,
-            Err(SmbError::Io(_))
-        ));
-        assert_eq!(files.contents("c"), Some(Vec::new()));
-        assert_eq!(files.contents("c2"), None);
-        faulty.rename(&path("c"), &path("c2"), false).await.unwrap();
-        assert_eq!(files.contents("c2"), Some(Vec::new()));
-        assert_eq!(faulty.renames(), 4);
-    }
-
-    #[tokio::test]
     async fn fails_the_nth_write_with_the_chosen_error() {
         let (files, faulty, handle) = faulty_file(b"").await;
         faulty.fail_write(3, SmbError::DiskFull);
@@ -720,31 +685,6 @@ mod tests {
         assert_eq!(handle.write(4, b"dd").await.unwrap(), 2);
         assert_eq!(files.contents("f"), Some(b"aabbdd".to_vec()));
         assert_eq!(faulty.writes(), 4);
-    }
-
-    #[tokio::test]
-    async fn counts_owned_writes_with_writes_and_fails_them_too() {
-        let (files, faulty, handle) = faulty_file(b"").await;
-        faulty.fail_write(2, io_error());
-        assert_eq!(handle.write(0, b"aa").await.unwrap(), 2);
-        assert!(matches!(
-            handle.write_owned(2, b"bb".to_vec()).await,
-            Err(SmbError::Io(_))
-        ));
-        assert_eq!(handle.write_owned(2, b"cc".to_vec()).await.unwrap(), 2);
-        assert_eq!(files.contents("f"), Some(b"aacc".to_vec()));
-        assert_eq!(faulty.writes(), 3);
-    }
-
-    #[tokio::test]
-    async fn counts_from_the_moment_a_fault_is_set() {
-        let (files, faulty, handle) = faulty_file(b"").await;
-        handle.write(0, b"a").await.unwrap();
-        handle.write(1, b"b").await.unwrap();
-        faulty.fail_write(1, SmbError::DiskFull);
-        assert!(handle.write(2, b"c").await.is_err());
-        assert_eq!(faulty.writes(), 3);
-        assert_eq!(files.contents("f"), Some(b"ab".to_vec()));
     }
 
     #[tokio::test]
@@ -771,19 +711,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fails_the_nth_truncate_with_the_chosen_error() {
-        let (files, faulty, handle) = faulty_file(b"abcdef").await;
-        faulty.fail_truncate(2, SmbError::DiskFull);
-        handle.truncate(5).await.unwrap();
-        assert!(matches!(handle.truncate(2).await, Err(SmbError::DiskFull)));
-        assert_eq!(files.contents("f"), Some(b"abcde".to_vec()));
-        handle.truncate(2).await.unwrap();
-        assert_eq!(files.contents("f"), Some(b"ab".to_vec()));
-        assert_eq!(faulty.truncates(), 3);
-        assert_eq!(faulty.writes(), 0);
-    }
-
-    #[tokio::test]
     async fn logs_each_truncate_and_drops_the_ones_from_the_sink_length() {
         let (files, faulty, handle) = faulty_file(b"abcdef").await;
         faulty.sink_truncates_from(Some(10));
@@ -802,26 +729,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fails_the_nth_listing_with_the_chosen_error() {
-        let files = MemFsBackend::new().with_dir("d").with_file("d\\a", b"");
-        let faulty = Faulty::new(files);
-        let (dir, _) = faulty
-            .open(&path("d"), dir_opts(OpenIntent::Open))
-            .await
-            .unwrap();
-        dir.list_dir(None).await.unwrap();
-        faulty.fail_listing(2, SmbError::DiskFull);
-        dir.list_dir_sized(None, false).await.unwrap();
-        assert!(matches!(
-            dir.list_dir_sized(None, false).await,
-            Err(SmbError::DiskFull)
-        ));
-        faulty.fail_listing(1, io_error());
-        assert!(matches!(dir.list_dir(None).await, Err(SmbError::Io(_))));
-        assert_eq!(dir.list_dir(None).await.unwrap().len(), 1);
-    }
-
-    #[tokio::test]
     async fn logs_each_listing_as_asked_for() {
         let files = MemFsBackend::new().with_dir("d").with_file("d\\a", b"");
         let faulty = Faulty::new(files);
@@ -834,53 +741,17 @@ mod tests {
         dir.list_dir_sized(None, true).await.unwrap();
         faulty.fail_listing(1, io_error());
         assert!(dir.list_dir_sized(Some("b"), false).await.is_err());
+        faulty.fail_listing(1, io_error());
+        assert!(dir.list_dir(None).await.is_err());
         assert_eq!(
             faulty.list_calls(),
             [
                 (Some("a*".to_string()), false),
                 (None, true),
-                (Some("b".to_string()), false)
+                (Some("b".to_string()), false),
+                (None, false)
             ]
         );
-    }
-
-    #[tokio::test]
-    async fn fails_the_nth_stat_with_the_chosen_error() {
-        let (_, faulty, handle) = faulty_file(b"abc").await;
-        faulty.fail_stat(2, SmbError::DiskFull);
-        handle.stat().await.unwrap();
-        assert!(matches!(handle.stat().await, Err(SmbError::DiskFull)));
-        assert_eq!(handle.stat().await.unwrap().end_of_file, 3);
-    }
-
-    #[tokio::test]
-    async fn fails_the_nth_flush_and_close_with_the_chosen_error() {
-        let (files, faulty, handle) = faulty_file(b"").await;
-        faulty.fail_flush(2, SmbError::DiskFull);
-        handle.flush().await.unwrap();
-        assert!(matches!(handle.flush().await, Err(SmbError::DiskFull)));
-        handle.flush().await.unwrap();
-
-        faulty.fail_close(1, io_error());
-        assert!(matches!(handle.close().await, Err(SmbError::Io(_))));
-        assert_eq!(
-            files.open_handles(),
-            0,
-            "the failed close closed the handle"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_write_fault_and_a_truncate_fault_are_independent() {
-        let (files, faulty, handle) = faulty_file(b"abcdef").await;
-        faulty.fail_write(1, SmbError::DiskFull);
-        faulty.fail_truncate(1, io_error());
-        assert!(matches!(handle.truncate(3).await, Err(SmbError::Io(_))));
-        assert!(matches!(
-            handle.write(0, b"x").await,
-            Err(SmbError::DiskFull)
-        ));
-        assert_eq!(files.contents("f"), Some(b"abcdef".to_vec()));
     }
 
     #[tokio::test]

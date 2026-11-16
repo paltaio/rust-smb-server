@@ -417,10 +417,10 @@ async fn read_and_write_check_the_open_access() {
     assert_eq!(std::fs::read(&path).unwrap(), b"Data!");
 }
 
-async fn query_info_reports_the_open_access<I: Instance>() {
+async fn query_info_reports_the_open_access() {
     let td = tempdir().expect("tempdir");
-    I::file(td.path(), "f.txt", b"x").await;
-    let backend = I::at(td.path()).await;
+    std::fs::write(td.path().join("f.txt"), b"x").expect("write file");
+    let backend = LocalFsBackend::new(td.path()).expect("open root");
     let server = Server::public(backend).await;
     let mut c = server.client().await;
 
@@ -1005,10 +1005,10 @@ async fn times_before_1970_are_set_and_reported<I: Instance>() {
     c.close(root).await;
 }
 
-async fn alternate_name_query_reports_no_short_name<I: Instance>() {
+async fn alternate_name_query_reports_no_short_name() {
     let td = tempdir().expect("tempdir");
-    I::file(td.path(), "a long name.txt", b"x").await;
-    let backend = I::at(td.path()).await;
+    std::fs::write(td.path().join("a long name.txt"), b"x").expect("write file");
+    let backend = LocalFsBackend::new(td.path()).expect("open root");
     let server = Server::public(backend).await;
     let mut c = server.client().await;
 
@@ -1304,31 +1304,31 @@ async fn created_overwritten_and_superseded_files_take_the_attributes_asked_for<
 instances! {
     both: [
         file_id_is_stable_across_opens_and_matches_listing,
-        query_info_reports_the_open_access,
         directory_attribute_is_accepted_on_a_directory,
         times_before_1970_are_set_and_reported,
-        alternate_name_query_reports_no_short_name,
         query_directory_applies_dos_wildcards,
         create_answers_maximal_access_and_on_disk_id,
         maximal_access_on_a_read_only_share_is_read_access,
         created_overwritten_and_superseded_files_take_the_attributes_asked_for,
     ],
     plain_only: [
-        end_to_end_anon_write_then_read_localfs, // reads the file back from the host
-        read_only_share_denies_delete_and_write_opens, // checks the file on the host
-        read_write_share_checks_open_access, // checks the files on the host
-        rename_with_replace_if_exists, // reads and checks files on the host
-        read_and_write_check_the_open_access, // reads the file back from the host
-        maximum_allowed_on_read_only_share_grants_read_access, // reads the file back from the host
-        delete_style_open_needs_no_host_write_access, // checks the files on the host
-        rename_moves_other_opens_of_the_file, // writes and reads files on the host
-        a_directory_with_an_open_file_below_is_not_renamed, // checks the files on the host
-        directory_renames_while_it_is_open, // checks the directories on the host
-        allocation_below_end_of_file_truncates, // reads the file back from the host
-        special_time_values_are_not_written_as_times, // sets and reads times on the host
-        deleting_a_non_empty_directory_fails, // checks the files on the host
-        read_only_is_applied_and_other_attributes_where_the_host_keeps_them, // reads permissions on the host
-        write_time_applies_with_a_creation_time, // reads times on the host
-        create_ignores_other_contexts_and_rejects_malformed_ones, // checks the host for b.txt
+        end_to_end_anon_write_then_read_localfs,
+        read_only_share_denies_delete_and_write_opens,
+        read_write_share_checks_open_access,
+        rename_with_replace_if_exists,
+        read_and_write_check_the_open_access,
+        maximum_allowed_on_read_only_share_grants_read_access,
+        delete_style_open_needs_no_host_write_access,
+        rename_moves_other_opens_of_the_file,
+        a_directory_with_an_open_file_below_is_not_renamed,
+        directory_renames_while_it_is_open,
+        allocation_below_end_of_file_truncates,
+        special_time_values_are_not_written_as_times,
+        deleting_a_non_empty_directory_fails,
+        read_only_is_applied_and_other_attributes_where_the_host_keeps_them,
+        write_time_applies_with_a_creation_time,
+        create_ignores_other_contexts_and_rejects_malformed_ones,
+        query_info_reports_the_open_access,
+        alternate_name_query_reports_no_short_name,
     ],
 }

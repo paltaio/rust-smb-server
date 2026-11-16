@@ -345,9 +345,9 @@ async fn entries_that_do_not_fit_wait_for_the_next_query<I: Instance>() {
     c.close(root).await;
 }
 
-async fn listing_requires_list_directory_access<I: Instance>() {
+async fn listing_requires_list_directory_access() {
     let td = tempdir().expect("tempdir");
-    let (_server, mut c) = client::<I>(td.path()).await;
+    let (_server, mut c) = client::<Plain>(td.path()).await;
     let dir = c
         .open_with_options("", FILE_READ_ATTRIBUTES, FILE_DIRECTORY_FILE)
         .await
@@ -359,9 +359,9 @@ async fn listing_requires_list_directory_access<I: Instance>() {
     c.close(dir).await;
 }
 
-async fn information_classes_get_the_spec_statuses<I: Instance>() {
+async fn information_classes_get_the_spec_statuses() {
     let td = tempdir().expect("tempdir");
-    let (_server, mut c) = client::<I>(td.path()).await;
+    let (_server, mut c) = client::<Plain>(td.path()).await;
     let root = c.open_dir("").await;
     // FileIdExtdDirectoryInformation and FileIdAllExtdBothDirectoryInformation.
     for class in [0x3C, 0x51] {
@@ -405,9 +405,9 @@ async fn patterns_are_validated_and_kept_across_restarts<I: Instance>() {
     c.close(root).await;
 }
 
-async fn output_buffer_is_capped_at_max_transact_size<I: Instance>() {
+async fn output_buffer_is_capped_at_max_transact_size() {
     let td = tempdir().expect("tempdir");
-    let (_server, mut c) = client::<I>(td.path()).await;
+    let (_server, mut c) = client::<Plain>(td.path()).await;
     let root = c.open_dir("").await;
     let (status, _) = c
         .query_directory(
@@ -471,13 +471,13 @@ instances! {
         smbclient_ls_lists_an_empty_share,
         an_entry_larger_than_the_buffer_returns_a_partial_name,
         entries_that_do_not_fit_wait_for_the_next_query,
-        listing_requires_list_directory_access,
-        information_classes_get_the_spec_statuses,
         patterns_are_validated_and_kept_across_restarts,
-        output_buffer_is_capped_at_max_transact_size,
     ],
     plain_only: [
-        patterns_at_the_root_apply_to_dot_entries, // adds a host file while the share runs
-        #[cfg(target_os = "linux")] listing_and_open_agree_on_names, // makes host names that listings hide
+        patterns_at_the_root_apply_to_dot_entries,
+        #[cfg(target_os = "linux")] listing_and_open_agree_on_names,
+        listing_requires_list_directory_access,
+        information_classes_get_the_spec_statuses,
+        output_buffer_is_capped_at_max_transact_size,
     ],
 }

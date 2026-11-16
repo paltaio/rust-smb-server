@@ -564,7 +564,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_write_10_gib_past_the_end_sends_a_header_and_one_block_whatever_the_file_was() {
+    async fn a_write_10_gib_past_the_end_sends_nothing_of_the_gap() {
         const FAR: u64 = 10 << 30;
         let run_at = H as u64 + (FAR >> BITS) * C as u64;
         let run_len = 5 + 100 + OVERHEAD;

@@ -358,25 +358,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_block_with_a_zero_nonce_and_other_bytes_does_not_open() {
-        let len = 2 * B + 10;
-        let plain = nonzero_pattern(len);
-        let mut bytes = stored(&plain);
-        let block = block_at(len, 1);
-        bytes[block.start..block.start + NONCE_LEN].fill(0);
-        let (_, layer) = layer_with(&bytes).await;
-        let handle = open_file(&layer, "f").await;
-
-        assert_io(handle.read(0, len as u32).await, io::ErrorKind::InvalidData);
-        assert_io(handle.read(B as u64, 1).await, io::ErrorKind::InvalidData);
-        assert_eq!(handle.read(0, B as u32).await.unwrap(), plain[..B]);
-        assert_eq!(
-            handle.read(2 * B as u64, 100).await.unwrap(),
-            plain[2 * B..]
-        );
-    }
-
-    #[tokio::test]
     async fn a_block_that_fails_authentication_fails_its_reads_with_one_warning_each() {
         let logs = Logs::new();
         let len = 3 * B + 100;

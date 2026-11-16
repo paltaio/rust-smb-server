@@ -1146,7 +1146,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_source_the_inner_backend_denies_twice_is_a_sharing_violation() {
+    async fn a_source_the_inner_backend_cannot_find_twice_is_a_sharing_violation() {
         let files = MemFsBackend::new();
         let hidden = Hidden::new(files.clone());
         let layer = names_over(hidden.clone()).await;
@@ -1158,7 +1158,10 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, SmbError::Sharing), "{error:?}");
-        assert!(layer.shared.names.fresh("").is_none(), "nothing is trusted");
+        assert!(
+            layer.shared.names.fresh("").is_none(),
+            "the cached names are dropped"
+        );
         assert!(files.contents(&stored_at("Foo")).is_some());
 
         hidden.show(&stored_at("Foo"));
