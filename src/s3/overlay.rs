@@ -163,9 +163,14 @@ impl Index {
             .is_some_and(|keys| keys.iter().any(|held| held == key))
     }
 
-    /// Whether an entry is at the directory `key` or below it.
+    /// Whether an entry is at the directory `key` or below it. A file at the
+    /// name is not at the directory.
     fn has_entry_at_or_below(&self, key: &str) -> bool {
-        if self.entries.contains_key(&self.slot(key)) {
+        if self
+            .entries
+            .get(&self.slot(key))
+            .is_some_and(|entry| entry.is_dir())
+        {
             return true;
         }
         let below = self.slot(&dir_prefix(key));
@@ -3333,6 +3338,19 @@ mod tests {
         overlay.install(vec![dir("d")], vec![tombstone(&["d/", "d/f"])]);
         assert!(!overlay.dir_dead("d"));
         assert!(overlay.tombstoned("d/f"));
+    }
+
+    #[test]
+    fn a_file_at_the_name_of_a_directory_does_not_keep_it() {
+        for fold in [false, true] {
+            let overlay = test_overlay(fold);
+            overlay.install(vec![kept("d")], vec![tombstone(&["d/"])]);
+            assert!(overlay.dir_dead("d"), "fold {fold}");
+            assert!(overlay.dead_above("d/f"), "fold {fold}");
+        }
+        let overlay = test_overlay(true);
+        overlay.install(vec![kept("D")], vec![tombstone(&["d/"])]);
+        assert!(overlay.dir_dead("d"));
     }
 
     #[test]

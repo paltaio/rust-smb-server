@@ -468,6 +468,112 @@ async fn the_share_root_cannot_be_deleted_or_renamed() {
     }
 }
 
+// Names made where a directory was deleted.
+
+/// The entries of the root as the backend lists them, with whether each is a
+/// directory and its size, sorted.
+async fn root_entries(rig: &Rig) -> Vec<(String, bool, u64)> {
+    let (root, _) = rig
+        .backend
+        .open(&SmbPath::root(), OpenOptions::default())
+        .await
+        .unwrap();
+    let mut entries: Vec<_> = root
+        .list_dir(None)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|entry| {
+            (
+                entry.info.name,
+                entry.info.is_directory,
+                entry.info.end_of_file,
+            )
+        })
+        .collect();
+    entries.sort();
+    entries
+}
+
+/// Makes the directory `name` through the backend.
+async fn make_dir(rig: &Rig, name: &str) {
+    let (dir, _) = rig
+        .backend
+        .open(&path(name), create_options(true))
+        .await
+        .unwrap();
+    dir.close().await.unwrap();
+}
+
+/// Makes the file `name` through the backend, holding `data`.
+async fn make_file(rig: &Rig, name: &str, data: &[u8]) {
+    let (file, _) = rig
+        .backend
+        .open(&path(name), create_options(false))
+        .await
+        .unwrap();
+    assert_eq!(file.write(0, data).await.unwrap() as usize, data.len());
+    file.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_file_made_where_a_directory_was_deleted_is_listed_as_a_file() {
+    let rig = Rig::writable_with(held).await;
+    make_dir(&rig, "d").await;
+    rig.backend.unlink(&path("d")).await.unwrap();
+    make_file(&rig, "d", b"data").await;
+
+    assert_eq!(root_entries(&rig).await, [("d".to_owned(), false, 4)]);
+    assert_eq!(
+        keys(&rig).await,
+        ["d/"],
+        "the marker is still in the bucket"
+    );
+    let (file, _) = rig
+        .backend
+        .open(&path("d"), OpenOptions::default())
+        .await
+        .unwrap();
+    assert!(!file.stat().await.unwrap().is_directory);
+
+    rig.backend.hold_uploads(false);
+    sync(&rig.backend).await.unwrap();
+    assert_eq!(keys(&rig).await, ["d"]);
+    assert_eq!(root_entries(&rig).await, [("d".to_owned(), false, 4)]);
+}
+
+#[tokio::test]
+async fn a_file_made_where_a_directory_was_deleted_in_another_case_is_listed_as_a_file() {
+    let rig = Rig::writable_with(held).await;
+    make_dir(&rig, "F").await;
+    rig.backend.unlink(&path("F")).await.unwrap();
+    make_file(&rig, "f", b"data").await;
+
+    assert_eq!(root_entries(&rig).await, [("f".to_owned(), false, 4)]);
+}
+
+#[tokio::test]
+async fn a_file_made_through_the_share_where_a_directory_was_deleted_is_listed_as_a_file() {
+    for (old, new) in [("d", "d"), ("F", "f")] {
+        let mut rig = Rig::writable_with(held).await;
+        let made = rig.smb.create(old, create_dir()).await.unwrap();
+        rig.smb.close(made.id).await;
+        let gone = rig.smb.create(old, dir_delete()).await.unwrap();
+        assert_eq!(rig.smb.set_delete(gone.id).await, 0);
+        rig.smb.close(gone.id).await;
+        make(&mut rig, new, b"data").await;
+
+        let root = rig.smb.open_dir("").await.unwrap();
+        let entries = rig.smb.list(root.id, "*").await;
+        rig.smb.close(root.id).await;
+        let shown: Vec<_> = entries
+            .iter()
+            .map(|entry| (entry.name.as_str(), entry.is_dir(), entry.size))
+            .collect();
+        assert_eq!(shown, [(new, false, 4)], "{old} deleted, {new} made");
+    }
+}
+
 // Renaming directories.
 
 #[tokio::test]

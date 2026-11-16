@@ -59,6 +59,8 @@ impl Fixture {
 const MEMFS: &[&str] = &["memfs"];
 /// The instances over `MemFsBackend`.
 const OVER_MEMFS: &[&str] = &["memfs", "layer_memfs"];
+/// The instance that is `S3Backend` itself.
+const S3: &[&str] = &["s3"];
 /// The instances over `S3Backend`.
 const OVER_S3: &[&str] = &["s3", "layer_s3"];
 
@@ -98,9 +100,10 @@ const EXCLUDED: &[(&str, &[&str])] = &[
     // MemFs and S3Backend report file_index 0.
     ("file_index_is_stable", OVER_MEMFS),
     ("file_index_is_stable", OVER_S3),
-    // S3Backend keeps listing the name of an unlinked directory, as a
-    // directory or in its old spelling, once another entry takes the name.
-    ("namespace_changes_match_a_model", OVER_S3),
+    // S3Backend refuses a case-only rename of a directory while the listing of
+    // its parent holds another directory of the new spelling, also one whose
+    // marker is to be deleted.
+    ("namespace_changes_match_a_model", S3),
     // MemFs unlinks a directory that has entries.
     ("unlink_refuses_a_directory_with_entries", OVER_MEMFS),
     // MemFs renames into a directory that does not exist.
