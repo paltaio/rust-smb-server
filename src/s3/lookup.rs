@@ -79,13 +79,15 @@ impl Shared {
 
     /// Drops what is cached of the object at `key`, which the backend
     /// deleted, and its row in the cached listing of its directory. The key
-    /// of a directory marker drops the directory. This comes after the store
-    /// deleted the object and before the overlay lets go of the key to
-    /// delete, so a listing made meanwhile sees the change to its rows.
+    /// of a directory marker drops the directory row only: a file of the same
+    /// name keeps its row. This comes after the store deleted the object and
+    /// before the overlay lets go of the key to delete, so a listing made
+    /// meanwhile sees the change to its rows.
     pub(super) fn deleted(&self, key: &str) {
-        let key = key.strip_suffix('/').unwrap_or(key);
-        let dir = parent_key(key);
-        self.cache().deleted_file(key, dir);
+        match key.strip_suffix('/') {
+            Some(dir_key) => self.cache().deleted_dir(dir_key, parent_key(dir_key)),
+            None => self.cache().deleted_file(key, parent_key(key)),
+        }
     }
 
     /// Makes what is cached of the object at `key` `known`, and puts `kind`

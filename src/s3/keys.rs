@@ -111,13 +111,33 @@ pub(super) struct Row {
 }
 
 impl Row {
-    fn is_dir(&self) -> bool {
+    pub(super) fn is_dir(&self) -> bool {
         matches!(self.kind, RowKind::Dir)
     }
 
     /// The bytes of the key the row stands for, relative to its directory.
     fn key_bytes(&self) -> impl Iterator<Item = u8> + '_ {
         self.name.bytes().chain(self.is_dir().then_some(b'/'))
+    }
+}
+
+/// A change the backend made to the row of a name.
+#[derive(Debug, Clone)]
+pub(super) enum RowEdit {
+    /// The row put in place of the row of its name.
+    Put(Row),
+    /// The directory row taken out, or the file row if `dir` is not set. A row
+    /// of the other kind stays.
+    Take { dir: bool },
+}
+
+impl RowEdit {
+    /// The row a name has once `edits` are made to `row`, oldest first.
+    fn apply(edits: &[RowEdit], row: Option<Row>) -> Option<Row> {
+        edits.iter().fold(row, |row, edit| match edit {
+            RowEdit::Put(put) => Some(put.clone()),
+            RowEdit::Take { dir } => row.filter(|held| held.is_dir() != *dir),
+        })
     }
 }
 
@@ -142,26 +162,33 @@ impl DirListing {
         DirListing { rows }
     }
 
-    /// The listing with the rows named in `edits` replaced, each by the row it
-    /// holds or by none.
-    pub(super) fn edited(self, mut edits: HashMap<String, Option<Row>>) -> DirListing {
-        let mut rows: Vec<Row> = self
-            .rows
-            .into_iter()
-            .filter(|row| !edits.contains_key(&row.name))
-            .collect();
-        rows.extend(edits.drain().filter_map(|(_, row)| row));
+    /// The listing with each name in `edits` given the row its changes leave,
+    /// oldest first, or none.
+    pub(super) fn edited(self, mut edits: HashMap<String, Vec<RowEdit>>) -> DirListing {
+        let mut rows: Vec<Row> = Vec::with_capacity(self.rows.len());
+        for row in self.rows {
+            match edits.remove(&row.name) {
+                Some(made) => rows.extend(RowEdit::apply(&made, Some(row))),
+                None => rows.push(row),
+            }
+        }
+        rows.extend(
+            edits
+                .into_values()
+                .filter_map(|made| RowEdit::apply(&made, None)),
+        );
         rows.sort_by(by_key);
         DirListing { rows }
     }
 
-    /// The listing without the row named `name`.
-    pub(super) fn without_row(&self, name: &str) -> DirListing {
+    /// The listing without the directory row named `name`, or without the file
+    /// row if `dir` is not set.
+    pub(super) fn without_row(&self, name: &str, dir: bool) -> DirListing {
         DirListing {
             rows: self
                 .rows
                 .iter()
-                .filter(|held| held.name != name)
+                .filter(|held| held.name != name || held.is_dir() != dir)
                 .cloned()
                 .collect(),
         }
@@ -170,6 +197,20 @@ impl DirListing {
     /// The row named exactly `name`.
     pub(super) fn find_exact(&self, name: &str) -> Option<&Row> {
         self.rows.iter().find(|row| row.name == name)
+    }
+
+    /// Whether a directory row, or a file row if `dir` is not set, has a name
+    /// that differs from `name` in case only and none is named `name`.
+    pub(super) fn has_other_spelling_only(&self, name: &str, dir: bool) -> bool {
+        let folded = name.to_lowercase();
+        let mut other = false;
+        for row in self.rows.iter().filter(|row| row.is_dir() == dir) {
+            if row.name == name {
+                return false;
+            }
+            other |= folds_to(&row.name, &folded);
+        }
+        other
     }
 
     /// Whether a row has a name that differs from `name` in case only.

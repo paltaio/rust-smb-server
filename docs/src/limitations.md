@@ -52,6 +52,7 @@ The settings named here, and how `S3Backend` works, are in [backends](backends.m
   - the keys below it keep changing while they are listed
 - A renamed directory tree gains a marker object for each of its directories.
 - Renames that form a cycle, such as two names swapped through a third, download and upload one file per cycle; that file must fit in the free space of the cache disk.
+- A file that takes the name of a directory, or a directory the name of a file, is stored after the object of the old name is deleted. When that delete comes only after the new object is stored, as when a file and a directory swap names or the only file of a directory takes the name of the directory, the new object is stored without the wait. A store that keeps a directory as a folder refuses it then, and the file or directory stays on `failures` until the next backend is built.
 - A copy for a rename or a time change gives the new object the default ACL of the bucket, not the original's.
 - A copy request has no ETag condition on its source. When another writer replaces the source meanwhile, the copy takes the replacement.
 - When the store refuses to copy an object onto itself, times and attributes set on a file larger than `part_size` are not stored. The server logs a warning.

@@ -161,7 +161,9 @@ impl Shared {
 
     /// Writes the record of the new directory, puts its marker object, and
     /// makes the directory known to the cache. A marker the store refuses
-    /// because the directory is there already counts as put. Once the marker
+    /// because the directory is there already counts as put. While a file of
+    /// the name of the directory, or of a name above it, is to be deleted, the
+    /// open leaves the marker to the job of the directory. Once the marker
     /// is put, keys to delete that name it, or another spelling of it that the
     /// store holds as the same object, are let go; if that fails, the open
     /// goes on and the job of the directory puts the marker again and lets
@@ -177,6 +179,9 @@ impl Shared {
         };
         let put = async {
             change::record(self, held).await?;
+            if self.overlay.marker_deferred(&dir_prefix(&key)) {
+                return Ok::<_, SmbError>(None);
+            }
             // The marker key is noted as written until the keys to delete
             // that name it are let go.
             let _writes = self.await_marker_write(held, &retry).await?;
@@ -192,10 +197,14 @@ impl Shared {
                 Ok(true) => self.settle_marker(held, &key, &retry).await.map(|()| true),
                 other => other,
             };
-            Ok::<_, SmbError>((head, taken))
+            Ok(Some((head, taken)))
         };
         let (head, taken) = match put.await {
-            Ok(put) => put,
+            Ok(Some(put)) => put,
+            Ok(None) => {
+                held.entry.state().creating = false;
+                return Ok(());
+            }
             Err(e) => {
                 if let Err(abandoned) = change::abandon(self, held).await {
                     warn!(error = %abandoned, "the record of a directory that was not made is still there");

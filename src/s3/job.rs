@@ -259,14 +259,16 @@ impl Job<'_> {
             )
         };
         let (status, code) = (error.http_status(), error.code().map(str::to_owned));
-        let moved = self
-            .blocking(move |shared, entry| outcome::conflict(shared, entry, error))
-            .await;
-        let code = code.as_deref();
+        // The caches forget the object before the call that waits for the entry
+        // can report the conflict, so a lookup made after it reads the bucket.
         self.shared.forget_file(&key);
         if let Some(base) = base.filter(|base| *base != key) {
             self.shared.forget_file(&base);
         }
+        let moved = self
+            .blocking(move |shared, entry| outcome::conflict(shared, entry, error))
+            .await;
+        let code = code.as_deref();
         match moved {
             Ok(_) => error!(
                 path = %self.path,

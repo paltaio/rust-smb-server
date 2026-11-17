@@ -107,9 +107,9 @@ struct Index {
     writing: HashMap<Slot, usize>,
     /// The entries that wait for a slot to clear.
     parked: HashMap<Slot, Vec<Arc<Entry>>>,
-    /// The slot each entry in `parked` waits for, by the address of the
-    /// entry.
-    parked_at: HashMap<usize, Slot>,
+    /// The slots each entry in `parked` waits for, by the address of the
+    /// entry: it wakes when any of them clears.
+    parked_at: HashMap<usize, Vec<Slot>>,
     /// The entries a change woke, for the queue.
     ready: Vec<Arc<Entry>>,
     /// A key cleared, and the worker is to look again.
@@ -144,12 +144,33 @@ struct Block {
     source: Option<Arc<Entry>>,
 }
 
+/// The key of the other kind of object that has the name of `key`: the marker
+/// of a directory for a file, and the file for a marker.
+fn twin_key(key: &str) -> String {
+    match key.strip_suffix('/') {
+        Some(file) => file.to_owned(),
+        None => dir_prefix(key),
+    }
+}
+
+/// Whether the job of an entry with this state waits to start: it has
+/// something to store, and nothing runs for it, holds it or has failed it.
+fn waiting(state: &State) -> bool {
+    state.has_work()
+        && state.job.is_none()
+        && state.failure.is_none()
+        && !state.detached
+        && !state.creating
+        && state.batch.is_none()
+}
+
 /// How a job that is due stands with the keys it needs.
 enum Blocked {
     No,
     /// The job resolves a cycle of entries that each wait for the next.
     Cycle,
-    Yes(String),
+    /// The job waits until any of these keys clears.
+    Yes(Vec<String>),
 }
 
 impl Index {
@@ -482,36 +503,206 @@ impl Index {
 
     /// Whether a job of `entry` may write `key`, or what it has to wait for.
     /// A request that deletes a key of its slot, a job that writes one, a key
-    /// above it that is to be deleted, and an entry that copies from one
-    /// stand in the way. A key above that is to be deleted becomes due at
-    /// once.
+    /// above it that is to be deleted, the object of the other kind that has
+    /// its name, and an entry that copies from one stand in the way. A key
+    /// above or the other object that is to be deleted becomes due at once,
+    /// unless its delete comes only after the job of `entry` has ended: the
+    /// write does not wait for it then, and the store takes it or refuses it.
     fn write_block(&mut self, key: &str, entry: &Arc<Entry>, now: Instant) -> Option<Block> {
+        let (block, delete) = self.blocker(key, entry)?;
+        if delete {
+            self.expedite(&block.key, now);
+        }
+        Some(block)
+    }
+
+    /// What [`write_block`](Self::write_block) finds, with whether the key to
+    /// wait for is one to be deleted, and no change to the index.
+    fn blocker(&self, key: &str, entry: &Arc<Entry>) -> Option<(Block, bool)> {
         let name = self.slot(key);
         let plain = |key: &str| Block {
             key: key.to_owned(),
             source: None,
         };
         if self.deleting.contains_key(&name) || self.writing.contains_key(&name) {
-            return Some(plain(key));
+            return Some((plain(key), false));
         }
-        if let Some(above) = self.pending_above(key) {
-            self.expedite(&above, now);
-            return Some(plain(&above));
+        let waits = self.delete_waits(key);
+        if let Some(wait) = waits.iter().find(|wait| !self.stuck_on(entry, wait)) {
+            return Some((plain(wait), true));
+        }
+        let twin = twin_key(key);
+        let twin_name = self.slot(&twin);
+        if self.deleting.contains_key(&twin_name) || self.writing.contains_key(&twin_name) {
+            return Some((plain(&twin), false));
         }
         let mut holders = self.holders(&name, Some(entry));
         let first = holders.pop()?;
-        Some(Block {
+        let block = Block {
             key: key.to_owned(),
             source: holders.is_empty().then_some(first),
+        };
+        Some((block, false))
+    }
+
+    /// The keys that are to be deleted and stand in the way of a write of
+    /// `key`: those above it, then the object of the other kind that has its
+    /// name, the marker of a directory for a file and the file for a marker. A
+    /// store that keeps a directory as a folder refuses either while the other
+    /// is there.
+    fn delete_waits(&self, key: &str) -> Vec<String> {
+        let mut waits: Vec<String> = key
+            .match_indices('/')
+            .map(|(at, _)| &key[..at])
+            .filter(|above| self.delete_awaited(above))
+            .map(str::to_owned)
+            .collect();
+        let twin = twin_key(key);
+        if !waits.contains(&twin) && self.delete_awaited(&twin) {
+            waits.push(twin);
+        }
+        waits
+    }
+
+    /// Whether `key` is to be deleted and something will still delete it. A
+    /// write that waits for a key that [`stays`](Self::stays) goes ahead, and
+    /// the store takes it or refuses it.
+    fn delete_awaited(&self, key: &str) -> bool {
+        self.hidden.get(&self.slot(key)).is_some_and(|keys| {
+            keys.iter()
+                .any(|held| (held == key || !self.apart.contains(held)) && !self.stays(held))
         })
     }
 
-    /// The first key above `key` that is to be deleted.
-    fn pending_above(&self, key: &str) -> Option<String> {
-        key.match_indices('/')
-            .map(|(at, _)| &key[..at])
-            .find(|above| self.hides(above))
-            .map(str::to_owned)
+    /// Whether the key to delete `held` stays in the bucket: no delete is left
+    /// to come for it, or for a key below it when it is a marker.
+    fn stays(&self, held: &str) -> bool {
+        let goes = |key: &str| {
+            self.tombs
+                .get(key)
+                .is_some_and(|tomb| tomb.failure.is_none())
+                || self.gone.get(key).is_some_and(|owners| {
+                    owners.iter().any(|owner| owner.state().failure.is_none())
+                })
+        };
+        if !goes(held) {
+            return true;
+        }
+        if !held.ends_with('/') {
+            return false;
+        }
+        let name = self.slot(held);
+        self.hidden
+            .range(name.clone()..)
+            .take_while(|(below, _)| below.starts_with(&name))
+            .any(|(_, keys)| keys.iter().any(|below| !goes(below)))
+    }
+
+    /// The entries whose jobs have to end before the key to delete `key`
+    /// goes, as [`blockers_of`](Self::blockers_of) finds them for each key of
+    /// its slot that is to be deleted.
+    fn deleters(&self, key: &str) -> Vec<Arc<Entry>> {
+        let mut found = Vec::new();
+        for held in self.hidden.get(&self.slot(key)).into_iter().flatten() {
+            if held == key || !self.apart.contains(held) {
+                self.blockers_of(held, &mut found);
+            }
+        }
+        found
+    }
+
+    /// Adds to `found` the entries that keep the key to delete `key` from
+    /// going: the entries that own it, those that copy from it, and for a
+    /// marker those that own a key to delete below it.
+    fn blockers_of(&self, key: &str, found: &mut Vec<Arc<Entry>>) {
+        let name = self.slot(key);
+        found.extend(self.gone.get(key).into_iter().flatten().cloned());
+        found.extend(self.holders(&name, None));
+        if !key.ends_with('/') {
+            return;
+        }
+        for (below, keys) in self
+            .hidden
+            .range(name.clone()..)
+            .take_while(|(below, _)| below.starts_with(&name))
+            .filter(|(below, _)| **below != name)
+        {
+            for held in keys {
+                found.extend(self.gone.get(held).into_iter().flatten().cloned());
+            }
+            found.extend(self.holders(below, None));
+        }
+    }
+
+    /// The entries that the job of `entry` waits for before it writes: those
+    /// that copy from the key it writes and those that delete a key in its
+    /// way. None for an entry whose job is not waiting to start, or that
+    /// writes nothing.
+    fn needs(&self, entry: &Arc<Entry>) -> Vec<Arc<Entry>> {
+        let key = {
+            let state = entry.state();
+            if !waiting(&state) || !state.writes() {
+                return Vec::new();
+            }
+            state.write_key()
+        };
+        let mut found = self.holders(&self.slot(&key), Some(entry));
+        for wait in self.delete_waits(&key) {
+            found.extend(self.deleters(&wait));
+        }
+        found.retain(|other| !Arc::ptr_eq(other, entry));
+        found
+    }
+
+    /// The entries of `from`, those they wait for, and so on.
+    fn reach(&self, from: Vec<Arc<Entry>>) -> Vec<Arc<Entry>> {
+        let mut seen: HashSet<*const Entry> = HashSet::new();
+        let mut reached = Vec::new();
+        let mut pending = from;
+        while let Some(next) = pending.pop() {
+            if seen.insert(Arc::as_ptr(&next)) {
+                pending.extend(self.needs(&next));
+                reached.push(next);
+            }
+        }
+        reached
+    }
+
+    /// Whether the delete of the key `wait` comes only after the job of
+    /// `entry` has ended, so that waiting for it is waiting for itself.
+    fn stuck_on(&self, entry: &Arc<Entry>, wait: &str) -> bool {
+        self.reach(self.deleters(wait))
+            .iter()
+            .any(|reached| Arc::ptr_eq(reached, entry))
+    }
+
+    /// Wakes the entries that wait for a delete that comes only after their
+    /// own jobs, when `entry`, which has to wait too, is among those it waits
+    /// for: the waits close on themselves, and an entry that parked before the
+    /// last of them began would not look again. Only an entry that has nothing
+    /// else in its way is woken, so it starts and the waits do not close
+    /// again. One that has another key in its way waits for that key.
+    fn wake_stuck(&mut self, entry: &Arc<Entry>, now: Instant) {
+        let reached = self.reach(self.needs(entry));
+        if !reached.iter().any(|other| Arc::ptr_eq(other, entry)) {
+            return;
+        }
+        for member in reached {
+            if Arc::ptr_eq(&member, entry) {
+                continue;
+            }
+            let (key, writes) = {
+                let state = member.state();
+                (state.write_key(), state.writes())
+            };
+            if !writes || !self.unpark(&member) {
+                continue;
+            }
+            match self.write_block(&key, &member, now) {
+                None => self.ready.push(member),
+                Some(block) => self.park_on(&member, &[block.key]),
+            }
+        }
     }
 
     /// Makes the keys no entry owns in the slot of `key` due at once, unless
@@ -583,37 +774,49 @@ impl Index {
 
     /// Queues the entries that wait for the slot `name`.
     fn wake_slot(&mut self, name: &Slot) {
-        if let Some(waiting) = self.parked.remove(name) {
-            for entry in waiting {
-                self.parked_at.remove(&(Arc::as_ptr(&entry) as usize));
-                self.ready.push(entry);
-            }
+        for entry in self.parked.remove(name).unwrap_or_default() {
+            self.unpark(&entry);
+            self.ready.push(entry);
         }
     }
 
-    /// Puts `entry` to wait for the slot of `key`. The caller marks it as
-    /// queued.
-    fn park(&mut self, entry: &Arc<Entry>, key: &str) {
+    /// Puts `entry` to wait until any of the slots of `keys` clears. The
+    /// caller marks it as queued.
+    fn park(&mut self, entry: &Arc<Entry>, keys: &[String]) {
         #[cfg(test)]
         {
             self.parks += 1;
         }
-        let name = self.slot(key);
-        self.parked_at
-            .insert(Arc::as_ptr(entry) as usize, name.clone());
-        self.parked.entry(name).or_default().push(Arc::clone(entry));
+        self.park_on(entry, keys);
+    }
+
+    /// Puts `entry`, which is marked as queued, to wait until any of the slots
+    /// of `keys` clears.
+    fn park_on(&mut self, entry: &Arc<Entry>, keys: &[String]) {
+        let mut names: Vec<Slot> = keys.iter().map(|key| self.slot(key)).collect();
+        names.sort_unstable();
+        names.dedup();
+        for name in &names {
+            self.parked
+                .entry(name.clone())
+                .or_default()
+                .push(Arc::clone(entry));
+        }
+        self.parked_at.insert(Arc::as_ptr(entry) as usize, names);
     }
 
     /// Takes `entry` out of the entries that wait, and returns whether it was
     /// one.
     fn unpark(&mut self, entry: &Arc<Entry>) -> bool {
-        let Some(name) = self.parked_at.remove(&(Arc::as_ptr(entry) as usize)) else {
+        let Some(names) = self.parked_at.remove(&(Arc::as_ptr(entry) as usize)) else {
             return false;
         };
-        if let Some(waiting) = self.parked.get_mut(&name) {
-            waiting.retain(|held| !Arc::ptr_eq(held, entry));
-            if waiting.is_empty() {
-                self.parked.remove(&name);
+        for name in names {
+            if let Some(waiting) = self.parked.get_mut(&name) {
+                waiting.retain(|held| !Arc::ptr_eq(held, entry));
+                if waiting.is_empty() {
+                    self.parked.remove(&name);
+                }
             }
         }
         true
@@ -787,8 +990,21 @@ impl Index {
 
     /// How a job of `entry` stands with the keys it needs. An entry that
     /// waits only for a copy that waits for it is part of a cycle; the one
-    /// whose base has the least key resolves it.
+    /// whose base has the least key resolves it. An entry that has to wait
+    /// wakes the entries that wait for a delete that comes only after their
+    /// own jobs, if its wait closes the chain.
     fn blocked(&mut self, entry: &Arc<Entry>, now: Instant) -> Blocked {
+        let blocked = self.standing(entry, now);
+        if matches!(blocked, Blocked::Yes(_)) {
+            self.wake_stuck(entry, now);
+        }
+        blocked
+    }
+
+    /// [`blocked`](Self::blocked) without the wake of the entries that wait
+    /// for their own jobs. An entry with nothing to write waits for all the
+    /// keys it owns to delete, and may go once any of them is free.
+    fn standing(&mut self, entry: &Arc<Entry>, now: Instant) -> Blocked {
         let (key, writes, gone, base, batch) = {
             let state = entry.state();
             (
@@ -800,17 +1016,13 @@ impl Index {
             )
         };
         if let Some(batch) = batch {
-            return Blocked::Yes(batch.key().to_owned());
+            return Blocked::Yes(vec![batch.key().to_owned()]);
         }
         if !writes {
-            let mut waits_for = None;
-            for key in &gone {
-                if !self.in_use(key, None) {
-                    return Blocked::No;
-                }
-                waits_for.get_or_insert(key);
+            if gone.is_empty() || gone.iter().any(|key| !self.in_use(key, None)) {
+                return Blocked::No;
             }
-            return waits_for.map_or(Blocked::No, |key| Blocked::Yes(key.clone()));
+            return Blocked::Yes(gone);
         }
         let Some(Block {
             key: waits_for,
@@ -828,9 +1040,9 @@ impl Index {
                 if self.unpark(&member) {
                     self.ready.push(member);
                 }
-                Blocked::Yes(waits_for)
+                Blocked::Yes(vec![waits_for])
             }
-            None => Blocked::Yes(waits_for),
+            None => Blocked::Yes(vec![waits_for]),
         }
     }
 }
@@ -1250,10 +1462,10 @@ impl Overlay {
         let cycle = match blocked {
             Blocked::No => false,
             Blocked::Cycle => true,
-            Blocked::Yes(key) => {
+            Blocked::Yes(keys) => {
                 state.queued = true;
                 drop(state);
-                index.park(&entry, &key);
+                index.park(&entry, &keys);
                 return Claim::Skip;
             }
         };
@@ -1868,6 +2080,9 @@ impl Overlay {
             }
             if state.pending() {
                 state.failure = Some(failure.clone());
+                for key in &state.gone {
+                    index.cleared(key);
+                }
             } else {
                 state.batch = None;
                 index.vacate_if_idle(member, &mut state);
@@ -1876,6 +2091,22 @@ impl Overlay {
         index.cleared(batch.key());
         drop(index);
         self.touch();
+    }
+
+    /// Notes that the entry failed for good: it deletes none of the keys it
+    /// owns, and the entries that wait for them look again. A call that waits
+    /// for the entry is not told: the caller does that once the record of the
+    /// failure is written.
+    pub(super) fn failed(&self, entry: &Arc<Entry>, failure: S3Error) {
+        let gone = {
+            let mut state = entry.state();
+            state.failure = Some(failure);
+            state.gone.clone()
+        };
+        let mut index = self.lock();
+        for key in &gone {
+            index.cleared(key);
+        }
     }
 
     /// Notes that the entry `id` left `batch` in memory only: a tombstone
@@ -1952,8 +2183,8 @@ impl Overlay {
     /// [`begin_write`](Self::begin_write) for the open that makes a directory
     /// and puts its marker object: only a request in flight for a key of the
     /// slot stands in the way. A file of the name of the directory that is to
-    /// be deleted does not. The key stays noted until the value returned is
-    /// dropped.
+    /// be deleted does not: see [`marker_deferred`](Self::marker_deferred). The
+    /// key stays noted until the value returned is dropped.
     pub(super) fn begin_marker_write(
         self: &Arc<Self>,
         entry: &Arc<Entry>,
@@ -1996,6 +2227,17 @@ impl Overlay {
         add(&mut index.writing, name);
         entry.state().writing.push(key.to_owned());
         Ok(())
+    }
+
+    /// Whether the open that makes the directory with the marker `key` leaves
+    /// the marker to the job of the directory, because a key above it is to be
+    /// deleted: a store that keeps a directory as a folder refuses the marker
+    /// while an object of that name is there. The job puts the marker once
+    /// the object is gone, as it does for a renamed directory.
+    pub(super) fn marker_deferred(&self, key: &str) -> bool {
+        let index = self.lock();
+        key.match_indices('/')
+            .any(|(at, _)| index.delete_awaited(&key[..at]))
     }
 
     /// Ends the notes of the keys the job of `entry` wrote.
@@ -3253,6 +3495,542 @@ mod tests {
     }
 
     #[test]
+    fn a_file_waits_for_the_marker_of_its_name_and_the_marker_is_deleted_at_once() {
+        let overlay = test_overlay(false);
+        let id = RecordId::parse(&"f".repeat(32)).unwrap();
+        let start = Instant::now();
+        overlay.unlinked(&dir("d"), &["d/".to_owned()], &id);
+        overlay.unlinked(&kept("other"), &["other".to_owned()], &id);
+        let file = kept("d");
+        file.state().set_local(local_data(0, 0));
+        let _held = overlay.insert_new(Arc::clone(&file)).unwrap();
+        assert!(claimed(&overlay, start).is_empty());
+        assert!(overlay.begin_write(&file, "d", &Stop::new()).is_err());
+        assert!(!claimable(&overlay, &file));
+        assert_eq!(overlay.waiting_for("d/"), 1);
+        assert_eq!(
+            claimed(&overlay, Instant::now()),
+            ["d/"],
+            "only the marker in the way"
+        );
+    }
+
+    #[test]
+    fn a_file_waits_while_the_marker_of_its_name_is_to_be_deleted_or_is_being_deleted() {
+        let overlay = test_overlay(false);
+        let owner = moved("b", "x", &["d/"]);
+        let _owner = overlay.insert_new(Arc::clone(&owner)).unwrap();
+        overlay.track(&owner);
+        let file = kept("d");
+        file.state().set_local(local_data(0, 0));
+        let _file = overlay.insert_new(Arc::clone(&file)).unwrap();
+        assert!(!claimable(&overlay, &file), "an entry is to delete it");
+        let claim = overlay.claim_gone(&["d/".to_owned()], &owner);
+        assert_eq!(claim.claimed.keys(), ["d/"]);
+        assert!(!claimable(&overlay, &file), "a request deletes it");
+        drop(claim);
+        assert!(!claimable(&overlay, &file), "it is still to be deleted");
+        owner.state().gone.clear();
+        overlay.track(&owner);
+        assert!(claimable(&overlay, &file));
+    }
+
+    #[test]
+    fn a_file_does_not_wait_for_a_marker_the_store_refused_to_delete() {
+        let overlay = test_overlay(false);
+        let id = RecordId::parse(&"f".repeat(32)).unwrap();
+        overlay.unlinked(&dir("d"), &["d/".to_owned()], &id);
+        let file = kept("d");
+        file.state().set_local(local_data(0, 0));
+        let _held = overlay.insert_new(Arc::clone(&file)).unwrap();
+        assert!(overlay.begin_write(&file, "d", &Stop::new()).is_err());
+        overlay.finish_tombs(&[("d/".to_owned(), S3Error::InvalidResponse("refused"))]);
+        assert!(overlay.begin_write(&file, "d", &Stop::new()).is_ok());
+    }
+
+    #[test]
+    fn a_marker_waits_for_the_file_of_its_name_and_the_file_is_deleted_at_once() {
+        let overlay = test_overlay(false);
+        let id = RecordId::parse(&"f".repeat(32)).unwrap();
+        overlay.unlinked(&kept("d"), &["d".to_owned()], &id);
+        let directory = dir("d");
+        let _held = overlay.insert_new(Arc::clone(&directory)).unwrap();
+        assert!(overlay.begin_write(&directory, "d/", &Stop::new()).is_err());
+        assert_eq!(claimed(&overlay, Instant::now()), ["d"]);
+    }
+
+    #[test]
+    fn a_marker_is_left_to_the_job_of_its_directory_while_a_key_above_it_is_to_be_deleted() {
+        let overlay = test_overlay(false);
+        let id = RecordId::parse(&"f".repeat(32)).unwrap();
+        overlay.unlinked(&kept("d"), &["d".to_owned()], &id);
+        assert!(overlay.marker_deferred("d/"));
+        assert!(overlay.marker_deferred("d/sub/"));
+        assert!(!overlay.marker_deferred("other/"));
+        assert!(!overlay.marker_deferred("dd/"));
+        overlay.finish_tombs(&[("d".to_owned(), S3Error::InvalidResponse("refused"))]);
+        assert!(
+            !overlay.marker_deferred("d/"),
+            "the store refused the delete"
+        );
+    }
+
+    /// Whether the job of `entry` may start now. The entry is as it was
+    /// before, unless the job had to wait.
+    fn starts(overlay: &Arc<Overlay>, entry: &Arc<Entry>) -> bool {
+        let later = Instant::now() + Duration::from_secs(60);
+        let started = matches!(overlay.claim(Arc::clone(entry), later), Claim::Run(..));
+        entry.state().job = None;
+        started
+    }
+
+    /// A directory that is not being made any more, with the marker to put.
+    fn marked_dir(key: &str, gone: &[&str]) -> Arc<Entry> {
+        let directory = dir(key);
+        {
+            let mut state = directory.state();
+            state.creating = false;
+            state.gone = gone.iter().map(|key| (*key).to_owned()).collect();
+        }
+        directory
+    }
+
+    /// Takes the entries that are queued for a job off the queue, so what the
+    /// queue holds later is what a change woke.
+    fn drain(overlay: &Arc<Overlay>) {
+        while woken(overlay).is_some() {}
+    }
+
+    /// The entry the worker takes off the queue.
+    fn woken(overlay: &Arc<Overlay>) -> Option<Arc<Entry>> {
+        overlay
+            .queue()
+            .pop_due(Instant::now() + Duration::from_secs(60))
+    }
+
+    #[test]
+    fn a_file_taking_the_name_of_its_directory_does_not_wait_for_the_directory() {
+        let overlay = test_overlay(false);
+        let id = RecordId::parse(&"f".repeat(32)).unwrap();
+        let start = Instant::now();
+        // `d/x` was moved to `tmp` and `d` deleted, and `tmp` moved to `d`: the
+        // file deletes `d/x` once it is stored, and `d/` goes after that.
+        overlay.unlinked(&dir("d"), &["d/".to_owned()], &id);
+        let file = moved("d", "d/x", &["d/x"]);
+        let _held = overlay.insert_new(Arc::clone(&file)).unwrap();
+        overlay.track(&file);
+        assert!(starts(&overlay, &file), "the file does not wait for itself");
+        assert_eq!(overlay.waiting_for("d/"), 0);
+
+        file.state().gone.clear();
+        overlay.track(&file);
+        assert_eq!(
+            claimed(&overlay, start + Duration::from_secs(6)),
+            ["d/"],
+            "the marker goes once the file it held up is stored"
+        );
+    }
+
+    #[test]
+    fn a_file_and_a_directory_that_swap_names_do_not_wait_for_each_other() {
+        let overlay = test_overlay(false);
+        // The file at `d` went to `x`, and the directory at `x` to `d`.
+        let file = moved("x", "d", &["d"]);
+        let directory = marked_dir("d", &["x/"]);
+        let _file = overlay.insert_new(Arc::clone(&file)).unwrap();
+        let _directory = overlay.insert_new(Arc::clone(&directory)).unwrap();
+        overlay.track(&file);
+        overlay.track(&directory);
+        assert!(starts(&overlay, &file));
+        assert!(starts(&overlay, &directory));
+        assert_eq!(overlay.waiting_for("x/") + overlay.waiting_for("d"), 0);
+    }
+
+    #[test]
+    fn a_file_wrapped_in_a_directory_of_its_name_does_not_wait_for_itself() {
+        let overlay = test_overlay(false);
+        // The file at `d` went to `d/d`, and a directory was made at `d`.
+        let file = moved("d/d", "d", &["d"]);
+        let directory = marked_dir("d", &[]);
+        let _file = overlay.insert_new(Arc::clone(&file)).unwrap();
+        let _directory = overlay.insert_new(Arc::clone(&directory)).unwrap();
+        overlay.track(&file);
+        overlay.track(&directory);
+        drain(&overlay);
+        assert!(!starts(&overlay, &directory), "it waits for the file's job");
+        assert_eq!(overlay.waiting_for("d"), 1);
+        assert!(starts(&overlay, &file), "the file waits for no other job");
+
+        file.state().gone.clear();
+        overlay.track(&file);
+        let next = woken(&overlay).expect("the directory looks again");
+        assert!(Arc::ptr_eq(&next, &directory));
+        assert!(starts(&overlay, &next));
+    }
+
+    #[test]
+    fn a_file_waits_for_a_directory_whose_marker_goes_after_a_job_that_waits_for_nothing() {
+        let overlay = test_overlay(false);
+        let file = kept("x");
+        file.state().set_local(local_data(0, 0));
+        let directory = marked_dir("d", &["x/"]);
+        let _file = overlay.insert_new(Arc::clone(&file)).unwrap();
+        let _directory = overlay.insert_new(Arc::clone(&directory)).unwrap();
+        overlay.track(&directory);
+        drain(&overlay);
+        assert!(!starts(&overlay, &file));
+        assert_eq!(overlay.waiting_for("x/"), 1);
+        assert!(starts(&overlay, &directory));
+
+        directory.state().gone.clear();
+        overlay.track(&directory);
+        let next = woken(&overlay).expect("the key cleared");
+        assert!(Arc::ptr_eq(&next, &file));
+        assert!(starts(&overlay, &next));
+    }
+
+    #[test]
+    fn an_entry_that_parked_for_a_delete_looks_again_when_a_later_wait_closes_the_chain() {
+        let overlay = test_overlay(false);
+        // `g` has to be stored before `x`, which copies from it, and deletes
+        // `x/`, which `x` waits for.
+        let owner = kept("g");
+        owner.state().set_local(local_data(0, 0));
+        owner.state().gone = vec!["x/".to_owned()];
+        let file = moved("x", "g", &[]);
+        let _owner = overlay.insert_new(Arc::clone(&owner)).unwrap();
+        let _file = overlay.insert_new(Arc::clone(&file)).unwrap();
+        overlay.track(&owner);
+        overlay.track(&file);
+        drain(&overlay);
+        owner.state().job = Some(Stop::new());
+        assert!(!starts(&overlay, &file), "the job of the owner is running");
+        assert_eq!(overlay.waiting_for("x/"), 1);
+        owner.state().job = None;
+        assert!(!starts(&overlay, &owner), "the file copies from its key");
+        let next = woken(&overlay).expect("the file looks again");
+        assert!(Arc::ptr_eq(&next, &file));
+        assert!(starts(&overlay, &next), "the file does not wait for itself");
+    }
+
+    #[test]
+    fn an_entry_parked_for_a_delete_waits_for_a_copy_in_its_way_when_the_chain_closes() {
+        let overlay = test_overlay(false);
+        // As in the test above, and `y` copies from `x` too.
+        let owner = kept("g");
+        owner.state().set_local(local_data(0, 0));
+        owner.state().gone = vec!["x/".to_owned()];
+        let file = moved("x", "g", &[]);
+        let copier = moved("y", "x", &[]);
+        let _owner = overlay.insert_new(Arc::clone(&owner)).unwrap();
+        let _file = overlay.insert_new(Arc::clone(&file)).unwrap();
+        let _copier = overlay.insert_new(Arc::clone(&copier)).unwrap();
+        for entry in [&owner, &file, &copier] {
+            overlay.track(entry);
+        }
+        drain(&overlay);
+        owner.state().job = Some(Stop::new());
+        assert!(!starts(&overlay, &file), "the job of the owner is running");
+        assert_eq!(overlay.waiting_for("x/"), 1);
+        owner.state().job = None;
+        assert!(!starts(&overlay, &owner), "the file copies from its key");
+        assert!(woken(&overlay).is_none(), "the copy of x is in its way");
+        assert_eq!(overlay.waiting_for("x"), 1);
+
+        copier.state().base = None;
+        overlay.track(&copier);
+        let next = woken(&overlay).expect("the copy of x ended");
+        assert!(Arc::ptr_eq(&next, &file));
+        assert!(starts(&overlay, &next), "the file does not wait for itself");
+    }
+
+    #[test]
+    fn a_file_does_not_wait_for_a_delete_that_waits_for_a_job_that_copies_from_its_key() {
+        let overlay = test_overlay(false);
+        let id = RecordId::parse(&"f".repeat(32)).unwrap();
+        // `d/x` waits for `d` to go, which waits for `e` to copy from it, which
+        // waits for the marker `e/`, which `d/x` is to delete.
+        overlay.unlinked(&plain("p"), &["d".to_owned()], &id);
+        let copier = moved("e", "d", &[]);
+        let file = kept("d/x");
+        file.state().set_local(local_data(0, 0));
+        file.state().gone = vec!["e/".to_owned()];
+        let _copier = overlay.insert_new(Arc::clone(&copier)).unwrap();
+        let _file = overlay.insert_new(Arc::clone(&file)).unwrap();
+        overlay.track(&copier);
+        overlay.track(&file);
+        drain(&overlay);
+        assert!(starts(&overlay, &file));
+        assert_eq!(overlay.waiting_for("d"), 0);
+    }
+
+    #[test]
+    fn a_file_does_not_wait_for_a_marker_that_waits_for_a_job_that_copies_from_a_key_below_it() {
+        let overlay = test_overlay(false);
+        let id = RecordId::parse(&"f".repeat(32)).unwrap();
+        // `d` waits for `d/` to go, which waits for `e` to copy from `d/f`,
+        // which waits for the marker `e/`, which `d` is to delete.
+        overlay.unlinked(&plain("p"), &["d/".to_owned(), "d/f".to_owned()], &id);
+        let copier = moved("e", "d/f", &[]);
+        let file = kept("d");
+        file.state().set_local(local_data(0, 0));
+        file.state().gone = vec!["e/".to_owned()];
+        let _copier = overlay.insert_new(Arc::clone(&copier)).unwrap();
+        let _file = overlay.insert_new(Arc::clone(&file)).unwrap();
+        overlay.track(&copier);
+        overlay.track(&file);
+        drain(&overlay);
+        assert!(starts(&overlay, &file));
+        assert_eq!(overlay.waiting_for("d/"), 0);
+    }
+
+    #[test]
+    fn a_file_does_not_wait_for_a_marker_that_waits_for_a_job_that_owns_a_key_below_it() {
+        let overlay = test_overlay(false);
+        let id = RecordId::parse(&"f".repeat(32)).unwrap();
+        // `d` waits for `d/` to go, which waits for the job of `e` to delete
+        // `d/f`, which comes after it stores `e`, which `d` copies from.
+        overlay.unlinked(&plain("p"), &["d/".to_owned()], &id);
+        let owner = kept("e");
+        owner.state().set_local(local_data(0, 0));
+        owner.state().gone = vec!["d/f".to_owned()];
+        let file = moved("d", "e", &[]);
+        let _owner = overlay.insert_new(Arc::clone(&owner)).unwrap();
+        let _file = overlay.insert_new(Arc::clone(&file)).unwrap();
+        overlay.track(&owner);
+        overlay.track(&file);
+        drain(&overlay);
+        assert!(starts(&overlay, &file));
+        assert_eq!(overlay.waiting_for("d/"), 0);
+    }
+
+    /// A directory whose marker is in the bucket, which is to delete `gone`.
+    fn deleting_dir(key: &str, gone: &[&str]) -> Arc<Entry> {
+        let directory = marked_dir(key, gone);
+        {
+            let mut state = directory.state();
+            state.own = None;
+            state.set_marker_pending(false);
+        }
+        directory
+    }
+
+    /// An entry with nothing to write that is to delete the markers `c/` and
+    /// `b/`, below each of which a key is to be deleted, and waits for them.
+    fn waiting_to_delete_two_markers(overlay: &Arc<Overlay>, below_b: &str) -> (Arc<Entry>, Held) {
+        let id = RecordId::parse(&"f".repeat(32)).unwrap();
+        overlay.unlinked(&plain("p"), &[below_b.to_owned()], &id);
+        overlay.unlinked(&plain("r"), &["c/x".to_owned()], &id);
+        let owner = deleting_dir("a", &["c/", "b/"]);
+        let held = overlay.insert_new(Arc::clone(&owner)).unwrap();
+        overlay.track(&owner);
+        drain(overlay);
+        assert!(!starts(overlay, &owner));
+        (owner, held)
+    }
+
+    #[test]
+    fn an_entry_waiting_to_delete_two_keys_wakes_when_the_second_is_free() {
+        let overlay = test_overlay(false);
+        let (owner, _held) = waiting_to_delete_two_markers(&overlay, "b/q");
+        assert_eq!(overlay.waiting_for("c/"), 1);
+        assert_eq!(overlay.waiting_for("b/"), 1);
+
+        overlay.lock().remove_tomb("b/q");
+        let next = woken(&overlay).expect("b/ is free");
+        assert!(Arc::ptr_eq(&next, &owner));
+        assert!(starts(&overlay, &next));
+        assert_eq!(overlay.waiting_for("c/"), 0);
+    }
+
+    #[test]
+    fn an_entry_waiting_to_delete_two_keys_wakes_when_the_second_is_free_in_another_case() {
+        let overlay = test_overlay(true);
+        let (owner, _held) = waiting_to_delete_two_markers(&overlay, "B/Q");
+
+        overlay.lock().remove_tomb("B/Q");
+        let next = woken(&overlay).expect("b/ is free");
+        assert!(Arc::ptr_eq(&next, &owner));
+        assert!(starts(&overlay, &next));
+    }
+
+    #[test]
+    fn an_entry_that_owns_two_spellings_of_a_key_waits_for_the_slot_once() {
+        let overlay = test_overlay(true);
+        let id = RecordId::parse(&"f".repeat(32)).unwrap();
+        overlay.unlinked(&plain("p"), &["b/q".to_owned()], &id);
+        let owner = deleting_dir("a", &["B/", "b/"]);
+        let _owner = overlay.insert_new(Arc::clone(&owner)).unwrap();
+        overlay.track(&owner);
+        drain(&overlay);
+        assert!(!starts(&overlay, &owner));
+        assert_eq!(overlay.waiting_for("b/"), 1);
+
+        overlay.lock().remove_tomb("b/q");
+        assert!(woken(&overlay).is_some());
+        assert!(woken(&overlay).is_none(), "it is queued once");
+    }
+
+    #[test]
+    fn an_entry_waiting_to_delete_two_keys_wakes_when_a_held_directory_is_let_go() {
+        let overlay = test_overlay(false);
+        let id = RecordId::parse(&"f".repeat(32)).unwrap();
+        overlay.unlinked(&plain("p"), &["c/x".to_owned()], &id);
+        let owner = deleting_dir("a", &["c/", "d/y"]);
+        let _owner = overlay.insert_new(Arc::clone(&owner)).unwrap();
+        overlay.track(&owner);
+        drain(&overlay);
+        let held = overlay.hold_below("d").unwrap();
+        assert!(!starts(&overlay, &owner), "both keys are in use");
+        assert_eq!(overlay.waiting_for("d/y"), 1);
+
+        drop(held);
+        let next = woken(&overlay).expect("d/y is free");
+        assert!(Arc::ptr_eq(&next, &owner));
+        assert!(starts(&overlay, &next));
+    }
+
+    #[test]
+    fn a_file_does_not_wait_for_a_key_that_only_an_entry_that_failed_owns() {
+        let overlay = test_overlay(false);
+        let owner = moved("b", "a", &["d/"]);
+        let _owner = overlay.insert_new(Arc::clone(&owner)).unwrap();
+        overlay.track(&owner);
+        let file = kept("d");
+        file.state().set_local(local_data(0, 0));
+        let _file = overlay.insert_new(Arc::clone(&file)).unwrap();
+        drain(&overlay);
+        assert!(!starts(&overlay, &file));
+        assert_eq!(overlay.waiting_for("d/"), 1);
+
+        overlay.failed(&owner, S3Error::InvalidResponse("refused"));
+        let next = woken(&overlay).expect("the owner failed");
+        assert!(Arc::ptr_eq(&next, &file));
+        assert!(starts(&overlay, &next));
+    }
+
+    #[test]
+    fn a_marker_is_not_left_to_the_job_of_its_directory_for_a_file_that_only_a_failed_entry_owns() {
+        let overlay = test_overlay(false);
+        let owner = moved("b", "a", &["d"]);
+        let _owner = overlay.insert_new(Arc::clone(&owner)).unwrap();
+        overlay.track(&owner);
+        assert!(overlay.marker_deferred("d/"));
+        overlay.failed(&owner, S3Error::InvalidResponse("refused"));
+        assert!(!overlay.marker_deferred("d/"));
+    }
+
+    #[test]
+    fn a_directory_does_not_wait_for_a_file_the_store_refused_to_delete() {
+        let overlay = test_overlay(false);
+        let id = RecordId::parse(&"f".repeat(32)).unwrap();
+        overlay.unlinked(&kept("d"), &["d".to_owned()], &id);
+        let directory = marked_dir("d", &[]);
+        let _directory = overlay.insert_new(Arc::clone(&directory)).unwrap();
+        drain(&overlay);
+        assert!(!starts(&overlay, &directory));
+        assert_eq!(overlay.waiting_for("d"), 1);
+
+        let request = overlay
+            .claim_tombs(Instant::now() + Duration::from_secs(60))
+            .expect("the file is due");
+        assert_eq!(request.keys(), ["d"]);
+        overlay.finish_tombs(&[("d".to_owned(), S3Error::InvalidResponse("refused"))]);
+        drop(request);
+        let next = woken(&overlay).expect("the request ended");
+        assert!(Arc::ptr_eq(&next, &directory));
+        assert!(starts(&overlay, &next));
+    }
+
+    #[test]
+    fn a_file_below_a_file_to_delete_waits_for_the_delete_unless_the_store_refused_it() {
+        let overlay = test_overlay(false);
+        let id = RecordId::parse(&"f".repeat(32)).unwrap();
+        overlay.unlinked(&kept("a"), &["a".to_owned()], &id);
+        let file = kept("a/b");
+        file.state().set_local(local_data(0, 0));
+        let _file = overlay.insert_new(Arc::clone(&file)).unwrap();
+        drain(&overlay);
+        assert!(!starts(&overlay, &file));
+        assert_eq!(overlay.waiting_for("a"), 1);
+
+        let request = overlay
+            .claim_tombs(Instant::now() + Duration::from_secs(60))
+            .expect("the file is due");
+        overlay.finish_tombs(&[("a".to_owned(), S3Error::InvalidResponse("refused"))]);
+        drop(request);
+        let next = woken(&overlay).expect("the request ended");
+        assert!(Arc::ptr_eq(&next, &file));
+        assert!(starts(&overlay, &next));
+    }
+
+    #[test]
+    fn a_file_waits_for_a_marker_while_a_key_to_delete_below_it_stays() {
+        let overlay = test_overlay(false);
+        let id = RecordId::parse(&"f".repeat(32)).unwrap();
+        overlay.unlinked(&dir("d"), &["d/".to_owned()], &id);
+        overlay.unlinked(&kept("d/x"), &["d/x".to_owned()], &id);
+        let file = kept("d");
+        file.state().set_local(local_data(0, 0));
+        let _file = overlay.insert_new(Arc::clone(&file)).unwrap();
+        assert!(!starts(&overlay, &file));
+        assert_eq!(overlay.waiting_for("d/"), 1);
+
+        overlay.finish_tombs(&[("d/x".to_owned(), S3Error::InvalidResponse("refused"))]);
+        assert!(starts(&overlay, &file), "the marker stays with it");
+    }
+
+    #[test]
+    fn a_marker_waits_for_a_write_of_the_file_of_its_name_that_outlives_its_entry() {
+        let overlay = test_overlay(false);
+        let id = RecordId::parse(&"f".repeat(32)).unwrap();
+        let file = kept("d");
+        file.state().set_local(local_data(0, 0));
+        let held = overlay.insert_new(Arc::clone(&file)).unwrap();
+        assert!(overlay.begin_write(&file, "d", &Stop::new()).is_ok());
+        overlay.unlinked(&file, &[], &id);
+        drop(held);
+        let directory = marked_dir("d", &[]);
+        let _directory = overlay.insert_new(Arc::clone(&directory)).unwrap();
+        assert!(overlay.begin_write(&directory, "d/", &Stop::new()).is_err());
+
+        overlay.end_writes(&file);
+        assert!(overlay.begin_write(&directory, "d/", &Stop::new()).is_ok());
+    }
+
+    #[test]
+    fn a_file_waits_for_a_write_of_the_marker_of_its_name_that_outlives_its_entry() {
+        let overlay = test_overlay(false);
+        let id = RecordId::parse(&"f".repeat(32)).unwrap();
+        let directory = marked_dir("d", &[]);
+        let held = overlay.insert_new(Arc::clone(&directory)).unwrap();
+        assert!(overlay.begin_write(&directory, "d/", &Stop::new()).is_ok());
+        overlay.unlinked(&directory, &[], &id);
+        drop(held);
+        let file = kept("d");
+        file.state().set_local(local_data(0, 0));
+        let _file = overlay.insert_new(Arc::clone(&file)).unwrap();
+        assert!(overlay.begin_write(&file, "d", &Stop::new()).is_err());
+
+        overlay.end_writes(&directory);
+        assert!(overlay.begin_write(&file, "d", &Stop::new()).is_ok());
+    }
+
+    #[test]
+    fn a_file_waits_for_a_request_that_deletes_the_marker_of_its_name_whoever_asked() {
+        let overlay = test_overlay(false);
+        let request = overlay.claim_gone(&["d/".to_owned()], &plain("other"));
+        assert_eq!(request.claimed.keys(), ["d/"]);
+        let file = kept("d");
+        file.state().set_local(local_data(0, 0));
+        let _held = overlay.insert_new(Arc::clone(&file)).unwrap();
+        assert!(overlay.begin_write(&file, "d", &Stop::new()).is_err());
+
+        drop(request);
+        assert!(overlay.begin_write(&file, "d", &Stop::new()).is_ok());
+    }
+
+    #[test]
     fn a_job_waits_on_the_key_in_its_way_and_wakes_when_it_clears() {
         let overlay = test_overlay(false);
         let file = kept("a");
@@ -4042,7 +4820,7 @@ mod tests {
         {
             let mut index = overlay.lock();
             a.state().queued = true;
-            index.park(&a, batch.key());
+            index.park(&a, &[batch.key().to_owned()]);
         }
         let before = queued(&overlay);
 

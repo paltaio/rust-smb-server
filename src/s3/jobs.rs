@@ -121,6 +121,10 @@ pub(super) struct Jobs {
     /// deletes keys.
     #[cfg(test)]
     pub(super) pause_landed: std::sync::Mutex<Option<Gates>>,
+    /// Makes the next job whose changes moved to the conflicts directory wait
+    /// once its entry has left the overlay.
+    #[cfg(test)]
+    pub(super) pause_conflict: std::sync::Mutex<Option<Gates>>,
     /// Makes the next lookup that found an object wait before it takes a hold
     /// on the entry for it.
     #[cfg(test)]
@@ -198,6 +202,8 @@ impl Jobs {
             pause_stored: std::sync::Mutex::new(None),
             #[cfg(test)]
             pause_landed: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            pause_conflict: std::sync::Mutex::new(None),
             #[cfg(test)]
             pause_found: std::sync::Mutex::new(None),
             #[cfg(test)]

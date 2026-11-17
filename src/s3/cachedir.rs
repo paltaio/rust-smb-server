@@ -156,6 +156,16 @@ fn mismatch() -> S3Error {
     )
 }
 
+impl Drop for CacheDir {
+    /// Releases the lock before the descriptor closes. A process that starts
+    /// while the directory is open holds a copy of the descriptor until it
+    /// runs its program, and the lock stays with the open file for as long as
+    /// a copy lives.
+    fn drop(&mut self) {
+        let _ = self.lock.unlock();
+    }
+}
+
 impl CacheDir {
     /// Makes the directory `root` if it is missing, takes its lock, and
     /// checks that it belongs to `identity`. Empties `tmp/`.
@@ -658,9 +668,10 @@ fn revived(
     live: &mut HashSet<RecordId>,
     recovered: &mut Recovered,
 ) {
-    exact.insert(entry.key.clone());
     if entry.is_dir {
         exact.insert(dir_prefix(&entry.key));
+    } else {
+        exact.insert(entry.key.clone());
     }
     if data.is_some() {
         live.insert(entry.id.clone());
@@ -902,6 +913,48 @@ mod tests {
         ));
         drop(first);
         CacheDir::open(temp.path(), &who()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_is_free_while_a_process_started_meanwhile_holds_a_copy_of_its_lock() {
+        use std::io::{Read as _, Write as _};
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::process::CommandExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let dir = CacheDir::open(temp.path(), &who()).unwrap();
+        let (mut started, started_tx) = std::io::pipe().unwrap();
+        let (go, mut go_tx) = std::io::pipe().unwrap();
+        let (started_fd, go_fd, go_tx_fd) =
+            (started_tx.as_raw_fd(), go.as_raw_fd(), go_tx.as_raw_fd());
+        let spawner = std::thread::spawn(move || {
+            let mut command = std::process::Command::new("true");
+            // SAFETY: `write`, `close` and `read` may run between fork and
+            // exec.
+            unsafe {
+                command.pre_exec(move || {
+                    let byte = 1u8;
+                    libc::write(started_fd, (&raw const byte).cast(), 1);
+                    libc::close(go_tx_fd);
+                    let mut answer = 0u8;
+                    libc::read(go_fd, (&raw mut answer).cast(), 1);
+                    Ok(())
+                });
+            }
+            let status = command.status();
+            drop((started_tx, go));
+            status
+        });
+
+        // The new process has copies of every descriptor and has not run
+        // its program yet.
+        started.read_exact(&mut [0u8]).unwrap();
+        drop(dir);
+        let reopened = CacheDir::open(temp.path(), &who());
+        go_tx.write_all(&[1]).unwrap();
+        assert!(spawner.join().unwrap().unwrap().success());
+        reopened.unwrap();
     }
 
     #[test]
@@ -1190,6 +1243,32 @@ mod tests {
                 "keys match as spelled, whatever the names do"
             );
             assert!(conflicts(temp.path()).is_empty());
+        }
+    }
+
+    #[test]
+    fn a_key_to_delete_that_names_a_file_stays_while_a_directory_has_its_name() {
+        for fold in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let dir = CacheDir::open(temp.path(), &who()).unwrap();
+            let made = EntryRecord {
+                is_dir: true,
+                ..entry("made", None)
+            };
+            store(&dir, &made, None);
+            store(&dir, &entry("kept.txt", None), None);
+            let file = tombstone(&dir, &["pre/fix/made"]);
+            let marker = tombstone(&dir, &["pre/fix/made/", "pre/fix/kept.txt"]);
+
+            let recovered = dir.recover("pre/fix", fold).unwrap();
+            assert_eq!(recovered.entries.len(), 2);
+            assert_eq!(
+                tombstone_keys(&recovered),
+                [vec!["pre/fix/made".to_owned()]],
+                "fold {fold}"
+            );
+            assert!(dir.record_path(&file.id).exists());
+            assert!(!dir.record_path(&marker.id).exists());
         }
     }
 

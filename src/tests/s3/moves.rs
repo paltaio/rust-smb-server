@@ -872,7 +872,7 @@ async fn an_editor_style_save_leaves_the_new_content_and_nothing_else() {
 
 #[tokio::test]
 async fn an_editor_save_that_keeps_the_old_file_aside_copies_it_before_the_new_one_lands() {
-    let mut rig = Rig::writable_with(uploading).await;
+    let mut rig = Rig::writable_with(held).await;
     put(rig.store(), "doc.txt", b"version 1").await;
     make(&mut rig, "doc.tmp", b"version 2").await;
     rig.backend
@@ -883,6 +883,7 @@ async fn an_editor_save_that_keeps_the_old_file_aside_copies_it_before_the_new_o
         .rename(&path("doc.tmp"), &path("doc.txt"), true)
         .await
         .unwrap();
+    rig.backend.hold_uploads(false);
     sync(&rig.backend).await.unwrap();
 
     assert_eq!(remote(&rig, "doc.txt").await.unwrap(), b"version 2");

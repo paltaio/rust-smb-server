@@ -10,15 +10,17 @@ use tokio::sync::Notify;
 
 use super::fixture::{MIB, foreground, pattern, put};
 use super::moves::{
-    all_records, copies, crash, deletes, exists, folds_case, is_delete, make, make_unrecorded,
-    path, remote,
+    all_records, copies, crash, deletes, exists, folds_case, is_copy, is_delete, make,
+    make_unrecorded, path, remote,
 };
 use super::proxy::{Fault, Reply, Seen};
 use super::share::{
     DELETE, READ, Rig, Spec, filetime, listing_reply, names, put_all, put_with, run_bounded,
     wait_for_requests, wait_until, wait_until_async,
 };
-use super::uploads::{fill, held, is_create_of, is_head_of, is_put_of, left, sync, uploading};
+use super::uploads::{
+    fill, held, is_create_of, is_head_of, is_put_of, left, sync, sync_while_progressing, uploading,
+};
 use super::writes::{changes, create_dir, create_file, create_options, open_rw, records};
 use crate::ntstatus::{
     STATUS_ACCESS_DENIED, STATUS_DIRECTORY_NOT_EMPTY, STATUS_OBJECT_NAME_COLLISION,
@@ -574,6 +576,415 @@ async fn a_file_made_through_the_share_where_a_directory_was_deleted_is_listed_a
     }
 }
 
+#[tokio::test]
+async fn a_file_made_where_a_directory_was_deleted_is_stored_after_the_marker_goes() {
+    let rig = Rig::writable_with(held).await;
+    make_dir(&rig, "d").await;
+    assert_eq!(root_entries(&rig).await, [("d".to_owned(), true, 0)]);
+    rig.backend.unlink(&path("d")).await.unwrap();
+    rig.backend.hold_sweeps(true);
+    make_file(&rig, "d", b"data").await;
+    rig.backend.hold_uploads(false);
+    wait_until("the file waits for the marker", || {
+        rig.backend.waiting_for("d/") == 1
+    })
+    .await;
+
+    assert_eq!(rig.proxy.count(is_put_of(&rig.bucket.name, "d")), 0);
+    assert_eq!(keys(&rig).await, ["d/"]);
+    assert_eq!(root_entries(&rig).await, [("d".to_owned(), false, 4)]);
+    rig.backend.hold_sweeps(false);
+    sync(&rig.backend).await.unwrap();
+
+    assert_eq!(keys(&rig).await, ["d"]);
+    assert_eq!(remote(&rig, "d").await.unwrap(), b"data");
+    assert_eq!(root_entries(&rig).await, [("d".to_owned(), false, 4)]);
+    assert!(rig.backend.failures().is_empty());
+    assert!(all_records(&rig).is_empty());
+    let seen = rig.proxy.seen();
+    let deleted = seen.iter().position(is_delete).unwrap();
+    let stored = seen
+        .iter()
+        .position(is_put_of(&rig.bucket.name, "d"))
+        .unwrap();
+    assert!(deleted < stored, "the marker goes before the file is put");
+}
+
+#[tokio::test]
+async fn a_file_made_where_a_directory_was_deleted_waits_for_the_delete_in_flight() {
+    let rig = Rig::writable_with(held).await;
+    make_dir(&rig, "d").await;
+    rig.backend.unlink(&path("d")).await.unwrap();
+    make_file(&rig, "d", b"data").await;
+    let gate = Arc::new(Notify::new());
+    rig.proxy
+        .inject(is_delete, Fault::Hold(Arc::clone(&gate)), 1);
+    rig.backend.hold_uploads(false);
+    wait_for_requests(&rig.proxy, 1, is_delete).await;
+    wait_until("the file waits for the delete", || {
+        rig.backend.waiting_for("d/") == 1
+    })
+    .await;
+    assert_eq!(rig.proxy.count(is_put_of(&rig.bucket.name, "d")), 0);
+
+    gate.notify_one();
+    sync(&rig.backend).await.unwrap();
+    assert_eq!(keys(&rig).await, ["d"]);
+    assert_eq!(remote(&rig, "d").await.unwrap(), b"data");
+    assert!(rig.backend.failures().is_empty());
+}
+
+#[tokio::test]
+async fn a_file_renamed_to_where_a_directory_was_deleted_is_copied_after_the_marker_goes() {
+    let rig = Rig::writable_with(held).await;
+    put(rig.store(), "f", b"data").await;
+    make_dir(&rig, "d").await;
+    rig.backend.unlink(&path("d")).await.unwrap();
+    rig.backend.hold_sweeps(true);
+    rig.backend
+        .rename(&path("f"), &path("d"), false)
+        .await
+        .unwrap();
+    rig.backend.hold_uploads(false);
+    wait_until("the copy waits for the marker", || {
+        rig.backend.waiting_for("d/") == 1
+    })
+    .await;
+    assert_eq!(copies(&rig), 0);
+
+    rig.backend.hold_sweeps(false);
+    sync(&rig.backend).await.unwrap();
+    assert_eq!(keys(&rig).await, ["d"]);
+    assert_eq!(remote(&rig, "d").await.unwrap(), b"data");
+    assert!(rig.backend.failures().is_empty());
+}
+
+#[tokio::test]
+async fn a_directory_made_where_a_file_was_deleted_gets_its_marker_after_the_delete() {
+    let mut rig = Rig::writable_with(held).await;
+    put(rig.store(), "d", b"old").await;
+    rig.backend.hold_sweeps(true);
+    rig.backend.unlink(&path("d")).await.unwrap();
+    make_dir(&rig, "d").await;
+
+    assert_eq!(rig.proxy.count(is_put_of(&rig.bucket.name, "d/")), 0);
+    assert_eq!(keys(&rig).await, ["d"]);
+    assert_eq!(root_entries(&rig).await, [("d".to_owned(), true, 0)]);
+    rig.backend.hold_uploads(false);
+    wait_until("the marker waits for the file", || {
+        rig.backend.waiting_for("d") == 1
+    })
+    .await;
+    assert_eq!(rig.proxy.count(is_put_of(&rig.bucket.name, "d/")), 0);
+
+    rig.backend.hold_sweeps(false);
+    sync(&rig.backend).await.unwrap();
+    assert_eq!(keys(&rig).await, ["d/"]);
+    assert_eq!(root_entries(&rig).await, [("d".to_owned(), true, 0)]);
+    assert!(rig.smb.open_dir("d").await.is_ok());
+    assert!(rig.backend.failures().is_empty());
+    assert!(all_records(&rig).is_empty());
+    let seen = rig.proxy.seen();
+    let deleted = seen.iter().position(is_delete).unwrap();
+    let stored = seen
+        .iter()
+        .position(is_put_of(&rig.bucket.name, "d/"))
+        .unwrap();
+    assert!(deleted < stored, "the file goes before the marker is put");
+}
+
+#[tokio::test]
+async fn a_directory_made_where_a_file_was_renamed_away_gets_its_marker_after_the_delete() {
+    let rig = Rig::writable_with(held).await;
+    put(rig.store(), "d", b"data").await;
+    rig.backend
+        .rename(&path("d"), &path("e"), false)
+        .await
+        .unwrap();
+    make_dir(&rig, "d").await;
+
+    assert_eq!(rig.proxy.count(is_put_of(&rig.bucket.name, "d/")), 0);
+    rig.backend.hold_uploads(false);
+    sync(&rig.backend).await.unwrap();
+    assert_eq!(keys(&rig).await, ["d/", "e"]);
+    assert_eq!(remote(&rig, "e").await.unwrap(), b"data");
+    assert!(rig.backend.failures().is_empty());
+}
+
+#[tokio::test]
+async fn a_directory_made_where_a_file_was_deleted_is_stored_after_a_restart() {
+    let rig = Rig::writable_with(held).await;
+    put(rig.store(), "d", b"old").await;
+    rig.backend.unlink(&path("d")).await.unwrap();
+    make_dir(&rig, "d").await;
+    assert_eq!(keys(&rig).await, ["d"]);
+    assert_eq!(tombstoned(&rig), ["d"]);
+
+    let rig = rig.restart_with(held).await;
+    assert_eq!(tombstoned(&rig), ["d"], "the file is still to be deleted");
+    assert_eq!(root_entries(&rig).await, [("d".to_owned(), true, 0)]);
+    rig.backend.hold_uploads(false);
+    sync(&rig.backend).await.unwrap();
+    assert_eq!(keys(&rig).await, ["d/"]);
+    assert!(rig.backend.failures().is_empty());
+    assert!(all_records(&rig).is_empty());
+}
+
+#[tokio::test]
+async fn a_directory_renamed_to_where_a_file_was_deleted_is_stored_after_a_restart() {
+    let rig = Rig::writable_with(held).await;
+    put(rig.store(), "d", b"old").await;
+    mark(&rig, "x/", &[]).await;
+    put(rig.store(), "x/f.txt", b"in x").await;
+    rig.backend.unlink(&path("d")).await.unwrap();
+    rig.backend
+        .rename(&path("x"), &path("d"), false)
+        .await
+        .unwrap();
+
+    let rig = rig.restart_with(held).await;
+    assert!(tombstoned(&rig).contains(&"d".to_owned()));
+    rig.backend.hold_uploads(false);
+    sync(&rig.backend).await.unwrap();
+    assert_eq!(keys(&rig).await, ["d/", "d/f.txt"]);
+    assert_eq!(remote(&rig, "d/f.txt").await.unwrap(), b"in x");
+    assert!(rig.backend.failures().is_empty());
+    assert!(all_records(&rig).is_empty());
+}
+
+// Names that take each other's places.
+
+/// [`sync`] with a deadline of 20 seconds, which a job that waits forever
+/// misses.
+async fn ends(rig: &Rig) -> Result<(), S3Error> {
+    tokio::time::timeout(Duration::from_secs(20), rig.backend.sync())
+        .await
+        .expect("sync returns")
+}
+
+/// Checks the end of a test whose renames put a file where a directory is, or
+/// the other way round: the store refuses what cannot be where the other
+/// object is, `sync` reports it, and every file and directory in `paths` has
+/// failed with it, none still waits for another, and the bucket is as it was.
+async fn assert_refused(rig: &Rig, done: Result<(), S3Error>, paths: &[&str], stored: &[&str]) {
+    assert_eq!(done.unwrap_err().http_status(), Some(409));
+    wait_until("every file and directory has ended", || {
+        rig.backend.failures().len() == paths.len()
+    })
+    .await;
+    let mut failed: Vec<(String, Option<u16>)> = rig
+        .backend
+        .failures()
+        .into_iter()
+        .map(|(path, error)| (path, error.http_status()))
+        .collect();
+    failed.sort();
+    let expected: Vec<(String, Option<u16>)> = paths
+        .iter()
+        .map(|path| ((*path).to_owned(), Some(409)))
+        .collect();
+    assert_eq!(failed, expected);
+    assert_eq!(keys(rig).await, stored);
+}
+
+#[tokio::test]
+async fn the_only_file_of_a_directory_that_takes_its_name_ends_with_the_refusal_of_the_store() {
+    let rig = Rig::writable_with(held).await;
+    mark(&rig, "d/", &[]).await;
+    put(rig.store(), "d/x", b"inner").await;
+    rig.backend
+        .rename(&path("d\\x"), &path("tmp"), false)
+        .await
+        .unwrap();
+    rig.backend.unlink(&path("d")).await.unwrap();
+    rig.backend
+        .rename(&path("tmp"), &path("d"), false)
+        .await
+        .unwrap();
+    assert_eq!(root_entries(&rig).await, [("d".to_owned(), false, 5)]);
+
+    rig.backend.hold_uploads(false);
+    let done = ends(&rig).await;
+    assert_refused(&rig, done, &["d"], &["d/", "d/x"]).await;
+    assert_eq!(rig.backend.waiting_for("d/"), 0);
+    assert_eq!(root_entries(&rig).await, [("d".to_owned(), false, 5)]);
+}
+
+#[tokio::test]
+async fn a_file_and_a_directory_that_swap_names_end_with_the_refusal_of_the_store() {
+    let rig = Rig::writable_with(held).await;
+    put(rig.store(), "d", b"file data").await;
+    mark(&rig, "x/", &[]).await;
+    put(rig.store(), "x/f.txt", b"in x").await;
+    for (from, to) in [("d", "tmp"), ("x", "d"), ("tmp", "x")] {
+        rig.backend
+            .rename(&path(from), &path(to), false)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        root_entries(&rig).await,
+        [("d".to_owned(), true, 0), ("x".to_owned(), false, 9)]
+    );
+
+    rig.backend.hold_uploads(false);
+    let done = ends(&rig).await;
+    assert_refused(&rig, done, &["d", "d/f.txt", "x"], &["d", "x/", "x/f.txt"]).await;
+    for key in ["d", "d/", "x", "x/"] {
+        assert_eq!(rig.backend.waiting_for(key), 0, "{key}");
+    }
+}
+
+#[tokio::test]
+async fn a_file_wrapped_in_a_directory_of_its_name_ends_with_the_refusal_of_the_store() {
+    let rig = Rig::writable_with(held).await;
+    put(rig.store(), "d", b"the file").await;
+    rig.backend
+        .rename(&path("d"), &path("tmp"), false)
+        .await
+        .unwrap();
+    make_dir(&rig, "d").await;
+    rig.backend
+        .rename(&path("tmp"), &path("d\\d"), false)
+        .await
+        .unwrap();
+    assert_eq!(root_entries(&rig).await, [("d".to_owned(), true, 0)]);
+
+    rig.backend.hold_uploads(false);
+    let done = ends(&rig).await;
+    assert_refused(&rig, done, &["d", "d/d"], &["d"]).await;
+    assert_eq!(rig.backend.waiting_for("d"), 0);
+}
+
+/// `b/q` moves to `z`, `b` is deleted, `c` moves to `b`, `b` to `a`, and `a/x`
+/// to `b`, while the copy to `z` is held. The directory `a` is to delete the
+/// markers `c/` and `b/`; the file `b` is to delete `c/x`, which keeps `c/` in
+/// use, and waits for `a` to delete `b/`, which `b/q` keeps in use until the
+/// copy ends. `a` deletes `b/` then, though `c/` is still in use.
+#[tokio::test]
+async fn a_directory_that_waits_for_two_markers_goes_when_the_second_is_free() {
+    let rig = Rig::writable_with(held).await;
+    mark(&rig, "b/", &[]).await;
+    put(rig.store(), "b/q", b"queued").await;
+    mark(&rig, "c/", &[]).await;
+    put(rig.store(), "c/x", b"in c").await;
+    rig.backend
+        .rename(&path("b\\q"), &path("z"), false)
+        .await
+        .unwrap();
+    rig.backend.unlink(&path("b")).await.unwrap();
+    for (from, to) in [("c", "b"), ("b", "a"), ("a\\x", "b")] {
+        rig.backend
+            .rename(&path(from), &path(to), false)
+            .await
+            .unwrap();
+    }
+    let gate = Arc::new(Notify::new());
+    rig.proxy.inject(
+        is_put_of(&rig.bucket.name, "z"),
+        Fault::Hold(Arc::clone(&gate)),
+        1,
+    );
+    rig.backend.hold_uploads(false);
+    wait_for_requests(&rig.proxy, 1, is_put_of(&rig.bucket.name, "z")).await;
+    wait_until("the file b and the directory a wait", || {
+        rig.backend.waiting_for("b/") > 0 && rig.backend.waiting_for("c/") > 0
+    })
+    .await;
+
+    gate.notify_one();
+    ends(&rig).await.unwrap();
+    assert_eq!(keys(&rig).await, ["a/", "b", "z"]);
+    assert_eq!(remote(&rig, "b").await.unwrap(), b"in c");
+    assert_eq!(remote(&rig, "z").await.unwrap(), b"queued");
+    assert!(rig.backend.failures().is_empty());
+    assert!(all_records(&rig).is_empty());
+}
+
+// Deletes the store refuses.
+
+#[tokio::test]
+async fn a_directory_made_where_a_file_could_not_be_deleted_has_its_marker_asked_for() {
+    let rig = Rig::writable_with(held).await;
+    put(rig.store(), "d", b"old").await;
+    rig.backend.unlink(&path("d")).await.unwrap();
+    make_dir(&rig, "d").await;
+    rig.proxy.inject(
+        is_delete,
+        Fault::Reply(Reply::error(403, "AccessDenied")),
+        usize::MAX,
+    );
+    rig.backend.hold_uploads(false);
+
+    wait_until("the marker is asked for", || {
+        rig.proxy.count(is_put_of(&rig.bucket.name, "d/")) > 0
+    })
+    .await;
+    assert_eq!(rig.backend.waiting_for("d"), 0);
+    assert!(ends(&rig).await.is_err(), "the delete stays refused");
+    assert_eq!(remote(&rig, "d").await.unwrap(), b"old");
+}
+
+#[tokio::test]
+async fn a_directory_made_where_a_file_that_failed_was_renamed_from_has_its_marker_asked_for() {
+    let rig = Rig::writable_with(held).await;
+    put(rig.store(), "d", b"data").await;
+    rig.backend
+        .rename(&path("d"), &path("e"), false)
+        .await
+        .unwrap();
+    make_dir(&rig, "d").await;
+    assert_eq!(rig.proxy.count(is_put_of(&rig.bucket.name, "d/")), 0);
+    rig.proxy.inject(
+        is_copy,
+        Fault::Reply(Reply::error(403, "AccessDenied")),
+        usize::MAX,
+    );
+    rig.backend.hold_uploads(false);
+
+    wait_until("the marker is asked for", || {
+        rig.proxy.count(is_put_of(&rig.bucket.name, "d/")) > 0
+    })
+    .await;
+    assert_eq!(rig.backend.waiting_for("d"), 0);
+    let failed: Vec<String> = rig
+        .backend
+        .failures()
+        .into_iter()
+        .map(|(path, _)| path)
+        .collect();
+    assert!(failed.contains(&"e".to_owned()), "{failed:?}");
+    assert_eq!(remote(&rig, "d").await.unwrap(), b"data");
+}
+
+#[tokio::test]
+async fn a_file_made_where_a_directory_could_not_be_emptied_is_asked_for_all_the_same() {
+    let rig = Rig::writable_with(held).await;
+    mark(&rig, "d/", &[]).await;
+    put(rig.store(), "d/x", b"x").await;
+    rig.backend.unlink(&path("d\\x")).await.unwrap();
+    rig.backend.unlink(&path("d")).await.unwrap();
+    rig.proxy.inject(
+        |seen| seen.method == "POST" && seen.has_param("delete"),
+        Fault::Reply(Reply::new(
+            200,
+            "<?xml version=\"1.0\"?><DeleteResult><Error><Key>d/x</Key>\
+             <Code>AccessDenied</Code><Message>refused</Message></Error></DeleteResult>",
+        )),
+        1,
+    );
+    make_file(&rig, "d", b"file").await;
+    assert_eq!(rig.backend.waiting_for("d/"), 0);
+    rig.backend.hold_uploads(false);
+
+    wait_until("the file is asked for", || {
+        rig.proxy.count(is_put_of(&rig.bucket.name, "d")) > 0
+    })
+    .await;
+    assert_eq!(rig.backend.waiting_for("d/"), 0);
+    assert!(ends(&rig).await.is_err(), "the delete stays refused");
+}
+
 // Names made in another case than one that was deleted.
 
 /// [`root_entries`] with the names in lower case, for a store that keeps the
@@ -845,6 +1256,33 @@ async fn a_file_renamed_to_another_case_leaves_no_row_behind_when_it_is_deleted(
 // Renaming directories.
 
 #[tokio::test]
+async fn a_renamed_directory_leaves_the_cached_listing_of_its_parent_under_its_new_name() {
+    let hour = Duration::from_secs(3600);
+    let rig = Rig::writable_with(|builder| held(builder).metadata_ttl(hour)).await;
+    mark(&rig, "d/", &[]).await;
+    put(rig.store(), "d/f.txt", b"x").await;
+    put(rig.store(), "other", b"y").await;
+    assert_eq!(
+        root_entries(&rig).await,
+        [("d".to_owned(), true, 0), ("other".to_owned(), false, 1)]
+    );
+    assert_eq!(
+        rig.backend.cached_listing(""),
+        Some(vec![("d".to_owned(), true), ("other".to_owned(), false)])
+    );
+
+    rig.backend
+        .rename(&path("d"), &path("e"), false)
+        .await
+        .unwrap();
+    assert_eq!(
+        rig.backend.cached_listing(""),
+        Some(vec![("e".to_owned(), true), ("other".to_owned(), false)])
+    );
+    assert!(!rig.backend.cached_object("d"));
+}
+
+#[tokio::test]
 async fn a_renamed_directory_shows_its_new_names_at_once_and_the_bucket_follows() {
     let mut rig = Rig::writable_with(held).await;
     put(rig.store(), "src/a.txt", b"alpha").await;
@@ -1063,7 +1501,7 @@ async fn a_directory_of_many_pages_is_renamed_whole() {
         b"many/1009.txt"
     );
     rig.backend.hold_uploads(false);
-    sync(&rig.backend).await.unwrap();
+    sync_while_progressing(&rig).await.unwrap();
     let all = keys(&rig).await;
     assert_eq!(all.len(), 1011);
     assert!(all.iter().all(|key| key.starts_with("lots/")));

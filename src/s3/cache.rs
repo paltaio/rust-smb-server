@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::time::Instant;
 
-use super::keys::{DirListing, FileStamp, Row, Slot, last_name, slot};
+use super::keys::{DirListing, FileStamp, Row, RowEdit, Slot, last_name, slot};
 use super::object::ObjectHead;
 
 /// Most keys the cache remembers a lookup of.
@@ -150,6 +150,28 @@ impl<V> Lru<V> {
         }
     }
 
+    /// Drops the entries of all the spellings of `key` that `keep` does not
+    /// keep.
+    fn remove_spellings_unless(&mut self, key: &str, keep: impl Fn(&V) -> bool) {
+        let spellings = if self.fold {
+            self.spellings
+                .get(&slot(key, true))
+                .cloned()
+                .unwrap_or_default()
+        } else {
+            vec![key.to_owned()]
+        };
+        for spelling in spellings {
+            if self
+                .entries
+                .get(&spelling)
+                .is_some_and(|entry| !keep(&entry.value))
+            {
+                self.remove(&spelling);
+            }
+        }
+    }
+
     #[cfg(test)]
     fn peek(&self, key: &str) -> Option<&V> {
         self.entries.get(key).map(|entry| &entry.value)
@@ -188,8 +210,9 @@ const MAX_READ_CHANGES: usize = 1000;
 enum Change<'a> {
     /// A row put in place of the row of its name.
     Put(&'a Row),
-    /// The row with this name taken out.
-    Take(&'a str),
+    /// The directory row with this name taken out, or the file row if the
+    /// flag is not set.
+    Take(&'a str, bool),
 }
 
 /// A read of the listing of a directory, from the cache or the store.
@@ -200,9 +223,9 @@ struct Read {
     name: Slot,
     /// The backend changed the rows of the directory since the read began.
     changed: bool,
-    /// The changes to the rows of `dir` since the read began, oldest first:
-    /// a name, and the row put in its place or none.
-    changes: Vec<(String, Option<Row>)>,
+    /// The changes to the rows of `dir` since the read began, oldest first,
+    /// each with the name it changes.
+    changes: Vec<(String, RowEdit)>,
     /// Whether `changes` is the whole of what the backend did to the rows
     /// since the read began. It is not for a read of a cached listing, nor
     /// after the rows were dropped, after a change to another spelling of
@@ -218,9 +241,12 @@ impl Read {
         let room = self.keep && self.dir == dir && self.changes.len() < MAX_READ_CHANGES;
         match change {
             Some(Change::Put(row)) if room => {
-                self.changes.push((row.name.clone(), Some(row.clone())));
+                self.changes
+                    .push((row.name.clone(), RowEdit::Put(row.clone())));
             }
-            Some(Change::Take(name)) if room => self.changes.push((name.to_owned(), None)),
+            Some(Change::Take(name, dir)) if room => {
+                self.changes.push((name.to_owned(), RowEdit::Take { dir }));
+            }
             _ => self.stop_keeping(),
         }
     }
@@ -339,22 +365,36 @@ impl MetaCache {
     /// listing whose row for the object is spelled in another case than `key`.
     /// The reads of that listing that are under way take in the change.
     pub(super) fn deleted_file(&mut self, key: &str, dir: &str) {
+        self.deleted_row(key, dir, false);
+    }
+
+    /// [`deleted_file`](Self::deleted_file) for the marker object of the
+    /// directory `key`, whose key has no trailing `/` here. Only the directory
+    /// row goes: a file of the same name keeps its row.
+    pub(super) fn deleted_dir(&mut self, key: &str, dir: &str) {
+        self.deleted_row(key, dir, true);
+    }
+
+    fn deleted_row(&mut self, key: &str, dir: &str, is_dir: bool) {
         let name = last_name(key);
-        self.keys.remove_spellings(key);
-        self.rows_changed(dir, Some(Change::Take(name)));
+        self.keys.remove_spellings_unless(key, |learned| {
+            if is_dir {
+                matches!(learned.value, Known::File(_))
+            } else {
+                matches!(learned.value, Known::Dir(_))
+            }
+        });
+        self.rows_changed(dir, Some(Change::Take(name, is_dir)));
         self.listings.remove_others(dir);
         let Some(learned) = self.listings.get(dir) else {
             return;
         };
         let (at, listing) = (learned.at, Arc::clone(&learned.value));
-        if self.fold
-            && listing.find_exact(name).is_none()
-            && listing.find_folded(name, false).is_some()
-        {
+        if self.fold && listing.has_other_spelling_only(name, is_dir) {
             self.listings.remove(dir);
             return;
         }
-        self.put_listing(dir, Arc::new(listing.without_row(name)), at);
+        self.put_listing(dir, Arc::new(listing.without_row(name, is_dir)), at);
     }
 
     /// Tells the reads of the listing of `dir` that are under way that the
@@ -458,22 +498,25 @@ impl MetaCache {
 /// store may hold both as one object: the listing is returned as it was.
 fn replay(
     listing: DirListing,
-    changes: Vec<(String, Option<Row>)>,
+    changes: Vec<(String, RowEdit)>,
     fold: bool,
 ) -> Result<DirListing, DirListing> {
     if changes.is_empty() {
         return Ok(listing);
     }
-    let last: HashMap<String, Option<Row>> = changes.into_iter().collect();
-    if fold && folds_apart(&listing, &last) {
+    let mut edits: HashMap<String, Vec<RowEdit>> = HashMap::new();
+    for (name, edit) in changes {
+        edits.entry(name).or_default().push(edit);
+    }
+    if fold && folds_apart(&listing, &edits) {
         return Err(listing);
     }
-    Ok(listing.edited(last))
+    Ok(listing.edited(edits))
 }
 
 /// Whether a changed name has another spelling among the rows of `listing` or
 /// the changed names.
-fn folds_apart(listing: &DirListing, changed: &HashMap<String, Option<Row>>) -> bool {
+fn folds_apart(listing: &DirListing, changed: &HashMap<String, Vec<RowEdit>>) -> bool {
     let mut folded: HashMap<String, &str> = HashMap::with_capacity(changed.len());
     for name in changed.keys() {
         if folded.insert(name.to_lowercase(), name).is_some() {
@@ -834,6 +877,124 @@ mod tests {
             row_names(&mut cache, "DIR", now),
             Some(vec!["g".to_owned()])
         );
+    }
+
+    fn dir_row(name: &str) -> Row {
+        Row {
+            name: name.to_owned(),
+            kind: RowKind::Dir,
+        }
+    }
+
+    fn rows_of(rows: Vec<Row>) -> Arc<DirListing> {
+        Arc::new(DirListing { rows })
+    }
+
+    #[test]
+    fn a_deleted_marker_leaves_what_is_cached_of_a_file_of_its_name() {
+        let now = Instant::now();
+        for fold in [false, true] {
+            let mut cache = MetaCache::new(Duration::from_secs(30), fold);
+            cache.put_known("d", Known::File(head("\"e\"", 1, 1)), now);
+            cache.put_listing("", rows_of(vec![file_row("d"), file_row("x")]), now);
+            cache.deleted_dir("d", "");
+            assert!(is_file(cache.known("d", now)), "fold {fold}");
+            assert_eq!(
+                row_names(&mut cache, "", now),
+                Some(vec!["d".to_owned(), "x".to_owned()]),
+                "fold {fold}"
+            );
+            cache.deleted_file("d", "");
+            assert!(cache.known("d", now).is_none(), "fold {fold}");
+            assert_eq!(
+                row_names(&mut cache, "", now),
+                Some(vec!["x".to_owned()]),
+                "fold {fold}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_deleted_file_leaves_what_is_cached_of_a_directory_of_its_name() {
+        let now = Instant::now();
+        for fold in [false, true] {
+            let mut cache = MetaCache::new(Duration::from_secs(30), fold);
+            cache.put_known("d", Known::Dir(None), now);
+            cache.put_listing("", rows_of(vec![dir_row("d"), file_row("x")]), now);
+            cache.deleted_file("d", "");
+            assert!(
+                matches!(cache.known("d", now), Some(Known::Dir(None))),
+                "fold {fold}"
+            );
+            assert_eq!(
+                row_names(&mut cache, "", now),
+                Some(vec!["d".to_owned(), "x".to_owned()]),
+                "fold {fold}"
+            );
+            cache.deleted_dir("d", "");
+            assert!(cache.known("d", now).is_none(), "fold {fold}");
+            assert_eq!(
+                row_names(&mut cache, "", now),
+                Some(vec!["x".to_owned()]),
+                "fold {fold}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_marker_deleted_in_another_case_drops_the_listing_when_names_fold() {
+        let now = Instant::now();
+        for (fold, kept) in [(true, false), (false, true)] {
+            let mut cache = MetaCache::new(Duration::from_secs(30), fold);
+            cache.put_listing("", rows_of(vec![dir_row("Dir"), file_row("dir")]), now);
+            cache.deleted_dir("dir", "");
+            assert_eq!(cache.listing("", now).is_some(), kept, "fold {fold}");
+            cache.put_listing("", rows_of(vec![file_row("Dir")]), now);
+            cache.deleted_dir("dir", "");
+            assert!(
+                cache.listing("", now).is_some(),
+                "fold {fold}: no directory row"
+            );
+        }
+    }
+
+    /// The names, and whether each is a directory, of a listing of the root
+    /// the store gave as `d` and `x`, a directory and a file, after `change`
+    /// was made to the rows while it was read.
+    fn read_with(fold: bool, change: impl FnOnce(&mut MetaCache)) -> Vec<(String, bool)> {
+        let mut cache = MetaCache::new(Duration::from_secs(30), fold);
+        let read = begin(&mut cache, "");
+        change(&mut cache);
+        let listing = DirListing {
+            rows: vec![dir_row("d"), file_row("x")],
+        };
+        let kept = cache.keep_read(read, listing, Instant::now());
+        kept.rows
+            .iter()
+            .map(|row| (row.name.clone(), row.is_dir()))
+            .collect()
+    }
+
+    #[test]
+    fn a_listing_read_while_a_file_was_put_and_a_marker_of_its_name_deleted_has_the_file() {
+        let both = [("d".to_owned(), false), ("x".to_owned(), false)];
+        for fold in [false, true] {
+            let put_then_marker = read_with(fold, |cache| {
+                cache.add_row("", file_row("d"));
+                cache.deleted_dir("d", "");
+            });
+            assert_eq!(put_then_marker, both, "fold {fold}");
+            let marker_then_put = read_with(fold, |cache| {
+                cache.deleted_dir("d", "");
+                cache.add_row("", file_row("d"));
+            });
+            assert_eq!(marker_then_put, both, "fold {fold}");
+            let put_then_file = read_with(fold, |cache| {
+                cache.add_row("", file_row("d"));
+                cache.deleted_file("d", "");
+            });
+            assert_eq!(put_then_file, &both[1..], "fold {fold}");
+        }
     }
 
     #[test]
@@ -1252,10 +1413,10 @@ mod tests {
         }
     }
 
-    fn changed_names(names: &[&str]) -> HashMap<String, Option<Row>> {
+    fn changed_names(names: &[&str]) -> HashMap<String, Vec<RowEdit>> {
         names
             .iter()
-            .map(|name| ((*name).to_owned(), Some(file_row(name))))
+            .map(|name| ((*name).to_owned(), vec![RowEdit::Put(file_row(name))]))
             .collect()
     }
 

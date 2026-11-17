@@ -152,7 +152,14 @@ use super::retry::Retry;
 /// `ObjectParentIsFile` or `ExistingObjectIsDirectory`, the directory is left
 /// without a marker; if it refuses the marker any other way, the object stays
 /// in the bucket and [`sync`](S3Backend::sync) fails (`OperationAborted` is
-/// tried again).
+/// tried again). A file is stored after the marker of a directory of its name
+/// is deleted, and a marker is put after the object of a file of its name is
+/// deleted. A directory made at the name of a file that is to be deleted shows
+/// at once, and its marker follows the delete. A write whose wait for such a
+/// delete would be a wait for the write itself, as when a file takes the name
+/// of the directory it was the only file of, is made without the wait, and the
+/// store takes it or refuses it. A delete the store refused for good, or one
+/// that only a file or directory that failed owns, is not waited for.
 ///
 /// Files renamed in a ring, as when two names swap through a third, are
 /// stored in turn. For each ring, the backend downloads one file and uploads
@@ -429,6 +436,40 @@ impl S3Backend {
     /// dropped meanwhile, the job ends without noting what it stored.
     pub(crate) fn pause_after_store(&self) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
         gates(&self.shared.jobs.pause_stored)
+    }
+
+    /// Makes the next job whose changes moved to the conflicts directory wait
+    /// once its entry has left the overlay, as
+    /// [`pause_after_hash`](Self::pause_after_hash) does.
+    pub(crate) fn pause_after_conflict(
+        &self,
+    ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        gates(&self.shared.jobs.pause_conflict)
+    }
+
+    /// Whether the metadata cache holds what a lookup of the object `key`
+    /// found.
+    pub(crate) fn cached_object(&self, key: &str) -> bool {
+        self.shared
+            .cache()
+            .known(key, tokio::time::Instant::now())
+            .is_some()
+    }
+
+    /// The names the metadata cache lists for the directory `dir`, each with
+    /// whether it is a directory, in order. `None` if it holds no listing.
+    pub(crate) fn cached_listing(&self, dir: &str) -> Option<Vec<(String, bool)>> {
+        let listing = self
+            .shared
+            .cache()
+            .listing(dir, tokio::time::Instant::now())?;
+        Some(
+            listing
+                .rows
+                .iter()
+                .map(|row| (row.name.clone(), row.is_dir()))
+                .collect(),
+        )
     }
 
     /// Makes the next lookup that found an object wait before it takes a hold

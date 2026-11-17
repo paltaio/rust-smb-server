@@ -15,7 +15,7 @@ use super::moves::{crash, make, path};
 use super::proxy::{Fault, Proxy, Reply, Seen};
 use super::share::{
     FILE_OVERWRITE_IF, Rig, Smb, filetime, is_data_read, listing_reply, names, run_bounded,
-    wait_for_requests, wait_until_async,
+    wait_for_requests, wait_until, wait_until_async,
 };
 use super::writes::{create_dir, create_file, entry_records, open_rw, records};
 use crate::ntstatus::STATUS_OBJECT_NAME_NOT_FOUND;
@@ -48,6 +48,33 @@ pub(crate) async fn sync(backend: &S3Backend) -> Result<(), S3Error> {
     tokio::time::timeout(Duration::from_secs(60), backend.sync())
         .await
         .expect("sync returns")
+}
+
+/// [`sync`] for a rig with a lot to store. It has no deadline of its own and
+/// panics when a minute passes with no change in the entries of the overlay,
+/// the records in the cache directory and the requests the proxy saw.
+pub(super) async fn sync_while_progressing(rig: &Rig) -> Result<(), S3Error> {
+    const STALL: Duration = Duration::from_secs(60);
+    let progress = || {
+        (
+            rig.backend.overlay_len(),
+            left(rig, "records"),
+            rig.proxy.count(|_| true),
+        )
+    };
+    let sync = rig.backend.sync();
+    tokio::pin!(sync);
+    let mut seen = progress();
+    loop {
+        match tokio::time::timeout(STALL, &mut sync).await {
+            Ok(done) => return done,
+            Err(_) => {
+                let now = progress();
+                assert_ne!(now, seen, "nothing changed in {STALL:?}");
+                seen = now;
+            }
+        }
+    }
 }
 
 fn sha(data: &[u8]) -> String {
@@ -560,6 +587,46 @@ async fn an_object_deleted_outside_moves_the_file_to_conflicts() {
 }
 
 #[tokio::test]
+async fn a_file_whose_object_is_deleted_outside_is_not_found_as_soon_as_its_changes_are_kept() {
+    let hour = Duration::from_secs(3600);
+    let mut rig = Rig::writable_with(|builder| held(builder).metadata_ttl(hour)).await;
+    put(rig.store(), "base.bin", &pattern(1, MIB)).await;
+    let file = rig.smb.create("base.bin", open_rw()).await.unwrap();
+    assert_eq!(rig.smb.write(file.id, 10, &[9; 20]).await, Ok(20));
+    rig.smb.close(file.id).await;
+    assert!(rig.backend.cached_object("base.bin"), "a lookup found it");
+    rig.store()
+        .delete_object("base.bin", foreground())
+        .await
+        .unwrap();
+    let (reached, resume) = rig.backend.pause_after_conflict();
+    // The job waits on a thread of its own, which a failed assertion has to
+    // let go of for the runtime to end.
+    let _resume = Resume(resume);
+    rig.backend.hold_uploads(false);
+    reached.notified().await;
+
+    assert_eq!(rig.backend.overlay_len(), 0, "the entry has left");
+    assert!(
+        !rig.backend.cached_object("base.bin"),
+        "the cache forgot the object before the entry left"
+    );
+    assert_eq!(
+        rig.smb.open("base.bin").await.unwrap_err(),
+        STATUS_OBJECT_NAME_NOT_FOUND
+    );
+}
+
+/// Lets the job that waits at a pause go on when it is dropped.
+struct Resume(Arc<Notify>);
+
+impl Drop for Resume {
+    fn drop(&mut self) {
+        self.0.notify_one();
+    }
+}
+
+#[tokio::test]
 async fn requests_the_store_fails_are_tried_again() {
     let mut rig = Rig::writable_with(held).await;
     let big = pattern(4, 11 * MIB);
@@ -1048,11 +1115,12 @@ async fn a_file_stored_and_opened_by_another_handle_while_the_store_is_read_is_l
 #[tokio::test]
 async fn a_listing_read_during_a_burst_of_stores_and_a_delete_shows_every_file_and_is_kept() {
     const FILES: usize = 1100;
-    // The listing waits for the stores of a thousand files, which may take
-    // longer than the default request timeout.
+    // The listing waits for the stores of a thousand files, and the reads of
+    // their metadata follow it. Either may take longer than the default request
+    // timeout or the time the cache trusts a listing.
+    let hour = Duration::from_secs(3600);
     let mut rig =
-        Rig::writable_with(|builder| held(builder).request_timeout(Duration::from_secs(3600)))
-            .await;
+        Rig::writable_with(|builder| held(builder).request_timeout(hour).metadata_ttl(hour)).await;
     put(rig.store(), "x.txt", b"x").await;
     rig.backend.unlink(&path("x.txt")).await.unwrap();
     for n in 0..FILES {
@@ -1060,7 +1128,7 @@ async fn a_listing_read_during_a_burst_of_stores_and_a_delete_shows_every_file_a
     }
     let (gate, listing) = listing_in_flight(&rig, &[("x.txt", 1)]).await;
     rig.backend.hold_uploads(false);
-    sync(&rig.backend).await.unwrap();
+    sync_while_progressing(&rig).await.unwrap();
     let open = rig.smb.open("f0000.txt").await.unwrap();
     gate.notify_one();
     let during = listing.await.unwrap();
@@ -1585,6 +1653,10 @@ async fn sync_reports_a_failure_the_store_will_not_fix_and_a_rebuild_tries_again
     })
     .await;
     assert!(sync(&rig.backend).await.is_err(), "it stays failed");
+    wait_until("the other file is stored", || {
+        rig.backend.overlay_len() == 1
+    })
+    .await;
     tokio::time::sleep(4 * DELAY).await;
     assert_eq!(
         rig.proxy.count(is_put_of(&rig.bucket.name, "denied.txt")),

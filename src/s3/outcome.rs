@@ -367,7 +367,7 @@ fn taken_over_held(shared: &Shared, owner: &Arc<Entry>, keys: &[String]) -> SmbR
     match deleted_held(shared, owner, keys) {
         Err(e) if !matches!(e, SmbError::AccessDenied | SmbError::DiskFull) => {
             let failure = S3Error::cache(e);
-            owner.state().failure = Some(failure.clone());
+            shared.overlay.failed(owner, failure.clone());
             shared.overlay.touch();
             Err(SmbError::Io(io::Error::other(failure)))
         }
@@ -412,7 +412,7 @@ pub(super) fn note_upload(
 /// Notes that the job of the entry failed for good with `error`, in the
 /// record of the entry.
 pub(super) fn failed(shared: &Shared, entry: &Arc<Entry>, error: S3Error) -> SmbResult<()> {
-    entry.state().failure = Some(error);
+    shared.overlay.failed(entry, error);
     persist(shared, entry, true)
 }
 
@@ -448,6 +448,8 @@ pub(super) fn conflict(
         state.gone.clear();
     }
     shared.overlay.evict(entry);
+    #[cfg(test)]
+    super::jobs::pause_blocking(&shared.jobs.pause_conflict);
     Ok(moved)
 }
 

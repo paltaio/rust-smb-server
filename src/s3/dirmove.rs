@@ -859,7 +859,7 @@ fn announce(shared: &Shared, from: &str, to: &str, root: &Arc<Entry>) {
             },
         );
     }
-    shared.deleted(from);
+    shared.deleted(&dir_prefix(from));
     if let Err(e) = outcome::take_over(shared, root, &dir_prefix(to), &shared.jobs.stop) {
         warn!(error = %e, "the keys to delete that name the marker of a moved directory could not be let go; its job lets them go");
     }

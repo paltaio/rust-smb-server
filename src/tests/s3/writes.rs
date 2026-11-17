@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::future::Future as _;
+use std::io::ErrorKind;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering::SeqCst;
@@ -52,10 +53,15 @@ pub(super) fn records(rig: &Rig) -> Vec<EntryRecord> {
     entry_records(rig.cache_dir())
 }
 
+/// A record the backend removes while the directory is read is left out.
 pub(super) fn entry_records(cache: &Path) -> Vec<EntryRecord> {
     let mut found = Vec::new();
     for file in fs::read_dir(cache.join("records")).unwrap() {
-        let bytes = fs::read(file.unwrap().path()).unwrap();
+        let bytes = match fs::read(file.unwrap().path()) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == ErrorKind::NotFound => continue,
+            Err(e) => panic!("{e}"),
+        };
         if let Record::Entry(entry) = Record::decode(&bytes).unwrap() {
             found.push(*entry);
         }
