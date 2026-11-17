@@ -23,22 +23,43 @@ The key is 32 raw bytes supplied by the program. The backend does not derive it 
 
 ## S3 bucket
 
-```rust
-use smb_server::{Access, EncryptedBackend, S3Backend, Share};
-
-let key: [u8; 32] = load_key()?;
-let s3 = S3Backend::builder("https://s3.example.com", "us-east-1", "vault-bucket")
-    .credentials("access-key", "secret-key")
-    .cache_dir("/var/cache/smb-vault")
-    .case_insensitive(false)
-    .build()
-    .await?;
-
-let vault = EncryptedBackend::builder(s3.clone(), key).build().await?;
-let share = Share::new("vault", vault).user("alice", Access::ReadWrite);
+```toml
+smb-server = { version = "0.11", features = ["s3", "encryption"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
-With encrypted names, build the inner `S3Backend` with `case_insensitive(false)`. With the default `true`, a lookup of a key the bucket does not hold also lists the directory. The cache directory records the case setting, and `build` refuses one made with the other value. Call `s3.sync()` after `serve` returns, as in [backends](backends.md#uploads-and-shutdown).
+```rust
+use smb_server::{Access, EncryptedBackend, S3Backend, Share, SmbServer};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let key: [u8; 32] = std::fs::read("/etc/smb/vault.key")?
+        .try_into()
+        .map_err(|_| "the key file must hold 32 bytes")?;
+
+    let s3 = S3Backend::builder("https://s3.example.com", "us-east-1", "vault-bucket")
+        .credentials("access-key", "secret-key")
+        .cache_dir("/var/cache/smb-vault")
+        .case_insensitive(false)
+        .build()
+        .await?;
+    let vault = EncryptedBackend::builder(s3.clone(), key).build().await?;
+
+    let server = SmbServer::builder()
+        .listen("0.0.0.0:4445".parse()?)
+        .user("alice", "password")
+        .share(Share::new("vault", vault).user("alice", Access::ReadWrite))
+        .build()?;
+    server.bind().await?;
+
+    let served = server.serve().await;
+    s3.sync().await?;
+    served?;
+    Ok(())
+}
+```
+
+With encrypted names, build the inner `S3Backend` with `case_insensitive(false)`. With the default `true`, a lookup of a key the bucket does not hold also lists the directory. The cache directory records the case setting, and `build` refuses one made with the other value. `sync` after `serve` returns puts the last changes in the bucket; see [backends](backends.md#uploads-and-shutdown).
 
 ## What is protected
 
