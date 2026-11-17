@@ -3,7 +3,7 @@
 Feature `encryption`, off by default. `EncryptedBackend` wraps another backend and stores file contents, and by default names, encrypted under a 32-byte key. The inner backend holds ciphertext and clients see plaintext.
 
 ```toml
-smb-server = { version = "0.11", features = ["encryption"] }
+smb-server = { version = "0.12", features = ["encryption"] }
 ```
 
 ## Local directory
@@ -24,7 +24,7 @@ The key is 32 raw bytes supplied by the program. The backend does not derive it 
 ## S3 bucket
 
 ```toml
-smb-server = { version = "0.11", features = ["s3", "encryption"] }
+smb-server = { version = "0.12", features = ["s3", "encryption"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 

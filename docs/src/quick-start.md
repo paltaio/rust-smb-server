@@ -15,7 +15,7 @@ cargo add smb-server
 
 ```toml
 [dependencies]
-smb-server = { version = "0.11", features = ["discovery"] }
+smb-server = { version = "0.12", features = ["discovery"] }
 ```
 
 ## Serve a directory
