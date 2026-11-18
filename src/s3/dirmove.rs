@@ -1039,6 +1039,7 @@ async fn read_base(shared: Arc<Shared>, entry: Arc<Entry>, key: String) {
 mod tests {
     use super::*;
     use crate::s3::cachedir::RecordOp;
+    use crate::tests::util::scratch_dir;
 
     fn named(dirs: &[&str]) -> HashSet<Slot> {
         dirs.iter().map(|dir| slot(dir, false)).collect()
@@ -1111,7 +1112,7 @@ mod tests {
 
     #[test]
     fn a_batch_record_is_rewritten_without_a_canceled_entry_and_removed_with_the_last() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = scratch_dir();
         let cache = CacheDir::open(temp.path(), "identity").unwrap();
         let (a, b) = (member("d/a"), member("d/b"));
         let (batch, record) = written(&cache, vec![a.clone(), b.clone()]);
@@ -1131,7 +1132,7 @@ mod tests {
 
     #[test]
     fn an_entry_stays_in_the_batch_when_its_record_cannot_be_written_without_it() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = scratch_dir();
         let cache = CacheDir::open(temp.path(), "identity").unwrap();
         let (a, b) = (member("d/a"), member("d/b"));
         let (batch, record) = written(&cache, vec![a.clone(), b]);
@@ -1148,7 +1149,7 @@ mod tests {
 
     #[test]
     fn entries_covered_by_tombstones_leave_the_batch_record_in_one_rewrite() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = scratch_dir();
         let cache = CacheDir::open(temp.path(), "identity").unwrap();
         let members = vec![member("d/a"), member("d/b"), member("d/c")];
         let (batch, record) = written(&cache, members.clone());
@@ -1173,7 +1174,7 @@ mod tests {
 
     #[test]
     fn a_canceled_member_goes_back_where_it_stood_and_the_record_says_so() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = scratch_dir();
         let cache = CacheDir::open(temp.path(), "identity").unwrap();
         let members = vec![member("d/a"), member("d/b"), member("d/c")];
         let ids: Vec<RecordId> = members.iter().map(|m| m.id.clone()).collect();
@@ -1190,7 +1191,7 @@ mod tests {
 
     #[test]
     fn the_last_member_that_left_brings_the_record_back() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = scratch_dir();
         let cache = CacheDir::open(temp.path(), "identity").unwrap();
         let only = member("d/a");
         let (batch, record) = written(&cache, vec![only.clone()]);
@@ -1203,7 +1204,7 @@ mod tests {
 
     #[test]
     fn a_covered_member_goes_back_without_a_write_unless_the_record_was_written_meanwhile() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = scratch_dir();
         let cache = CacheDir::open(temp.path(), "identity").unwrap();
         let members = vec![member("d/a"), member("d/b"), member("d/c")];
         let ids: Vec<RecordId> = members.iter().map(|m| m.id.clone()).collect();
@@ -1228,7 +1229,7 @@ mod tests {
 
     #[test]
     fn a_member_does_not_go_back_into_a_batch_that_is_over() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = scratch_dir();
         let cache = CacheDir::open(temp.path(), "identity").unwrap();
         let members = vec![member("d/a"), member("d/b")];
         let (batch, record) = written(&cache, members.clone());

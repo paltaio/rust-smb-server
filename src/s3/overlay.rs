@@ -2626,6 +2626,7 @@ mod tests {
     use crate::s3::entry::State;
     use crate::s3::lookup::DirRef;
     use crate::s3::record::{BatchRecord, RecordId};
+    use crate::tests::util::scratch_dir;
 
     /// A bound on the entries below a directory that no test reaches.
     const NO_LIMIT: usize = usize::MAX;
@@ -2999,7 +3000,7 @@ mod tests {
 
     #[test]
     fn a_key_is_kept_apart_only_while_it_is_to_be_deleted() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = scratch_dir();
         let cache = CacheDir::open(&dir.path().join("c"), "identity").unwrap();
         let overlay = test_overlay(true);
         overlay.keep_apart("F");
@@ -3395,7 +3396,7 @@ mod tests {
 
     #[test]
     fn a_new_entry_at_a_key_to_delete_takes_it_off_the_records_that_name_it() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = scratch_dir();
         let cache = CacheDir::open(&dir.path().join("c"), "identity").unwrap();
         let overlay = test_overlay(false);
         let id = RecordId::parse(&"d".repeat(32)).unwrap();
@@ -4837,7 +4838,7 @@ mod tests {
 
     #[test]
     fn an_entry_that_goes_back_to_its_batch_is_no_longer_covered_by_a_tombstone_record() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = scratch_dir();
         let cache = CacheDir::open(&dir.path().join("c"), "identity").unwrap();
         let overlay = test_overlay(false);
         let (a, b) = (kept("a"), kept("b"));
@@ -4874,7 +4875,7 @@ mod tests {
     #[test]
     fn the_record_of_a_batch_is_written_without_the_entries_that_left_it_before_their_tombstone_goes()
      {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = scratch_dir();
         let cache = CacheDir::open(&dir.path().join("c"), "identity").unwrap();
         let overlay = test_overlay(false);
         let (a, b, c) = (kept("a"), kept("b"), kept("c"));

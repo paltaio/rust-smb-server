@@ -24,6 +24,7 @@ use crate::s3::client::S3Client;
 use crate::s3::encode::uri_encode;
 use crate::server::ServerState;
 use crate::tests::peer::{Peer, status};
+use crate::tests::util::scratch_dir;
 use crate::utils::FILETIME_OFFSET;
 use crate::{Handle, OpenOptions, S3Backend, S3BackendBuilder, Share, ShareBackend, SmbServer};
 
@@ -157,7 +158,7 @@ impl Rig {
     ) -> Self {
         let bucket = TestBucket::new().await;
         let proxy = Proxy::start(bucket.gateway.addr).await;
-        Rig::start(bucket, proxy, tempfile::tempdir().unwrap(), configure).await
+        Rig::start(bucket, proxy, scratch_dir(), configure).await
     }
 
     /// The cache directory.

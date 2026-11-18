@@ -19,6 +19,7 @@ use super::writes::{changes, create_dir, create_file, open_rw, records};
 use crate::ntstatus::STATUS_OBJECT_NAME_NOT_FOUND;
 use crate::s3::record::{Record, RecordId, TombstoneRecord};
 use crate::tests::logs::Logs;
+use crate::tests::util::scratch_dir;
 use crate::{OpenIntent, OpenOptions, S3Backend, S3Error, ShareBackend, SmbPath};
 
 /// What a directory listing and the files in it say, for comparing.
@@ -187,7 +188,7 @@ async fn ids_are_random_and_not_made_from_the_name() {
     let first = records(&rig)[0].id.clone();
 
     let (bucket, proxy, _cache) = rig.stop().await;
-    let mut rig = Rig::start(bucket, proxy, tempfile::tempdir().unwrap(), |b| b).await;
+    let mut rig = Rig::start(bucket, proxy, scratch_dir(), |b| b).await;
     let file = rig.smb.create("same.txt", create_file()).await.unwrap();
     assert_eq!(rig.smb.flush(file.id).await, 0);
     assert_ne!(first, records(&rig)[0].id);
@@ -335,7 +336,7 @@ async fn records_and_data_that_cannot_be_used_move_to_conflicts_and_the_rest_com
 
 #[tokio::test]
 async fn a_move_to_conflicts_is_logged_at_error_level() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = scratch_dir();
     let junk = "2".repeat(32);
     let logs = Logs::new();
     let dir = crate::s3::cachedir::CacheDir::open(temp.path(), "identity").unwrap();

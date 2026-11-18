@@ -173,7 +173,9 @@ impl CacheDir {
     /// # Errors
     ///
     /// Fails when the directory cannot be made or used, when another backend
-    /// holds its lock, and when it belongs to another identity.
+    /// holds its lock, and when it belongs to another identity. On Windows it
+    /// also fails on a volume that does not delete with POSIX semantics, such
+    /// as an SMB share.
     pub(crate) fn open(root: &Path, identity: &str) -> Result<CacheDir, S3Error> {
         let mut dirs = DirBuilder::new();
         dirs.recursive(true);
@@ -236,6 +238,8 @@ impl CacheDir {
                 let _ = fs::remove_dir_all(&path);
             }
         }
+        #[cfg(windows)]
+        check_posix_delete(&root.join("tmp").join("probe"))?;
         Ok(dir)
     }
 
@@ -792,6 +796,38 @@ fn sync_dir(_dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Makes the file `probe` and deletes it with POSIX semantics. A data file
+/// is deleted while a handle keeps it open, and its name is made again at
+/// once, which needs those semantics. Fails where the volume refuses them,
+/// as an SMB share does. The file is gone either way.
+#[cfg(windows)]
+fn check_posix_delete(probe: &Path) -> Result<(), S3Error> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_READ_ATTRIBUTES};
+
+    use crate::host::{delete_posix, nt_error, refuses_posix};
+
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .access_mode(DELETE | FILE_READ_ATTRIBUTES)
+        .open(probe)
+        .map_err(cache_error)?;
+    let Err(status) = delete_posix(&file, false) else {
+        return Ok(());
+    };
+    drop(file);
+    let _ = fs::remove_file(probe);
+    if refuses_posix(status) {
+        Err(S3Error::InvalidArgument(
+            "on Windows the cache directory must be on a local NTFS or ReFS volume",
+        ))
+    } else {
+        Err(cache_error(nt_error(status)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, UNIX_EPOCH};
@@ -800,6 +836,7 @@ mod tests {
     use crate::s3::object::{Metadata, ObjectHead};
     use crate::s3::ranges::RangeSet;
     use crate::s3::record::{BaseRecord, LocalRecord};
+    use crate::tests::util::scratch_dir;
 
     const WHO: &str = "http://127.0.0.1:9000";
 
@@ -860,7 +897,7 @@ mod tests {
 
     #[test]
     fn a_new_directory_has_the_layout() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = scratch_dir();
         let root = temp.path().join("cache");
         let dir = CacheDir::open(&root, &who()).unwrap();
         assert_eq!(
@@ -876,7 +913,7 @@ mod tests {
     #[test]
     fn a_new_directory_and_its_files_are_private() {
         use std::os::unix::fs::PermissionsExt as _;
-        let temp = tempfile::tempdir().unwrap();
+        let temp = scratch_dir();
         let root = temp.path().join("cache");
         let dir = CacheDir::open(&root, &who()).unwrap();
         let record = entry("f", Some(2));
@@ -894,7 +931,7 @@ mod tests {
 
     #[test]
     fn the_volume_of_the_directory_reports_its_size_and_free_space() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = scratch_dir();
         let dir = CacheDir::open(temp.path(), &who()).unwrap();
         let info = dir.volume_info().unwrap();
         assert!(info.total_allocation_units > 0);
@@ -905,7 +942,7 @@ mod tests {
 
     #[test]
     fn a_second_backend_cannot_use_a_directory_that_is_in_use() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = scratch_dir();
         let first = CacheDir::open(temp.path(), &who()).unwrap();
         assert!(matches!(
             CacheDir::open(temp.path(), &who()),
@@ -922,7 +959,7 @@ mod tests {
         use std::os::fd::AsRawFd as _;
         use std::os::unix::process::CommandExt as _;
 
-        let temp = tempfile::tempdir().unwrap();
+        let temp = scratch_dir();
         let dir = CacheDir::open(temp.path(), &who()).unwrap();
         let (mut started, started_tx) = std::io::pipe().unwrap();
         let (go, mut go_tx) = std::io::pipe().unwrap();
@@ -959,7 +996,7 @@ mod tests {
 
     #[test]
     fn a_directory_of_another_endpoint_bucket_prefix_or_case_setting_is_refused() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = scratch_dir();
         drop(CacheDir::open(temp.path(), &who()).unwrap());
         for other in [
             identity(WHO, "bucket", "pre", true),
@@ -993,7 +1030,7 @@ mod tests {
 
     #[test]
     fn a_directory_with_files_and_no_identity_is_refused() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = scratch_dir();
         drop(CacheDir::open(temp.path(), &who()).unwrap());
         fs::remove_file(temp.path().join("identity")).unwrap();
         fs::write(
@@ -1009,7 +1046,7 @@ mod tests {
 
     #[test]
     fn open_empties_tmp() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = scratch_dir();
         drop(CacheDir::open(temp.path(), &who()).unwrap());
         fs::write(temp.path().join("tmp/left"), "x").unwrap();
         fs::create_dir(temp.path().join("tmp/dir")).unwrap();
@@ -1020,7 +1057,7 @@ mod tests {
 
     #[test]
     fn a_record_replaces_the_one_before_leaves_no_temp_file_and_can_be_removed_twice() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = scratch_dir();
         let dir = CacheDir::open(temp.path(), &who()).unwrap();
         let id = new_id().unwrap();
         dir.write_record(&id, "one").unwrap();
@@ -1034,7 +1071,7 @@ mod tests {
 
     #[test]
     fn records_with_their_data_come_back() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = scratch_dir();
         let dir = CacheDir::open(temp.path(), &who()).unwrap();
         let with_data = entry("dir/a.txt", Some(5));
         let without = entry("b.txt", None);
@@ -1070,7 +1107,7 @@ mod tests {
 
     #[test]
     fn records_that_do_not_parse_move_to_conflicts() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = scratch_dir();
         let dir = CacheDir::open(temp.path(), &who()).unwrap();
         let records = temp.path().join("records");
         let good = entry("good", None);
@@ -1103,7 +1140,7 @@ mod tests {
 
     #[test]
     fn a_record_whose_data_is_missing_or_short_moves_to_conflicts_with_its_data() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = scratch_dir();
         let dir = CacheDir::open(temp.path(), &who()).unwrap();
         let missing = entry("missing", Some(10));
         store(&dir, &missing, None);
@@ -1131,7 +1168,7 @@ mod tests {
 
     #[test]
     fn a_data_file_that_has_the_claimed_ranges_is_cut_or_grown_to_the_length() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = scratch_dir();
         let dir = CacheDir::open(temp.path(), &who()).unwrap();
         let mut grown = entry("grown", Some(10));
         grown.local.as_mut().unwrap().present = std::iter::once(0..4).collect();
@@ -1149,7 +1186,7 @@ mod tests {
 
     #[test]
     fn data_files_without_a_record_are_removed() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = scratch_dir();
         let dir = CacheDir::open(temp.path(), &who()).unwrap();
         let orphan = new_id().unwrap();
         dir.create_data(&orphan, 4).unwrap();
@@ -1167,7 +1204,7 @@ mod tests {
 
     #[test]
     fn records_for_names_that_differ_only_in_case_clash_when_case_is_ignored() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = scratch_dir();
         let dir = CacheDir::open(temp.path(), &who()).unwrap();
         store(&dir, &entry("Name", None), None);
         store(&dir, &entry("name", None), None);
@@ -1199,7 +1236,7 @@ mod tests {
     #[test]
     fn keys_an_entry_holds_are_dropped_from_tombstone_records() {
         for fold in [false, true] {
-            let temp = tempfile::tempdir().unwrap();
+            let temp = scratch_dir();
             let dir = CacheDir::open(temp.path(), &who()).unwrap();
             store(&dir, &entry("a.txt", None), None);
             store(&dir, &entry("Sub/B.txt", None), None);
@@ -1249,7 +1286,7 @@ mod tests {
     #[test]
     fn a_key_to_delete_that_names_a_file_stays_while_a_directory_has_its_name() {
         for fold in [false, true] {
-            let temp = tempfile::tempdir().unwrap();
+            let temp = scratch_dir();
             let dir = CacheDir::open(temp.path(), &who()).unwrap();
             let made = EntryRecord {
                 is_dir: true,
@@ -1274,7 +1311,7 @@ mod tests {
 
     #[test]
     fn a_tombstone_record_that_loses_every_key_is_removed() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = scratch_dir();
         let dir = CacheDir::open(temp.path(), &who()).unwrap();
         store(&dir, &entry("a.txt", None), None);
         let gone = tombstone(&dir, &["pre/fix/a.txt"]);
@@ -1286,7 +1323,7 @@ mod tests {
 
     #[test]
     fn two_tombstone_records_with_a_key_in_common_clash() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = scratch_dir();
         let dir = CacheDir::open(temp.path(), &who()).unwrap();
         tombstone(&dir, &["pre/fix/a", "pre/fix/b"]);
         tombstone(&dir, &["pre/fix/c", "pre/fix/b"]);
@@ -1297,7 +1334,7 @@ mod tests {
 
     #[test]
     fn records_with_a_wrong_key_a_taken_name_or_a_key_outside_the_prefix_move_to_conflicts() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = scratch_dir();
         let dir = CacheDir::open(temp.path(), &who()).unwrap();
         let mut wrong = entry("a", None);
         wrong.key = "elsewhere/a".to_owned();
@@ -1321,7 +1358,7 @@ mod tests {
 
     #[test]
     fn a_conflict_takes_the_data_file_and_the_record_under_one_new_id() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = scratch_dir();
         let dir = CacheDir::open(temp.path(), &who()).unwrap();
         let held = entry("held", Some(4));
         store(&dir, &held, Some(b"data"));
@@ -1346,7 +1383,7 @@ mod tests {
 
     #[test]
     fn a_conflict_whose_data_file_cannot_be_moved_leaves_both_files_in_place() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = scratch_dir();
         let dir = CacheDir::open(temp.path(), &who()).unwrap();
         let held = entry("held", Some(4));
         store(&dir, &held, Some(b"data"));
@@ -1363,7 +1400,7 @@ mod tests {
 
     #[test]
     fn a_record_whose_data_file_cannot_be_moved_stays_with_it_until_the_next_build() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = scratch_dir();
         let dir = CacheDir::open(temp.path(), &who()).unwrap();
         let short = entry("short", Some(10));
         store(&dir, &short, Some(b"abc"));
@@ -1388,7 +1425,7 @@ mod tests {
 
     #[test]
     fn a_crash_between_the_two_moves_of_a_conflict_keeps_the_data_in_conflicts() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = scratch_dir();
         let dir = CacheDir::open(temp.path(), &who()).unwrap();
         let held = entry("held", Some(4));
         store(&dir, &held, Some(b"data"));
@@ -1439,7 +1476,7 @@ mod tests {
 
     #[test]
     fn the_entries_of_a_batch_replace_the_older_records_and_get_records_of_their_own() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = scratch_dir();
         let dir = CacheDir::open(temp.path(), &who()).unwrap();
         let held = entry("old/held.txt", Some(4));
         store(&dir, &held, Some(b"data"));
@@ -1473,7 +1510,7 @@ mod tests {
 
     #[test]
     fn a_batch_does_not_outdate_a_record_of_the_same_or_a_later_generation() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = scratch_dir();
         let dir = CacheDir::open(temp.path(), &who()).unwrap();
         let first = entry("old/first.txt", None);
         let second = entry("old/second.txt", None);
@@ -1502,7 +1539,7 @@ mod tests {
 
     #[test]
     fn an_entry_that_became_a_tombstone_after_a_batch_is_not_brought_back() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = scratch_dir();
         let dir = CacheDir::open(temp.path(), &who()).unwrap();
         let gone = entry("old/gone.txt", None);
         let kept = entry("old/kept.txt", None);
@@ -1524,7 +1561,7 @@ mod tests {
 
     #[test]
     fn the_newest_batch_gives_an_entry_its_place() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = scratch_dir();
         let dir = CacheDir::open(temp.path(), &who()).unwrap();
         let held = entry("one/f.txt", None);
         let first = moved(&held, "two/f.txt");
@@ -1571,7 +1608,7 @@ mod tests {
 
     #[test]
     fn a_member_of_a_batch_that_cannot_be_used_moves_to_conflicts_with_its_data() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = scratch_dir();
         let dir = CacheDir::open(temp.path(), &who()).unwrap();
         let broken = entry("old/broken.txt", Some(8));
         let fine = entry("old/fine.txt", None);
@@ -1591,7 +1628,7 @@ mod tests {
 
     #[test]
     fn a_batch_member_with_nothing_left_to_do_is_not_brought_back_and_its_older_record_goes() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = scratch_dir();
         let dir = CacheDir::open(temp.path(), &who()).unwrap();
         let held = entry("old/held.txt", None);
         let kept = entry("old/kept.txt", None);

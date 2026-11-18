@@ -223,7 +223,7 @@ fn run_helper() {
 
 fn serve(binary: &OsStr) -> Result<(), String> {
     let setting = |name| std::env::var(name).unwrap();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::tests::util::scratch_dir();
     let root = dir.path().join("root");
     let sidecar = dir.path().join("sidecar");
     let log = dir.path().join("gateway.log");

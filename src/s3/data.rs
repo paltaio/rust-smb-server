@@ -203,6 +203,7 @@ pub(super) fn disk_error(e: io::Error) -> SmbError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tests::util::scratch_dir;
 
     #[test]
     fn a_full_disk_and_a_quota_have_their_own_errors() {
@@ -240,7 +241,7 @@ mod tests {
 
     #[test]
     fn a_data_file_has_its_length_and_reads_holes_as_zeros() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = scratch_dir();
         let path = dir.path().join("data");
         let file = create(&path, 100).unwrap();
         assert_eq!(file.metadata().unwrap().len(), 100);
@@ -262,7 +263,7 @@ mod tests {
 
     #[test]
     fn a_data_file_is_opened_by_its_path_and_kept_open_only_when_kept() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = scratch_dir();
         let path = dir.path().join("data");
         create(&path, 4).unwrap();
         let data = DataFile::new(path, None);
@@ -280,7 +281,7 @@ mod tests {
 
     #[test]
     fn a_kept_descriptor_reaches_a_data_file_that_is_deleted_or_made_again() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = scratch_dir();
         let path = dir.path().join("data");
         write_all_at(&create(&path, 0).unwrap(), b"old", 0).unwrap();
         let data = DataFile::new(path.clone(), None);
@@ -300,7 +301,7 @@ mod tests {
     #[test]
     fn a_data_file_of_holes_takes_few_blocks() {
         use std::os::unix::fs::MetadataExt as _;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = scratch_dir();
         let file = create(&dir.path().join("data"), 64 << 20).unwrap();
         write_all_at(&file, b"x", 10 << 20).unwrap();
         let meta = file.metadata().unwrap();
@@ -313,7 +314,7 @@ mod tests {
     fn a_data_file_is_marked_sparse() {
         use std::os::windows::fs::MetadataExt as _;
         const FILE_ATTRIBUTE_SPARSE_FILE: u32 = 0x200;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = scratch_dir();
         let file = create(&dir.path().join("data"), 1 << 20).unwrap();
         let attributes = file.metadata().unwrap().file_attributes();
         assert_ne!(attributes & FILE_ATTRIBUTE_SPARSE_FILE, 0);

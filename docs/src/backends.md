@@ -70,7 +70,7 @@ let share = Share::new("s3", s3.clone()).user("alice", Access::ReadWrite);
 
 ### Cache directory
 
-Holds every change that is not in the bucket yet: file data, times, attributes, renames and deletes. It must be on durable local storage. If the directory is lost, so are those changes.
+Holds every change that is not in the bucket yet: file data, times, attributes, renames and deletes. It must be on durable local storage. If the directory is lost, so are those changes. On Windows it must be on a local NTFS or ReFS volume; `build` refuses one on an SMB share or a mapped network drive.
 
 - Made if missing. One backend uses it at a time. It stays locked until every clone of the backend is dropped, the handles opened through it are closed, and the requests in flight and the background saves of closed files have ended.
 - Belongs to one endpoint, bucket, prefix and case setting. `build` refuses it with another.

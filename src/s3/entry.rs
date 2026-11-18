@@ -906,6 +906,7 @@ impl Entry {
 mod tests {
     use super::*;
     use crate::s3::object::Metadata;
+    use crate::tests::util::scratch_dir;
 
     fn head(etag: &str, size: u64) -> Arc<ObjectHead> {
         Arc::new(ObjectHead {
@@ -1106,7 +1107,7 @@ mod tests {
 
     #[test]
     fn the_data_file_of_an_entry_stays_open_only_while_a_handle_is_open() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = scratch_dir();
         let path = dir.path().join("data");
         crate::s3::data::create(&path, 4).unwrap();
         let mut state = State::new("f".to_owned(), false);
@@ -1132,7 +1133,7 @@ mod tests {
 
     #[test]
     fn a_created_file_keeps_the_descriptor_its_data_file_was_made_with() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = scratch_dir();
         let path = dir.path().join("data");
         let file = crate::s3::data::create(&path, 0).unwrap();
         let id = RecordId::parse(&"c".repeat(32)).unwrap();

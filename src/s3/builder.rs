@@ -171,7 +171,9 @@ impl S3BackendBuilder {
     /// handles opened through it are closed and the requests in flight have
     /// ended. The directory must belong to this endpoint, bucket, prefix and
     /// [case setting](Self::case_insensitive), and be on storage that
-    /// survives a restart: what it holds is not in the bucket.
+    /// survives a restart: what it holds is not in the bucket. On Windows it
+    /// must be on a local NTFS or ReFS volume; `build` refuses one on an SMB
+    /// share or a mapped network drive.
     ///
     /// Required unless the backend is [`read_only`](Self::read_only), and
     /// refused with it.
@@ -722,5 +724,30 @@ mod tests {
                 "{endpoint} {region} {bucket}"
             );
         }
+    }
+
+    /// A cache directory on an SMB share, here the administrative share of a
+    /// directory on this host, is refused, and the file that probed the
+    /// share's deletes is gone.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_cache_directory_on_an_smb_share_is_refused() {
+        use crate::tests::util::{on_admin_share, scratch_dir};
+
+        let local = scratch_dir();
+        let built = S3Backend::builder("http://127.0.0.1:1", "r", "b")
+            .credentials("a", "s")
+            .cache_dir(on_admin_share(local.path()).join("cache"))
+            .build()
+            .await;
+        let Err(e) = built else {
+            panic!("a backend was built");
+        };
+        assert!(
+            matches!(e, S3Error::InvalidArgument(why) if why.contains("local NTFS or ReFS volume")),
+            "{e}"
+        );
+        let left = std::fs::read_dir(local.path().join("cache").join("tmp")).unwrap();
+        assert_eq!(left.count(), 0);
     }
 }

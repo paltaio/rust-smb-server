@@ -12,6 +12,7 @@ use crate::tests::data::pattern;
 use crate::tests::s3::fixture::TestBucket;
 use crate::tests::s3::share::worker_ended;
 use crate::tests::s3::uploads::{held, sync};
+use crate::tests::util::scratch_dir;
 
 /// A name long enough to be stored with a side object, made of `letter`.
 fn long(letter: &str) -> String {
@@ -97,7 +98,7 @@ async fn assert_tree(backend: Backend<'_>, dirs: &[String], files: &[(String, Ve
 async fn a_tree_written_through_the_layer_reads_back_after_sync_and_a_rebuild() {
     let exact = |builder: S3BackendBuilder| held(builder).case_insensitive(false);
     let bucket = TestBucket::new().await;
-    let cache = tempfile::tempdir().unwrap();
+    let cache = scratch_dir();
     let (dirs, files) = (dirs(), files());
 
     let (store, exited) = s3_backend(&bucket, cache.path(), exact).await.unwrap();
@@ -115,7 +116,7 @@ async fn a_tree_written_through_the_layer_reads_back_after_sync_and_a_rebuild() 
     drop(store);
     worker_ended(exited).await;
 
-    let fresh = tempfile::tempdir().unwrap();
+    let fresh = scratch_dir();
     for cache in [cache.path(), fresh.path()] {
         read_back(&bucket, cache, exact, &dirs, &files).await;
     }
