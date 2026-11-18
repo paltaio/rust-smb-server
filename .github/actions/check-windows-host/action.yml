@@ -1,0 +1,29 @@
+name: check the Windows host
+description: Fails unless the admin share of the workspace drive is reachable, which the tests use, and logs the state of Microsoft Defender.
+
+runs:
+  using: composite
+  steps:
+    - name: check the admin share of the workspace drive
+      shell: pwsh
+      run: |
+        $share = '\\localhost\' + $env:GITHUB_WORKSPACE.Substring(0, 1) + '$'
+        try {
+          Get-ChildItem -LiteralPath $share -ErrorAction Stop | Out-Null
+        } catch {
+          Get-Service LanmanServer, LanmanWorkstation | Format-Table Name, Status, StartType
+          Get-SmbShare -ErrorAction Continue | Format-Table Name, Path
+          Write-Output "::error::$share is not reachable, and the tests use it: $($_.Exception.Message)"
+          exit 1
+        }
+
+    - name: log the state of Microsoft Defender
+      shell: pwsh
+      run: |
+        try {
+          $status = Get-MpComputerStatus -ErrorAction Stop
+          $preference = Get-MpPreference -ErrorAction Stop
+          Write-Output "RealTimeProtectionEnabled=$($status.RealTimeProtectionEnabled) DisableScanningNetworkFiles=$($preference.DisableScanningNetworkFiles)"
+        } catch {
+          Write-Output "the state of Microsoft Defender was not read: $($_.Exception.Message)"
+        }
