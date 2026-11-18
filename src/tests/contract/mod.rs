@@ -13,7 +13,10 @@
 //! entry the instance passes stops the test.
 //!
 //! `rebuild` holds one test outside the instances: the layer over S3 across a
-//! restart.
+//! restart. On Windows, `namespace_changes_match_a_model_under_an_opener`
+//! is another: the model run over a UNC root with each case-only rename run
+//! while the new case is held open, which counts the names the backend
+//! corrected.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -237,10 +240,21 @@ macro_rules! instance {
 instance!(memfs, instances::memfs);
 #[cfg(feature = "localfs")]
 instance!(localfs, instances::localfs);
+#[cfg(all(windows, feature = "localfs"))]
+instance!(localfs_unc, instances::localfs_unc);
 #[cfg(feature = "encryption")]
 instance!(layer_memfs, instances::layer_memfs);
 #[cfg(all(feature = "encryption", feature = "localfs"))]
 instance!(layer_localfs, instances::layer_localfs);
+#[cfg(all(windows, feature = "encryption", feature = "localfs"))]
+instance!(layer_localfs_unc, instances::layer_localfs_unc);
+#[cfg(all(windows, feature = "localfs"))]
+instance!(localfs_unc_contended, instances::localfs_unc_contended);
+#[cfg(all(windows, feature = "encryption", feature = "localfs"))]
+instance!(
+    layer_localfs_unc_contended,
+    instances::layer_localfs_unc_contended
+);
 #[cfg(all(feature = "encryption", feature = "localfs"))]
 instance!(layer_clear_localfs, instances::layer_clear_localfs);
 #[cfg(all(feature = "encryption", feature = "localfs"))]
@@ -249,3 +263,61 @@ instance!(layer_exact_localfs, instances::layer_exact_localfs);
 instance!(s3, instances::s3);
 #[cfg(all(feature = "encryption", feature = "s3"))]
 instance!(layer_s3, instances::layer_s3);
+
+/// The model run of `namespace` over a share root on a UNC path, with each
+/// rename that changes only the case of a name run while another handle
+/// holds the name open in the new case, as a virus scanner can. The SMB
+/// client can then leave the old case on the server, so such renames go
+/// through the backend's correction, and the run still sees the names it
+/// asked for.
+#[cfg(all(windows, feature = "localfs"))]
+#[tokio::test]
+async fn namespace_changes_match_a_model_under_an_opener() {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE,
+    };
+
+    use crate::fs::LocalFsBackend;
+    use crate::tests::util::{on_admin_share, scratch_dir};
+
+    let dir = scratch_dir();
+    let share = on_admin_share(dir.path());
+    let held = Arc::new(AtomicUsize::new(0));
+    let backend = {
+        let (share, held) = (share.clone(), Arc::clone(&held));
+        LocalFsBackend::new(&share).unwrap().before_rename(Box::new(
+            move |parent, name, case_only| {
+                if !case_only {
+                    return None;
+                }
+                // A rename to the case the server stores already changes
+                // nothing.
+                let dir = share.join(parent);
+                let name = name.to_str()?;
+                let stored = std::fs::read_dir(&dir)
+                    .ok()?
+                    .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+                    .find(|stored| stored.to_lowercase() == name.to_lowercase())?;
+                if stored == name {
+                    return None;
+                }
+                let open = std::fs::OpenOptions::new()
+                    .access_mode(FILE_READ_ATTRIBUTES)
+                    .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                    .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                    .open(dir.join(name))
+                    .ok()?;
+                held.fetch_add(1, Ordering::Relaxed);
+                Some(open)
+            },
+        ))
+    };
+    namespace::namespace_changes_match_a_model(&backend).await;
+    let held = held.load(Ordering::Relaxed);
+    assert!(held > 0, "no case-only rename ran with its new case held");
+    assert!(backend.corrections() > 0, "no name was corrected");
+}

@@ -299,6 +299,8 @@ pub trait ShareBackend: Send + Sync + 'static {
     /// `path` is missing and [`SmbError::NotFound`] when only the last
     /// component is.
     ///
+    /// A new entry is stored under the spelling of the last name of `path`.
+    ///
     /// A backend that reports [`BackendCapabilities::named_streams`] keeps
     /// the named streams of a file that [`OpenIntent::Truncate`] or
     /// [`OpenIntent::OverwriteOrCreate`] overwrites: the protocol layer
@@ -321,6 +323,10 @@ pub trait ShareBackend: Send + Sync + 'static {
     /// [`SmbError::Exists`] unless `replace_if_exists` is set. With it set,
     /// an existing file is replaced; an existing directory is never
     /// replaced: fail with [`SmbError::AccessDenied`] (MS-FSA 2.1.5.15.12).
+    ///
+    /// A rename gives the entry the spelling of `to`, also when only the
+    /// case changes. A rename that replaces an entry spelled differently,
+    /// or that names its own path, may keep the stored spelling.
     async fn rename(&self, from: &SmbPath, to: &SmbPath, replace_if_exists: bool) -> SmbResult<()>;
 
     /// Static capabilities. TREE_CONNECT clamps access to read-only when

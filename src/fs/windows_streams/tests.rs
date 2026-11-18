@@ -5,13 +5,14 @@ use tempfile::TempDir;
 use super::*;
 use crate::backend::{FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_READONLY, ShareBackend};
 use crate::fs::LocalFsBackend;
+use crate::fs::dir::ambient_authority;
+use crate::fs::windows_dir::is_link;
 use crate::path::SmbPath;
 
 /// A backend on a new directory beside the test binary, on the build's
 /// volume.
 fn backend() -> (TempDir, LocalFsBackend) {
-    let exe = std::env::current_exe().unwrap();
-    let td = tempfile::tempdir_in(exe.parent().unwrap()).unwrap();
+    let td = crate::tests::util::scratch_dir();
     let backend = LocalFsBackend::new(td.path()).unwrap();
     assert!(backend.capabilities().named_streams);
     (td, backend)
@@ -19,7 +20,7 @@ fn backend() -> (TempDir, LocalFsBackend) {
 
 /// True if `td` is on ReFS, which cannot rename streams.
 fn on_refs(td: &TempDir) -> bool {
-    let dir = Dir::open_ambient_dir(td.path(), cap_std::ambient_authority()).unwrap();
+    let dir = Dir::open_ambient_dir(td.path(), ambient_authority()).unwrap();
     volume(&dir).unwrap().refs
 }
 
@@ -560,7 +561,7 @@ async fn renames_on_refs_are_refused_before_anything_changes() {
     let (td, backend) = backend();
     create(&backend, "f.txt", "a", b"data").await;
     create(&backend, "f.txt", "b", b"").await;
-    let root = Arc::new(Dir::open_ambient_dir(td.path(), cap_std::ambient_authority()).unwrap());
+    let root = Arc::new(Dir::open_ambient_dir(td.path(), ambient_authority()).unwrap());
     let place = Place {
         root,
         root_dev: None,
@@ -805,7 +806,7 @@ async fn a_junction_out_of_the_share_has_no_streams() {
     assert!(td.path().join("j").is_dir());
     // The junction has a stream of its own, which only a peek that kept
     // the junction itself would find.
-    let dir = Dir::open_ambient_dir(td.path(), cap_std::ambient_authority()).unwrap();
+    let dir = Dir::open_ambient_dir(td.path(), ambient_authority()).unwrap();
     {
         use std::os::windows::io::AsHandle as _;
         let (junction, _) = nt_open(
@@ -832,4 +833,114 @@ async fn a_junction_out_of_the_share_has_no_streams() {
     assert!(opened.is_err(), "{opened:?}");
     let peeked = peek(&backend, &["j"], &[("AFP_AfpInfo", 60)]).await;
     assert_eq!(peeked, [vec![None]]);
+}
+
+/// A stream opened through a held file that was renamed on the host, with
+/// another file made under its old name, belongs to the held file or fails
+/// as not found, and the new file gets no stream.
+#[test]
+fn a_stream_opened_through_a_renamed_file_leaves_the_new_one_alone() {
+    use crate::fs::windows_dir::tests::{Root, on_each_root, reach};
+    use crate::tests::util::scratch_dir;
+
+    on_each_root(|root| {
+        let td = scratch_dir();
+        std::fs::write(td.path().join("f.txt"), b"old").unwrap();
+        let dir = Dir::open_ambient_dir(reach(td.path(), root), ambient_authority()).unwrap();
+        let mut opts = DirOpenOptions::new();
+        opts.read(true)
+            .access_mode(FILE_READ_ATTRIBUTES | SYNCHRONIZE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+        let base = dir.open_with("f.txt", &opts).unwrap().into_std();
+        std::fs::rename(td.path().join("f.txt"), td.path().join("g.txt")).unwrap();
+        std::fs::write(td.path().join("f.txt"), b"new").unwrap();
+
+        for (stream, disposition) in [("made", FILE_CREATE), ("made-if", FILE_OPEN_IF)] {
+            let opened = open_relative(
+                &base,
+                Some(&name(stream)),
+                FILE_GENERIC_WRITE,
+                SHARE_ALL,
+                disposition,
+            )
+            .map(drop);
+            let on = |file: &str| td.path().join(format!("{file}:{stream}")).exists();
+            match (root, opened) {
+                (_, Ok(())) => assert!(on("g.txt"), "{stream}"),
+                (Root::Unc, Err(e)) if e.kind() == io::ErrorKind::NotFound => {
+                    assert!(!on("g.txt"), "{stream}");
+                }
+                (_, Err(e)) => panic!("{stream}: {e}"),
+            }
+            assert!(!on("f.txt"), "{stream}");
+        }
+    });
+}
+
+/// A named stream written through a share root on a UNC path reads back
+/// through it, and is the NTFS stream of the file on the host.
+#[tokio::test]
+async fn a_stream_round_trips_on_a_unc_root() {
+    let td = crate::tests::util::scratch_dir();
+    let unc = crate::tests::util::on_admin_share(td.path());
+    let backend = LocalFsBackend::new(unc).unwrap();
+    assert!(backend.capabilities().named_streams);
+    create(&backend, "f.txt", "Zone.Identifier", b"[ZoneTransfer]").await;
+
+    let (h, _) = open(&backend, "f.txt", "zone.identifier", OpenIntent::Open)
+        .await
+        .unwrap();
+    assert_eq!(read_all(h.as_ref()).await, b"[ZoneTransfer]");
+    h.close().await.unwrap();
+    assert_eq!(
+        streams(&backend, "f.txt").await,
+        [("Zone.Identifier".to_string(), 14)]
+    );
+    assert_eq!(
+        host_stream(&td, "f.txt", "Zone.Identifier").unwrap(),
+        b"[ZoneTransfer]"
+    );
+    assert_eq!(std::fs::read(td.path().join("f.txt")).unwrap(), b"");
+}
+
+/// Named streams made or renamed while another program opens their names
+/// in the other case, as a virus scanner does, keep the case they were
+/// given.
+#[tokio::test]
+async fn streams_named_while_another_program_opens_them_in_the_other_case_keep_their_case() {
+    use crate::fs::windows_dir::tests::{Opener, on_each_root_async, reach};
+    use crate::tests::util::on_admin_share;
+
+    on_each_root_async(|root| async move {
+        let td = crate::tests::util::scratch_dir();
+        let backend = LocalFsBackend::new(reach(td.path(), root)).unwrap();
+        for i in 0..31 {
+            let file = format!("b{i}");
+            std::fs::write(td.path().join(&file), b"x").unwrap();
+            let opener = Opener::start(vec![on_admin_share(td.path()).join(format!("{file}:S"))]);
+            if i < 30 {
+                let (h, action) = open(&backend, &file, "s", OpenIntent::Create)
+                    .await
+                    .unwrap();
+                assert_eq!(action, OpenAction::Created, "{file}");
+                h.close().await.unwrap();
+            } else {
+                create(&backend, &file, "x", b"data").await;
+                let id = id(&backend, &file).await;
+                backend
+                    .rename_stream(&p(&file), id, Some(&name("x")), Some(&name("s")), false)
+                    .await
+                    .unwrap();
+            }
+            opener.stop();
+            let host = File::open(td.path().join(&file)).unwrap();
+            let names: Vec<String> = list(&host)
+                .unwrap()
+                .into_iter()
+                .map(|s| s.name.as_str().to_string())
+                .collect();
+            assert_eq!(names, ["s"], "{file}");
+        }
+    })
+    .await;
 }

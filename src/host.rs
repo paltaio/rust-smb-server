@@ -10,7 +10,16 @@ use std::io;
 use std::os::windows::io::{AsHandle, AsRawHandle as _};
 
 #[cfg(windows)]
-use windows_sys::Win32::System::IO::DeviceIoControl;
+use windows_sys::Wdk::Storage::FileSystem::{FileDispositionInformationEx, NtSetInformationFile};
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::{NTSTATUS, RtlNtStatusToDosError};
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::{
+    FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
+    FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO_EX,
+};
+#[cfg(windows)]
+use windows_sys::Win32::System::IO::{DeviceIoControl, IO_STATUS_BLOCK};
 #[cfg(windows)]
 use windows_sys::Win32::System::Ioctl::{FILE_SET_SPARSE_BUFFER, FSCTL_SET_SPARSE};
 
@@ -19,6 +28,64 @@ use crate::backend::VolumeInfo;
 
 /// Longest name `SmbPath` accepts, in UTF-16 code units.
 const MAX_NAME_LENGTH: u32 = 255;
+
+#[cfg(windows)]
+pub(crate) const ERROR_INVALID_FUNCTION: i32 = 1;
+#[cfg(windows)]
+pub(crate) const ERROR_NOT_SUPPORTED: i32 = 50;
+#[cfg(windows)]
+pub(crate) const ERROR_INVALID_PARAMETER: i32 = 87;
+
+/// The Win32 error code an NTSTATUS stands for.
+#[cfg(windows)]
+pub(crate) fn dos_error(status: NTSTATUS) -> i32 {
+    // SAFETY: a pure conversion of a status code.
+    unsafe { RtlNtStatusToDosError(status) as i32 }
+}
+
+/// The error an NTSTATUS stands for.
+#[cfg(windows)]
+pub(crate) fn nt_error(status: NTSTATUS) -> io::Error {
+    io::Error::from_raw_os_error(dos_error(status))
+}
+
+/// True if `status` is how a volume refuses a delete with POSIX semantics:
+/// ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED or ERROR_INVALID_FUNCTION.
+#[cfg(windows)]
+pub(crate) fn refuses_posix(status: NTSTATUS) -> bool {
+    matches!(
+        dos_error(status),
+        ERROR_INVALID_PARAMETER | ERROR_NOT_SUPPORTED | ERROR_INVALID_FUNCTION
+    )
+}
+
+/// Deletes the file or directory `file` is open on, with DELETE access,
+/// with POSIX semantics: its name goes at once, while other handles of it
+/// stay open. With `ignore_readonly` a read-only file goes too. A volume
+/// without POSIX deletes, such as an SMB share, refuses as
+/// [`refuses_posix`] tells.
+#[cfg(windows)]
+pub(crate) fn delete_posix(file: &File, ignore_readonly: bool) -> Result<(), NTSTATUS> {
+    let mut flags = FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS;
+    if ignore_readonly {
+        flags |= FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE;
+    }
+    let info = FILE_DISPOSITION_INFO_EX { Flags: flags };
+    let mut status_block = IO_STATUS_BLOCK::default();
+    // SAFETY: `info` is a live FILE_DISPOSITION_INFO_EX of the size passed,
+    // the layout of FileDispositionInformationEx, and the handle stays open
+    // for the call.
+    let status = unsafe {
+        NtSetInformationFile(
+            file.as_raw_handle(),
+            &mut status_block,
+            (&raw const info).cast(),
+            size_of::<FILE_DISPOSITION_INFO_EX>() as u32,
+            FileDispositionInformationEx,
+        )
+    };
+    if status < 0 { Err(status) } else { Ok(()) }
+}
 
 /// The volume `st` describes, in units of its own block size. `fsid` is the
 /// filesystem id the serial number is made from.

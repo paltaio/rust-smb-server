@@ -2,9 +2,9 @@
 //!
 //! Each named stream is an NTFS alternate data stream of its file or
 //! directory, opened with `NtCreateFile` relative to a handle of the file
-//! that cap-std opened inside the share, under the name `:name:$DATA`. A
-//! stream name holds no `\`, and the open does not follow reparse points,
-//! so it cannot leave that file. NTFS compares stream names by their
+//! opened inside the share, under the name `:name:$DATA`. A stream name
+//! holds no `\`, and the open does not follow reparse points, so it cannot
+//! leave that file. NTFS compares stream names by their
 //! uppercase forms and keeps the spelling a stream was made with; a stream
 //! handle follows the file through renames and the stream through renames
 //! of the stream.
@@ -12,43 +12,43 @@
 use std::fs::File;
 use std::io;
 use std::os::windows::fs::FileExt as _;
-use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
+use std::os::windows::io::AsRawHandle as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use cap_std::fs::{Dir, Metadata, OpenOptions as CapOpenOptions};
 use tokio::task::spawn_blocking;
 use tracing::debug;
-use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::Storage::FileSystem::{
     FILE_CREATE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_IF, FILE_OPEN_REPARSE_POINT,
-    FILE_OVERWRITE, FILE_OVERWRITE_IF, FILE_SYNCHRONOUS_IO_NONALERT, FileStreamInformation,
-    NtCreateFile, NtQueryInformationFile,
+    FILE_SYNCHRONOUS_IO_NONALERT, FileStreamInformation, NtQueryInformationFile,
 };
-use windows_sys::Win32::Foundation::{
-    HANDLE, NTSTATUS, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, UNICODE_STRING,
-};
+use windows_sys::Win32::Foundation::{HANDLE, NTSTATUS};
 use windows_sys::Win32::Storage::FileSystem::{
-    DELETE, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
-    FILE_DISPOSITION_INFO, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES,
-    FILE_READ_DATA, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    FILE_STANDARD_INFO, FILE_WRITE_ATTRIBUTES, FileAttributeTagInfo, FileDispositionInfo,
-    FileRenameInfo, FileStandardInfo, GetFileInformationByHandleEx, SYNCHRONIZE,
-    SetFileInformationByHandle,
+    DELETE, FILE_DISPOSITION_INFO, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES,
+    FILE_READ_DATA, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_STANDARD_INFO, FILE_WRITE_ATTRIBUTES,
+    FileDispositionInfo, FileRenameInfo, FileStandardInfo, GetFileInformationByHandleEx,
+    SYNCHRONIZE, SetFileInformationByHandle,
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
+use super::dir::{Dir, Metadata, OpenOptions as DirOpenOptions};
 use super::local::{
     file_index, file_info_from_metadata, file_key, host_file_times, io_to_smb, join_to_io,
     link_count, set_host_attributes,
 };
 use super::volume::volume_of;
+use super::windows_dir::{
+    ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED, ERROR_SHARING_VIOLATION,
+    FILE_CREATED, Made, Names, RootVolume, SHARE_ALL, Wait, collided, last_component, moved,
+    nt_error, nt_open, reopen, same_file, upcase,
+};
 use crate::backend::{DirEntry, FileInfo, FileTimes, Handle, OpenAction, OpenIntent, OpenOptions};
 use crate::error::{SmbError, SmbResult};
 use crate::path::is_valid_component;
 use crate::stream::{StreamInfo, StreamName};
+use crate::utils::utf16le_to_units;
 
 /// The volume stores named streams (MS-FSCC 2.5.1).
 const FILE_NAMED_STREAMS: u32 = 0x0004_0000;
@@ -56,21 +56,13 @@ const FILE_NAMED_STREAMS: u32 = 0x0004_0000;
 /// `FILE_FLAG_BACKUP_SEMANTICS`, which opens directories as well as files.
 const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
 
-/// `FILE_CREATED`, `FILE_OVERWRITTEN` and `FILE_SUPERSEDED` in the
-/// information of an `NtCreateFile` that succeeded.
-const FILE_CREATED: usize = 2;
-const FILE_OVERWRITTEN: usize = 3;
-const FILE_SUPERSEDED: usize = 0;
+const ERROR_ACCESS_DENIED: i32 = 5;
 
 const STATUS_BUFFER_OVERFLOW: NTSTATUS = 0x8000_0005_u32 as NTSTATUS;
 const STATUS_END_OF_FILE: NTSTATUS = 0xC000_0011_u32 as NTSTATUS;
 const STATUS_INFO_LENGTH_MISMATCH: NTSTATUS = 0xC000_0004_u32 as NTSTATUS;
 const STATUS_BUFFER_TOO_SMALL: NTSTATUS = 0xC000_0023_u32 as NTSTATUS;
 
-pub(super) const ERROR_INVALID_FUNCTION: i32 = 1;
-const ERROR_SHARING_VIOLATION: i32 = 32;
-pub(super) const ERROR_NOT_SUPPORTED: i32 = 50;
-pub(super) const ERROR_INVALID_PARAMETER: i32 = 87;
 const ERROR_FILE_SYSTEM_LIMITATION: i32 = 665;
 
 /// Most named streams one file has. Past it, the rest are not listed, and
@@ -85,18 +77,9 @@ const MAX_ENTRY: usize = (24_usize + 2 * (1 + 255 + 6)).next_multiple_of(8);
 /// streams, each with the longest name.
 const MAX_LISTING: usize = (MAX_STREAMS + 1) * MAX_ENTRY;
 
-const SHARE_ALL: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
-
 // ---------------------------------------------------------------------------
 // Host calls
 // ---------------------------------------------------------------------------
-
-/// The error an NTSTATUS stands for.
-fn nt_error(status: NTSTATUS) -> io::Error {
-    // SAFETY: a pure conversion of a status code.
-    let code = unsafe { RtlNtStatusToDosError(status) };
-    io::Error::from_raw_os_error(code as i32)
-}
 
 /// The error a stream request answers for `e`. A volume without named
 /// streams refuses access: a stream request must not fail with
@@ -132,16 +115,6 @@ pub(super) fn volume(root: &Dir) -> Option<Volume> {
     })
 }
 
-/// `c` as NTFS compares it: its uppercase form where that is one
-/// character, else itself.
-fn upcase(c: char) -> char {
-    let mut upper = c.to_uppercase();
-    match (upper.next(), upper.next()) {
-        (Some(u), None) => u,
-        _ => c,
-    }
-}
-
 /// True if NTFS takes `a` and `b` for the same stream name: their
 /// characters compare by uppercase form, one by one.
 fn same_name(a: &StreamName, b: &StreamName) -> bool {
@@ -158,8 +131,12 @@ fn object_name(stream: Option<&StreamName>) -> Vec<u16> {
 }
 
 /// Opens the stream `stream` of the file `base` is open on, the default
-/// stream when `None`, with `access`, `share` and `disposition`. Returns
-/// the handle and what the open did.
+/// stream when `None`, with `access` and FILE_READ_ATTRIBUTES, `share` and
+/// `disposition`. Returns the handle and what the open did.
+///
+/// An SMB share opens the stream by the path `base` was opened by, which
+/// may name another file by now. A stream of another file fails as not
+/// found, and one the open made there is marked to be deleted first.
 fn open_relative(
     base: &File,
     stream: Option<&StreamName>,
@@ -167,78 +144,33 @@ fn open_relative(
     share: u32,
     disposition: u32,
 ) -> io::Result<(File, usize)> {
-    nt_open(
+    let (file, done) = nt_open(
         base.as_raw_handle() as HANDLE,
         object_name(stream),
-        access,
+        access | FILE_READ_ATTRIBUTES,
         share,
         disposition,
         FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
-    )
-}
-
-/// Opens `name` relative to the open handle `root` with `access`, `share`,
-/// `disposition` and `options`. Returns the handle and what the open did.
-fn nt_open(
-    root: HANDLE,
-    mut name: Vec<u16>,
-    access: u32,
-    share: u32,
-    disposition: u32,
-    options: u32,
-) -> io::Result<(File, usize)> {
-    let bytes = u16::try_from(name.len() * 2).map_err(|_| io::ErrorKind::InvalidFilename)?;
-    let unicode = UNICODE_STRING {
-        Length: bytes,
-        MaximumLength: bytes,
-        Buffer: name.as_mut_ptr(),
-    };
-    let attributes = OBJECT_ATTRIBUTES {
-        Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
-        RootDirectory: root,
-        ObjectName: &unicode,
-        Attributes: OBJ_CASE_INSENSITIVE,
-        SecurityDescriptor: std::ptr::null(),
-        SecurityQualityOfService: std::ptr::null(),
-    };
-    let mut handle: HANDLE = std::ptr::null_mut();
-    let mut status_block = IO_STATUS_BLOCK::default();
-    // SAFETY: every pointer refers to a live local that outlives the call:
-    // `attributes` names `unicode`, whose buffer is `name`, and the root
-    // is an open handle the caller holds. The call writes only `handle`
-    // and `status_block`.
-    let status = unsafe {
-        NtCreateFile(
-            &mut handle,
-            access | SYNCHRONIZE,
-            &attributes,
-            &mut status_block,
-            std::ptr::null(),
-            FILE_ATTRIBUTE_NORMAL,
-            share,
-            disposition,
-            options,
-            std::ptr::null(),
-            0,
-        )
-    };
-    if status < 0 {
-        return Err(nt_error(status));
+    )?;
+    if same_file(base, &file)? {
+        return Ok((file, done));
     }
-    // SAFETY: the call succeeded, so `handle` is an open handle that
-    // nothing else owns.
-    let file = unsafe { File::from_raw_handle(handle as _) };
-    Ok((file, status_block.Information))
+    if done == FILE_CREATED
+        && let Err(e) = reopen(&file, DELETE).and_then(|made| delete_on_close(&made))
+    {
+        debug!(error = %e, "a stream made on another file was left there");
+    }
+    Err(moved())
 }
 
-/// The disposition of `intent`.
+/// The disposition of `intent`. An overwrite opens an existing stream
+/// without changing it, to be emptied once the stream is known to be the
+/// right one.
 fn disposition(intent: OpenIntent) -> u32 {
     match intent {
-        OpenIntent::Open => FILE_OPEN,
+        OpenIntent::Open | OpenIntent::Truncate => FILE_OPEN,
         OpenIntent::Create => FILE_CREATE,
-        OpenIntent::OpenOrCreate => FILE_OPEN_IF,
-        OpenIntent::OverwriteOrCreate => FILE_OVERWRITE_IF,
-        OpenIntent::Truncate => FILE_OVERWRITE,
+        OpenIntent::OpenOrCreate | OpenIntent::OverwriteOrCreate => FILE_OPEN_IF,
     }
 }
 
@@ -328,6 +260,84 @@ fn rename(file: &File, to: Option<&StreamName>, replace: bool) -> io::Result<()>
     Ok(())
 }
 
+/// A named stream a create or a rename named, as
+/// [`RootVolume::settle`] reads and changes its name.
+struct StreamNames<'a> {
+    volume: &'a RootVolume,
+    /// The file or directory the stream belongs to.
+    base: &'a File,
+    /// The handle the call made or renamed the stream through.
+    made: &'a File,
+    /// The name it was given.
+    stream: &'a StreamName,
+    /// `made` has DELETE access.
+    deletable: bool,
+}
+
+impl Names for StreamNames<'_> {
+    fn stored(&self, file: &File) -> io::Result<Vec<u16>> {
+        // The normalized name of a stream ends in `file:name`.
+        if let Some(path) = self.volume.normalized(file)? {
+            let last = last_component(&path);
+            if let Some(colon) = last.iter().position(|&unit| unit == u16::from(b':')) {
+                let name = &last[colon + 1..];
+                let suffix: Vec<u16> = ":$DATA".encode_utf16().collect();
+                return Ok(name
+                    .strip_suffix(suffix.as_slice())
+                    .unwrap_or(name)
+                    .to_vec());
+            }
+        }
+        list(self.base)?
+            .into_iter()
+            .find(|s| same_name(&s.name, self.stream))
+            .map(|s| s.name.as_str().encode_utf16().collect())
+            .ok_or_else(|| io::ErrorKind::NotFound.into())
+    }
+
+    fn reopen(&self) -> io::Result<File> {
+        if self.deletable {
+            return self.made.try_clone();
+        }
+        let mut wait = Wait::default();
+        loop {
+            let reopened = nt_open(
+                self.made.as_raw_handle() as HANDLE,
+                Vec::new(),
+                DELETE | FILE_READ_ATTRIBUTES,
+                SHARE_ALL,
+                FILE_OPEN,
+                FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
+            )
+            .and_then(|(file, _)| {
+                if same_file(self.base, &file)? {
+                    Ok(file)
+                } else {
+                    Err(moved())
+                }
+            });
+            match reopened {
+                Err(e) if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION) && wait.again() => {}
+                reopened => return reopened,
+            }
+        }
+    }
+
+    fn rename(&self, file: &File, name: &[u16]) -> io::Result<()> {
+        let name: StreamName = String::from_utf16(name)
+            .ok()
+            .and_then(|name| name.parse().ok())
+            .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidFilename))?;
+        let mut wait = Wait::default();
+        loop {
+            match rename(file, Some(&name), false) {
+                Err(e) if e.raw_os_error() == Some(ERROR_ACCESS_DENIED) && wait.again() => {}
+                renamed => return renamed,
+            }
+        }
+    }
+}
+
 /// The named streams of the file `file` is open on, none where its volume
 /// has none.
 pub(super) fn list(file: &File) -> io::Result<Vec<StreamInfo>> {
@@ -392,11 +402,8 @@ fn parse_listing(buf: &[u8]) -> Vec<StreamInfo> {
         let Some(name) = field(at + 24, len as usize) else {
             break;
         };
-        let units: Vec<u16> = name
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
-            .collect();
-        let named = String::from_utf16(&units).ok().and_then(|name| {
+        let named = utf16le_to_units(name).and_then(|units| {
+            let name = String::from_utf16(&units).ok()?;
             let name = name.strip_prefix(':')?.strip_suffix(":$DATA")?;
             name.parse::<StreamName>().ok()
         });
@@ -420,15 +427,26 @@ pub(super) fn list_smb(file: &File) -> SmbResult<Vec<StreamInfo>> {
 
 /// The size and up to the given number of first bytes of each stream
 /// `entries` names of each entry of `dir` it names, `None` where the entry
-/// has no such stream or it cannot be read. Each entry is opened once,
-/// with [`open_entry`], and its streams relative to it.
+/// has no such stream or it cannot be read. `dir` is held for the whole
+/// call, and each entry is opened once from that hold, with
+/// [`open_entry`], and its streams relative to it.
 pub(super) fn peek_entries(
     dir: &Dir,
     entries: &[(String, Vec<(StreamName, u32)>)],
 ) -> Vec<Vec<Option<(u64, Bytes)>>> {
+    let dir = match dir.pin() {
+        Ok(dir) => dir,
+        Err(e) => {
+            debug!(error = %e, "streams of listed entries not read");
+            return entries
+                .iter()
+                .map(|(_, streams)| vec![None; streams.len()])
+                .collect();
+        }
+    };
     entries
         .iter()
-        .map(|(name, streams)| match open_entry(dir, name) {
+        .map(|(name, streams)| match open_entry(&dir, name) {
             Ok(base) => streams
                 .iter()
                 .map(|(stream, max)| {
@@ -447,56 +465,18 @@ pub(super) fn peek_entries(
 }
 
 /// Opens the entry `name` of `dir` for its attributes, to open its streams
-/// through, without following a reparse point there. A symlink or a
-/// junction is opened through cap-std instead, which follows it only to a
-/// target below `dir`; other reparse points, such as deduplicated,
-/// compressed or cloud files, keep the first handle.
+/// through. A symlink there is followed only to a target below `dir`, and
+/// a junction is not followed; other reparse points, such as deduplicated,
+/// compressed or cloud files, are opened themselves.
 fn open_entry(dir: &Dir, name: &str) -> io::Result<File> {
-    use cap_primitives::fs::OpenOptionsExt as _;
-    use std::os::windows::io::AsHandle as _;
     if !is_valid_component(name) {
         return Err(io::ErrorKind::InvalidFilename.into());
     }
-    let (file, _) = nt_open(
-        dir.as_handle().as_raw_handle() as HANDLE,
-        name.encode_utf16().collect(),
-        FILE_READ_ATTRIBUTES,
-        SHARE_ALL,
-        FILE_OPEN,
-        FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
-    )?;
-    if !is_link(&file)? {
-        return Ok(file);
-    }
-    let mut opts = CapOpenOptions::new();
+    let mut opts = DirOpenOptions::new();
     opts.read(true)
         .access_mode(FILE_READ_ATTRIBUTES | SYNCHRONIZE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
     Ok(dir.open_with(name, &opts)?.into_std())
-}
-
-/// True if `file` is open on a symlink or a junction itself.
-fn is_link(file: &File) -> io::Result<bool> {
-    const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
-    const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
-    let mut info = FILE_ATTRIBUTE_TAG_INFO::default();
-    // SAFETY: `info` is a live local of the size passed.
-    let ok = unsafe {
-        GetFileInformationByHandleEx(
-            file.as_raw_handle() as HANDLE,
-            FileAttributeTagInfo,
-            (&raw mut info).cast(),
-            std::mem::size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
-        )
-    };
-    if ok == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
-        && matches!(
-            info.ReparseTag,
-            IO_REPARSE_TAG_MOUNT_POINT | IO_REPARSE_TAG_SYMLINK
-        ))
 }
 
 /// The size of the stream `stream` of the file `base` is open on and up to
@@ -542,8 +522,7 @@ impl Place {
     /// streams through. A file at `rel` whose id is not `id` is not found,
     /// unless `id` is `0`.
     fn base(&self, rel: &Path, id: u64) -> io::Result<(File, Metadata)> {
-        use cap_primitives::fs::OpenOptionsExt as _;
-        let mut opts = CapOpenOptions::new();
+        let mut opts = DirOpenOptions::new();
         opts.read(true)
             .access_mode(FILE_READ_ATTRIBUTES | SYNCHRONIZE)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
@@ -553,6 +532,40 @@ impl Place {
             return Err(io::ErrorKind::NotFound.into());
         }
         Ok((base, md))
+    }
+
+    /// Gives the stream of `base` that `file` is open on, which a create or
+    /// a rename named `stream`, that name on a remote root, as
+    /// [`RootVolume::settle`] says. A new stream whose name another one took
+    /// meanwhile is deleted.
+    fn settle(&self, base: &File, file: &File, stream: &StreamName, made: Made) -> io::Result<()> {
+        let volume = self.root.volume();
+        if !volume.is_remote() {
+            return Ok(());
+        }
+        let requested: Vec<u16> = stream.as_str().encode_utf16().collect();
+        let names = StreamNames {
+            volume,
+            base,
+            made: file,
+            stream,
+            deletable: made != Made::Created,
+        };
+        let settled = volume.settle(&names, made, &requested, file);
+        if let Err(e) = &settled
+            && let Some(left) = collided(e)
+        {
+            let removed = String::from_utf16(&left.aside)
+                .ok()
+                .and_then(|name| name.parse::<StreamName>().ok())
+                .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidFilename))
+                .and_then(|aside| open_relative(base, Some(&aside), DELETE, SHARE_ALL, FILE_OPEN))
+                .and_then(|(aside, _)| delete_on_close(&aside));
+            if let Err(e) = removed {
+                debug!(error = %e, "a new stream was left under a temporary name");
+            }
+        }
+        settled
     }
 
     /// Opens the named stream `stream` of the file at `rel`, which has the
@@ -592,9 +605,19 @@ impl Place {
                 SHARE_ALL,
                 disposition(opts.intent),
             )?;
+            if done == FILE_CREATED {
+                self.settle(&base, &file, &stream, Made::Created)?;
+            }
             let action = match done {
                 FILE_CREATED => OpenAction::Created,
-                FILE_OVERWRITTEN | FILE_SUPERSEDED => OpenAction::Overwritten,
+                _ if matches!(
+                    opts.intent,
+                    OpenIntent::Truncate | OpenIntent::OverwriteOrCreate
+                ) =>
+                {
+                    file.set_len(0)?;
+                    OpenAction::Overwritten
+                }
                 _ => OpenAction::Opened,
             };
             let handle: Box<dyn Handle> = Box::new(StreamHandle {
@@ -704,7 +727,15 @@ impl Place {
                 SHARE_ALL,
                 FILE_OPEN,
             )
-            .and_then(|(source, _)| rename(&source, Some(&to), false));
+            .and_then(|(source, _)| {
+                rename(&source, Some(&to), false)?;
+                let made = if from.as_ref().is_some_and(|from| same_name(from, &to)) {
+                    Made::CaseOnly
+                } else {
+                    Made::Moved
+                };
+                self.settle(&base, &source, &to, made)
+            });
             if let Some((target, name)) = aside {
                 let settled = match &renamed {
                     Ok(()) => delete_on_close(&target),

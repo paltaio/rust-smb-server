@@ -456,7 +456,11 @@ mod tests {
     pub(crate) mod filesystems;
     pub(crate) mod folding;
     pub(crate) mod gated;
-    #[cfg(any(feature = "s3", feature = "encryption"))]
+    #[cfg(any(
+        feature = "s3",
+        feature = "encryption",
+        all(windows, feature = "localfs")
+    ))]
     pub(crate) mod logs;
     pub(crate) mod memfs;
     mod notify;

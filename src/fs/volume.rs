@@ -5,8 +5,7 @@ use std::io;
 #[cfg(windows)]
 use std::os::windows::io::AsHandle;
 
-use cap_std::fs::Dir;
-
+use super::dir::Dir;
 use crate::backend::VolumeInfo;
 
 /// Size and identity of the volume holding `dir`. `root_dev` is the host

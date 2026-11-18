@@ -36,7 +36,6 @@ tracing = "0.1"
 thiserror = "1"
 uuid = { version = "1.10", features = ["v4"] }
 cap-std = "3"
-cap-primitives = "~3.4"
 
 # RustCrypto family
 hmac  = "0.12"
@@ -58,7 +57,6 @@ thiserror.workspace = true
 uuid.workspace = true
 binrw = { workspace = true }
 getrandom = "0.4"
-cap-std = { workspace = true, optional = true }
 hmac.workspace = true
 sha2.workspace = true
 md-5.workspace = true
@@ -83,10 +81,10 @@ http-body-util = { version = "0.1", optional = true }
 tower-service = { version = "0.3", optional = true }
 
 [target.'cfg(windows)'.dependencies]
-cap-primitives = { workspace = true, optional = true }
 windows-sys = { version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_SystemServices"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
+cap-std = { workspace = true, optional = true }
 rustix = { version = "1", features = ["fs"], optional = true }
 libc = "0.2.173"
 
@@ -98,7 +96,7 @@ zbus = { version = "6.2", default-features = false, features = ["tokio"], option
 
 [features]
 default = ["localfs"]
-localfs = ["dep:cap-std", "dep:cap-primitives", "dep:rustix", "dep:windows-sys"]
+localfs = ["dep:cap-std", "dep:rustix", "dep:windows-sys"]
 s3 = [
     "dep:hyper",
     "dep:hyper-util",

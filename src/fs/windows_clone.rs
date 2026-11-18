@@ -10,16 +10,15 @@ use std::io;
 use std::os::windows::fs::MetadataExt as _;
 use std::os::windows::io::AsRawHandle as _;
 
-use cap_std::fs::{Dir, Metadata};
 use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_SPARSE_FILE;
 use windows_sys::Win32::System::Ioctl::{DUPLICATE_EXTENTS_DATA, FSCTL_DUPLICATE_EXTENTS_TO_FILE};
 use windows_sys::Win32::System::SystemServices::FILE_SUPPORTS_BLOCK_REFCOUNTING;
 
+use super::dir::{Dir, Metadata};
 use super::local::{file_key, io_to_smb};
 use super::volume::volume_of;
-use super::windows_streams::{
-    ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED, refused,
-};
+use super::windows_dir::{ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED};
+use super::windows_streams::refused;
 use crate::error::{SmbError, SmbResult};
 use crate::host::{control, set_sparse, volume_info_of};
 
@@ -164,9 +163,9 @@ mod tests {
     use super::*;
     use std::os::windows::fs::FileExt as _;
 
-    use cap_std::ambient_authority;
     use tempfile::TempDir;
 
+    use crate::fs::dir::ambient_authority;
     use crate::tests::data::pattern;
 
     const ERROR_NOT_SAME_DEVICE: i32 = 17;

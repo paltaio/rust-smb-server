@@ -1,16 +1,16 @@
 //! `LocalFsBackend`: a `ShareBackend` backed by a real on-disk directory.
 //!
-//! The share root is opened once via `cap_std::fs::Dir::open_ambient_dir` and
-//! kept as the sole authority handle. All subsequent path operations are
-//! resolved relative to that handle, so a malicious symlink or `..` smuggled
-//! through `SmbPath` cannot escape the sandbox; `cap-std` enforces this at
-//! every step.
+//! The share root is opened once via `Dir::open_ambient_dir` and kept as the
+//! sole authority handle. All subsequent path operations are resolved
+//! relative to that handle, one name at a time, so a malicious symlink or
+//! `..` smuggled through `SmbPath` cannot escape the sandbox: `cap-std`
+//! enforces this at every step on Unix, and `windows_dir` on Windows.
 //!
 //! - Blocking FS calls run on `tokio::task::spawn_blocking`.
 //! - `read_only()` flips a flag that makes write-class opens reject early
 //!   with `SmbError::AccessDenied`.
 //! - `list_dir` applies the MS-FSA 2.1.4.4 wildcards (`*`, `?`, `<`, `>`,
-//!   `"`) itself, since cap-std only provides raw `entries()`. Matching
+//!   `"`) itself, since a `Dir` only lists raw `entries()`. Matching
 //!   ignores case only where the host looks names up case-insensitively.
 //!   `"*.*"` matches every name, as `"*"` does.
 //! - Listings leave out names a client could not open again: names that are
@@ -27,8 +27,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use cap_std::ambient_authority;
-use cap_std::fs::{Dir, Metadata, OpenOptions as CapOpenOptions};
 use tokio::task::spawn_blocking;
 use tracing::debug;
 
@@ -42,6 +40,7 @@ use crate::path::{SmbPath, same_path};
 use crate::stream::StreamName;
 use crate::utils::{FILETIME_OFFSET, system_time_to_filetime};
 
+use super::dir::{Dir, Metadata, OpenOptions as DirOpenOptions, ambient_authority};
 use super::volume;
 use crate::backend::VolumeInfo;
 use crate::path::is_valid_component;
@@ -181,6 +180,46 @@ use crate::wildcard::Pattern;
 /// fails with STATUS_ACCESS_DENIED unless the server may write the file
 /// whatever its mode.
 ///
+/// On Windows, a share root may be a UNC path or a mapped drive. A lookup
+/// holds each directory on its way open without delete sharing until it
+/// ends, so the server's account needs traverse rights on the share's
+/// directories, and a rename or delete of a directory a lookup is passing
+/// through fails with STATUS_SHARING_VIOLATION.
+///
+/// On Windows, a rename refused with STATUS_ACCESS_DENIED, as a directory
+/// rename is while another program has an entry below it open, is tried
+/// again for up to one second before it fails.
+///
+/// On Windows, where the share root is on another machine, the SMB client
+/// of Windows can store a new name in the case another program uses to
+/// open it at the same moment, as a virus scanner does, and can drop a
+/// rename that changes only the case of a name. So after each create and
+/// rename of a file, a directory or a named stream there, the backend
+/// reads back the name the server stored. A name stored in another
+/// spelling is renamed to `~smb-<32 hex digits>` in its directory, or among
+/// the streams of its file, then to the name asked for. In between, the
+/// entry lists under the temporary name and an open of its name can miss
+/// it; if the server stops then, the entry stays under the temporary name
+/// in its directory, where nothing removes it. A case-only rename that
+/// cannot be corrected fails and leaves the name as it was. A create whose
+/// entry another program holds open without sharing delete access
+/// succeeds under the spelling the server stored, with a warning logged. A
+/// create whose name another client takes during the correction fails
+/// with STATUS_SHARING_VIOLATION, and the entry it made is deleted.
+///
+/// On Windows, where the volume of the share root refuses POSIX deletes,
+/// as an SMB share does, a delete moves the entry into the hidden directory
+/// `.smb-deleted` in the share root and marks it to be deleted when its
+/// last handle closes, so its name is free at once; the file system
+/// removes it at that close. The first delete that needs `.smb-deleted`
+/// makes it, and the backend keeps it open from then on and deletes what
+/// earlier runs left in it, except a directory that still has entries,
+/// which stays with a warning logged. If something else has that name,
+/// deleted names stay until their last handle closes. A read-only backend
+/// never makes it. On every Windows volume, clients cannot open, list or
+/// rename into `.smb-deleted` under any spelling, and cannot create its
+/// name in the share root.
+///
 /// On Windows, extended attributes are the NTFS ones, on volumes that
 /// store them; NTFS keeps the letters a-z of their names in uppercase.
 /// macOS hosts have none: every extended attribute there is a named
@@ -211,6 +250,9 @@ pub struct LocalFsBackend {
     /// the share has no named streams.
     #[cfg(target_os = "linux")]
     store: Option<Arc<super::streams::Store>>,
+    /// Where deleted entries go on a volume without POSIX deletes.
+    #[cfg(windows)]
+    trash: Arc<super::windows_trash::Trash>,
     /// Runs between the lookup of a path and its open.
     #[cfg(test)]
     after_locate: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -221,8 +263,11 @@ impl LocalFsBackend {
     /// not a directory.
     pub fn new(path: impl AsRef<Path>) -> io::Result<Self> {
         let dir = Dir::open_ambient_dir(path, ambient_authority())?;
-        let root_dev = file_key(&dir.dir_metadata()?).map(|(dev, _)| dev);
+        let root_key = file_key(&dir.dir_metadata()?);
+        let root_dev = root_key.map(|(dev, _)| dev);
         let case_sensitive = volume::is_case_sensitive(&dir);
+        #[cfg(windows)]
+        let dir = dir.reserve(super::windows_trash::TRASH_NAME, case_sensitive);
         let root = Arc::new(dir);
         #[cfg(target_os = "linux")]
         let streams = super::streams::supported(&root).then(Arc::default);
@@ -261,6 +306,8 @@ impl LocalFsBackend {
             volume,
             #[cfg(target_os = "linux")]
             store,
+            #[cfg(windows)]
+            trash: Arc::new(super::windows_trash::Trash::new(root_key, case_sensitive)),
             #[cfg(test)]
             after_locate: None,
         })
@@ -272,6 +319,27 @@ impl LocalFsBackend {
             after_locate: Some(Arc::new(f)),
             ..self
         }
+    }
+
+    /// Makes the backend delete as on a volume that refuses POSIX deletes.
+    #[cfg(all(test, windows))]
+    pub(crate) fn without_posix_delete(self) -> Self {
+        self.trash.refuse_posix();
+        self
+    }
+
+    /// Makes `hook` run before each rename on a remote root, as
+    /// [`RenameHook`](super::windows_dir::RenameHook) says.
+    #[cfg(all(test, windows))]
+    pub(crate) fn before_rename(self, hook: super::windows_dir::RenameHook) -> Self {
+        self.root.volume().before_rename(hook);
+        self
+    }
+
+    /// How many names stored in another spelling the backend has corrected.
+    #[cfg(all(test, windows))]
+    pub(crate) fn corrections(&self) -> usize {
+        self.root.volume().corrections()
     }
 
     /// Mark the backend as read-only. All write-class opens and writes return
@@ -374,14 +442,18 @@ impl LocalFsBackend {
     }
 
     /// True if `path` is the name the stream store takes in the share
-    /// root, which no client may make.
+    /// root, or on Windows the directory deleted entries go to, which no
+    /// client may make.
     fn reserves(&self, path: &SmbPath) -> bool {
         #[cfg(target_os = "linux")]
-        if let Some(hidden) = self.store.as_ref().and_then(|store| store.hidden_name()) {
-            return matches!(path.components(), [name] if is_hidden(name, hidden, self.case_sensitive));
-        }
-        let _ = path;
-        false
+        let hidden = self.store.as_ref().and_then(|store| store.hidden_name());
+        #[cfg(windows)]
+        let hidden = Some(super::windows_trash::TRASH_NAME);
+        #[cfg(not(any(target_os = "linux", windows)))]
+        let hidden: Option<&str> = None;
+        hidden.is_some_and(
+            |hidden| matches!(path.components(), [name] if is_hidden(name, hidden, self.case_sensitive)),
+        )
     }
 
     /// Makes the stream store of a writable share, so it exists before a
@@ -487,23 +559,24 @@ fn in_store() -> io::Error {
 }
 
 /// What [`special_file`] carries.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 #[derive(Debug)]
 struct Special;
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 impl std::fmt::Display for Special {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("not a regular file or directory")
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 impl std::error::Error for Special {}
 
-/// The error for an open of a FIFO, a socket or a device node, which
+/// The error for an open of a FIFO, a socket or a device node, or on
+/// Windows of a link of a kind the share does not follow, which
 /// [`io_to_smb`] makes [`SmbError::SpecialFile`].
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub(super) fn special_file() -> io::Error {
     io::Error::other(Special)
 }
@@ -677,8 +750,7 @@ fn lock_hook() -> std::sync::MutexGuard<'static, Option<Box<dyn Fn() + Send>>> {
 }
 
 /// True if `name` is `hidden` under the case rule `case_sensitive`.
-#[cfg(target_os = "linux")]
-fn is_hidden(name: &str, hidden: &str, case_sensitive: bool) -> bool {
+pub(super) fn is_hidden(name: &str, hidden: &str, case_sensitive: bool) -> bool {
     name == hidden || (!case_sensitive && name.to_lowercase() == hidden.to_lowercase())
 }
 
@@ -687,11 +759,11 @@ fn is_hidden(name: &str, hidden: &str, case_sensitive: bool) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Convert a validated `SmbPath` into a relative `PathBuf` suitable for
-/// `cap_std::fs::Dir` lookups.
+/// `Dir` lookups.
 ///
 /// `SmbPath` is already validated (no `..`, no forbidden chars, no doubled
 /// separators), so this is purely a join. The empty `SmbPath` (root) yields
-/// `PathBuf::from(".")`, which cap-std accepts for `metadata` etc.
+/// `PathBuf::from(".")`, which a `Dir` accepts for `metadata` etc.
 pub(super) fn to_rel_path(path: &SmbPath) -> PathBuf {
     if path.is_root() {
         return PathBuf::from(".");
@@ -709,16 +781,15 @@ pub(super) fn to_rel_path(path: &SmbPath) -> PathBuf {
 
 pub(super) fn io_to_smb(err: io::Error) -> SmbError {
     use io::ErrorKind::*;
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     if err.get_ref().is_some_and(|inner| inner.is::<Special>()) {
         return SmbError::SpecialFile;
     }
     #[cfg(windows)]
+    if err.raw_os_error() == Some(super::windows_dir::ERROR_SHARING_VIOLATION)
+        || super::windows_dir::collided(&err).is_some()
     {
-        const ERROR_SHARING_VIOLATION: i32 = 32;
-        if err.raw_os_error() == Some(ERROR_SHARING_VIOLATION) {
-            return SmbError::Sharing;
-        }
+        return SmbError::Sharing;
     }
     match err.kind() {
         NotFound => SmbError::NotFound,
@@ -891,11 +962,7 @@ pub(super) fn file_key(md: &Metadata) -> Option<(u64, u64)> {
     }
     #[cfg(windows)]
     {
-        // The hidden trait returns `None` where `cap_fs_ext::MetadataExt` panics on scan metadata.
-        use cap_primitives::fs::_WindowsByHandle;
-        let volume = _WindowsByHandle::volume_serial_number(md)?;
-        let index = _WindowsByHandle::file_index(md)?;
-        Some((volume.into(), index))
+        Some((md.volume_serial_number()?.into(), md.file_index()?))
     }
 }
 
@@ -926,7 +993,7 @@ pub(super) fn link_count(md: &Metadata) -> Option<u64> {
     }
     #[cfg(windows)]
     {
-        cap_primitives::fs::_WindowsByHandle::number_of_links(md).map(u64::from)
+        md.number_of_links().map(u64::from)
     }
 }
 
@@ -943,7 +1010,7 @@ fn is_dir_entry(md: &Metadata) -> bool {
     #[cfg(windows)]
     {
         const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
-        cap_std::fs::MetadataExt::file_attributes(md) & FILE_ATTRIBUTE_DIRECTORY != 0
+        md.file_attributes() & FILE_ATTRIBUTE_DIRECTORY != 0
     }
 }
 
@@ -952,7 +1019,7 @@ fn is_dir_entry(md: &Metadata) -> bool {
 /// file index, so the entry is opened for it, falling back to the scan data
 /// when the open fails.
 #[cfg_attr(unix, expect(unused_variables, reason = "dir is used on Windows only"))]
-fn entry_metadata(dir: &Dir, entry: &cap_std::fs::DirEntry) -> io::Result<Metadata> {
+fn entry_metadata(dir: &Dir, entry: &super::dir::DirEntry) -> io::Result<Metadata> {
     #[cfg(unix)]
     {
         entry.metadata()
@@ -965,8 +1032,8 @@ fn entry_metadata(dir: &Dir, entry: &cap_std::fs::DirEntry) -> io::Result<Metada
 }
 
 /// Opens the directory `rel` below `root`. On Windows the handle shares
-/// delete access, which `Dir::open_dir` leaves out, and has
-/// `FILE_WRITE_ATTRIBUTES` when `write_attributes` is set.
+/// delete access and has `FILE_WRITE_ATTRIBUTES` when `write_attributes` is
+/// set.
 #[cfg_attr(
     unix,
     expect(unused_variables, reason = "write_attributes is used on Windows only")
@@ -978,21 +1045,16 @@ fn open_dir_handle(root: &Dir, rel: &Path, write_attributes: bool) -> io::Result
     }
     #[cfg(windows)]
     {
-        use cap_primitives::fs::OpenOptionsExt as _;
         const GENERIC_READ: u32 = 0x8000_0000;
         const FILE_WRITE_ATTRIBUTES: u32 = 0x0000_0100;
         const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
 
-        let mut opts = CapOpenOptions::new();
+        let mut opts = DirOpenOptions::new();
         opts.read(true).custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
         if write_attributes {
             opts.access_mode(GENERIC_READ | FILE_WRITE_ATTRIBUTES);
         }
-        let file = root.open_with(rel, &opts)?;
-        if !file.metadata()?.is_dir() {
-            return Err(io::ErrorKind::NotADirectory.into());
-        }
-        Ok(Dir::from_std_file(file.into_std()))
+        root.open_dir(rel, &opts)
     }
 }
 
@@ -1096,7 +1158,7 @@ pub(super) fn set_host_attributes(
         };
         match set(file) {
             Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
-                set(&super::windows_eas::reopen(file, FILE_WRITE_ATTRIBUTES)?)
+                set(&super::windows_dir::reopen(file, FILE_WRITE_ATTRIBUTES)?)
             }
             result => result,
         }
@@ -1140,7 +1202,7 @@ fn set_created(times: std::fs::FileTimes, t: SystemTime) -> std::fs::FileTimes {
 
 /// The host time of the FILETIME `ft`, before 1970 too; `None` where the
 /// host's clock cannot hold it.
-fn filetime_to_system_time(ft: u64) -> Option<SystemTime> {
+pub(super) fn filetime_to_system_time(ft: u64) -> Option<SystemTime> {
     let ticks = |n: u64| Duration::new(n / 10_000_000, (n % 10_000_000) as u32 * 100);
     match ft.checked_sub(FILETIME_OFFSET) {
         Some(after) => UNIX_EPOCH.checked_add(ticks(after)),
@@ -1200,7 +1262,7 @@ fn host_attributes(md: &Metadata) -> u32 {
     }
     #[cfg(windows)]
     {
-        cap_std::fs::MetadataExt::file_attributes(md)
+        md.file_attributes()
     }
 }
 
@@ -1223,9 +1285,11 @@ fn unix_mode(md: &Metadata) -> Option<u32> {
 // ---------------------------------------------------------------------------
 
 /// Entries of `dir` whose names match `pattern`, every entry for `None`.
-/// Names a client could not open again are left out, and entries that
-/// resolve to the object with the host identity `hidden`. With `eas`, each
-/// entry carries the size of its extended attributes.
+/// Names a client could not open again are left out, entries that resolve
+/// to the object with the host identity `hidden`, and the name of
+/// `hidden_name` under its case rule. With `eas`, each entry carries the
+/// size of its extended attributes. On Windows, `dir` is held for the whole
+/// listing, and every entry is looked up from that hold.
 #[cfg_attr(
     not(any(target_os = "linux", windows)),
     expect(
@@ -1238,8 +1302,13 @@ fn list_entries(
     pattern: Option<&str>,
     root_dev: Option<u64>,
     hidden: Option<(u64, u64)>,
+    hidden_name: Option<(&str, bool)>,
     eas: bool,
 ) -> io::Result<Vec<SmbDirEntry>> {
+    #[cfg(windows)]
+    let held = dir.pin()?;
+    #[cfg(windows)]
+    let dir = &held;
     let pattern = pattern.filter(|p| !matches!(*p, "" | "*" | "*.*"));
     #[cfg(windows)]
     let ea_sizes = if eas {
@@ -1262,7 +1331,10 @@ fn list_entries(
             debug!(name = ?os_name, "listing leaves out a name clients cannot open");
             continue;
         };
-        if pattern.as_ref().is_some_and(|p| !p.matches(name)) {
+        if pattern.as_ref().is_some_and(|p| !p.matches(name))
+            || hidden_name
+                .is_some_and(|(hidden, case_sensitive)| is_hidden(name, hidden, case_sensitive))
+        {
             continue;
         }
         let md = match listed_metadata(dir, &entry) {
@@ -1302,7 +1374,7 @@ fn list_entries(
 /// [`FileInfo::ea_size`] of a listed entry with metadata `md`, as an open
 /// of its name sees it; 0 when it cannot be read.
 #[cfg(target_os = "linux")]
-fn listed_ea_size(dir: &Dir, entry: &cap_std::fs::DirEntry, name: &str, md: &Metadata) -> u32 {
+fn listed_ea_size(dir: &Dir, entry: &super::dir::DirEntry, name: &str, md: &Metadata) -> u32 {
     use super::eas::{Source, size};
     if !md.is_file() && !md.is_dir() {
         return 0;
@@ -1310,7 +1382,7 @@ fn listed_ea_size(dir: &Dir, entry: &cap_std::fs::DirEntry, name: &str, md: &Met
     let sized = if entry.file_type().is_ok_and(|ty| ty.is_symlink()) {
         // The target, opened without reading it, inside the share.
         use cap_std::fs::OpenOptionsExt as _;
-        let mut opts = CapOpenOptions::new();
+        let mut opts = DirOpenOptions::new();
         opts.read(true).custom_flags(libc::O_PATH);
         dir.open_with(name, &opts).and_then(|target| {
             let md = target.metadata()?;
@@ -1332,7 +1404,7 @@ fn listed_ea_size(dir: &Dir, entry: &cap_std::fs::DirEntry, name: &str, md: &Met
 /// Metadata of a listed entry as an open of its name sees it: a symlink
 /// reports its target, or itself when the target cannot be reached inside
 /// the share.
-fn listed_metadata(dir: &Dir, entry: &cap_std::fs::DirEntry) -> io::Result<Metadata> {
+fn listed_metadata(dir: &Dir, entry: &super::dir::DirEntry) -> io::Result<Metadata> {
     if entry.file_type()?.is_symlink()
         && let Ok(md) = dir.metadata(entry.file_name())
     {
@@ -1486,6 +1558,39 @@ impl LocalFsBackend {
             .unwrap_or(false)
     }
 
+    /// `made`, the result of a create at `at`. A create whose name another
+    /// entry took while the name was corrected left the entry it made
+    /// under a temporary name, which is deleted here, a directory with
+    /// `is_dir`.
+    #[cfg(windows)]
+    async fn discard_collided<T>(
+        &self,
+        at: &Located,
+        is_dir: bool,
+        made: io::Result<T>,
+    ) -> io::Result<T> {
+        use std::os::windows::ffi::OsStringExt as _;
+
+        let Err(e) = made else {
+            return made;
+        };
+        let Some(left) = super::windows_dir::collided(&e) else {
+            return Err(e);
+        };
+        let name = std::ffi::OsString::from_wide(&left.aside);
+        let rel = at.rel.parent().unwrap_or(Path::new("")).join(name);
+        let shown = rel.display().to_string();
+        let (trash, root) = (Arc::clone(&self.trash), Arc::clone(&at.base));
+        let removed = spawn_blocking(move || trash.remove(&root, &rel, is_dir))
+            .await
+            .map_err(join_to_io)
+            .and_then(|removed| removed);
+        if let Err(removed) = removed {
+            tracing::warn!(name = %shown, error = %removed, "a new entry was left under a temporary name");
+        }
+        Err(e)
+    }
+
     async fn open_entry(
         &self,
         path: &SmbPath,
@@ -1509,7 +1614,7 @@ impl LocalFsBackend {
         let existing = {
             let root = Arc::clone(&root);
             let rel = rel.clone();
-            spawn_blocking(move || -> io::Result<Option<cap_std::fs::FileType>> {
+            spawn_blocking(move || -> io::Result<Option<super::dir::FileType>> {
                 match root.metadata(&rel) {
                     Ok(md) => Ok(Some(md.file_type())),
                     Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -1529,8 +1634,8 @@ impl LocalFsBackend {
             // Directory CREATE intents: Create / OpenOrCreate / OverwriteOrCreate
             // imply mkdir; Open / Truncate require existing.
             let intent = opts.intent;
-            let located = located.clone();
-            let (dir_handle, action) = spawn_blocking(move || -> io::Result<(Dir, OpenAction)> {
+            let at = located.clone();
+            let made = spawn_blocking(move || -> io::Result<(Dir, OpenAction)> {
                 let action = match intent {
                     OpenIntent::Open => OpenAction::Opened,
                     OpenIntent::Create => {
@@ -1548,13 +1653,15 @@ impl LocalFsBackend {
                     }
                 };
                 let dir = open_dir_handle(&root, &rel, write_attributes)?;
-                located.verify(&dir)?;
+                at.verify(&dir)?;
                 Ok((dir, action))
             })
             .await
             .map_err(join_to_io)
-            .map_err(io_to_smb)?
             .map_err(io_to_smb)?;
+            #[cfg(windows)]
+            let made = self.discard_collided(&located, true, made).await;
+            let (dir_handle, action) = made.map_err(io_to_smb)?;
 
             let handle: Box<dyn Handle> = Box::new(LocalHandle::Dir {
                 name: file_name_for(path),
@@ -1568,6 +1675,8 @@ impl LocalFsBackend {
                 hub: self.hub.clone(),
                 #[cfg(target_os = "linux")]
                 store: self.store.clone(),
+                #[cfg(windows)]
+                trash: Arc::clone(&self.trash),
             });
             return Ok((handle, action));
         }
@@ -1602,6 +1711,8 @@ impl LocalFsBackend {
                         hub: self.hub.clone(),
                         #[cfg(target_os = "linux")]
                         store: self.store.clone(),
+                        #[cfg(windows)]
+                        trash: Arc::clone(&self.trash),
                     });
                     return Ok((handle, OpenAction::Opened));
                 }
@@ -1613,7 +1724,9 @@ impl LocalFsBackend {
         }
 
         // 2. Open the file for the intent.
-        let (std_file, action) = spawn_blocking(move || {
+        #[cfg(windows)]
+        let at = located.clone();
+        let opened = spawn_blocking(move || {
             #[cfg(target_os = "linux")]
             if located.checked {
                 let (file, action) = open_file_nofollow(&root, &rel, opts)?;
@@ -1626,8 +1739,10 @@ impl LocalFsBackend {
         })
         .await
         .map_err(join_to_io)
-        .map_err(io_to_smb)?
-        .map_err(open_to_smb)?;
+        .map_err(io_to_smb)?;
+        #[cfg(windows)]
+        let opened = self.discard_collided(&at, false, opened).await;
+        let (std_file, action) = opened.map_err(open_to_smb)?;
 
         let handle: Box<dyn Handle> = Box::new(LocalHandle::File {
             name: file_name_for(path),
@@ -1646,7 +1761,7 @@ impl LocalFsBackend {
 
 /// True for a FIFO, a socket or a device node. Opening one can block or
 /// act on a device, so such entries are refused before any open.
-fn is_special(ty: &cap_std::fs::FileType) -> bool {
+fn is_special(ty: &super::dir::FileType) -> bool {
     #[cfg(unix)]
     {
         use cap_std::fs::FileTypeExt as _;
@@ -1689,7 +1804,7 @@ fn open_to_smb(e: io::Error) -> SmbError {
 /// name a FIFO, a socket or a device node took since it was checked fails
 /// as changed, so the open is looked at again.
 #[cfg(unix)]
-fn open_with(root: &Dir, rel: &Path, options: &CapOpenOptions) -> io::Result<cap_std::fs::File> {
+fn open_with(root: &Dir, rel: &Path, options: &DirOpenOptions) -> io::Result<super::dir::File> {
     root.open_with(rel, options).map_err(|e| {
         if root
             .metadata(rel)
@@ -1703,7 +1818,7 @@ fn open_with(root: &Dir, rel: &Path, options: &CapOpenOptions) -> io::Result<cap
 }
 
 #[cfg(windows)]
-fn open_with(root: &Dir, rel: &Path, options: &CapOpenOptions) -> io::Result<cap_std::fs::File> {
+fn open_with(root: &Dir, rel: &Path, options: &DirOpenOptions) -> io::Result<super::dir::File> {
     root.open_with(rel, options)
 }
 
@@ -1733,11 +1848,11 @@ fn open_file(
     root: &Dir,
     rel: &Path,
     opts: OpenOptions,
-) -> io::Result<(cap_std::fs::File, OpenAction)> {
+) -> io::Result<(super::dir::File, OpenAction)> {
     let existing = existing_file_options(&opts);
-    let mut created = CapOpenOptions::new();
+    let mut created = DirOpenOptions::new();
     created.read(opts.read).write(true).create_new(true);
-    let mut truncated = CapOpenOptions::new();
+    let mut truncated = DirOpenOptions::new();
     truncated.read(opts.read).write(true);
     // Windows refuses to truncate a HIDDEN or SYSTEM file as it opens it;
     // the file is emptied once open instead.
@@ -1876,27 +1991,26 @@ fn open_file_nofollow(
     Ok((file, action))
 }
 
-/// cap-std options that open an existing file with the access `opts` asks
+/// `Dir` options that open an existing file with the access `opts` asks
 /// for, and on Unix without blocking.
-fn existing_file_options(opts: &OpenOptions) -> CapOpenOptions {
-    let mut cap_opts = CapOpenOptions::new();
-    cap_opts.read(true).write(opts.write);
+fn existing_file_options(opts: &OpenOptions) -> DirOpenOptions {
+    let mut dir_opts = DirOpenOptions::new();
+    dir_opts.read(true).write(opts.write);
     #[cfg(unix)]
     {
         use cap_std::fs::OpenOptionsExt as _;
-        cap_opts.custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY);
+        dir_opts.custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY);
     }
     // Unix sets times and permissions through a read-only descriptor.
     // Windows needs the access right, which a read-only file grants without
     // write access.
     #[cfg(windows)]
     if opts.write_attributes && !opts.write {
-        use cap_primitives::fs::OpenOptionsExt as _;
         const GENERIC_READ: u32 = 0x8000_0000;
         const FILE_WRITE_ATTRIBUTES: u32 = 0x0000_0100;
-        cap_opts.access_mode(GENERIC_READ | FILE_WRITE_ATTRIBUTES);
+        dir_opts.access_mode(GENERIC_READ | FILE_WRITE_ATTRIBUTES);
     }
-    cap_opts
+    dir_opts
 }
 
 #[async_trait]
@@ -1963,15 +2077,25 @@ impl ShareBackend for LocalFsBackend {
         let Located {
             base: root, rel, ..
         } = located;
+        #[cfg(windows)]
+        let trash = Arc::clone(&self.trash);
 
         spawn_blocking(move || -> io::Result<()> {
             // Pick the call from the entry itself: the error `remove_file`
             // returns for a directory differs between hosts. Neither call
             // follows a final symlink, so a link is removed as a link.
-            if is_dir_entry(&root.symlink_metadata(&rel)?) {
-                root.remove_dir(&rel)
-            } else {
-                root.remove_file(&rel)
+            let is_dir = is_dir_entry(&root.symlink_metadata(&rel)?);
+            #[cfg(windows)]
+            {
+                trash.remove(&root, &rel, is_dir)
+            }
+            #[cfg(unix)]
+            {
+                if is_dir {
+                    root.remove_dir(&rel)
+                } else {
+                    root.remove_file(&rel)
+                }
             }
         })
         .await
@@ -2014,10 +2138,21 @@ impl ShareBackend for LocalFsBackend {
         let same_name = same_path(from, to, self.capabilities().case_sensitive);
         let (root, from) = (from_at.base, from_at.rel);
         let (to_root, to_path) = (to_at.base, to_at.rel);
+        #[cfg(windows)]
+        let trash = Arc::clone(&self.trash);
+
+        // On Windows the target of a case-only rename is the source itself,
+        // and a stat of it would open it under the target's spelling.
+        let target_checked = !(cfg!(windows) && same_name);
 
         let result = spawn_blocking(move || -> io::Result<()> {
             let from_md = root.symlink_metadata(&from)?;
-            match to_root.symlink_metadata(&to_path) {
+            let to_md = if target_checked {
+                to_root.symlink_metadata(&to_path)
+            } else {
+                Err(io::ErrorKind::NotFound.into())
+            };
+            match to_md {
                 Ok(to_md) => {
                     let from_key = file_key(&from_md);
                     let same_file = from_key.is_some() && from_key == file_key(&to_md);
@@ -2037,6 +2172,9 @@ impl ShareBackend for LocalFsBackend {
                     // A file with one link reached under two spellings is a
                     // single entry and goes through the rename.
                     if same_file && !same_name && link_count(&from_md) > Some(1) {
+                        #[cfg(windows)]
+                        return trash.remove(&root, &from, false);
+                        #[cfg(unix)]
                         return root.remove_file(&from);
                     }
                 }
@@ -2248,9 +2386,9 @@ impl LocalFsBackend {
 // Handle
 // ---------------------------------------------------------------------------
 
-/// Internal handle variant. `File` carries a `std::fs::File` (after cap-std
-/// has done the safe open); `Dir` keeps the `cap_std::fs::Dir` for listing
-/// and setting times.
+/// Internal handle variant. `File` carries a `std::fs::File` (after the
+/// `Dir` has done the safe open); `Dir` keeps the `Dir` for listing and
+/// setting times.
 enum LocalHandle {
     File {
         name: String,
@@ -2279,6 +2417,10 @@ enum LocalHandle {
         hub: Option<Arc<super::inotify::Hub>>,
         #[cfg(target_os = "linux")]
         store: Option<Arc<super::streams::Store>>,
+        /// Where deleted entries go, which listings of the share root
+        /// leave out.
+        #[cfg(windows)]
+        trash: Arc<super::windows_trash::Trash>,
     },
 }
 
@@ -2573,6 +2715,8 @@ impl Handle for LocalHandle {
                 dir_handle,
                 root_dev,
                 eas,
+                #[cfg(windows)]
+                trash,
                 ..
             } => {
                 let dir_handle = Arc::clone(dir_handle);
@@ -2580,12 +2724,25 @@ impl Handle for LocalHandle {
                 let pat = pattern.map(|s| s.to_owned());
                 #[cfg(target_os = "linux")]
                 let store = self.store();
+                #[cfg(windows)]
+                let trash = Arc::clone(trash);
                 spawn_blocking(move || {
                     #[cfg(target_os = "linux")]
                     let hidden = store.and_then(|store| store.key());
                     #[cfg(not(target_os = "linux"))]
                     let hidden = None;
-                    list_entries(&dir_handle, pat.as_deref(), root_dev, hidden, eas)
+                    #[cfg(windows)]
+                    let hidden_name = trash.hidden_in(&dir_handle);
+                    #[cfg(not(windows))]
+                    let hidden_name = None;
+                    list_entries(
+                        &dir_handle,
+                        pat.as_deref(),
+                        root_dev,
+                        hidden,
+                        hidden_name,
+                        eas,
+                    )
                 })
                 .await
                 .map_err(join_to_io)
@@ -3278,7 +3435,7 @@ pub(super) mod tests {
     #[cfg(windows)]
     #[test]
     fn sharing_violation_maps_to_sharing() {
-        const ERROR_SHARING_VIOLATION: i32 = 32;
+        use crate::fs::windows_dir::ERROR_SHARING_VIOLATION;
         assert!(matches!(
             io_to_smb(io::Error::from_raw_os_error(ERROR_SHARING_VIOLATION)),
             SmbError::Sharing

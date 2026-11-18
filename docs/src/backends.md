@@ -20,6 +20,12 @@ Paths and symlinks cannot reach outside the directory.
 
 `sweep_streams()` frees stored stream data no file uses. See [named streams](streams.md#stream-store).
 
+On Windows, the directory may be a UNC path or a mapped drive. The server's account needs traverse rights on the share's directories. Where the volume refuses POSIX deletes, as an SMB share does, deleted entries go to the hidden directory `.smb-deleted` in the share root until their last handle closes, so a deleted name is free at once. Clients cannot list, open or create `.smb-deleted`.
+
+On Windows, a rename refused with STATUS_ACCESS_DENIED, as a directory rename is while another program has an entry below it open, is tried again for up to one second before it fails.
+
+When the directory is on another machine, the SMB client of Windows can store a new name in the case another program uses to open it at the same moment, as a virus scanner does, and can drop a rename that changes only the case of a name. So after each create and rename of a file, directory or named stream, the backend reads back the name the server stored, and renames one stored in another spelling to `~smb-<32 hex digits>`, then to the name asked for. In between, the entry lists under the temporary name. If the server stops then, the entry stays under that name in its directory; nothing removes it. A case-only rename that cannot be corrected fails and leaves the name as it was. A create whose entry another program holds open without sharing delete access succeeds under the spelling the server stored, with a warning logged. A create whose name another client takes during the correction fails with STATUS_SHARING_VIOLATION, and its entry is deleted.
+
 ## S3Backend
 
 Feature `s3`, off by default. Serves a bucket, or the keys below a prefix, as a share. A file is an object and a directory is a key prefix. The store must offer ListObjectsV2, HeadObject, ranged GetObject, PutObject, CopyObject, multipart uploads with UploadPartCopy and DeleteObjects, all signed with SigV4.

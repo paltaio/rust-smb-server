@@ -17,6 +17,10 @@ use crate::tests::memfs::MemFsBackend;
 use crate::tests::s3::fixture::TestBucket;
 #[cfg(feature = "s3")]
 use crate::tests::s3::share::{worker_ended, writable_builder};
+#[cfg(any(feature = "s3", all(windows, feature = "localfs")))]
+use crate::tests::util::scratch_dir;
+#[cfg(all(windows, feature = "localfs"))]
+use crate::tests::util::{Contender, on_admin_share};
 #[cfg(feature = "s3")]
 use crate::{S3Backend, S3BackendBuilder};
 
@@ -75,6 +79,69 @@ pub(super) async fn layer_exact_localfs() -> Result<Fixture, Error> {
     Ok(over(layer, dir))
 }
 
+/// A backend whose share root is a new directory beside the test binary,
+/// reached through the administrative share of its drive on this host.
+#[cfg(all(windows, feature = "localfs"))]
+fn local_unc() -> Result<(LocalFsBackend, tempfile::TempDir), Error> {
+    let dir = scratch_dir();
+    Ok((LocalFsBackend::new(on_admin_share(dir.path()))?, dir))
+}
+
+#[cfg(all(windows, feature = "localfs"))]
+pub(super) async fn localfs_unc() -> Result<Fixture, Error> {
+    let (backend, dir) = local_unc()?;
+    Ok(over(backend, dir))
+}
+
+#[cfg(all(windows, feature = "encryption", feature = "localfs"))]
+pub(super) async fn layer_localfs_unc() -> Result<Fixture, Error> {
+    let (backend, dir) = local_unc()?;
+    Ok(over(names_over(backend).await, dir))
+}
+
+/// The names of the model run in `namespace`, which the contender opens in
+/// the other case in every directory.
+#[cfg(all(windows, feature = "localfs"))]
+fn contended_names() -> Vec<String> {
+    ["f", "F", "g.txt", "G.TXT", "d", "D", "e"]
+        .into_iter()
+        .map(str::to_string)
+        .chain(["x".repeat(150), "X".repeat(150)])
+        .collect()
+}
+
+/// `backend` over the share root `dir`, whose names a [`Contender`] opens
+/// in the other case through the administrative share until the test is
+/// over; `after` checks it made a whole pass over the tree.
+#[cfg(all(windows, feature = "localfs"))]
+fn contended(backend: impl crate::backend::ShareBackend, dir: tempfile::TempDir) -> Fixture {
+    let contender = Contender::start(on_admin_share(dir.path()), &contended_names());
+    Fixture {
+        after: Some(Box::pin(async move {
+            let passes = tokio::task::spawn_blocking(move || contender.stop())
+                .await
+                .expect("the contender stopped");
+            drop(dir);
+            assert!(passes > 0, "the contender made no pass over the tree");
+        })),
+        ..Fixture::new(backend)
+    }
+}
+
+/// [`localfs_unc`] with a [`Contender`] on its names.
+#[cfg(all(windows, feature = "localfs"))]
+pub(super) async fn localfs_unc_contended() -> Result<Fixture, Error> {
+    let (backend, dir) = local_unc()?;
+    Ok(contended(backend, dir))
+}
+
+/// [`layer_localfs_unc`] with a [`Contender`] on its names.
+#[cfg(all(windows, feature = "encryption", feature = "localfs"))]
+pub(super) async fn layer_localfs_unc_contended() -> Result<Fixture, Error> {
+    let (backend, dir) = local_unc()?;
+    Ok(contended(names_over(backend).await, dir))
+}
+
 /// A backend of the bucket that keeps its changes in `cache`, built with the
 /// settings `configure` makes, and the signal that its worker has ended.
 #[cfg(feature = "s3")]
@@ -102,7 +169,7 @@ fn after_s3(exited: watch::Receiver<bool>, cache: tempfile::TempDir) -> BoxFutur
 #[cfg(feature = "s3")]
 pub(super) async fn s3() -> Result<Fixture, Error> {
     let bucket = TestBucket::new().await;
-    let cache = tempfile::tempdir()?;
+    let cache = scratch_dir();
     let (backend, exited) = s3_backend(&bucket, cache.path(), |builder| builder).await?;
     Ok(Fixture {
         after: Some(after_s3(exited, cache)),
@@ -114,7 +181,7 @@ pub(super) async fn s3() -> Result<Fixture, Error> {
 #[cfg(all(feature = "encryption", feature = "s3"))]
 pub(super) async fn layer_s3() -> Result<Fixture, Error> {
     let bucket = TestBucket::new().await;
-    let cache = tempfile::tempdir()?;
+    let cache = scratch_dir();
     let (backend, exited) = s3_backend(&bucket, cache.path(), |builder| {
         builder.case_insensitive(false)
     })
