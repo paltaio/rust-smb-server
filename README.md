@@ -2,7 +2,7 @@
 
 SMB 2 and 3 file-sharing server library for Rust.
 
-Docs: [paltaio.github.io/rust-smb-server](https://paltaio.github.io/rust-smb-server/). API: [docs.rs/smb-server](https://docs.rs/smb-server).
+[docs](https://paltaio.github.io/rust-smb-server/) | [api](https://docs.rs/smb-server) | [crate](https://crates.io/crates/smb-server)
 
 ## Install
 
