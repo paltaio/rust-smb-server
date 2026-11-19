@@ -1,6 +1,6 @@
 # Network discovery
 
-Needs the `discovery` feature. The server is announced while `serve()` runs and withdrawn before it returns. The listen address must not be loopback.
+Requires the `discovery` feature. The server is announced while `serve()` runs and withdrawn before it returns. The listen address must not be loopback.
 
 ```rust
 SmbServer::builder()
@@ -12,7 +12,7 @@ SmbServer::builder()
 
 ## mDNS and DNS-SD
 
-`_smb._tcp` service on the listen port. Shows up in the Finder sidebar, GNOME Files and Dolphin.
+Advertises `_smb._tcp` on the listen port. Appears in the macOS Finder sidebar, GNOME Files, and Dolphin.
 
 | Host | Registers with |
 |---|---|
@@ -21,44 +21,44 @@ SmbServer::builder()
 | Windows | DNS Client service |
 | Otherwise | Built-in mDNS responder |
 
-Name: `Discovery::name` if set. Otherwise the [NetBIOS name](#netbios-name), except on macOS with neither `name` nor `model` set, where it is the computer name.
+The advertised name is `Discovery::name` if set. Otherwise it defaults to the [NetBIOS name](#netbios-name), except on macOS with neither `name` nor `model` set, where it uses the computer name.
 
 ## WS-Discovery (Windows Explorer)
 
-Shows up in the Explorer Network view, under the NetBIOS name and workgroup.
+Appears in the Windows Explorer Network view under the NetBIOS name and workgroup.
 
-Requires:
+Requirements:
 
 - a host other than Windows
 - port 445
-- a NetBIOS name equal to the host name; otherwise a warning is logged
-- network discovery on for the client's network profile
+- a NetBIOS name matching the host name (otherwise a warning is logged)
+- network discovery enabled for the client's network profile
 
-Also:
+Additional setup:
 
-- Listen on `[::]:445`. Windows may resolve the name to IPv6 and connect over IPv6 only.
-- On macOS, run as root, or macOS may block the messages.
+- Listen on `[::]:445`. Windows may resolve the host name to IPv6 and connect over IPv6 only.
+- On macOS, run as root, or the OS may block the announcements.
 
 ## NetBIOS name
 
-First label of the host name, upper case, cut to 15 characters. `netbios_name` on the builder sets another.
+Defaults to the first label of the host name in uppercase, truncated to 15 characters. Override it with `netbios_name` on the builder.
 
 ## Firewall
 
-| Port | For |
+| Port | Purpose |
 |---|---|
 | UDP 5353 | mDNS |
 | UDP 3702 | WS-Discovery |
-| TCP 5357 | WS-Discovery. If taken, a free port is used and a warning logged |
+| TCP 5357 | WS-Discovery. If already in use, a free port is chosen and a warning is logged |
 
 ## Options
 
-`Discovery::new()` then:
+Configure `Discovery::new()` with:
 
 | Call | Sets |
 |---|---|
-| `.name(name)` | Name file managers list the server under |
-| `.model(code)` | Model code the Finder picks the server's icon by |
-| `.ws_discovery(bool)` | `false`: off. `true`: required, `build()` fails if it cannot be announced. Unset: announced when the requirements above are met |
-| `.workgroup(name)` | Workgroup Windows lists it in, `WORKGROUP` by default |
-| `.manufacturer`, `.model_name`, `.firmware_version` | What Windows shows in the server's properties |
+| `.name(name)` | Name displayed by file managers |
+| `.model(code)` | Model code macOS Finder uses to choose the server icon |
+| `.ws_discovery(bool)` | `false` disables WS-Discovery; `true` requires it and fails `build()` if it cannot be announced. When unset, it is announced whenever the requirements above are met |
+| `.workgroup(name)` | Workgroup shown in Windows (`WORKGROUP` by default) |
+| `.manufacturer`, `.model_name`, `.firmware_version` | Fields shown in the server's Windows properties |

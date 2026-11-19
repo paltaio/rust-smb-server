@@ -38,11 +38,11 @@ server.serve().await?;
 
 ## Stop
 
-`server.shutdown()`, or `server.shutdown_handle()` from another task. `serve()` then:
+Call `server.shutdown()`, or use `server.shutdown_handle()` from another task. Once triggered, `serve()`:
 
-- stops accepting connections
-- closes each connection after its current request
-- returns once every connection and every disconnected durable handle is closed
+- stops accepting new connections
+- closes each active connection after its current request finishes
+- returns once every connection and disconnected durable handle has closed
 
 ## Run the example
 
@@ -50,7 +50,7 @@ server.serve().await?;
 cargo run -p minimal-smb-example
 ```
 
-Listens on `127.0.0.1:4445`. Serves directories under `smb-example` in the system temp directory.
+The example listens on `127.0.0.1:4445` and serves directories under `smb-example` in the system temp directory.
 
 | Share | Access |
 |---|---|
@@ -62,12 +62,12 @@ Listens on `127.0.0.1:4445`. Serves directories under `smb-example` in the syste
 |---|---|
 | `SMB_LISTEN` | Listen address |
 | `SMB_ROOT` | Root directory for the shares |
-| `SMB_PASSWORD` | Password for `alice` and `bob`. Unset: generated and logged at startup |
-| `SMB_DISCOVERY=1` | Announce on the network. Needs `--features discovery` and a non-loopback address |
-| `SMB_STREAMS=0` | Named streams off |
-| `SMB_COPY=0` | Server-side copy off |
-| `SMB_S3_BUCKET` | Serve this S3 bucket as the only share, `s3`. Needs `--features s3`. See [backends](backends.md#example) |
-| `SMB_ENCRYPTION_KEY` | Encryption key, 64 hex digits. Adds `vault`, an encrypted share. With `SMB_S3_BUCKET`, encrypts `s3` instead. Needs `--features encryption`. See [encrypted storage](encrypted-storage.md#example) |
+| `SMB_PASSWORD` | Password for `alice` and `bob`. If unset, a password is generated and logged at startup |
+| `SMB_DISCOVERY=1` | Announce the server on the network. Requires `--features discovery` and a non-loopback address |
+| `SMB_STREAMS=0` | Disable named streams |
+| `SMB_COPY=0` | Disable server-side copy |
+| `SMB_S3_BUCKET` | Serve this S3 bucket as the only share (`s3`). Requires `--features s3`. See [backends](backends.md#example) |
+| `SMB_ENCRYPTION_KEY` | 64-hex-digit encryption key. Adds an encrypted `vault` share, or encrypts `s3` when `SMB_S3_BUCKET` is also set. Requires `--features encryption`. See [encrypted storage](encrypted-storage.md#example) |
 
 ```sh
 SMB_DISCOVERY=1 SMB_LISTEN='[::]:4445' cargo run -p minimal-smb-example --features discovery

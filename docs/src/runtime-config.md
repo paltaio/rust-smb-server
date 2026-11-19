@@ -18,13 +18,13 @@ server.serve().await?;
 
 | Call | Effect |
 |---|---|
-| `add_user(name, password)` | Adds a user. On an existing user, replaces the password and ends their sessions |
-| `remove_user(name)` | Ends the user's sessions |
-| `add_share(share)` | Open to new tree connections |
-| `remove_share(name)` | Closes its tree connections and open handles |
-| `grant_share_user(share, user, access)` | Lowering access ends the user's tree connections on the share |
-| `revoke_share_user(share, user)` | Closes the user's tree connections and handles on the share |
-| `set_share_mode(share, ShareMode)` | Closes the share's tree connections. A public mode on a share with users fails |
-| `set_max_opens_per_connection(n)` | New limit; opens already held stay open |
+| `add_user(name, password)` | Adds a user, or replaces the password and disconnects active sessions for an existing user |
+| `remove_user(name)` | Removes the user and disconnects their active sessions |
+| `add_share(share)` | Adds a share and makes it available to new tree connections |
+| `remove_share(name)` | Removes the share and closes its tree connections and open handles |
+| `grant_share_user(share, user, access)` | Grants or updates a user's access on the share; lowering access disconnects their tree connections to that share |
+| `revoke_share_user(share, user)` | Revokes a user's access and closes their tree connections and open handles on that share |
+| `set_share_mode(share, ShareMode)` | Changes the share's access mode and closes its tree connections. Switching a share with listed users to a public mode fails |
+| `set_max_opens_per_connection(n)` | Updates the per-connection open-handle limit; already open handles stay open |
 
-Each call that cuts a user off also closes that user's [disconnected durable handles](durable-handles.md).
+Any call that disconnects a user also closes their [disconnected durable handles](durable-handles.md).

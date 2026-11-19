@@ -10,7 +10,7 @@ SMB 2 and 3 file-sharing server library for Rust.
 cargo add smb-server
 ```
 
-## Use
+## Usage
 
 ```rust
 use smb_server::{Access, LocalFsBackend, Share, SmbServer};
@@ -28,7 +28,7 @@ server.bind().await?;
 server.serve().await?;
 ```
 
-An encrypted share over an S3 bucket, with `cargo add smb-server --features s3,encryption`:
+Serve an encrypted share backed by an S3 bucket (with `cargo add smb-server --features s3,encryption`):
 
 ```rust
 use smb_server::{Access, EncryptedBackend, S3Backend, Share, SmbServer};

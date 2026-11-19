@@ -1,6 +1,6 @@
 # Encrypted storage
 
-Feature `encryption`, off by default. `EncryptedBackend` wraps another backend and stores file contents, and by default names, encrypted under a 32-byte key. The inner backend holds ciphertext and clients see plaintext.
+Feature `encryption`, off by default. `EncryptedBackend` wraps another backend and encrypts file contents and, by default, file names under a 32-byte key. The inner backend stores ciphertext while clients see plaintext.
 
 ```toml
 smb-server = { version = "0.12", features = ["encryption"] }
@@ -19,7 +19,7 @@ let vault = EncryptedBackend::builder(LocalFsBackend::new("/srv/vault")?, key)
 let share = Share::new("vault", vault).user("alice", Access::ReadWrite);
 ```
 
-The key is 32 raw bytes supplied by the program. The backend does not derive it from a passphrase.
+The key must be 32 raw bytes supplied by the caller; the backend does not derive it from a passphrase.
 
 ## S3 bucket
 
@@ -59,100 +59,100 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-With encrypted names, build the inner `S3Backend` with `case_insensitive(false)`. With the default `true`, a lookup of a key the bucket does not hold also lists the directory. The cache directory records the case setting, and `build` refuses one made with the other value. `sync` after `serve` returns puts the last changes in the bucket; see [backends](backends.md#uploads-and-shutdown).
+When encrypting names, configure the inner `S3Backend` with `case_insensitive(false)`. With the default `true`, looking up a missing key also lists the directory. The cache directory records the case setting, so `build()` rejects a cache created with the opposite value. Call `sync()` after `serve()` returns so pending changes reach the bucket; see [backends](backends.md#uploads-and-shutdown).
 
 ## What is protected
 
-Contents are encrypted in blocks with AES-256-GCM, each file under a key of its own. Each file that holds data starts with a header carrying a random file id, from which the file's key derives. Names are encrypted with AES-SIV unless `encrypt_names(false)` is set.
+File contents are encrypted in blocks with AES-256-GCM, using a separate key per file. Every non-empty file starts with a header carrying a random file ID from which that file's key is derived. File names are encrypted with AES-SIV unless `encrypt_names(false)` is set.
 
-Someone who reads the inner backend's storage still learns:
+Someone with access to the inner backend's storage still learns:
 
-- the exact size of every file, and where it has holes (blocks never written)
-- the number of files and directories, and the shape of the tree
-- times, attributes and POSIX modes
-- the length of every name, and which names are equal in different directories
+- the exact size of every file and where it has holes (blocks never written)
+- the number of files and directories, and the shape of the directory tree
+- timestamps, attributes, and POSIX modes
+- the length of every name, and which names are identical across different directories
 - the block size and whether names are encrypted
-- between two copies of the storage, which blocks were rewritten and which files were truncated to zero
-- every name, with `encrypt_names(false)`
+- between two snapshots of the storage, which blocks were rewritten and which files were truncated to zero
+- every file name, if `encrypt_names(false)` is set
 
-A changed byte inside a block, a block moved to another position or to a file with another file id, a changed file header and a file made under another key fail the read. A forged or altered name is left out of listings and does not open. [Limitations](limitations.md#integrity-and-visibility) lists the changes that go undetected. Every user who can open the share can read every file in it.
+Modifying bytes inside a block, moving a block to another offset or to a file with a different file ID, altering a file header, or reading a file encrypted under another key all cause reads to fail. Forged or altered names are omitted from listings and cannot be opened. See [limitations](limitations.md#integrity-and-visibility) for changes that go undetected. Every user allowed to open the share can read every file in it.
 
 ## Settings
 
 | Call | Default | Effect |
 |---|---|---|
-| `encrypt_names(bool)` | `true` | Store names encrypted. Fixed when the share is created |
-| `block_size(bytes)` | 64 KiB | Plaintext bytes in a block, a power of two from 8 KiB to 1 MiB. Fixed when the share is created |
-| `long_name_threshold(chars)` | 255 | Longest stored name, 62 to 255. A name whose encrypted form is longer is stored as `<hash>.l`, 34 characters, beside a `<hash>.n` object that holds the encrypted name. Fixed when the share is created. Not allowed with `encrypt_names(false)` |
-| `case_insensitive(bool)` | `true` | Match encrypted names without regard to case. With names in the clear the inner backend's rule decides |
-| `name_cache_ttl(duration)` | 30 s | How long the decrypted names of a directory are trusted for changes made outside this backend. `Duration::ZERO` lists the directory again on every lookup that needs it. Applies only to encrypted names that match without regard to case |
-| `restore_marker()` | Off | Lets `build` write a new [marker](#marker) |
+| `encrypt_names(bool)` | `true` | Encrypts file and directory names. Fixed when the share is created |
+| `block_size(bytes)` | 64 KiB | Plaintext bytes per block, a power of two from 8 KiB to 1 MiB. Fixed when the share is created |
+| `long_name_threshold(chars)` | 255 | Longest stored name, 62 to 255 characters. Longer encrypted names are stored as `<hash>.l` (34 characters) next to a `<hash>.n` object holding the encrypted name. Fixed when the share is created; not allowed with `encrypt_names(false)` |
+| `case_insensitive(bool)` | `true` | Matches encrypted names without regard to case. With plaintext names, the inner backend's rule applies |
+| `name_cache_ttl(duration)` | 30 s | How long decrypted directory names are trusted against changes made outside this backend. `Duration::ZERO` re-lists the directory on every lookup that needs it. Applies only to case-insensitive encrypted names |
+| `restore_marker()` | Off | Allows `build()` to write a new [marker](#marker) |
 
-`encrypt_names`, `block_size` and `long_name_threshold` are stored in the marker. One that is not set takes the share's value, or its default in a new share, and one that differs from the share's fails `build` with `SettingMismatch`. A value outside its range fails with `InvalidSetting`. `case_insensitive` and `name_cache_ttl` are not stored: each takes its default unless set.
+`encrypt_names`, `block_size`, and `long_name_threshold` are stored in the marker. Any setting not specified on the builder uses the marker's value (or its default for a new share), and specifying a value that differs from the marker fails `build()` with `SettingMismatch`. Out-of-range values fail with `InvalidSetting`. `case_insensitive` and `name_cache_ttl` are not stored in the marker and take their defaults unless set.
 
 ## Marker
 
-The root of the inner backend holds `.smb-encryption`, 60 bytes: the format version, the settings fixed at creation, a random 16-byte share id and an HMAC-SHA-256 of them under a key derived from the share key. Clients cannot list or open it.
+The root of the inner backend stores a 60-byte `.smb-encryption` marker containing the format version, the settings fixed at creation, a random 16-byte share ID, and an HMAC-SHA-256 over those fields using a key derived from the share key. Clients cannot list or open this file.
 
-`build` writes it into an empty root, unless the inner backend is read-only, and reads it from any other root. It fails when:
+`build()` writes the marker into an empty root (unless the inner backend is read-only) and reads it from any non-empty root. It fails in these cases:
 
-| Root | Error |
+| Root state | Error |
 |---|---|
-| Marker of the right size, magic and version whose HMAC fails: another key, or a changed byte after the version | `KeyMismatch` |
-| Marker of the wrong size or with other magic, or a directory | `MarkerInvalid` |
-| Marker of a format version this release does not read | `UnsupportedFormat` |
-| Entries and no marker | `MarkerMissing` |
+| Marker has the right size, magic, and version, but HMAC verification fails (wrong key or tampered bytes after the version) | `KeyMismatch` |
+| Marker has the wrong size, wrong magic, or is a directory | `MarkerInvalid` |
+| Marker uses a format version this release does not support | `UnsupportedFormat` |
+| Root has entries but no marker | `MarkerMissing` |
 
-A crash during the first build can leave a short marker, which gives `MarkerInvalid`. Delete it and build again.
+A crash during the first build can leave a truncated marker, causing `MarkerInvalid`. Delete it and build again.
 
-`restore_marker()` writes a new marker into a root that has entries and no marker. The marker takes the settings set on the builder, else the defaults: pass the settings the share was made with. Before `build` writes, it checks the key and the block size:
+`restore_marker()` writes a new marker into a non-empty root that is missing one. The marker records the settings configured on the builder (or defaults), so pass the same settings the share was created with. Before writing, `build()` verifies the key and block size:
 
-- With encrypted names, at least one entry of the root must decode under the key.
-- The first file that holds data, found breadth first among at most 10,000 entries, must have a header of the chosen block size and a first block that is a hole or verifies under the key.
+- With encrypted names, at least one entry in the root must decode under the key.
+- The first non-empty file, found breadth-first within the first 10,000 entries, must have a header matching the chosen block size and a first block that is either a hole or verifies under the key.
 
-A failed check is `KeyMismatch`, or `SettingMismatch` for the block size, and nothing is written. With names in the clear any file counts: a stray file such as `.DS_Store` that comes first in the root fails with `KeyMismatch` until it is removed. With names in the clear and no file that holds data, no check can reject a wrong key.
+If verification fails, `build()` returns `KeyMismatch` (or `SettingMismatch` for the block size) and writes nothing. With plaintext names, any file counts: a stray file such as `.DS_Store` encountered first in the root causes `KeyMismatch` until removed. With plaintext names and no non-empty files, no check can reject a wrong key.
 
 ## Keys
 
-- Give each share a key of its own. With one key, a stored file copied into another share's storage reads back through that share when both use the same block size.
-- The key is not stored anywhere. Losing it loses the data. Losing the marker loses no data. `restore_marker()` does not check `encrypt_names` or `long_name_threshold`, so keep a record of them.
-- `build` wipes the builder's copy of the key once the derived keys exist, and the derived keys and AES key schedules are wiped when dropped. A copy the caller keeps is the caller's to wipe. Not wiped: the `hmac` and `sha2` crates' internal state, and the GHASH subkey of `aes-gcm`, which sits in each cipher and in copies made during setup and for every operation. `aes-gcm` wipes one temporary copy of it.
+- Give each share its own key. If two shares share a key and block size, a stored file copied from one share's storage can be read through the other.
+- The key is not stored anywhere. Losing the key loses the data. Losing the marker loses no data, but `restore_marker()` does not verify `encrypt_names` or `long_name_threshold`, so keep a record of those settings.
+- `build()` wipes the builder's copy of the key once derived keys are created, and derived keys and AES key schedules are wiped on drop. Any copy retained by the caller is the caller's responsibility to wipe. Not wiped: internal state in the `hmac` and `sha2` crates, and the GHASH subkey in `aes-gcm` (which lives in each cipher and in copies made during setup and per operation; `aes-gcm` wipes only one temporary copy).
 
 ## Damaged blocks
 
-A read of a block that fails authentication returns STATUS_UNEXPECTED_IO_ERROR and logs a warning with the path, the stored path and the block number. Reads elsewhere in the file work, and a write that covers the whole block replaces it. Clients show:
+Reading a block that fails authentication returns `STATUS_UNEXPECTED_IO_ERROR` and logs a warning with the path, stored path, and block number. Reads elsewhere in the file still work, and a write covering the entire block replaces it. Client behavior:
 
 | Client | Result |
 |---|---|
-| Windows Explorer | "Interrupted Action" (0x8007045D) with Try Again, Skip and Cancel |
-| `robocopy` | Retries every 30 seconds up to a million times by default. Pass `/R` and `/W`, for example `/R:2 /W:1` |
-| macOS Finder | Error -8084. The copy is left at full size, with zeros after the point of failure |
+| Windows Explorer | "Interrupted Action" (`0x8007045D`) with Try Again, Skip, and Cancel |
+| `robocopy` | Retries every 30 seconds up to a million times by default. Pass `/R` and `/W` (for example, `/R:2 /W:1`) |
+| macOS Finder | Error `-8084`. Leaves a full-size copy filled with zeros after the point of failure |
 | `cp` on macOS and Linux | "Input/output error" |
 
-A copy inside the share fails the same way. Finder shows error -36 and leaves no file.
+A copy inside the share fails the same way; Finder shows error `-36` and leaves no file.
 
 ## Limits
 
-- Contents: with random nonces, NIST SP 800-38D allows 2^32 block encryptions under one key. The limit applies to each file's key: 256 TiB written to one file at 64 KiB blocks, 32 TiB at 8 KiB, 4 PiB at 1 MiB, every rewrite of a block counted. A truncation to zero, or an open that overwrites the file, starts a new key. The backend does not count writes.
-- Names: RFC 5297 advises at most 2^48 distinct AES-SIV invocations per key. The share uses one for each distinct name.
+- Contents: with random nonces, NIST SP 800-38D allows up to 2^32 block encryptions per key. This limit applies per file key: 256 TiB written to one file at 64 KiB blocks, 32 TiB at 8 KiB, or 4 PiB at 1 MiB, counting every block rewrite. Truncating a file to zero or overwriting it on open starts a new key. The backend does not track write counts.
+- Names: RFC 5297 advises at most 2^48 distinct AES-SIV invocations per key. The share uses one invocation per distinct name.
 
 ## aarch64
 
-AES and GHASH run in software unless the crate is built with both flags:
+On aarch64, AES and GHASH run in software unless the crate is built with both flags:
 
 ```sh
 RUSTFLAGS="--cfg aes_armv8 --cfg polyval_armv8" cargo build --release
 ```
 
-On aarch64 targets other than Linux, Android and Apple platforms, the `aes` target feature must also be enabled, for example with `-C target-feature=+aes` in `RUSTFLAGS`. Linux and Android detect it at run time, and Apple platforms assume it.
+On aarch64 targets other than Linux, Android, and Apple platforms, also enable the `aes` target feature (for example, `-C target-feature=+aes` in `RUSTFLAGS`). Linux and Android detect it at runtime, and Apple platforms assume it.
 
 ## Example
 
-With `--features encryption` and `SMB_ENCRYPTION_KEY` set to 64 hex digits, the example adds `vault`, a share over the `vault` directory of `SMB_ROOT`, with `alice` read-write and `bob` read-only. With `SMB_S3_BUCKET` set, which needs `--features s3,encryption`, it encrypts the `s3` share instead. A value that is not 64 hex digits stops the example, and so does the variable without the feature.
+With `--features encryption` and `SMB_ENCRYPTION_KEY` set to 64 hex digits, the example adds a `vault` share backed by the `vault` directory inside `SMB_ROOT`, with `alice` read-write and `bob` read-only. When `SMB_S3_BUCKET` is also set (requiring `--features s3,encryption`), it encrypts the `s3` share instead. An invalid key length or setting `SMB_ENCRYPTION_KEY` without the `encryption` feature stops the example.
 
 ```sh
 SMB_ENCRYPTION_KEY='<64 hex digits>' cargo run -p minimal-smb-example --features encryption
 ```
 
 - Any 64 hex digits work as a key, such as the output of `openssl rand -hex 32`.
-- Switching the variable on or off for an `SMB_S3_CACHE` an earlier run used fails on the cache directory's case setting.
+- Toggling `SMB_ENCRYPTION_KEY` on or off while reusing an existing `SMB_S3_CACHE` fails due to the cache directory's recorded case setting.

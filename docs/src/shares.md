@@ -15,19 +15,19 @@ SmbServer::builder()
 | `.public()` | Anonymous and guest, read-write |
 | `.public_read_only()` | Anonymous and guest, read-only |
 
-- Without `.public()` or `.public_read_only()`, only listed users get in.
-- A public share takes no `.user()` entries; `build()` fails with `PublicMixedWithUsers`.
+- Without `.public()` or `.public_read_only()`, only listed users can connect.
+- A public share cannot also list `.user()` entries; `build()` fails with `PublicMixedWithUsers`.
 
 ## Guest
 
-- Logon as `guest` with an empty password gets anonymous access, unless a user named `guest` (any case) is configured. The Finder sends this for Connect As Guest.
-- Guest and anonymous sessions are neither signed nor encrypted. A client that requires signing gets no guest session.
+- Logging on as `guest` with an empty password grants anonymous access, unless a user named `guest` (any case) is configured. macOS Finder sends this for Connect As Guest.
+- Guest and anonymous sessions are neither signed nor encrypted. Clients that require signing cannot establish a guest session.
 
 ## Per-share switches
 
-All on by default.
+All options are enabled by default.
 
-| Call on `Share` | Turns off |
+| Call on `Share` | Disables |
 |---|---|
 | `.leases(false)` | [Leases](leases.md) |
 | `.durable_handles(false)` | [Durable handles](durable-handles.md) |
@@ -35,7 +35,7 @@ All on by default.
 | `.named_streams(false)` | [Named streams](streams.md) |
 | `.extended_attributes(false)` | [Extended attributes](extended-attributes.md) |
 | `.server_side_copy(false)` | [Server-side copy](copy.md) |
-| `.listed(false)` | The share in [share listings](share-listing.md) |
+| `.listed(false)` | Showing the share in [share listings](share-listing.md) |
 
 Other calls on `Share`:
 
